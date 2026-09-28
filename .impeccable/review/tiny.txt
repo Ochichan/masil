@@ -1,0 +1,8 @@
+┌──────────────────────┐
+│Terminal too small for│
+│the agent desk        │
+│                      │
+│                      │
+│Minimum: 28 x 9       │
+│             [q Close]│
+└──────────────────────┘

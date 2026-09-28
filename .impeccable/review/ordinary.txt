@@ -1,0 +1,23 @@
+
+rmux  Agent desk  Observer connected           l EN   t Dark   ? Help   q Close
+
+ All 16   Attention 3   Working 6   Unavailable 0
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│/ Search agents                                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Agents ──────────────────────────────────────────────────────────────────────┐
+│ Working agent-00  1 pending / Unseen                                         │
+│ Idle agent-01  1 pending / Unseen                                            │
+│ Working agent-03  1 pending / Unseen                                         │
+│ Idle agent-02  None                                                          │
+│ Idle agent-04  None                                                          │
+│ Idle agent-05  None                                                          │
+│ Working agent-06  None                                                       │
+│ Idle agent-07  None                                                          │
+│ Idle agent-08  None                                                          │
+│ Working agent-09  None                                                       │
+└──────────────────────────────────────────────────────────────────────────────┘
+ a Mark seen   g Go to pane   Enter Details
+
+Arrows or j/k move; Enter opens details; Shift-F10 opens actions.

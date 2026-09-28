@@ -65,6 +65,8 @@ parent directory는 현재 UID 소유이고 group/other 접근이 없어야 한�
 
 ## 검증 상태와 다음 작업
 
+`rmux-agent ui`와 `sidebar`는 선택적인 터미널 관리 화면이다. 기존 tmux 기본 키를 바꾸지 않고 에이전트 목록·필터·검색·상세·확인 표시·guarded pane 이동을 제공한다. [실행과 조작 안내](agent-desk.md), [상호작용 설계](ui/agent-desk.md), [UI 검증 기록](validation/2026-09-28-agent-desk.md)을 참고한다.
+
 OpenCode의 native 상태를 관찰하려면 [agentd 실행 안내](agent-observation.md)를 따른다. `serve`는 별도 foreground 프로세스이며 `status`, `agents`, `inspect`, `stop`으로 조회·종료한다. 상태와 pane의 연결은 `explicit_unverified`로 표시하고 TUI의 현재 session이라고 단정하지 않는다. [검증 기록](validation/2026-09-28-agentd.md)에 통합 결과와 idle 비용을 기록한다.
 
 - [x] 전체 고정 terminal source, provenance, local build.

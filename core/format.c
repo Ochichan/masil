@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "rmux-bridge.h"
 
 /*
  * Build a list of key-value pairs and use them to expand #{key} entries in a
@@ -2336,6 +2337,24 @@ format_cb_pane_output_generation(struct format_tree *ft)
 	return (NULL);
 }
 
+/* Callback for rmux_core_boot_id. */
+static void *
+format_cb_rmux_core_boot_id(__unused struct format_tree *ft)
+{
+	return (xstrdup(rmux_bridge_get_boot_id()));
+}
+
+/* Callback for rmux_pty_generation. */
+static void *
+format_cb_rmux_pty_generation(struct format_tree *ft)
+{
+	if (*rmux_bridge_get_boot_id() == '\0' || ft->wp == NULL ||
+	    ft->wp->rmux_generation_exhausted)
+		return (xstrdup(""));
+	return (format_printf("%llu",
+	    (unsigned long long)ft->wp->rmux_pty_generation));
+}
+
 /* Callback for pane_last_prompt_time. */
 static void *
 format_cb_pane_last_prompt_time(struct format_tree *ft)
@@ -3998,6 +4017,12 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "pid", FORMAT_TABLE_STRING,
 	  format_cb_pid
+	},
+	{ "rmux_core_boot_id", FORMAT_TABLE_STRING,
+	  format_cb_rmux_core_boot_id
+	},
+	{ "rmux_pty_generation", FORMAT_TABLE_STRING,
+	  format_cb_rmux_pty_generation
 	},
 	{ "scroll_region_lower", FORMAT_TABLE_STRING,
 	  format_cb_scroll_region_lower

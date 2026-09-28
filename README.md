@@ -6,6 +6,8 @@ rmux는 tmux의 기능과 기본 키 조작을 갖추고, 각 코딩 에이전�
 
 `attention`은 승인·질문 대기 목록을, `ack`는 daemon 수명 동안 클라이언트들이 공유하는 확인 표시를 제공한다. `watch-agents`로 전체 목록의 최신 상태를 계속 받을 수 있다. 확인 명령은 provider 요청을 승인하지 않는다.
 
+`rmux-agent ui`는 검색·필터·상세 보기·확인 표시·pane 이동을 제공하는 터미널 관리 화면이다. `sidebar`는 34열 사이드패널을 열고 tmux 줌으로 확대한다. 마우스 선택·메뉴·휠·스크롤바·구분선 드래그, 영어·한국어, 어두운·밝은·터미널 테마를 지원한다. [관리 화면 사용법](docs/agent-desk.md)을 참고한다.
+
 ```sh
 make                 # 코어와 선택적 Rust 관찰 CLI
 ./bin/rmux -L main new-session -s work
@@ -40,6 +42,8 @@ macOS 초기 비교에서 50-pane idle 서버 RSS는 rmux 4.44 MiB, stock tmux 4
 | 문서 | 다루는 내용 |
 | --- | --- |
 | [현재 구현과 실행](docs/implementation-status.md) | 빌드·사용법, 실제 기능과 남은 작업 |
+| [에이전트 관리 화면](docs/agent-desk.md) | 사이드패널·확대 화면, 마우스·키보드, 영어·한국어 |
+| [UI 상호작용 설계](docs/ui/agent-desk.md) | 화면 구성, 입력 소유권, 상태·복구·반응형 계약 |
 | [코어 관찰 IPC](docs/core-observation.md) | 구현된 wire protocol·상한·generation·실패 의미 |
 | [OpenCode 관찰 daemon](docs/agent-observation.md) | 시작·조회·중지, 상태와 연결의 한계, 자원 상한 |
 | [대기 요청 확인과 live 목록](docs/attention.md) | 미확인 목록, revision별 shared ack, snapshot stream |

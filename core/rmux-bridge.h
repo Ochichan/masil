@@ -21,6 +21,7 @@ struct window_pane;
 
 void	rmux_bridge_start(void);
 void	rmux_bridge_stop(void);
+const char *rmux_bridge_get_boot_id(void);
 
 void	rmux_bridge_pane_created(struct window_pane *);
 void	rmux_bridge_pane_destroyed(struct window_pane *);

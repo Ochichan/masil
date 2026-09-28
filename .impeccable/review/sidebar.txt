@@ -1,0 +1,24 @@
+Agents                      Online
+
+ l EN   t D   ?   q
+ All 16           Wait 3
+ Work 6           Unavailable 0
+┌────────────────────────────────┐
+│/ Search agents                 │
+└────────────────────────────────┘
+┌ Agents ────────────────────────┐
+│ agent-00  Working              │
+│  Approval  1 pending  Unseen   │
+│ agent-01  Idle                 │
+│  Question  1 pending  Unseen   │
+│ agent-03  Working              │
+│  Approval  1 pending  Unseen   │
+│ agent-02  Idle                 │
+│  None                          │
+│ agent-04  Idle                 │
+│  None                          │
+└────────────────────────────────┘
+ a Mark seen      g Pane
+ Enter Details    z Expand
+j/k Move  Enter Details  ? Help
+Shared window layout

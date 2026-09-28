@@ -1,0 +1,31 @@
+
+rmux  Agent desk  Observer connected                                                   l EN   t Dark   ? Help   q Close
+
+ All 16   Attention 3   Working 6   Unavailable 0
+
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│nothing-matches                                                                                                 Clear │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Agents ──────────────────────────────────────┐ ┌ Evidence inspector ─────────────────────────────────────────────────┐
+│          No agents match this view.          │ │Select an agent to inspect its evidence.                             │
+│        Clear the search or choose All.       │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+└──────────────────────────────────────────────┘ └─────────────────────────────────────────────────────────────────────┘
+ a Mark seen   g Go to pane   Enter Details
+
+Type to search; Ctrl-U clears; Esc returns to the list.

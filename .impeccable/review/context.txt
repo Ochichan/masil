@@ -1,0 +1,31 @@
+
+rmux  Agent desk  Observer connected                                                   l EN   t Dark   ? Help   q Close
+
+ All 16   Attention 3   Working 6   Unavailable 0
+
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│/ Search agents                                                                                                       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Agents ──────────────────────────────────────┐ ┌ Evidence inspector ─────────────────────────────────────────────────┐
+│ Working ┌ Agent actions ─────────┐en         │ │agent-00                                                             │
+│ Idle age│ Mark seen              │           │ │Activity: Working                                                    │
+│ Working │ Go to pane             │en         │ │Attention: Approval request / Unseen                                 │
+│ Idle age│ Details                │           │ │Approval request: 1 / Question: 0                                    │
+│ Idle age│ Copy ID                │           │ │                                                                     │
+│ Idle age└────────────────────────┘           │ │Source: local                                                        │
+│ Working agent-06  None                       │ │Session: ses_0                                                       │
+│ Idle agent-07  None                          │ │Pane: %0                                                             │
+│ Idle agent-08  None                          │ │Evidence: Fresh                                                      │
+│ Working agent-09  None                       │ │Observed at: 2026-09-28 04:00:20.221 UTC                             │
+│ Idle agent-10  None                          │ │Binding: Configured pane; foreground agent not verified              │
+│ Idle agent-11  None                          │ │Foreground agent verified: No                                        │
+│ Working agent-12  None                       │ │                                                                     │
+│ Idle agent-13  None                          │ │Core / Process: Running                                              │
+│ Idle agent-14  None                          │ │Core evidence: Fresh                                                 │
+│ Working agent-15  None                       │ │PTY generation: 1                                                    │
+│                                              │ │                                                                     │
+│                                              │ │                                                                     │
+└──────────────────────────────────────────────┘ └─────────────────────────────────────────────────────────────────────┘
+ a Mark seen   g Go to pane   Enter Details
+
+Arrows or j/k move; Enter opens details; Shift-F10 opens actions.

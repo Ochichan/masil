@@ -31,7 +31,7 @@ fn choice(value: &Value, values: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-fn validate(value: &Value) -> Result<(String, u64, Scope), String> {
+pub(crate) fn validate(value: &Value) -> Result<(String, u64, Scope), String> {
     let envelope = object_with_fields(
         value,
         &[

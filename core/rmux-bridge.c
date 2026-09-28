@@ -1669,6 +1669,14 @@ rmux_bridge_private_parent(const char *path)
 	return (0);
 }
 
+const char *
+rmux_bridge_get_boot_id(void)
+{
+	if (!rmux_bridge_enabled)
+		return ("");
+	return (rmux_bridge_boot_id);
+}
+
 void
 rmux_bridge_start(void)
 {

@@ -21,6 +21,7 @@ test: core baseline agent benchmark-env
 	python3 tests/test_agent_stream_cli.py
 	@if [ "$$(uname -s)" = Darwin ]; then python3 tests/test_respawn_failure.py; fi
 	.build/bench-venv/bin/python tests/test_benchmark_harness.py
+	.build/bench-venv/bin/python tests/test_ui.py
 	cargo test --locked --manifest-path agent/Cargo.toml
 
 benchmark-env:
