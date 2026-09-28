@@ -1,0 +1,109 @@
+python3 scripts/build.py
+core-build: .build/logs/core-build.log
+tmux next-3.9 /Users/ochi/Documents/Projects/rmux/bin/rmux
+python3 scripts/build.py --baseline
+baseline-build: .build/logs/baseline-build.log
+tmux next-3.9 /Users/ochi/Documents/Projects/rmux/bin/tmux-baseline
+python3 scripts/build.py --agent
+agent-build: .build/logs/agent-build.log
+agent-smoke: .build/logs/agent-smoke.log
+python3 -m venv .build/bench-venv
+PIP_DISABLE_PIP_VERSION_CHECK=1 .build/bench-venv/bin/python -m pip install -r tests/performance/requirements.txt
+Requirement already satisfied: pyte==0.8.2 in ./.build/bench-venv/lib/python3.13/site-packages (from -r tests/performance/requirements.txt (line 2)) (0.8.2)
+Requirement already satisfied: wcwidth==0.2.13 in ./.build/bench-venv/lib/python3.13/site-packages (from -r tests/performance/requirements.txt (line 3)) (0.2.13)
+python3 tests/test_compatibility.py
+test_buffers_and_formats (__main__.Compatibility.test_buffers_and_formats) ... ok
+test_control_mode (__main__.Compatibility.test_control_mode) ... ok
+test_default_public_inventory (__main__.Compatibility.test_default_public_inventory) ... ok
+test_editor_defaults (__main__.Compatibility.test_editor_defaults) ... ok
+test_layout_session_links_and_zoom (__main__.Compatibility.test_layout_session_links_and_zoom) ... ok
+test_native_error_semantics_and_alias (__main__.Compatibility.test_native_error_semantics_and_alias) ... ok
+test_native_hook_and_async_queue (__main__.Compatibility.test_native_hook_and_async_queue) ... ok
+test_native_prefix_and_detach (__main__.Compatibility.test_native_prefix_and_detach) ... ok
+test_protocol_product_isolation_and_inheritance (__main__.Compatibility.test_protocol_product_isolation_and_inheritance) ... ok
+test_unicode_capture_and_copy_mode (__main__.Compatibility.test_unicode_capture_and_copy_mode) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 1.073s
+
+OK
+python3 tests/test_bridge.py
+bridge integration: passed
+python3 tests/test_watch.py
+test_atomic_admission_and_idle_cleanup (__main__.WatchIntegration.test_atomic_admission_and_idle_cleanup) ... ok
+test_blocked_writer_expires_while_native_input_progresses (__main__.WatchIntegration.test_blocked_writer_expires_while_native_input_progresses) ... ok
+test_filtered_journal_scan_continues_without_more_native_output (__main__.WatchIntegration.test_filtered_journal_scan_continues_without_more_native_output) ... ok
+test_global_watch_capacity_and_shared_references (__main__.WatchIntegration.test_global_watch_capacity_and_shared_references) ... ok
+test_lifecycle_and_deleted_dirty_slot (__main__.WatchIntegration.test_lifecycle_and_deleted_dirty_slot) ... ok
+test_rust_cli_receives_real_core_event (__main__.WatchIntegration.test_rust_cli_receives_real_core_event) ... ok
+test_scope_fence_and_coalesced_output (__main__.WatchIntegration.test_scope_fence_and_coalesced_output) ... ok
+test_slow_reader_reports_loss_without_blocking_native_commands (__main__.WatchIntegration.test_slow_reader_reports_loss_without_blocking_native_commands) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 8.437s
+
+OK
+python3 tests/test_watch_cli.py
+watch CLI integration: passed
+python3 tests/test_agentd.py
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 9.209s
+
+OK
+python3 tests/test_attention.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 7.608s
+
+OK
+python3 tests/test_agent_stream_cli.py
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.100s
+
+OK
+forkpty failure injection: passed
+.build/bench-venv/bin/python tests/test_benchmark_harness.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.135s
+
+OK
+cargo test --locked --manifest-path agent/Cargo.toml
+    Blocking waiting for file lock on package cache
+   Compiling rmux-agent v0.1.0 (/Users/ochi/Documents/Projects/rmux/agent)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.78s
+     Running unittests src/main.rs (agent/target/debug/deps/rmux_agent-06298a9aa3d76367)
+
+running 28 tests
+test opencode::tests::json_projection_has_explicit_collection_bound ... ok
+test opencode::tests::health_is_the_runtime_provider_version_source ... ok
+test attention::tests::exact_full_set_is_order_independent_and_includes_ids_after_public_limit ... ok
+test opencode::tests::existing_session_absent_from_sparse_status_is_idle_not_done ... ok
+test opencode::tests::coalesced_watch_aba_invalidates_acknowledgement ... ok
+test observation::tests::rejects_remote_ambiguous_or_duplicate_sources ... ok
+test attention::tests::producer_generation_detects_coalesced_aba_and_old_daemon_epoch_is_rejected ... ok
+test opencode::tests::sse_decoder_handles_split_frames_and_rejects_malformed_envelopes ... ok
+test opencode::tests::snapshot_rejects_wrong_session_identity_or_directory ... ok
+test attention::tests::unavailable_preserves_identity_and_ack_until_a_real_reconnect ... ok
+test daemon::tests::ack_reconciles_a_new_source_value_before_checking_the_revision ... ok
+test attention::tests::resolved_then_reappearing_attention_gets_a_new_revision ... ok
+test daemon::tests::repeated_ack_of_the_same_attention_revision_is_idempotent ... ok
+test daemon::tests::pty_lifecycle_permanently_invalidates_the_association ... ok
+test opencode::tests::events_are_filtered_by_exact_session_and_disposal_directory ... ok
+test observation::tests::missing_evidence_is_not_false_absence_or_current_activity ... ok
+test daemon::tests::management_requests_are_strict_and_bounded ... ok
+test attention::tests::stale_ack_is_rejected_and_repeated_current_ack_is_idempotent ... ok
+test opencode::tests::continuously_ready_irrelevant_stream_cannot_starve_snapshot ... ok
+test opencode::tests::pending_generation_records_intermediate_aba_snapshots ... ok
+test opencode::tests::publication_fence_blocks_while_an_sse_frame_is_partial ... ok
+test opencode::tests::publication_fence_requires_an_observed_pending_boundary ... ok
+test opencode::tests::snapshot_maps_status_and_filters_requests_by_exact_session ... ok
+test opencode::tests::request_ids_are_bounded_per_row_while_counts_are_exact ... ok
+test tests::rejects_nested_duplicate_fields ... ok
+test tests::accepts_unicode_and_enforces_depth ... ok
+test opencode::tests::sse_decoder_resets_partial_deadline_for_a_new_frame_and_bounds_batches ... ok
+test daemon::tests::maximum_observation_snapshot_fits_the_response_frame ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s

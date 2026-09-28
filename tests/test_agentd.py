@@ -160,7 +160,7 @@ def manager_query(path: Path, kind, **fields):
         return json.loads(exact(length))
 
 
-class AgentdIntegration(unittest.TestCase):
+class AgentdHarness(unittest.TestCase):
     def setUp(self):
         self.core = Server(RMUX, command=["/bin/cat"])
         self.bridge = self.core.path / "observe.sock"
@@ -212,6 +212,8 @@ class AgentdIntegration(unittest.TestCase):
     def fresh(self):
         wait_for(lambda: self.row()["native"]["freshness"] == "fresh", 8)
 
+
+class AgentdIntegration(AgentdHarness):
     def test_lifecycle_readonly_state_and_child_isolation(self):
         result = subprocess.run([str(AGENT), "--socket", str(self.manager), "status"],
                                 capture_output=True, text=True, check=True)

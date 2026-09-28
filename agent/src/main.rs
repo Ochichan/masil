@@ -1,4 +1,6 @@
 //! Read-only client for the core observation protocol. No daemon autostart.
+mod agent_stream;
+mod attention;
 mod daemon;
 mod observation;
 mod opencode;
@@ -599,8 +601,29 @@ fn serve_command(socket: &str, args: &[String]) -> Result<i32, String> {
 }
 
 fn manager_query(socket: &str, command: &str, args: &[String]) -> Result<i32, String> {
-    if args.len() != usize::from(command == "inspect") {
-        return Err("incorrect manager query arguments".into());
+    let mut request = json!({"v":1,"kind":command,"request_id":command});
+    match command {
+        "inspect" if args.len() == 1 => request["id"] = args[0].clone().into(),
+        "attention" if args == ["--all"] => request["all"] = true.into(),
+        "ack" if args.len() == 5 => {
+            request["id"] = args[0].clone().into();
+            for pair in args[1..].chunks_exact(2) {
+                let field = match pair[0].as_str() {
+                    "--epoch" => "epoch",
+                    "--revision" => "revision",
+                    _ => return Err("ack requires ID --epoch E --revision R".into()),
+                };
+                if request.get(field).is_some() {
+                    return Err("repeated ack option".into());
+                }
+                request[field] = pair[1].clone().into();
+            }
+            if request.get("epoch").is_none() || request.get("revision").is_none() {
+                return Err("ack requires ID --epoch E --revision R".into());
+            }
+        }
+        "status" | "agents" | "stop" | "attention" if args.is_empty() => {}
+        _ => return Err("incorrect manager query arguments".into()),
     }
     let mut stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
@@ -627,10 +650,6 @@ fn manager_query(socket: &str, command: &str, args: &[String]) -> Result<i32, St
     stream
         .set_write_timeout(Some(Duration::from_secs(3)))
         .map_err(|e| e.to_string())?;
-    let mut request = json!({"v":1,"kind":command,"request_id":command});
-    if command == "inspect" {
-        request["id"] = args[0].clone().into();
-    }
     let response = exchange(&mut stream, request)?;
     if response["kind"] != command && response["kind"] != "error" {
         return Err("unexpected manager response kind".into());
@@ -646,7 +665,7 @@ fn execute() -> Result<i32, String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args == ["--help"] {
         println!(
-            "rmux-agent 0.1.0 — read-only observation\n\nCore socket:\n  rmux-agent --socket PATH hello|inventory|snapshot %N|stats\n  rmux-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nManager socket:\n  rmux-agent --socket PATH serve --core CORE_SOCKET --config FILE\n  rmux-agent --socket PATH status|agents|inspect ID|stop\n\nExplicit core bridge required: RMUX_BRIDGE_SOCKET=/private/path/observe.sock rmux ...\nProvider associations are unverified TUI bindings. No prompt submission, approval, completion claim, or daemon autostart."
+            "rmux-agent 0.1.0 — read-only observation\n\nCore socket:\n  rmux-agent --socket PATH hello|inventory|snapshot %N|stats\n  rmux-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nManager socket:\n  rmux-agent --socket PATH serve --core CORE_SOCKET --config FILE\n  rmux-agent --socket PATH status|agents|inspect ID|stop\n  rmux-agent --socket PATH attention [--all]\n  rmux-agent --socket PATH ack ID --epoch E --revision R\n  rmux-agent --socket PATH watch-agents [--count N]\n\nAcknowledgements are shared only for this daemon lifetime and never approve provider requests.\n\nExplicit core bridge required: RMUX_BRIDGE_SOCKET=/private/path/observe.sock rmux ...\nProvider associations are unverified TUI bindings. No prompt submission, approval, completion claim, or daemon autostart."
         );
         return Ok(0);
     }
@@ -661,7 +680,13 @@ fn execute() -> Result<i32, String> {
     if command == "serve" {
         return serve_command(&args[1], &args[3..]);
     }
-    if matches!(command, "status" | "agents" | "inspect" | "stop") {
+    if command == "watch-agents" {
+        return agent_stream::run(&args[1], &args[3..]);
+    }
+    if matches!(
+        command,
+        "status" | "agents" | "inspect" | "stop" | "attention" | "ack"
+    ) {
         return manager_query(&args[1], command, &args[3..]);
     }
     if !matches!(

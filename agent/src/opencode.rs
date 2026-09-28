@@ -68,6 +68,47 @@ struct Snapshot {
     provider_version: Option<String>,
 }
 
+#[derive(Default)]
+struct PendingTracker {
+    sessions: HashMap<String, PendingIdentity>,
+}
+
+#[derive(Default)]
+struct PendingIdentity {
+    observation: Option<PendingObservation>,
+    generation: u64,
+}
+
+#[derive(PartialEq, Eq)]
+enum PendingObservation {
+    Missing,
+    Present(Vec<String>),
+}
+
+impl PendingTracker {
+    fn observe(&mut self, sessions: &mut [NativeSession]) {
+        for session in sessions {
+            let identity = self.sessions.entry(session.id.clone()).or_default();
+            let observation = if session.exists == Some(true) {
+                let mut canonical = session.pending_keys.clone();
+                canonical.sort_unstable();
+                canonical.dedup();
+                PendingObservation::Present(canonical)
+            } else {
+                PendingObservation::Missing
+            };
+            if identity.observation.as_ref() != Some(&observation) {
+                identity.generation = identity
+                    .generation
+                    .checked_add(1)
+                    .expect("pending generation exhausted");
+                identity.observation = Some(observation);
+            }
+            session.pending_generation = identity.generation;
+        }
+    }
+}
+
 struct SessionInfoProjection {
     id: String,
     directory: String,
@@ -104,6 +145,7 @@ pub async fn observe_source(config: SourceConfig, output: watch::Sender<SourceSt
     };
 
     let mut backoff = BACKOFF_MIN;
+    let mut pending_tracker = PendingTracker::default();
     while !output.is_closed() {
         let connected_at = Instant::now();
         let mut response = match connect_sse(&client, &config, auth.as_ref()).await {
@@ -179,7 +221,7 @@ pub async fn observe_source(config: SourceConfig, output: watch::Sender<SourceSt
                         output.send_modify(|state| {
                             state.reconciliations = state.reconciliations.saturating_add(1);
                         });
-                        let next = match result {
+                        let mut next = match result {
                             Ok(next) => next,
                             Err(error) => break error,
                         };
@@ -211,6 +253,7 @@ pub async fn observe_source(config: SourceConfig, output: watch::Sender<SourceSt
                             stream_budget = 0;
                             continue;
                         }
+                        pending_tracker.observe(&mut next.sessions);
                         output.send_modify(|state| {
                             state.sessions = next.sessions;
                             state.provider_version = next.provider_version;
@@ -712,6 +755,8 @@ fn project_snapshot(
             question_count: 0,
             request_ids_truncated: false,
             observed_at_ms,
+            pending_keys: Vec::new(),
+            pending_generation: 0,
         });
     }
 
@@ -789,11 +834,13 @@ fn project_requests(
         let stored = session.permission_ids.len() + session.question_ids.len();
         if permission {
             session.permission_count = session.permission_count.saturating_add(1);
+            session.pending_keys.push(format!("permission:{id}"));
             if stored < MAX_STORED_REQUEST_IDS {
                 session.permission_ids.push(id.to_owned());
             }
         } else {
             session.question_count = session.question_count.saturating_add(1);
+            session.pending_keys.push(format!("question:{id}"));
             if stored < MAX_STORED_REQUEST_IDS {
                 session.question_ids.push(id.to_owned());
             }
@@ -1132,6 +1179,105 @@ mod tests {
         assert_eq!(parent.question_count, 1);
         assert_eq!(parent.permission_ids.len() + parent.question_ids.len(), 16);
         assert!(parent.request_ids_truncated);
+        assert_eq!(parent.pending_keys.len(), 21);
+        assert!(parent.pending_keys.contains(&"permission:per_16".into()));
+        assert!(parent.pending_keys.contains(&"question:que_parent".into()));
+    }
+
+    #[test]
+    fn pending_generation_records_intermediate_aba_snapshots() {
+        let config = config();
+        let snapshot = |request_id: &str| {
+            project_snapshot(
+                &config,
+                json!({}),
+                vec![Some(info("ses_parent", None)), None],
+                json!([{"id": request_id, "sessionID": "ses_parent"}]),
+                json!([]),
+            )
+            .unwrap()
+        };
+        let mut tracker = PendingTracker::default();
+
+        let mut first = snapshot("per_a");
+        tracker.observe(&mut first.sessions);
+        let first_generation = first.sessions[0].pending_generation;
+
+        let mut intermediate = snapshot("per_b");
+        tracker.observe(&mut intermediate.sessions);
+        let mut final_snapshot = snapshot("per_a");
+        tracker.observe(&mut final_snapshot.sessions);
+
+        assert!(intermediate.sessions[0].pending_generation > first_generation);
+        assert!(
+            final_snapshot.sessions[0].pending_generation
+                > intermediate.sessions[0].pending_generation
+        );
+        assert_eq!(
+            final_snapshot.sessions[0].pending_keys,
+            first.sessions[0].pending_keys
+        );
+
+        let mut missing =
+            project_snapshot(&config, json!({}), vec![None, None], json!([]), json!([])).unwrap();
+        tracker.observe(&mut missing.sessions);
+        let mut reappeared = snapshot("per_a");
+        tracker.observe(&mut reappeared.sessions);
+        assert!(
+            missing.sessions[0].pending_generation > final_snapshot.sessions[0].pending_generation
+        );
+        assert!(reappeared.sessions[0].pending_generation > missing.sessions[0].pending_generation);
+    }
+
+    #[test]
+    fn coalesced_watch_aba_invalidates_acknowledgement() {
+        use crate::attention::AttentionBook;
+
+        let config = config();
+        let snapshot = |request_id: &str| {
+            project_snapshot(
+                &config,
+                json!({}),
+                vec![Some(info("ses_parent", None)), None],
+                json!([{"id": request_id, "sessionID": "ses_parent"}]),
+                json!([]),
+            )
+            .unwrap()
+        };
+        let mut tracker = PendingTracker::default();
+        let mut first = snapshot("per_a");
+        tracker.observe(&mut first.sessions);
+        let first = first.sessions.remove(0);
+        let (sender, mut receiver) = watch::channel(first.clone());
+        let mut book = AttentionBook::new("daemon".into());
+        let acknowledged = book.reconcile(
+            &first.id,
+            1,
+            first.pending_generation,
+            true,
+            &first.pending_keys,
+        );
+        book.acknowledge(&first.id, "daemon", &acknowledged.revision)
+            .unwrap();
+
+        let mut intermediate = snapshot("per_b");
+        tracker.observe(&mut intermediate.sessions);
+        sender.send_replace(intermediate.sessions.remove(0));
+        let mut final_snapshot = snapshot("per_a");
+        tracker.observe(&mut final_snapshot.sessions);
+        sender.send_replace(final_snapshot.sessions.remove(0));
+
+        let latest = receiver.borrow_and_update();
+        assert_eq!(latest.pending_keys, first.pending_keys);
+        let after_aba = book.reconcile(
+            &latest.id,
+            1,
+            latest.pending_generation,
+            true,
+            &latest.pending_keys,
+        );
+        assert_ne!(after_aba.revision, acknowledged.revision);
+        assert!(!after_aba.acknowledged);
     }
 
     #[test]

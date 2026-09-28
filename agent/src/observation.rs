@@ -50,6 +50,10 @@ pub struct NativeSession {
     pub question_count: usize,
     pub request_ids_truncated: bool,
     pub observed_at_ms: u64,
+    #[serde(skip)]
+    pub pending_keys: Vec<String>,
+    #[serde(skip)]
+    pub(crate) pending_generation: u64,
 }
 
 impl NativeSession {
@@ -68,6 +72,8 @@ impl NativeSession {
             question_count: 0,
             request_ids_truncated: false,
             observed_at_ms: 0,
+            pending_keys: vec![],
+            pending_generation: 0,
         }
     }
 }
@@ -113,6 +119,7 @@ impl SourceState {
             session.permission_count = 0;
             session.question_count = 0;
             session.request_ids_truncated = false;
+            session.pending_keys.clear();
         }
     }
 }

@@ -77,7 +77,8 @@ OpenCode의 native 상태를 관찰하려면 [agentd 실행 안내](agent-observ
 - [ ] Linux/BSD와 실제 IME·clipboard·SSH·중첩 terminal 행렬 검증.
 - [x] 선택 scope의 watch/event/gap, dirty 병합, 느린 구독자 정리, Rust streaming CLI.
 - [x] foreground agentd, OpenCode GET/SSE 상태·승인·질문 대기 관찰, source/core freshness 분리.
-- [ ] verified TUI binding, provider 확대, attention UI와 나머지 durable 관리 계층.
+- [x] shared attention 목록과 revision별 메모리 확인, bounded live snapshot CLI. [사용법](attention.md).
+- [ ] verified TUI binding, provider 확대, native menu/focus와 durable 관리 계층.
 
 upstream suite는 최초 전체 실행과 실패 항목 재검증을 합쳐 두 제품 각각 163/164 통과했다. `screen-redraw-menus.sh`는 stock에서도 같은 fixture 차이가 남는다. 정규화·재검증 조건과 원시 결과는 [검증 기록](validation/2026-09-28-core.md)에 있다. 전체 플랫폼의 완전 호환이나 출시 gate 통과를 주장하지 않는다.
 

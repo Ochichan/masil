@@ -37,6 +37,8 @@ core 관찰 socket을 켠 서버가 먼저 필요하다. [코어 관찰 실행 �
 
 `serve`는 foreground 실행이다. `stop`·SIGINT·SIGTERM은 관찰 daemon만 종료한다. core, pane의 TUI, OpenCode 서버는 계속 실행된다. config는 시작할 때 읽고 변경되지 않는다. 대상 변경은 daemon을 종료하고 새 config로 다시 시작한다.
 
+`attention`으로 미확인 승인·질문 목록을 보고 `ack`로 특정 요청 묶음을 확인 처리할 수 있다. `watch-agents`는 전체 현재 목록을 변경 때만 전송한다. 여러 클라이언트가 공유하는 메모리 확인 상태와 정확한 revision 사용법은 [대기 요청 확인](attention.md)에 있다. ack는 provider 승인 응답이 아니다.
+
 ## 결과의 의미
 
 | 필드 | 의미 |
@@ -69,7 +71,7 @@ pane PTY 교체·종료·삭제, core stream gap 또는 동기화 후 연결 손
 - 관리 socket은 owner private directory, 0600, same UID, 최대 32개 동시 client. 요청 8 KiB·응답 64 KiB·읽기/쓰기 각각 3초. 기존 socket 경로는 덮어쓰지 않는다.
 - canonical core socket 옆의 `.agentd.lock`에 OS lock을 잡아 중복 관찰 daemon을 거절한다. lock 파일은 종료 후에도 남으며 내용이나 존재가 daemon 생존 여부를 뜻하지 않는다. crash 후 남은 manager socket은 소유자가 process 종료를 확인하고 처리해야 한다.
 
-manager wire framing은 4-byte big-endian 길이 + UTF-8 JSON이다. 요청은 `{v:1,kind,request_id}`이며 inspect만 `id`를 추가한다. 한 연결에 요청/응답 하나를 처리한다. status의 sources/observations는 개수이며, agents의 observations는 배열이다. CLI exit 0은 조회 성공, 2는 요청/연결/프로토콜 오류, 3은 존재하는 socket에 연결할 수 없는 status, 5는 manager error 응답이다. 미시작 status는 `not_started`와 exit 0을 반환한다.
+manager wire framing은 4-byte big-endian 길이 + UTF-8 JSON이다. 기본 요청은 `{v:1,kind,request_id}`이며 inspect는 `id`를 추가한다. attention·ack·watch-agents의 확장 schema는 [목록 계약](attention.md)에 있다. 일반 query는 한 연결에 요청/응답 하나이며 watch-agents만 계속 전송한다. status의 sources/observations는 개수이며, agents의 observations는 배열이다. CLI exit 0은 조회 성공, 2는 요청/연결/프로토콜 오류, 3은 존재하는 socket에 연결할 수 없는 status 또는 stream 손실, 5는 manager error 응답이다. 미시작 status는 `not_started`와 exit 0을 반환한다.
 
 ## API 기준과 검증
 

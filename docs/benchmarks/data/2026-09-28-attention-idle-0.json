@@ -1,0 +1,40 @@
+{
+  "kind": "short_idle_probe",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "agent_sha256": "557db333443cd13e4f0662a11a404aaccc084868f458eef89c767f875a0c599a",
+  "core_sha256": "30eb68ffa907e99c798ea34741d5c59fdb6101773122469697f68f28a78387de",
+  "provider": "deterministic local HTTP/SSE fixture; no model or TUI",
+  "cpu_method": "ps cumulative CPU delta; short interval and coarse timer resolution",
+  "samples": [
+    {
+      "observations": 1,
+      "sources": 1,
+      "elapsed_seconds": 5.002159000025131,
+      "projection_subscribers": 0,
+      "rss_bytes": 3391488,
+      "threads": 1,
+      "cpu_seconds": 0.0,
+      "http_requests_while_idle": 0,
+      "sse_connections": 1,
+      "initial_http_requests": 6,
+      "cpu_percent_one_core": 0.0,
+      "core_rss_bytes": 4308992,
+      "readable_projection_subscribers": 0
+    },
+    {
+      "observations": 50,
+      "sources": 1,
+      "elapsed_seconds": 5.003339040966239,
+      "projection_subscribers": 0,
+      "rss_bytes": 5029888,
+      "threads": 1,
+      "cpu_seconds": 0.0,
+      "http_requests_while_idle": 0,
+      "sse_connections": 1,
+      "initial_http_requests": 55,
+      "cpu_percent_one_core": 0.0,
+      "core_rss_bytes": 4538368,
+      "readable_projection_subscribers": 0
+    }
+  ]
+}

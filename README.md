@@ -4,6 +4,8 @@ rmux는 tmux의 기능과 기본 키 조작을 갖추고, 각 코딩 에이전�
 
 현재는 tmux 전체 소스를 기반으로 터미널 코어, 읽기 전용 관찰 IPC, 선택적 경량 agentd를 구현했다. `bin/rmux`로 session·window·pane·attach/detach·copy mode·control mode를 사용할 수 있다. `rmux-agent watch`는 pane 변경·종료·누락을, `serve`는 OpenCode native session의 작업·승인·질문 대기를 관찰한다. prompt 전송, 승인 처리, 대화 복구는 다음 단계다.
 
+`attention`은 승인·질문 대기 목록을, `ack`는 daemon 수명 동안 클라이언트들이 공유하는 확인 표시를 제공한다. `watch-agents`로 전체 목록의 최신 상태를 계속 받을 수 있다. 확인 명령은 provider 요청을 승인하지 않는다.
+
 ```sh
 make                 # 코어와 선택적 Rust 관찰 CLI
 ./bin/rmux -L main new-session -s work
@@ -40,6 +42,8 @@ macOS 초기 비교에서 50-pane idle 서버 RSS는 rmux 4.44 MiB, stock tmux 4
 | [현재 구현과 실행](docs/implementation-status.md) | 빌드·사용법, 실제 기능과 남은 작업 |
 | [코어 관찰 IPC](docs/core-observation.md) | 구현된 wire protocol·상한·generation·실패 의미 |
 | [OpenCode 관찰 daemon](docs/agent-observation.md) | 시작·조회·중지, 상태와 연결의 한계, 자원 상한 |
+| [대기 요청 확인과 live 목록](docs/attention.md) | 미확인 목록, revision별 shared ack, snapshot stream |
+| [확인·스트림 검증](docs/validation/2026-09-28-attention.md) | 동시 클라이언트·재접속·최대 범위·느린 구독자 |
 | [관찰 daemon 검증](docs/validation/2026-09-28-agentd.md) | 실제 core 통합·OpenCode smoke·idle 비용 |
 | [실시간 관찰 검증](docs/validation/2026-09-28-watch.md) | watch·용량·누락·backpressure·추가 비용 |
 | [코어 검증 기록](docs/validation/2026-09-28-core.md) | 실제 테스트 결과, upstream 공통 실패와 재검증 |
