@@ -1,31 +1,31 @@
 
-rmux  Agent desk ┌ Agent desk help ───────────────────────────────────────────────────────────────────┐? Help   q Close
-                 │                                                                          Esc Close │
- All 16   Attenti│FIND AND INSPECT                                                                    │
-                 │↑/↓ or j/k   Move through agents                                                    │
-┌────────────────│Home/End     First or last agent                                                    │────────────────┐
-│/ Search agents │PgUp/PgDn   Move one visible page                                                   │                │
-└────────────────│/            Search names, IDs and sessions                                         │────────────────┘
-┌ Agents ────────│Tab          Move between visible regions                                           │────────────────┐
-│ Working agent-0│Enter        Open details or run focused action                                     │                │
-│ Idle agent-01  │                                                                                    │                │
-│ Working agent-0│ACT                                                                                 │                │
-│ Idle agent-02  │a            Mark the selected request seen                                         │                │
-│ Idle agent-04  │g            Go to the configured pane                                              │                │
-│ Idle agent-05  │c            Copy the selected ID to the tmux buffer                                │                │
-│ Working agent-0│z            Expand or restore the owned side panel                                 │                │
-│ Idle agent-07  │r            Retry observer connection when offline                                 │                │
-│ Idle agent-08  │Shift-F10    Open the selected agent's actions                                      │                │
-│ Working agent-0│Right-click  Open the same action menu                                              │                │
-│ Idle agent-10  │Double-click Go to the configured pane                                              │ed              │
-│ Idle agent-11  │                                                                                    │                │
-│ Working agent-1│VIEW                                                                                │                │
-│ Idle agent-13  │Mouse wheel  Scroll the region under the pointer                                    │                │
-│ Idle agent-14  │Drag divider Resize list and inspector                                              │                │
-│ Working agent-1│l            Switch English / Korean                                                │                │
-│                │t            Change color theme                                                     │                │
-│                │?            Open or close this help                                                │                │
-└────────────────│Esc          Close the top layer or go back                                         │────────────────┘
- a Mark seen   g │q            Close the agent desk                                                   │
-                 │                                                                                    │
-Arrows or j/k mov└────────────────────────────────────────────────────────────────────────────────────┘
+ rmux  Agent desk┌ Agent desk help ─────────────────────────────────────────────────────── Esc Close ─┐ Help   q Close
+                 │ FIND AND INSPECT                                                                   │
+  All 16   Attent│ ↑/↓ or j/k    Move through agents                                                  │
+                 │ Home/End      First or last agent                                                  │
+┌────────────────│ PgUp/PgDn     Move one visible page                                                │────────────────┐
+│/ Search agents │ /             Search names, IDs and sessions                                       │                │
+└────────────────│ Tab           Move between visible regions                                         │────────────────┘
+┌ Agents ────────│ Enter         Open details or run focused action                                   │────────────────┐
+│› agent-00  Work│                                                                                    │                │
+│  agent-01  Idle│ ACT                                                                                │                │
+│  agent-03  Work│ a             Mark the selected request seen                                       │                │
+│  agent-02  Idle│ g             Go to the configured pane                                            │                │
+│  agent-04  Idle│ c             Copy the selected ID to the tmux buffer                              │                │
+│  agent-05  Idle│ z             Expand or restore the owned side panel                               │                │
+│  agent-06  Work│ r             Retry observer connection when offline                               │                │
+│  agent-07  Idle│ Shift-F10     Open the selected agent's actions                                    │                │
+│  agent-08  Idle│ Right-click   Open the same action menu                                            │                │
+│  agent-09  Work│ Double-click  Go to the configured pane                                            │                │
+│  agent-10  Idle│                                                                                    │                │
+│  agent-11  Idle│ VIEW                                                                               │                │
+│  agent-12  Work│ Mouse wheel   Scroll the region under the pointer                                  │not verified    │
+│  agent-13  Idle│ Drag divider  Resize list and inspector                                            │                │
+│  agent-14  Idle│ l             Switch English / Korean                                              │                │
+│  agent-15  Work│ t             Change color theme                                                   │                │
+│                │ ?             Open or close this help                                              │                │
+│                │ Esc           Close the top layer or go back                                       │                │
+└────────────────│ q             Close the agent desk                                                 │────────────────┘
+  a Mark seen   g│                                                                                    │
+                 │ TRUTH AND OWNERSHIP                                                                │
+ Arrows or j/k mo└────────────────────────────────────────────────────────────────────────────────────┘

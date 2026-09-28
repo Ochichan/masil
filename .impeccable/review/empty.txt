@@ -1,22 +1,22 @@
 
-rmux  Agent desk  Observer connected                                                   l EN   t Dark   ? Help   q Close
+ rmux  Agent desk  Observer connected                                                 l EN   t Dark   ? Help   q Close
 
- All 16   Attention 3   Working 6   Unavailable 0
+  All 16   Attention 3   Working 6   Unavailable 0
 
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │nothing-matches                                                                                                 Clear │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Agents ──────────────────────────────────────┐ ┌ Evidence inspector ─────────────────────────────────────────────────┐
-│          No agents match this view.          │ │Select an agent to inspect its evidence.                             │
-│        Clear the search or choose All.       │ │                                                                     │
+│                                              │ │ Select an agent to inspect its evidence.                            │
 │                                              │ │                                                                     │
 │                                              │ │                                                                     │
 │                                              │ │                                                                     │
 │                                              │ │                                                                     │
 │                                              │ │                                                                     │
-│                                              │ │                                                                     │
-│                                              │ │                                                                     │
-│                                              │ │                                                                     │
+│          No agents match this view.          │ │                                                                     │
+│        Clear the search or choose All.       │┃│                                                                     │
+│                                              │┃│                                                                     │
+│                                              │┃│                                                                     │
 │                                              │ │                                                                     │
 │                                              │ │                                                                     │
 │                                              │ │                                                                     │
@@ -26,6 +26,6 @@ rmux  Agent desk  Observer connected                                            
 │                                              │ │                                                                     │
 │                                              │ │                                                                     │
 └──────────────────────────────────────────────┘ └─────────────────────────────────────────────────────────────────────┘
- a Mark seen   g Go to pane   Enter Details
+  a Mark seen   g Go to pane   Enter Details
 
-Type to search; Ctrl-U clears; Esc returns to the list.
+ Type to search; Ctrl-U clears; Esc returns to the list.

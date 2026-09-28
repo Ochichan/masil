@@ -50,7 +50,7 @@ The default dark theme uses charcoal layers and a single teal accent. The light 
 
 ### Primary
 
-- **Desk Teal:** Marks the current focus, selected controls, interactive hover, focused borders, active dividers, and scrollbar thumbs.
+- **Desk Teal:** Marks the current focus, selected controls, interactive hover, focused borders and region titles, keyboard hints inside controls, the selected-row marker, active dividers, and scrollbar thumbs.
 
 ### Semantic
 
@@ -82,9 +82,11 @@ Normal terminal text carries most content. Bold marks the rmux title, selected i
 
 The vertical order is fixed: header, filters, search, list or inspector body, action strip, and footer. The header owns product, view, connection, language, theme, help, and close. The footer owns focus hints, connection messages, and factual action receipts.
 
-At 100 columns by 24 rows or larger, the list and inspector appear side by side with a draggable one-cell divider. The list starts at 48 columns and both regions retain at least 34 columns. Below either wide threshold, the body shows the list or the opened inspector as one region.
+Outside the compact sidebar, header, filter, action, and footer text starts one cell in from the edge so it lines up with the text inside bordered regions. The header keeps one padding row above and below from 28 rows up; below that it is a single row, and the filter row moves down one row so a gap still separates it from the header.
 
-The native side panel targets 34 columns. In compact mode below 60 columns, rows use two lines and filters and actions use two labeled columns across two rows when height permits. Below 18 rows, header, filters, search, actions, and footer each compress to one row. Below 28 columns or 9 rows, the desk shows only the minimum-size message and a working Close control.
+At 100 columns by 24 rows or larger, the list and inspector appear side by side with a draggable one-cell divider. The divider sits on the canvas with a three-cell grip that turns teal on hover and fills teal while dragging. The list starts at 48 columns and both regions retain at least 34 columns. Below either wide threshold, the body shows the list or the opened inspector as one region.
+
+The native side panel targets 34 columns. In compact mode below 60 columns, the header shows identity and connection on its first row and its controls on the second, rows use two lines, and filters and actions use two labeled columns across two rows when height permits. Below 18 rows, header, filters, search, actions, and footer each compress to one row. Below 28 columns or 9 rows, the desk shows only the minimum-size message and a working Close control.
 
 Native zoom is a tmux pane operation owned by the sidebar. Expand and Restore change the tmux layout while the same rmux model, filters, selection, and action rules remain active.
 
@@ -112,7 +114,7 @@ The header keeps the view name and observer state visible. Wide layouts show ful
 
 ### Filters
 
-All, Attention, Working, and Unavailable always carry observed-row counts. Attention includes only pending requests with available attention evidence. Working includes working and retrying activity. When the observer disconnects, Unavailable includes every retained row and the rows read as last-known evidence.
+All, Attention, Working, and Unavailable always carry observed-row counts. A filter with a zero count keeps its label in muted text. Control rows choose one label set for every control that fits the width: full labels, then short labels, then counts or keys alone. Labels never mix levels within one row. Attention includes only pending requests with available attention evidence. Working includes working and retrying activity. When the observer disconnects, Unavailable includes every retained row and the rows read as last-known evidence.
 
 ### Search field
 
@@ -120,17 +122,17 @@ Search matches observation identity, source, session, and pane identity. The fie
 
 ### Agent list
 
-Rows sort pending attention first and then by stable observation identity. Selection follows that identity across live reordering. A selected row uses the raised fill and bold identity text. Compact rows reserve one line for identity and activity and one for the named attention type, count, and seen state. Approval and Question remain labeled rather than collapsing into an unlabeled number.
+Rows sort pending attention first and then by stable observation identity. Selection follows that identity across live reordering. Wide rows place identity, activity, and attention in aligned columns sized from every filtered row, so columns stay put while scrolling. A selected row uses the raised fill, bold identity text, and a teal `›` marker; a hovered row shows a muted marker. Activity and attention carry separate colors: activity uses the working, pending, or unavailable role, and attention uses amber only for unseen pending requests. The word `pending` drops when the column cannot hold it; the kind, count, and seen state stay. Compact rows reserve one line for identity with right-aligned activity and one for the named attention type, count, and seen state. Approval and Question remain labeled rather than collapsing into an unlabeled number.
 
-Unavailable rows use `State unavailable`. An offline row uses `Last known`. Freshness, configured but unverified bindings, invalidated associations, and exited or removed core state remain distinct. A disconnected observer leaves last-known evidence, never a completion claim.
+Unavailable rows use `State unavailable`. An offline row uses `Last known`. An empty list says why: connecting, no observed agents, no search match, or no pending requests. Freshness, configured but unverified bindings, invalidated associations, and exited or removed core state remain distinct. A disconnected observer leaves last-known evidence, never a completion claim.
 
 ### Evidence inspector
 
-The inspector names activity, last activity, attention kind, Approval count, Question count, source, session, pane, native freshness, observation time, binding, foreground verification, core process, core freshness, and PTY generation. Native and core evidence stay separate. Supplemental detail can extend the inspector but cannot overwrite a newer complete row.
+The inspector names activity, last activity, attention kind, Approval count, Question count, source, session, pane, native freshness, observation time, binding, foreground verification, core process, core freshness, and PTY generation. Native and core evidence stay separate under the `Native session` and `Core pane` headings. Labels sit in a muted column and values carry their semantic role. Values wrap under their own column and never lose trailing words; below 20 columns of value space, each label sits above its value. Supplemental detail can extend the inspector but cannot overwrite a newer complete row.
 
 ### Action controls
 
-Idle controls use the raised fill. Focused or hovered controls use teal with dark accent text. A pressed control uses amber. Disabled controls return to the panel fill with muted text and remain labeled.
+Idle controls use the raised fill with the keyboard key in bold teal before the label. Focused or hovered controls use teal with dark accent text. A pressed control uses amber. Disabled controls return to the panel fill with muted text and remain labeled.
 
 `Mark seen` requires a connected observer, available pending attention, a nonempty daemon epoch and attention revision, and no acknowledgement already in flight. It sends the displayed epoch and revision. It never grants provider approval or answers a question.
 
@@ -138,7 +140,7 @@ Idle controls use the raised fill. Focused or hovered controls use teal with dar
 
 ### Overlays, scrolling, and ownership
 
-Help and the row action menu own keyboard and mouse input while open. A click outside closes the top overlay and consumes that click. List, inspector, and help scroll independently. Wheel input goes only to the region under the pointer.
+Help and the row action menu own keyboard and mouse input while open. Help aligns keys in one column, wraps notes to its width, and places its Esc Close control in the top border. Menu items show their keyboard key at the right edge. A click outside closes the top overlay and consumes that click. List, inspector, and help scroll independently. Wheel input goes only to the region under the pointer.
 
 A control activates only when press and release land on the same current target within two seconds. Row actions also retain the selected observation identity and revision across the gesture. A double-click uses the same row identity, button position, and a 500 millisecond window. Keyboard shortcuts call the same guarded actions as mouse controls.
 

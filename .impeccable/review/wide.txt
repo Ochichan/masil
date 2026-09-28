@@ -1,31 +1,31 @@
 
-rmux  Agent desk  Observer connected                                                   l EN   t Dark   ? Help   q Close
+ rmux  Agent desk  Observer connected                                                 l EN   t Dark   ? Help   q Close
 
- All 16   Attention 3   Working 6   Unavailable 0
+  All 16   Attention 3   Working 6   Unavailable 0
 
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │/ Search agents                                                                                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Agents ──────────────────────────────────────┐ ┌ Evidence inspector ─────────────────────────────────────────────────┐
-│ Working agent-00  1 pending / Unseen         │ │agent-00                                                             │
-│ Idle agent-01  1 pending / Unseen            │ │Activity: Working                                                    │
-│ Working agent-03  1 pending / Unseen         │ │Attention: Approval request / Unseen                                 │
-│ Idle agent-02  None                          │ │Approval request: 1 / Question: 0                                    │
-│ Idle agent-04  None                          │ │                                                                     │
-│ Idle agent-05  None                          │ │Source: local                                                        │
-│ Working agent-06  None                       │ │Session: ses_0                                                       │
-│ Idle agent-07  None                          │ │Pane: %0                                                             │
-│ Idle agent-08  None                          │ │Evidence: Fresh                                                      │
-│ Working agent-09  None                       │ │Observed at: 2026-09-28 04:00:20.221 UTC                             │
-│ Idle agent-10  None                          │ │Binding: Configured pane; foreground agent not verified              │
-│ Idle agent-11  None                          │ │Foreground agent verified: No                                        │
-│ Working agent-12  None                       │ │                                                                     │
-│ Idle agent-13  None                          │ │Core / Process: Running                                              │
-│ Idle agent-14  None                          │ │Core evidence: Fresh                                                 │
-│ Working agent-15  None                       │ │PTY generation: 1                                                    │
-│                                              │ │                                                                     │
-│                                              │ │                                                                     │
+│› agent-00  Working  Approval 1  Unseen       │ │ agent-00                                                            │
+│  agent-01  Idle     Question 1  Unseen       │ │ Activity          Working                                           │
+│  agent-03  Working  Approval 1  Unseen       │ │ Attention         Approval request / Unseen                         │
+│  agent-02  Idle     None                     │ │ Approval request  1                                                 │
+│  agent-04  Idle     None                     │ │ Question          0                                                 │
+│  agent-05  Idle     None                     │ │                                                                     │
+│  agent-06  Working  None                     │ │ Native session                                                      │
+│  agent-07  Idle     None                     │┃│ Source            local                                             │
+│  agent-08  Idle     None                     │┃│ Session           ses_0                                             │
+│  agent-09  Working  None                     │┃│ Pane              %0                                                │
+│  agent-10  Idle     None                     │ │ Evidence          Fresh                                             │
+│  agent-11  Idle     None                     │ │ Observed at       2026-09-28 05:34:49.311 UTC                       │
+│  agent-12  Working  None                     │ │ Binding           Configured pane; foreground agent not verified    │
+│  agent-13  Idle     None                     │ │ Foreground agent  Not verified                                      │
+│  agent-14  Idle     None                     │ │                                                                     │
+│  agent-15  Working  None                     │ │ Core pane                                                           │
+│                                              │ │ Process           Running                                           │
+│                                              │ │ Evidence          Fresh                                             │
 └──────────────────────────────────────────────┘ └─────────────────────────────────────────────────────────────────────┘
- a Mark seen   g Go to pane   Enter Details
+  a Mark seen   g Go to pane   Enter Details
 
-Arrows or j/k move; Enter opens details; Shift-F10 opens actions.
+ Arrows or j/k move; Enter opens details; Shift-F10 opens actions.

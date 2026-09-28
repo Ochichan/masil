@@ -1,9 +1,11 @@
 use super::i18n::{
-    Text, action_label, activity_label, attention_label, compact_action_label,
-    compact_attention_label, compact_filter_label, evidence_label, filter_label, help_lines,
+    HelpItem, Text, action_label, activity_label, attention_label, compact_action_label,
+    compact_attention_label, compact_filter_label, evidence_label, filter_label, help_items,
     language_name, process_label, theme_name, tr,
 };
-use super::model::{Action, App, Filter, Focus, HitRegion, HitTarget, Language, Overlay, Theme};
+use super::model::{
+    Action, App, Filter, Focus, HitRegion, HitTarget, Language, Observation, Overlay, Theme,
+};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -71,6 +73,88 @@ impl Palette {
             },
         }
     }
+
+    fn tone(self, tone: Tone) -> Color {
+        match tone {
+            Tone::Normal => self.text,
+            Tone::Muted => self.muted,
+            Tone::Good => self.success,
+            Tone::Warn => self.warning,
+            Tone::Bad => self.danger,
+        }
+    }
+}
+
+/// Semantic text roles. Color only reinforces a label that is already visible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Tone {
+    Normal,
+    Muted,
+    Good,
+    Warn,
+    Bad,
+}
+
+/// A labelled control. The key hint is drawn in the accent role so keyboard
+/// routes stay visible next to every mouse target.
+#[derive(Clone)]
+struct Control {
+    key: String,
+    label: String,
+    quiet: bool,
+    key_right: bool,
+}
+
+impl Control {
+    fn new(key: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            quiet: false,
+            key_right: false,
+        }
+    }
+
+    fn quiet(mut self, quiet: bool) -> Self {
+        self.quiet = quiet;
+        self
+    }
+
+    fn width(&self) -> u16 {
+        let key = cell_width(&self.key);
+        let label = cell_width(&self.label);
+        let gap = usize::from(key > 0 && label > 0);
+        (key + gap + label + 2) as u16
+    }
+}
+
+/// Picks the most descriptive label set whose controls fit on one line.
+fn fit_level(levels: &[Vec<Control>], gap: u16, width: u16) -> usize {
+    levels
+        .iter()
+        .position(|controls| row_width(controls, gap) <= width)
+        .unwrap_or(levels.len().saturating_sub(1))
+}
+
+fn row_width(controls: &[Control], gap: u16) -> u16 {
+    controls
+        .iter()
+        .map(Control::width)
+        .sum::<u16>()
+        .saturating_add(gap.saturating_mul(controls.len().saturating_sub(1) as u16))
+}
+
+/// One logical inspector entry before wrapping to the current width.
+#[derive(Clone, Debug, PartialEq)]
+enum Entry {
+    Banner(String),
+    Title(String),
+    Heading(String),
+    Field(&'static str, String, Tone),
+    Note(String),
+    Placeholder(String),
+    Raw(String),
+    Gap,
 }
 
 impl App {
@@ -91,7 +175,15 @@ impl App {
 
         let dense = area.height < 18;
         let compact_narrow = self.compact && area.width < 60;
-        let header_height = if dense { 1 } else { 3 };
+        // Chrome text lines up with the text inside bordered regions.
+        let gutter = u16::from(!compact_narrow);
+        let header_height = if dense {
+            1
+        } else if compact_narrow || area.height >= 28 {
+            3
+        } else {
+            1
+        };
         let filters_height = if dense { 1 } else { 2 };
         let search_height = if dense { 1 } else { 3 };
         let actions_height = if dense {
@@ -117,8 +209,8 @@ impl App {
         y += actions_height;
         let footer = Rect::new(area.x, y, area.width, footer_height.min(area.bottom() - y));
 
-        self.draw_header(frame, header, palette, dense);
-        self.draw_filters(frame, filters, palette, dense);
+        self.draw_header(frame, header, palette, dense, gutter);
+        self.draw_filters(frame, filters, palette, dense, gutter);
         self.draw_search(frame, search, palette, dense);
 
         let wide = area.width >= 100 && area.height >= 24;
@@ -136,15 +228,7 @@ impl App {
             );
             self.draw_list(frame, list, palette, false);
             if divider.width > 0 && inspector.width > 0 {
-                frame.render_widget(
-                    Block::default().style(Style::default().bg(if self.drag.is_some() {
-                        palette.accent
-                    } else {
-                        palette.track
-                    })),
-                    divider,
-                );
-                self.push_hit(divider, HitTarget::Divider, 1);
+                self.draw_divider(frame, divider, palette);
             }
             self.draw_inspector(frame, inspector, palette);
         } else if self.details_open {
@@ -153,8 +237,8 @@ impl App {
             self.draw_list(frame, body, palette, self.compact || area.width < 60);
         }
 
-        self.draw_actions(frame, actions, palette, dense, wide);
-        self.draw_footer(frame, footer, palette);
+        self.draw_actions(frame, actions, palette, dense, wide, gutter);
+        self.draw_footer(frame, footer, palette, gutter);
         self.draw_overlay(frame, area, palette);
         self.dirty = false;
     }
@@ -166,7 +250,58 @@ impl App {
             .style(Style::default().bg(palette.panel).fg(palette.text));
         frame.render_widget(block, area);
         let inner = inset(area, 1);
-        if inner.height > 0 {
+        let inner = if inner.width > 2 {
+            inset_x(inner, 1)
+        } else {
+            inner
+        };
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        // Bottom-up: Close, current size, minimum size, then the message.
+        let mut bottom = inner.bottom();
+        let close = Control::new("q", tr(self.language, Text::Close));
+        let close_width = close.width().min(inner.width);
+        bottom -= 1;
+        self.draw_control(
+            frame,
+            Rect::new(
+                inner.right().saturating_sub(close_width),
+                bottom,
+                close_width,
+                1,
+            ),
+            &close,
+            HitTarget::Close,
+            palette,
+            false,
+        );
+        let current = format!(
+            "{} {} x {}",
+            tr(self.language, Text::CurrentSize),
+            area.width,
+            area.height
+        );
+        for (text, color) in [
+            (tr(self.language, Text::MinimumSize), palette.muted),
+            (current.as_str(), palette.text),
+        ] {
+            if bottom <= inner.y + 1 {
+                break;
+            }
+            bottom -= 1;
+            frame.render_widget(
+                Paragraph::new(clip(text, inner.width as usize)).style(Style::default().fg(color)),
+                Rect::new(inner.x, bottom, inner.width, 1),
+            );
+        }
+        let message = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            bottom.saturating_sub(inner.y),
+        );
+        if message.height > 0 {
             frame.render_widget(
                 Paragraph::new(tr(self.language, Text::TerminalTooSmall))
                     .style(
@@ -175,71 +310,104 @@ impl App {
                             .add_modifier(Modifier::BOLD),
                     )
                     .wrap(Wrap { trim: true }),
-                Rect::new(
-                    inner.x,
-                    inner.y,
-                    inner.width,
-                    inner.height.saturating_sub(2),
-                ),
+                message,
             );
-        }
-        if inner.height >= 2 {
-            frame.render_widget(
-                Paragraph::new(tr(self.language, Text::MinimumSize))
-                    .style(Style::default().fg(palette.muted)),
-                Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 1),
-            );
-        }
-        if inner.height >= 1 {
-            let label = format!("[q {}]", tr(self.language, Text::Close));
-            let width = cell_width(&label).min(inner.width as usize) as u16;
-            let close = Rect::new(
-                inner.right().saturating_sub(width),
-                inner.bottom() - 1,
-                width,
-                1,
-            );
-            frame.render_widget(
-                Paragraph::new(clip(&label, width as usize)).style(
-                    Style::default()
-                        .fg(palette.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                close,
-            );
-            self.push_hit(close, HitTarget::Close, 1);
         }
     }
 
-    fn draw_header(&mut self, frame: &mut Frame, area: Rect, palette: Palette, dense: bool) {
+    fn connection_label(&self, short: bool, palette: Palette) -> (&'static str, Color) {
+        let key = match (self.connected, self.rows.is_empty(), short) {
+            (true, _, false) => Text::Connected,
+            (true, _, true) => Text::ShortConnected,
+            (false, true, false) => Text::Connecting,
+            (false, true, true) => Text::ShortConnecting,
+            (false, false, false) => Text::Disconnected,
+            (false, false, true) => Text::ShortDisconnected,
+        };
+        let color = if self.connected {
+            palette.success
+        } else {
+            palette.warning
+        };
+        (tr(self.language, key), color)
+    }
+
+    /// Header controls in focus-index order: Close, Help, Theme, Language.
+    fn header_levels(&self) -> Vec<Vec<Control>> {
+        let language = language_name(self.language);
+        let theme = theme_name(self.language, self.theme);
+        let close = tr(self.language, Text::Close);
+        let help = tr(self.language, Text::Help);
+        vec![
+            vec![
+                Control::new("q", close),
+                Control::new("?", help),
+                Control::new("t", theme),
+                Control::new("l", language),
+            ],
+            vec![
+                Control::new("q", ""),
+                Control::new("?", ""),
+                Control::new("t", theme),
+                Control::new("l", language),
+            ],
+            vec![
+                Control::new("q", ""),
+                Control::new("?", ""),
+                Control::new("t", ""),
+                Control::new("l", language),
+            ],
+            vec![
+                Control::new("q", ""),
+                Control::new("?", ""),
+                Control::new("t", ""),
+                Control::new("l", ""),
+            ],
+        ]
+    }
+
+    fn draw_header(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        palette: Palette,
+        dense: bool,
+        gutter: u16,
+    ) {
         frame.render_widget(
             Block::default().style(Style::default().bg(palette.panel)),
             area,
         );
+        let product = Span::styled(
+            tr(self.language, Text::Product),
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        );
+        let levels = self.header_levels();
+        self.header_controls = 0;
         if self.compact && area.width < 60 && !dense {
-            let status = if self.connected {
-                tr(self.language, Text::ShortConnected)
-            } else if self.rows.is_empty() {
-                tr(self.language, Text::ShortConnecting)
-            } else {
-                tr(self.language, Text::ShortDisconnected)
-            };
+            // Row 0: identity and connection. Row 1: controls. Row 2 separates
+            // the header controls from the filter controls below.
+            let (status, color) = self.connection_label(true, palette);
             let status_width = cell_width(status).min(area.width as usize) as u16;
             let title_width = area.width.saturating_sub(status_width + 1);
+            let title = clip_line(
+                vec![
+                    product,
+                    Span::styled(
+                        format!(" {}", tr(self.language, Text::Agents)),
+                        Style::default().fg(palette.text),
+                    ),
+                ],
+                title_width as usize,
+            );
             frame.render_widget(
-                Paragraph::new(clip(tr(self.language, Text::Agents), title_width as usize)).style(
-                    Style::default()
-                        .fg(palette.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Paragraph::new(title),
                 Rect::new(area.x, area.y, title_width, 1),
             );
             frame.render_widget(
-                Paragraph::new(status).style(Style::default().fg(if self.connected {
-                    palette.success
-                } else {
-                    palette.warning
-                })),
+                Paragraph::new(status).style(Style::default().fg(color)),
                 Rect::new(
                     area.right().saturating_sub(status_width),
                     area.y,
@@ -247,46 +415,20 @@ impl App {
                     1,
                 ),
             );
-            let controls = [
-                (
-                    HitTarget::Language,
-                    format!(
-                        "l {}",
-                        if self.language == Language::English {
-                            "EN"
-                        } else {
-                            "KO"
-                        }
-                    ),
-                    3,
-                ),
-                (
-                    HitTarget::Theme,
-                    format!(
-                        "t {}",
-                        match self.theme {
-                            Theme::Dark => "D",
-                            Theme::Light => "L",
-                            Theme::Terminal => "T",
-                        }
-                    ),
-                    2,
-                ),
-                (HitTarget::Help, "?".to_owned(), 1),
-                (HitTarget::Close, "q".to_owned(), 0),
-            ];
-            self.header_controls = 0;
+            let level = fit_level(&levels, 1, area.width);
+            let controls_y = area.y + 1.min(area.height.saturating_sub(1));
             let mut x = area.x;
-            let controls_y = area.bottom().saturating_sub(1);
-            for (target, label, focus_index) in controls {
-                let width = (cell_width(&label) + 2) as u16;
+            // Drawn left to right, so walk the focus order backwards.
+            for (focus_index, control) in levels[level].iter().enumerate().rev() {
+                let width = control.width();
                 if x + width > area.right() {
                     break;
                 }
+                let target = header_target(focus_index);
                 self.draw_control(
                     frame,
                     Rect::new(x, controls_y, width, 1),
-                    &label,
+                    control,
                     target,
                     palette,
                     self.focus == Focus::Header && self.header_focus == focus_index,
@@ -296,107 +438,65 @@ impl App {
             }
             return;
         }
-        let line = if dense { area } else { inset_y(area, 1) };
+        let line = inset_x(
+            if area.height >= 3 {
+                inset_y(area, 1)
+            } else {
+                Rect::new(area.x, area.y, area.width, 1)
+            },
+            gutter,
+        );
         let view = if self.compact && self.last_area.width < 100 {
             tr(self.language, Text::Sidebar)
         } else {
             tr(self.language, Text::Desk)
         };
-        let connection = if self.connected {
-            tr(self.language, Text::Connected)
-        } else if self.rows.is_empty() {
-            tr(self.language, Text::Connecting)
-        } else {
-            tr(self.language, Text::Disconnected)
-        };
-        let connection_color = if self.connected {
-            palette.success
-        } else {
-            palette.warning
-        };
-        let title = Line::from(vec![
-            Span::styled(
-                tr(self.language, Text::Product),
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
+        let (connection, connection_color) = self.connection_label(false, palette);
+        let title = vec![
+            product,
             Span::styled(format!("  {view}"), Style::default().fg(palette.text)),
             Span::styled(
                 format!("  {connection}"),
                 Style::default().fg(connection_color),
             ),
-        ]);
-        frame.render_widget(Paragraph::new(title), line);
-
-        let compact_labels = line.width < 76;
-        let mut right = line.right();
-        let controls = [
-            (
-                HitTarget::Close,
-                if compact_labels {
-                    "q".to_owned()
-                } else {
-                    format!("q {}", tr(self.language, Text::Close))
-                },
-            ),
-            (
-                HitTarget::Help,
-                if compact_labels {
-                    "?".to_owned()
-                } else {
-                    format!("? {}", tr(self.language, Text::Help))
-                },
-            ),
-            (
-                HitTarget::Theme,
-                if compact_labels {
-                    "t".to_owned()
-                } else {
-                    format!("t {}", theme_name(self.language, self.theme))
-                },
-            ),
-            (
-                HitTarget::Language,
-                if compact_labels {
-                    language_name(self.language).to_owned()
-                } else {
-                    format!("l {}", language_name(self.language))
-                },
-            ),
         ];
-        self.header_controls = 0;
-        for (index, (target, label)) in controls.into_iter().enumerate() {
-            let needed = (cell_width(&label) + 2) as u16;
-            if right <= line.x + needed {
+        let title_width = title
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .sum::<usize>() as u16;
+        let level = fit_level(
+            &levels,
+            1,
+            line.width.saturating_sub(title_width.saturating_add(2)),
+        );
+        let mut right = line.right();
+        for (index, control) in levels[level].iter().enumerate() {
+            let needed = control.width();
+            if right < line.x + needed {
                 break;
             }
             right -= needed;
-            let rect = Rect::new(right, line.y, needed, 1);
+            let target = header_target(index);
             self.draw_control(
                 frame,
-                rect,
-                &label,
-                target.clone(),
+                Rect::new(right, line.y, needed, 1),
+                control,
+                target,
                 palette,
                 self.focus == Focus::Header && self.header_focus == index,
             );
             self.header_controls += 1;
             right = right.saturating_sub(1);
         }
+        let title_room = right.saturating_sub(line.x).saturating_sub(1);
+        frame.render_widget(
+            Paragraph::new(clip_line(title, title_room as usize)),
+            Rect::new(line.x, line.y, title_room, 1),
+        );
     }
 
-    fn draw_filters(&mut self, frame: &mut Frame, area: Rect, palette: Palette, dense: bool) {
-        frame.render_widget(
-            Block::default().style(Style::default().bg(palette.canvas)),
-            area,
-        );
-        let line = if dense {
-            area
-        } else {
-            Rect::new(area.x, area.y, area.width, 1)
-        };
-        let counts = [
+    fn filter_counts(&self) -> [usize; 4] {
+        [
             self.rows.len(),
             self.rows
                 .iter()
@@ -411,28 +511,62 @@ impl App {
             } else {
                 self.rows.len()
             },
-        ];
-        if self.compact && area.width < 60 {
+        ]
+    }
+
+    fn draw_filters(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        palette: Palette,
+        dense: bool,
+        gutter: u16,
+    ) {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.canvas)),
+            area,
+        );
+        let counts = self.filter_counts();
+        let labels: [fn(Language, Filter) -> &'static str; 2] =
+            [filter_label, compact_filter_label];
+        let levels = labels
+            .into_iter()
+            .map(|label| {
+                Filter::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, filter)| {
+                        Control::new(
+                            "",
+                            format!("{} {}", label(self.language, filter), counts[index]),
+                        )
+                        .quiet(counts[index] == 0)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .chain(std::iter::once(
+                counts
+                    .iter()
+                    .map(|count| Control::new("", count.to_string()).quiet(*count == 0))
+                    .collect(),
+            ))
+            .collect::<Vec<_>>();
+
+        if self.compact && area.width < 60 && !dense {
+            // Two labelled columns across two rows.
+            let width = area.width.saturating_sub(1) / 2;
+            let level = levels
+                .iter()
+                .position(|controls| controls.iter().all(|control| control.width() <= width))
+                .unwrap_or(levels.len() - 1);
             for (index, filter) in Filter::ALL.into_iter().enumerate() {
-                let (column, row) = if dense {
-                    (index as u16, 0)
-                } else {
-                    ((index % 2) as u16, (index / 2) as u16)
-                };
-                let columns = if dense { 4 } else { 2 };
-                let gap = columns - 1;
-                let width = area.width.saturating_sub(gap) / columns;
-                let x = area.x + column * (width + 1);
-                let rect = Rect::new(x, area.y + row, width, 1);
-                let label = format!(
-                    "{} {}",
-                    compact_filter_label(self.language, filter),
-                    counts[index]
-                );
+                let column = (index % 2) as u16;
+                let row = (index / 2) as u16;
+                let rect = Rect::new(area.x + column * (width + 1), area.y + row, width, 1);
                 self.draw_control(
                     frame,
                     rect,
-                    &clip(&label, rect.width.saturating_sub(2) as usize),
+                    &levels[level][index],
                     HitTarget::Filter(filter),
                     palette,
                     self.filter == filter,
@@ -440,24 +574,26 @@ impl App {
             }
             return;
         }
+        // A one-row header leaves no gap above the filters, so the spare row
+        // moves above them.
+        let row = if area.height > 1 && self.last_area.height < 28 {
+            area.y + 1
+        } else {
+            area.y
+        };
+        let line = inset_x(Rect::new(area.x, row, area.width, 1), gutter);
+        let level = fit_level(&levels, 1, line.width);
         let mut x = line.x;
         for (index, filter) in Filter::ALL.into_iter().enumerate() {
-            let long = format!("{} {}", filter_label(self.language, filter), counts[index]);
-            let short = format!("{}", counts[index]);
-            let label = if x + (cell_width(&long) as u16 + 3) <= line.right() {
-                long
-            } else {
-                short
-            };
-            let width = (cell_width(&label) + 2) as u16;
+            let control = &levels[level][index];
+            let width = control.width();
             if x + width > line.right() {
                 break;
             }
-            let rect = Rect::new(x, line.y, width, 1);
             self.draw_control(
                 frame,
-                rect,
-                &label,
+                Rect::new(x, line.y, width, 1),
+                control,
                 HitTarget::Filter(filter),
                 palette,
                 self.filter == filter,
@@ -467,12 +603,13 @@ impl App {
     }
 
     fn draw_search(&mut self, frame: &mut Frame, area: Rect, palette: Palette, dense: bool) {
+        let focused = self.focus == Focus::Search;
         let block = if dense {
             Block::default().style(Style::default().bg(palette.panel))
         } else {
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(if self.focus == Focus::Search {
+                .border_style(Style::default().fg(if focused {
                     palette.accent
                 } else {
                     palette.track
@@ -484,47 +621,65 @@ impl App {
         if inner.width == 0 || inner.height == 0 {
             return;
         }
-        let clear_label = if self.search.is_empty() {
-            String::new()
-        } else {
-            format!(" {} ", tr(self.language, Text::Clear))
-        };
-        let clear_width = cell_width(&clear_label).min(inner.width as usize) as u16;
+        let clear =
+            (!self.search.is_empty()).then(|| Control::new("", tr(self.language, Text::Clear)));
+        let clear_width = clear
+            .as_ref()
+            .map_or(0, |control| control.width().min(inner.width));
         let field_width = inner.width.saturating_sub(clear_width);
-        let placeholder = format!("/ {}", tr(self.language, Text::Search));
-        let (shown, cursor_x, start) = if self.search.is_empty() {
-            (placeholder.clone(), 0, 0)
+        let field = Rect::new(inner.x, inner.y, field_width, 1);
+        let cursor_x = if self.search.is_empty() {
+            self.search_view_start = 0;
+            let placeholder = vec![
+                Span::styled(
+                    "/ ",
+                    Style::default()
+                        .fg(if focused {
+                            palette.muted
+                        } else {
+                            palette.accent
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    tr(self.language, Text::Search),
+                    Style::default().fg(palette.muted),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(clip_line(placeholder, field.width as usize)),
+                field,
+            );
+            0
         } else {
-            search_window(
+            let (shown, cursor_x, start) = search_window(
                 &self.search,
                 self.search_cursor,
                 field_width.saturating_sub(1) as usize,
-            )
+            );
+            self.search_view_start = start;
+            frame.render_widget(
+                Paragraph::new(clip(&shown, field.width as usize))
+                    .style(Style::default().fg(palette.text)),
+                field,
+            );
+            cursor_x
         };
-        self.search_view_start = start;
-        let style = if self.search.is_empty() {
-            Style::default().fg(palette.muted)
-        } else {
-            Style::default().fg(palette.text)
-        };
-        let field = Rect::new(inner.x, inner.y, field_width, 1);
-        frame.render_widget(
-            Paragraph::new(clip(&shown, field.width as usize)).style(style),
-            field,
-        );
         self.push_hit(field, HitTarget::Search, 1);
-        if clear_width > 0 {
-            let clear = Rect::new(field.right(), inner.y, clear_width, 1);
+        if let Some(control) = clear
+            && clear_width > 0
+        {
+            let rect = Rect::new(field.right(), inner.y, clear_width, 1);
             self.draw_control(
                 frame,
-                clear,
-                clear_label.trim(),
+                rect,
+                &control,
                 HitTarget::ClearSearch,
                 palette,
                 false,
             );
         }
-        if self.focus == Focus::Search && self.overlay.is_none() && field.width > 0 {
+        if focused && self.overlay.is_none() && field.width > 0 {
             let x = field
                 .x
                 .saturating_add(cursor_x.min(field.width.saturating_sub(1) as usize) as u16);
@@ -532,19 +687,91 @@ impl App {
         }
     }
 
-    fn draw_list(&mut self, frame: &mut Frame, area: Rect, palette: Palette, two_line: bool) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let block = Block::default()
+    fn region_block(&self, title: Text, focused: bool, palette: Palette) -> Block<'static> {
+        Block::default()
             .borders(Borders::ALL)
-            .title(format!(" {} ", tr(self.language, Text::Agents)))
-            .border_style(Style::default().fg(if self.focus == Focus::List {
+            .title(format!(" {} ", tr(self.language, title)))
+            .title_style(if focused {
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.muted)
+            })
+            .border_style(Style::default().fg(if focused {
                 palette.accent
             } else {
                 palette.track
             }))
-            .style(Style::default().bg(palette.panel));
+            .style(Style::default().bg(palette.panel))
+    }
+
+    /// Activity column: a disconnected observer or unavailable source never
+    /// shows a current activity claim.
+    fn row_state(&self, row: &Observation) -> (&'static str, Tone) {
+        if !self.connected {
+            (tr(self.language, Text::LastKnown), Tone::Bad)
+        } else if row.is_unavailable() {
+            (tr(self.language, Text::StateUnavailable), Tone::Bad)
+        } else {
+            let tone = match row.activity.as_str() {
+                "working" => Tone::Good,
+                "retrying" => Tone::Warn,
+                _ => Tone::Muted,
+            };
+            (activity_label(self.language, &row.activity), tone)
+        }
+    }
+
+    /// Attention column: named kind, count and seen state, each in words.
+    fn row_attention(&self, row: &Observation, verbose: bool) -> Vec<(String, Tone, bool)> {
+        let kind = compact_attention_label(self.language, &row.attention_kind);
+        if !row.pending {
+            return vec![(kind.to_owned(), Tone::Muted, false)];
+        }
+        let current = self.connected && row.attention_available;
+        let (kind_tone, seen_tone, bold) = match (current, row.acknowledged) {
+            (false, _) => (Tone::Muted, Tone::Muted, false),
+            (true, false) => (Tone::Warn, Tone::Warn, true),
+            (true, true) => (Tone::Normal, Tone::Muted, false),
+        };
+        vec![
+            (
+                if verbose {
+                    format!(
+                        "{kind} {} {}",
+                        row.attention_total(),
+                        tr(self.language, Text::Pending)
+                    )
+                } else {
+                    format!("{kind} {}", row.attention_total())
+                },
+                kind_tone,
+                false,
+            ),
+            (
+                format!(
+                    "  {}",
+                    tr(
+                        self.language,
+                        if row.acknowledged {
+                            Text::Seen
+                        } else {
+                            Text::Unseen
+                        }
+                    )
+                ),
+                seen_tone,
+                bold,
+            ),
+        ]
+    }
+
+    fn draw_list(&mut self, frame: &mut Frame, area: Rect, palette: Palette, two_line: bool) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let block = self.region_block(Text::Agents, self.focus == Focus::List, palette);
         let inner = inset(area, 1);
         frame.render_widget(block, area);
         if inner.width == 0 || inner.height == 0 {
@@ -565,22 +792,62 @@ impl App {
             .cloned()
             .collect::<Vec<_>>();
         if rows.is_empty() {
-            let text = format!(
-                "{}\n{}",
-                tr(self.language, Text::NoRows),
-                tr(self.language, Text::NoRowsHint)
-            );
+            let (message, hint) = self.empty_list_text();
+            let text = if hint.is_empty() {
+                message.to_owned()
+            } else {
+                format!("{message}\n{hint}")
+            };
             frame.render_widget(
                 Paragraph::new(text)
                     .style(Style::default().fg(palette.muted))
                     .alignment(Alignment::Center)
                     .wrap(Wrap { trim: true }),
-                inner,
+                inset_x(
+                    Rect::new(
+                        inner.x,
+                        inner.y + (inner.height / 3).min(inner.height.saturating_sub(1)),
+                        inner.width,
+                        inner.height - (inner.height / 3).min(inner.height.saturating_sub(1)),
+                    ),
+                    1,
+                ),
             );
             return;
         }
         let has_scroll = rows.len() > self.list_page;
-        let content_width = inner.width.saturating_sub(u16::from(has_scroll));
+        let content_width = inner.width.saturating_sub(u16::from(has_scroll)) as usize;
+        // Columns are sized from every filtered row, not just the visible
+        // page, so they stay put while the list scrolls.
+        let state_width = rows
+            .iter()
+            .map(|row| cell_width(self.row_state(row).0))
+            .max()
+            .unwrap_or(0);
+        let id_width = rows
+            .iter()
+            .map(|row| cell_width(&row.id))
+            .max()
+            .unwrap_or(0);
+        let attention_width = |verbose: bool| {
+            rows.iter()
+                .map(|row| {
+                    self.row_attention(row, verbose)
+                        .iter()
+                        .map(|(text, _, _)| cell_width(text))
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        // Keep "pending" only while every row's attention fits beside the
+        // identity; the kind, count and seen state always stay.
+        let verbose = if two_line {
+            attention_width(true) + 2 <= content_width
+        } else {
+            2 + id_width + 2 + state_width + 2 + attention_width(true) <= content_width
+        };
+        let attention_width = attention_width(verbose);
         for (visible, observation) in rows
             .iter()
             .skip(self.list_scroll)
@@ -592,134 +859,97 @@ impl App {
             if height == 0 {
                 continue;
             }
-            let rect = Rect::new(inner.x, y, content_width, height);
+            let rect = Rect::new(inner.x, y, content_width as u16, height);
             let selected = self.selected_id.as_deref() == Some(observation.id.as_str());
-            let background = if selected {
-                palette.raised
-            } else {
-                palette.panel
+            let target = HitTarget::Row {
+                id: observation.id.clone(),
+                revision: observation.attention_revision.clone(),
             };
+            let hovered = self.hover.as_ref() == Some(&target);
             frame.render_widget(
-                Block::default().style(Style::default().bg(background)),
+                Block::default().style(Style::default().bg(if selected {
+                    palette.raised
+                } else {
+                    palette.panel
+                })),
                 rect,
             );
-            let unavailable = !self.connected || observation.is_unavailable();
-            let state_color = if unavailable {
-                palette.danger
-            } else if observation.pending && !observation.acknowledged {
-                palette.warning
-            } else if matches!(observation.activity.as_str(), "working" | "retrying") {
-                palette.success
-            } else {
-                palette.muted
-            };
-            let state = if unavailable {
-                tr(self.language, Text::StateUnavailable)
-            } else {
-                activity_label(self.language, &observation.activity)
-            };
-            let attention = if observation.pending {
-                format!(
-                    "{} {} / {}",
-                    observation.attention_total(),
-                    tr(self.language, Text::Pending),
-                    if observation.acknowledged {
-                        tr(self.language, Text::Seen)
+            let marker = Span::styled(
+                if selected || hovered { "› " } else { "  " },
+                Style::default()
+                    .fg(if selected {
+                        palette.accent
                     } else {
-                        tr(self.language, Text::Unseen)
-                    }
-                )
+                        palette.muted
+                    })
+                    .add_modifier(Modifier::BOLD),
+            );
+            let id_style = Style::default().fg(palette.text).add_modifier(if selected {
+                Modifier::BOLD
             } else {
-                attention_label(self.language, &observation.attention_kind).to_owned()
-            };
-            if two_line {
-                let activity = if self.connected {
-                    activity_label(self.language, &observation.activity)
-                } else {
-                    tr(self.language, Text::LastKnown)
-                };
-                let id_width = rect.width.saturating_sub(cell_width(activity) as u16 + 3);
-                let first = Line::from(vec![
+                Modifier::empty()
+            });
+            let (state, state_tone) = self.row_state(observation);
+            let state_style = Style::default().fg(palette.tone(state_tone));
+            let attention = self
+                .row_attention(observation, verbose)
+                .into_iter()
+                .map(|(text, tone, bold)| {
                     Span::styled(
-                        format!(" {}", clip(&observation.id, id_width as usize)),
-                        Style::default().fg(palette.text).add_modifier(if selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                    ),
-                    Span::styled(
-                        format!("  {activity}"),
+                        text,
                         Style::default()
-                            .fg(state_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]);
+                            .fg(palette.tone(tone))
+                            .add_modifier(if bold {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if two_line {
+                // Identity left, state right; attention on its own line.
+                let room = content_width.saturating_sub(2 + 2 + cell_width(state) + 1);
+                let id = clip(&observation.id, room);
+                let pad = content_width.saturating_sub(2 + cell_width(&id) + cell_width(state) + 1);
+                let first = vec![
+                    marker,
+                    Span::styled(id, id_style),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(state, state_style),
+                ];
                 frame.render_widget(
-                    Paragraph::new(first),
+                    Paragraph::new(clip_line(first, content_width)),
                     Rect::new(rect.x, rect.y, rect.width, 1),
                 );
                 if height > 1 {
-                    let compact_attention = if observation.pending {
-                        format!(
-                            "  {}  {} {}  {}",
-                            compact_attention_label(self.language, &observation.attention_kind),
-                            observation.attention_total(),
-                            tr(self.language, Text::Pending),
-                            if observation.acknowledged {
-                                tr(self.language, Text::Seen)
-                            } else {
-                                tr(self.language, Text::Unseen)
-                            }
-                        )
-                    } else {
-                        format!(
-                            "  {}",
-                            compact_attention_label(self.language, &observation.attention_kind)
-                        )
-                    };
+                    let mut second = vec![Span::raw("  ")];
+                    second.extend(attention);
                     frame.render_widget(
-                        Paragraph::new(clip(&compact_attention, rect.width as usize)).style(
-                            Style::default().fg(if observation.pending {
-                                palette.warning
-                            } else {
-                                palette.muted
-                            }),
-                        ),
+                        Paragraph::new(clip_line(second, content_width)),
                         Rect::new(rect.x, rect.y + 1, rect.width, 1),
                     );
                 }
             } else {
-                let first = Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", clip(state, 18)),
-                        Style::default()
-                            .fg(state_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        clip(&observation.id, content_width.saturating_sub(20) as usize),
-                        Style::default().fg(palette.text).add_modifier(if selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                    ),
-                    Span::styled(format!("  {attention}"), Style::default().fg(state_color)),
-                ]);
+                // Marker, identity, activity and attention in aligned columns.
+                let room = content_width.saturating_sub(2 + 2 + state_width + 2);
+                let id_column = id_width.min((room / 2).max(room.saturating_sub(attention_width)));
+                let line = vec![
+                    marker,
+                    Span::styled(pad(&observation.id, id_column), id_style),
+                    Span::raw("  "),
+                    Span::styled(pad(state, state_width), state_style),
+                    Span::raw("  "),
+                ]
+                .into_iter()
+                .chain(attention)
+                .collect();
                 frame.render_widget(
-                    Paragraph::new(first),
+                    Paragraph::new(clip_line(line, content_width)),
                     Rect::new(rect.x, rect.y, rect.width, 1),
                 );
             }
-            self.push_hit(
-                rect,
-                HitTarget::Row {
-                    id: observation.id.clone(),
-                    revision: observation.attention_revision.clone(),
-                },
-                1,
-            );
+            self.push_hit(rect, target, 1);
         }
         if has_scroll {
             self.draw_scrollbar(
@@ -736,56 +966,110 @@ impl App {
         }
     }
 
+    /// Explains why the list is empty without implying a completed state.
+    fn empty_list_text(&self) -> (&'static str, &'static str) {
+        if self.rows.is_empty() {
+            if self.connected {
+                (
+                    tr(self.language, Text::NoAgentsObserved),
+                    tr(self.language, Text::NoAgentsHint),
+                )
+            } else {
+                (tr(self.language, Text::Connecting), "")
+            }
+        } else if !self.search.is_empty() {
+            (
+                tr(self.language, Text::NoRows),
+                tr(self.language, Text::NoRowsHint),
+            )
+        } else if self.filter == Filter::Attention
+            && self.connected
+            && !self.rows.iter().any(Observation::is_unavailable)
+        {
+            (
+                tr(self.language, Text::NoPending),
+                tr(self.language, Text::ChooseAllHint),
+            )
+        } else {
+            (
+                tr(self.language, Text::NoRows),
+                tr(self.language, Text::ChooseAllHint),
+            )
+        }
+    }
+
+    fn draw_divider(&mut self, frame: &mut Frame, divider: Rect, palette: Palette) {
+        let dragging = self.drag.is_some();
+        let hovered = self.hover == Some(HitTarget::Divider);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(if dragging {
+                palette.accent
+            } else {
+                palette.canvas
+            })),
+            divider,
+        );
+        if !dragging {
+            let grip = divider.height.min(3);
+            let top = divider.y + divider.height.saturating_sub(grip) / 2;
+            frame.render_widget(
+                Paragraph::new(vec![Line::from("┃"); grip as usize]).style(
+                    Style::default()
+                        .fg(if hovered {
+                            palette.accent
+                        } else {
+                            palette.muted
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Rect::new(divider.x, top, 1, grip),
+            );
+        }
+        self.push_hit(divider, HitTarget::Divider, 1);
+    }
+
     fn draw_inspector(&mut self, frame: &mut Frame, area: Rect, palette: Palette) {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} ", tr(self.language, Text::Inspector)))
-            .title_style(Style::default().fg(palette.muted))
-            .border_style(Style::default().fg(if self.focus == Focus::Inspector {
-                palette.accent
-            } else {
-                palette.track
-            }))
-            .style(Style::default().bg(palette.panel));
+        let block = self.region_block(Text::Inspector, self.focus == Focus::Inspector, palette);
         let inner = inset(area, 1);
         frame.render_widget(block, area);
-        let lines = self.inspector_text();
-        self.inspector_lines = lines.len();
-        self.inspector_page = inner.height.max(1) as usize;
-        self.clamp_selection_and_scroll();
         if inner.width == 0 || inner.height == 0 {
+            self.inspector_page = 1;
             return;
         }
-        let has_scroll = lines.len() > self.inspector_page;
+        let page = inner.height.max(1) as usize;
+        let padded = |scroll: bool| inset_x(inner, 1).width.saturating_sub(u16::from(scroll));
+        // Wrapping depends on whether a scrollbar takes a column.
+        let mut lines = self.inspector_view(padded(false) as usize, palette);
+        let has_scroll = lines.len() > page;
+        if has_scroll {
+            lines = self.inspector_view(padded(true) as usize, palette);
+        }
+        self.inspector_lines = lines.len();
+        self.inspector_page = page;
+        self.clamp_selection_and_scroll();
         let content = Rect::new(
-            inner.x,
+            inner.x + 1.min(inner.width),
             inner.y,
-            inner.width.saturating_sub(u16::from(has_scroll)),
+            padded(has_scroll),
             inner.height,
         );
         let visible = lines
-            .iter()
+            .into_iter()
             .skip(self.inspector_scroll)
             .take(self.inspector_page)
-            .map(|line| Line::from(clip(line, content.width as usize)))
             .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(visible)
-                .style(Style::default().fg(palette.text))
-                .wrap(Wrap { trim: false }),
-            content,
-        );
-        self.push_hit(content, HitTarget::InspectorBody, 1);
+        frame.render_widget(Paragraph::new(visible), content);
+        self.push_hit(inner, HitTarget::InspectorBody, 1);
         if has_scroll {
             self.draw_scrollbar(
                 frame,
                 Rect::new(inner.right() - 1, inner.y, 1, inner.height),
                 self.inspector_scroll,
                 self.inspector_page,
-                lines.len(),
+                self.inspector_lines,
                 HitTarget::InspectorTrack,
                 HitTarget::InspectorThumb,
                 palette,
@@ -794,149 +1078,300 @@ impl App {
         }
     }
 
-    fn inspector_text(&self) -> Vec<String> {
-        let Some(row) = self.selected() else {
-            return vec![tr(self.language, Text::NoSelection).to_owned()];
-        };
-        let mut lines = Vec::new();
+    fn freshness(&self, value: &str) -> (String, Tone) {
         if !self.connected {
-            lines.push(tr(self.language, Text::StaleEvidence).to_owned());
-            lines.push(String::new());
+            return (tr(self.language, Text::LastKnown).to_owned(), Tone::Warn);
         }
-        lines.push(row.id.clone());
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::Activity),
-            activity_label(self.language, &row.activity)
+        let tone = match value {
+            "fresh" => Tone::Good,
+            "syncing" | "connecting" => Tone::Warn,
+            _ => Tone::Bad,
+        };
+        (evidence_label(self.language, value).to_owned(), tone)
+    }
+
+    fn inspector_entries(&self) -> Vec<Entry> {
+        let language = self.language;
+        let Some(row) = self.selected() else {
+            return vec![Entry::Placeholder(
+                tr(language, Text::NoSelection).to_owned(),
+            )];
+        };
+        let mut entries = Vec::new();
+        if !self.connected {
+            entries.push(Entry::Banner(tr(language, Text::StaleEvidence).to_owned()));
+            entries.push(Entry::Gap);
+        }
+        entries.push(Entry::Title(row.id.clone()));
+        let activity_tone = if !self.connected || row.is_unavailable() {
+            Tone::Muted
+        } else {
+            match row.activity.as_str() {
+                "working" => Tone::Good,
+                "retrying" => Tone::Warn,
+                "idle" => Tone::Normal,
+                _ => Tone::Muted,
+            }
+        };
+        entries.push(Entry::Field(
+            tr(language, Text::Activity),
+            activity_label(language, &row.activity).to_owned(),
+            activity_tone,
         ));
         if let Some(last) = &row.last_activity {
-            lines.push(format!(
-                "{}: {}",
-                tr(self.language, Text::LastActivity),
-                activity_label(self.language, last)
+            entries.push(Entry::Field(
+                tr(language, Text::LastActivity),
+                activity_label(language, last).to_owned(),
+                Tone::Normal,
             ));
         }
-        lines.push(if row.pending {
-            format!(
-                "{}: {} / {}",
-                tr(self.language, Text::Attention),
-                attention_label(self.language, &row.attention_kind),
-                if row.acknowledged {
-                    tr(self.language, Text::Seen)
+        let kind = attention_label(language, &row.attention_kind);
+        entries.push(if row.pending {
+            let tone = if !self.connected || row.acknowledged {
+                Tone::Normal
+            } else {
+                Tone::Warn
+            };
+            Entry::Field(
+                tr(language, Text::Attention),
+                format!(
+                    "{kind} / {}",
+                    tr(
+                        language,
+                        if row.acknowledged {
+                            Text::Seen
+                        } else {
+                            Text::Unseen
+                        }
+                    )
+                ),
+                tone,
+            )
+        } else {
+            Entry::Field(tr(language, Text::Attention), kind.to_owned(), Tone::Muted)
+        });
+        entries.push(Entry::Field(
+            tr(language, Text::Approval),
+            row.permission_count.to_string(),
+            Tone::Normal,
+        ));
+        entries.push(Entry::Field(
+            tr(language, Text::Question),
+            row.question_count.to_string(),
+            Tone::Normal,
+        ));
+
+        entries.push(Entry::Gap);
+        entries.push(Entry::Heading(tr(language, Text::NativeSection).to_owned()));
+        entries.push(Entry::Field(
+            tr(language, Text::Source),
+            row.source_id.clone(),
+            Tone::Normal,
+        ));
+        entries.push(Entry::Field(
+            tr(language, Text::Session),
+            row.session_id.clone(),
+            Tone::Normal,
+        ));
+        entries.push(Entry::Field(
+            tr(language, Text::Pane),
+            row.pane_id.clone().unwrap_or_else(|| "--".to_owned()),
+            Tone::Normal,
+        ));
+        let (native, native_tone) = self.freshness(&row.native_freshness);
+        entries.push(Entry::Field(
+            tr(language, Text::Freshness),
+            native,
+            native_tone,
+        ));
+        entries.push(Entry::Field(
+            tr(language, Text::Observed),
+            utc_timestamp(row.observed_at_ms),
+            Tone::Normal,
+        ));
+        let (binding, binding_tone) = match row.binding.as_str() {
+            "explicit_unverified" => (Text::ConfiguredUnverified, Tone::Warn),
+            "invalidated" => (Text::BindingInvalidated, Tone::Bad),
+            _ => (Text::StateUnavailable, Tone::Bad),
+        };
+        entries.push(Entry::Field(
+            tr(language, Text::Binding),
+            tr(language, binding).to_owned(),
+            binding_tone,
+        ));
+        entries.push(Entry::Field(
+            tr(language, Text::FrontendVerified),
+            tr(
+                language,
+                if row.frontend_verified {
+                    Text::Verified
                 } else {
-                    tr(self.language, Text::Unseen)
-                }
+                    Text::NotVerified
+                },
+            )
+            .to_owned(),
+            Tone::Normal,
+        ));
+
+        entries.push(Entry::Gap);
+        entries.push(Entry::Heading(tr(language, Text::CoreSection).to_owned()));
+        let process = process_label(language, &row.core_process);
+        entries.push(if self.connected {
+            Entry::Field(
+                tr(language, Text::Process),
+                process.to_owned(),
+                match row.core_process.as_str() {
+                    "running" => Tone::Good,
+                    "exited" | "removed" => Tone::Bad,
+                    _ => Tone::Muted,
+                },
             )
         } else {
-            format!(
-                "{}: {}",
-                tr(self.language, Text::Attention),
-                attention_label(self.language, &row.attention_kind)
+            Entry::Field(
+                tr(language, Text::Process),
+                format!("{process} ({})", tr(language, Text::LastKnown)),
+                Tone::Warn,
             )
         });
-        lines.push(format!(
-            "{}: {} / {}: {}",
-            tr(self.language, Text::Approval),
-            row.permission_count,
-            tr(self.language, Text::Question),
-            row.question_count
+        let (core, core_tone) = self.freshness(&row.core_freshness);
+        entries.push(Entry::Field(tr(language, Text::Freshness), core, core_tone));
+        entries.push(Entry::Field(
+            tr(language, Text::PtyGeneration),
+            row.pty_generation
+                .clone()
+                .unwrap_or_else(|| "--".to_owned()),
+            Tone::Normal,
         ));
-        lines.push(String::new());
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::Source),
-            row.source_id
-        ));
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::Session),
-            row.session_id
-        ));
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::Pane),
-            row.pane_id.as_deref().unwrap_or("--")
-        ));
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::Freshness),
-            if self.connected {
-                evidence_label(self.language, &row.native_freshness)
-            } else {
-                tr(self.language, Text::LastKnown)
-            }
-        ));
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::Observed),
-            utc_timestamp(row.observed_at_ms)
-        ));
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::Binding),
-            match row.binding.as_str() {
-                "explicit_unverified" => tr(self.language, Text::ConfiguredUnverified),
-                "invalidated" => tr(self.language, Text::BindingInvalidated),
-                _ => tr(self.language, Text::StateUnavailable),
-            }
-        ));
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::FrontendVerified),
-            if row.frontend_verified {
-                tr(self.language, Text::Yes)
-            } else {
-                tr(self.language, Text::No)
-            }
-        ));
-        lines.push(String::new());
-        let process = process_label(self.language, &row.core_process);
-        lines.push(if self.connected {
-            format!(
-                "{} / {}: {}",
-                tr(self.language, Text::Core),
-                tr(self.language, Text::Process),
-                process
-            )
-        } else {
-            format!(
-                "{} / {}: {} ({})",
-                tr(self.language, Text::Core),
-                tr(self.language, Text::Process),
-                process,
-                tr(self.language, Text::LastKnown)
-            )
-        });
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::CoreEvidence),
-            if self.connected {
-                evidence_label(self.language, &row.core_freshness)
-            } else {
-                tr(self.language, Text::LastKnown)
-            }
-        ));
-        lines.push(format!(
-            "{}: {}",
-            tr(self.language, Text::PtyGeneration),
-            row.pty_generation.as_deref().unwrap_or("--")
-        ));
-        if !self.connected {
-            lines.push(String::new());
-            lines.push(tr(self.language, Text::NavigationUnavailable).to_owned());
+        let note = if !self.connected {
+            Some(Text::NavigationUnavailable)
         } else if !self.native_available {
-            lines.push(String::new());
-            lines.push(tr(self.language, Text::NativeUnavailable).to_owned());
+            Some(Text::NativeUnavailable)
         } else if !self.action_enabled(Action::GoToPane) {
-            lines.push(String::new());
-            lines.push(tr(self.language, Text::NavigationUnavailable).to_owned());
+            Some(Text::NavigationUnavailable)
+        } else {
+            None
+        };
+        if let Some(note) = note {
+            entries.push(Entry::Gap);
+            entries.push(Entry::Note(tr(language, note).to_owned()));
         }
         if let Some(details) = self.details.get(&row.id) {
-            lines.push(String::new());
-            lines.push(tr(self.language, Text::RawDetails).to_uppercase());
-            flatten_details(details, "", 0, &mut lines);
+            entries.push(Entry::Gap);
+            entries.push(Entry::Heading(
+                tr(language, Text::RawDetails).to_uppercase(),
+            ));
+            let mut raw = Vec::new();
+            flatten_details(details, "", 0, &mut raw);
+            entries.extend(raw.into_iter().map(Entry::Raw));
+        }
+        entries
+    }
+
+    /// Wraps inspector entries to `width`. Values wrap under their own
+    /// column, so a narrow panel never drops the end of an evidence label.
+    fn inspector_view(&self, width: usize, palette: Palette) -> Vec<Line<'static>> {
+        let entries = self.inspector_entries();
+        let label_width = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Field(label, _, _) => Some(cell_width(label)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            + 2;
+        // Stack labels above values when two columns would squeeze values.
+        let stacked = width < label_width + 20;
+        let muted = Style::default().fg(palette.muted);
+        let mut lines = Vec::new();
+        for entry in entries {
+            match entry {
+                Entry::Gap => lines.push(Line::default()),
+                Entry::Banner(text) => lines.extend(wrap(&text, width).into_iter().map(|line| {
+                    Line::styled(
+                        line,
+                        Style::default()
+                            .fg(palette.warning)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                })),
+                Entry::Title(text) => lines.extend(wrap(&text, width).into_iter().map(|line| {
+                    Line::styled(
+                        line,
+                        Style::default()
+                            .fg(palette.text)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                })),
+                Entry::Heading(text) => lines.extend(
+                    wrap(&text, width)
+                        .into_iter()
+                        .map(|line| Line::styled(line, muted.add_modifier(Modifier::BOLD))),
+                ),
+                Entry::Note(text) => lines.extend(
+                    wrap(&text, width)
+                        .into_iter()
+                        .map(|line| Line::styled(line, Style::default().fg(palette.warning))),
+                ),
+                Entry::Placeholder(text) => lines.extend(
+                    wrap(&text, width)
+                        .into_iter()
+                        .map(|line| Line::styled(line, muted)),
+                ),
+                Entry::Raw(text) => lines.extend(
+                    wrap(&text, width)
+                        .into_iter()
+                        .map(|line| Line::styled(line, Style::default().fg(palette.text))),
+                ),
+                Entry::Field(label, value, tone) => {
+                    let value_style = Style::default().fg(palette.tone(tone));
+                    if stacked {
+                        lines.push(Line::styled(clip(label, width), muted));
+                        lines.extend(wrap(&value, width.saturating_sub(2)).into_iter().map(
+                            |line| {
+                                Line::from(vec![Span::raw("  "), Span::styled(line, value_style)])
+                            },
+                        ));
+                    } else {
+                        let values = wrap(&value, width.saturating_sub(label_width));
+                        for (index, line) in values.into_iter().enumerate() {
+                            let lead = if index == 0 {
+                                Span::styled(pad(label, label_width), muted)
+                            } else {
+                                Span::raw(" ".repeat(label_width))
+                            };
+                            lines.push(Line::from(vec![lead, Span::styled(line, value_style)]));
+                        }
+                    }
+                }
+            }
         }
         lines
+    }
+
+    fn action_levels(&self, actions: &[Action], expanded: bool) -> Vec<Vec<Control>> {
+        let waiting = self.ack_in_flight.is_some();
+        let control = |action: Action, compact: bool, key_only: bool| {
+            let is_waiting = action == Action::MarkSeen && waiting;
+            let is_expanded = expanded && action == Action::Expand;
+            let label = if key_only {
+                ""
+            } else if compact {
+                compact_action_label(self.language, action, is_waiting, is_expanded)
+            } else {
+                action_label(self.language, action, is_waiting, is_expanded)
+            };
+            Control::new(action_shortcut(action), label)
+        };
+        [(false, false), (true, false), (false, true)]
+            .into_iter()
+            .map(|(compact, key_only)| {
+                actions
+                    .iter()
+                    .map(|action| control(*action, compact, key_only))
+                    .collect()
+            })
+            .collect()
     }
 
     fn draw_actions(
@@ -946,21 +1381,22 @@ impl App {
         palette: Palette,
         dense: bool,
         expanded: bool,
+        gutter: u16,
     ) {
         frame.render_widget(
             Block::default().style(Style::default().bg(palette.panel)),
             area,
         );
-        let line = if dense {
-            area
-        } else {
-            Rect::new(area.x, area.y, area.width, 1)
-        };
         let actions = self.visible_actions();
+        let levels = self.action_levels(&actions, expanded);
         self.action_controls = 0;
         self.action_focus = self.action_focus.min(actions.len().saturating_sub(1));
         if self.compact && self.last_area.width < 60 && !dense {
             let width = area.width.saturating_sub(1) / 2;
+            let level = levels
+                .iter()
+                .position(|controls| controls.iter().all(|control| control.width() <= width))
+                .unwrap_or(levels.len() - 1);
             for (index, action) in actions.into_iter().enumerate() {
                 let column = (index % 2) as u16;
                 let row = (index / 2) as u16;
@@ -968,21 +1404,10 @@ impl App {
                     break;
                 }
                 let rect = Rect::new(area.x + column * (width + 1), area.y + row, width, 1);
-                let waiting = action == Action::MarkSeen && self.ack_in_flight.is_some();
-                let label = format!(
-                    "{} {}",
-                    action_shortcut(action),
-                    compact_action_label(
-                        self.language,
-                        action,
-                        waiting,
-                        expanded && action == Action::Expand
-                    )
-                );
                 self.draw_control(
                     frame,
                     rect,
-                    &clip(&label, rect.width.saturating_sub(2) as usize),
+                    &levels[level][index],
                     HitTarget::Action(action),
                     palette,
                     self.focus == Focus::Actions && self.action_focus == index,
@@ -994,51 +1419,19 @@ impl App {
                 .min(self.action_controls.saturating_sub(1));
             return;
         }
-        let full_width = actions
-            .iter()
-            .map(|action| {
-                let shortcut = action_shortcut(*action);
-                let waiting = *action == Action::MarkSeen && self.ack_in_flight.is_some();
-                cell_width(&format!(
-                    "{shortcut} {}",
-                    action_label(
-                        self.language,
-                        *action,
-                        waiting,
-                        expanded && *action == Action::Expand
-                    )
-                )) + 2
-            })
-            .sum::<usize>()
-            + actions.len().saturating_sub(1);
-        let use_full_labels = full_width <= line.width as usize;
+        let line = inset_x(Rect::new(area.x, area.y, area.width, 1), gutter);
+        let level = fit_level(&levels, 1, line.width);
         let mut x = line.x;
         for (index, action) in actions.into_iter().enumerate() {
-            let shortcut = action_shortcut(action);
-            let waiting = action == Action::MarkSeen && self.ack_in_flight.is_some();
-            let full = format!(
-                "{shortcut} {}",
-                action_label(
-                    self.language,
-                    action,
-                    waiting,
-                    expanded && action == Action::Expand
-                )
-            );
-            let label = if use_full_labels {
-                full
-            } else {
-                shortcut.to_owned()
-            };
-            let width = (cell_width(&label) + 2) as u16;
+            let control = &levels[level][index];
+            let width = control.width();
             if x + width > line.right() {
                 break;
             }
-            let rect = Rect::new(x, line.y, width, 1);
             self.draw_control(
                 frame,
-                rect,
-                &label,
+                Rect::new(x, line.y, width, 1),
+                control,
                 HitTarget::Action(action),
                 palette,
                 self.focus == Focus::Actions && self.action_focus == index,
@@ -1051,7 +1444,7 @@ impl App {
             .min(self.action_controls.saturating_sub(1));
     }
 
-    fn draw_footer(&mut self, frame: &mut Frame, area: Rect, palette: Palette) {
+    fn draw_footer(&mut self, frame: &mut Frame, area: Rect, palette: Palette, gutter: u16) {
         if area.height == 0 {
             return;
         }
@@ -1059,6 +1452,7 @@ impl App {
             Block::default().style(Style::default().bg(palette.canvas)),
             area,
         );
+        let line = inset_x(area, gutter);
         let status = self
             .toast
             .as_deref()
@@ -1082,17 +1476,17 @@ impl App {
             palette.warning
         };
         frame.render_widget(
-            Paragraph::new(clip(&status, area.width as usize)).style(Style::default().fg(color)),
-            Rect::new(area.x, area.y, area.width, 1),
+            Paragraph::new(clip(&status, line.width as usize)).style(Style::default().fg(color)),
+            Rect::new(line.x, line.y, line.width, 1),
         );
         if area.height > 1 && self.compact {
             frame.render_widget(
                 Paragraph::new(clip(
                     tr(self.language, Text::SharedSidebarShort),
-                    area.width as usize,
+                    line.width as usize,
                 ))
                 .style(Style::default().fg(palette.muted)),
-                Rect::new(area.x, area.y + 1, area.width, 1),
+                Rect::new(line.x, line.y + 1, line.width, 1),
             );
         }
     }
@@ -1136,31 +1530,105 @@ impl App {
         }
     }
 
+    fn help_text(&self, width: usize, palette: Palette) -> Vec<Line<'static>> {
+        let items = help_items(self.language);
+        let key_width = items
+            .iter()
+            .filter_map(|item| match item {
+                HelpItem::Key(key, _) => Some(cell_width(key)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            + 2;
+        let stacked = width < key_width + 20;
+        let key_style = Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD);
+        let mut lines = Vec::new();
+        for item in items {
+            match item {
+                HelpItem::Gap => lines.push(Line::default()),
+                HelpItem::Group(name) => lines.push(Line::styled(
+                    clip(name, width),
+                    Style::default()
+                        .fg(palette.muted)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                HelpItem::Note(text) => lines.extend(
+                    wrap(text, width)
+                        .into_iter()
+                        .map(|line| Line::styled(line, Style::default().fg(palette.text))),
+                ),
+                HelpItem::Key(key, text) if stacked => {
+                    lines.push(Line::styled(clip(key, width), key_style));
+                    lines.extend(wrap(text, width.saturating_sub(2)).into_iter().map(|line| {
+                        Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(line, Style::default().fg(palette.text)),
+                        ])
+                    }));
+                }
+                HelpItem::Key(key, text) => {
+                    for (index, line) in wrap(text, width.saturating_sub(key_width))
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let lead = if index == 0 {
+                            Span::styled(pad(key, key_width), key_style)
+                        } else {
+                            Span::raw(" ".repeat(key_width))
+                        };
+                        lines.push(Line::from(vec![
+                            lead,
+                            Span::styled(line, Style::default().fg(palette.text)),
+                        ]));
+                    }
+                }
+            }
+        }
+        lines
+    }
+
     fn draw_help(&mut self, frame: &mut Frame, area: Rect, palette: Palette) {
-        let width = area.width.saturating_sub(4).clamp(24, 86);
-        let height = area.height.saturating_sub(2).clamp(7, 34);
+        let width = area.width.saturating_sub(4).clamp(24, 86).min(area.width);
+        let text_width = |scroll: bool| width.saturating_sub(4 + u16::from(scroll)) as usize;
+        let max_height = area.height.saturating_sub(2).max(7).min(area.height);
+        let mut lines = self.help_text(text_width(false), palette);
+        let page = max_height.saturating_sub(2).max(1) as usize;
+        let has_scroll = lines.len() > page;
+        if has_scroll {
+            lines = self.help_text(text_width(true), palette);
+        }
+        let height = (lines.len() as u16 + 2).clamp(7, max_height);
         let modal = centered(area, width, height);
         frame.render_widget(Clear, modal);
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", tr(self.language, Text::HelpTitle)))
+            .title_style(
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
             .border_style(Style::default().fg(palette.accent))
             .style(Style::default().bg(palette.panel).fg(palette.text));
         let inner = inset(modal, 1);
         frame.render_widget(block, modal);
         self.push_hit(modal, HitTarget::OverlaySurface, 100);
-        let close_label = format!("Esc {}", tr(self.language, Text::Close));
-        let close_width = (cell_width(&close_label) + 2).min(inner.width as usize) as u16;
-        let close = Rect::new(
-            inner.right().saturating_sub(close_width),
-            inner.y,
+        // The close control sits in the top border so every row holds help.
+        let close = Control::new("Esc", tr(self.language, Text::Close));
+        let close_width = close.width().min(modal.width.saturating_sub(2));
+        let close_rect = Rect::new(
+            modal.right().saturating_sub(close_width + 2),
+            modal.y,
             close_width,
             1,
         );
         self.draw_control(
             frame,
-            close,
-            &close_label,
+            close_rect,
+            &close,
             HitTarget::DismissOverlay,
             palette,
             false,
@@ -1168,41 +1636,29 @@ impl App {
         if let Some(hit) = self.hits.last_mut() {
             hit.z = 102;
         }
-        let content = Rect::new(
-            inner.x,
-            inner.y + 1,
-            inner.width,
-            inner.height.saturating_sub(1),
-        );
-        let lines = help_lines(self.language);
         self.help_lines = lines.len();
-        self.help_page = content.height.max(1) as usize;
+        self.help_page = inner.height.max(1) as usize;
         self.clamp_selection_and_scroll();
-        let has_scroll = lines.len() > self.help_page;
         let text_area = Rect::new(
-            content.x,
-            content.y,
-            content.width.saturating_sub(u16::from(has_scroll)),
-            content.height,
+            inner.x + 1.min(inner.width),
+            inner.y,
+            text_width(has_scroll) as u16,
+            inner.height,
         );
         let visible = lines
-            .iter()
+            .into_iter()
             .skip(self.help_scroll)
             .take(self.help_page)
-            .map(|line| Line::from(clip(line, text_area.width as usize)))
             .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(visible).wrap(Wrap { trim: false }),
-            text_area,
-        );
-        self.push_hit(text_area, HitTarget::HelpBody, 101);
+        frame.render_widget(Paragraph::new(visible), text_area);
+        self.push_hit(inner, HitTarget::HelpBody, 101);
         if has_scroll {
             self.draw_scrollbar(
                 frame,
-                Rect::new(content.right() - 1, content.y, 1, content.height),
+                Rect::new(inner.right() - 1, inner.y, 1, inner.height),
                 self.help_scroll,
                 self.help_page,
-                lines.len(),
+                self.help_lines,
                 HitTarget::HelpTrack,
                 HitTarget::HelpThumb,
                 palette,
@@ -1213,13 +1669,32 @@ impl App {
 
     fn draw_context(&mut self, frame: &mut Frame, area: Rect, palette: Palette) {
         let actions = self.context_actions();
-        let width = if self.language == Language::Korean {
-            30
-        } else {
-            26
-        }
-        .min(area.width - 2);
-        let height = (actions.len() as u16 + 2).min(area.height);
+        let waiting = self.ack_in_flight.is_some();
+        let items = actions
+            .iter()
+            .map(|action| {
+                let mut control = Control::new(
+                    action_shortcut(*action),
+                    action_label(
+                        self.language,
+                        *action,
+                        *action == Action::MarkSeen && waiting,
+                        false,
+                    ),
+                );
+                control.key_right = true;
+                control
+            })
+            .collect::<Vec<_>>();
+        let title = format!(" {} ", tr(self.language, Text::ContextMenu));
+        let width = items
+            .iter()
+            .map(|control| control.width() + 3)
+            .max()
+            .unwrap_or(0)
+            .max(cell_width(&title) as u16 + 4)
+            .min(area.width.saturating_sub(2));
+        let height = (items.len() as u16 + 2).min(area.height);
         let x = self
             .context_anchor
             .0
@@ -1233,7 +1708,12 @@ impl App {
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" {} ", tr(self.language, Text::ContextMenu)))
+                .title(title)
+                .title_style(
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .border_style(Style::default().fg(palette.accent))
                 .style(Style::default().bg(palette.panel)),
             menu,
@@ -1241,14 +1721,17 @@ impl App {
         self.push_hit(menu, HitTarget::OverlaySurface, 100);
         let inner = inset(menu, 1);
         self.context_selection = self.context_selection.min(actions.len().saturating_sub(1));
-        for (index, action) in actions.into_iter().enumerate().take(inner.height as usize) {
+        for (index, (action, control)) in actions
+            .into_iter()
+            .zip(items)
+            .enumerate()
+            .take(inner.height as usize)
+        {
             let rect = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
-            let waiting = action == Action::MarkSeen && self.ack_in_flight.is_some();
-            let label = action_label(self.language, action, waiting, false);
             self.draw_control(
                 frame,
                 rect,
-                label,
+                &control,
                 HitTarget::ContextItem(action),
                 palette,
                 self.context_selection == index,
@@ -1298,7 +1781,7 @@ impl App {
         &mut self,
         frame: &mut Frame,
         rect: Rect,
-        label: &str,
+        control: &Control,
         target: HitTarget,
         palette: Palette,
         selected: bool,
@@ -1317,24 +1800,66 @@ impl App {
             }
             _ => true,
         };
-        let (fg, bg) = if !enabled {
-            (palette.muted, palette.panel)
+        let (fg, key_fg, bg) = if !enabled {
+            (palette.muted, palette.muted, palette.panel)
         } else if pressed {
-            (palette.accent_text, palette.warning)
+            (palette.accent_text, palette.accent_text, palette.warning)
         } else if selected || hovered {
-            (palette.accent_text, palette.accent)
+            (palette.accent_text, palette.accent_text, palette.accent)
+        } else if control.key_right {
+            (palette.text, palette.muted, palette.panel)
         } else {
-            (palette.text, palette.raised)
-        };
-        let text = format!(" {} ", label);
-        frame.render_widget(
-            Paragraph::new(clip(&text, rect.width as usize)).style(
-                Style::default().fg(fg).bg(bg).add_modifier(if selected {
-                    Modifier::BOLD
+            (
+                if control.quiet {
+                    palette.muted
                 } else {
-                    Modifier::empty()
-                }),
-            ),
+                    palette.text
+                },
+                palette.accent,
+                palette.raised,
+            )
+        };
+        let base = Style::default().fg(fg).bg(bg).add_modifier(if selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+        let key = Span::styled(
+            control.key.clone(),
+            base.fg(key_fg).add_modifier(if enabled {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        );
+        let spans = if control.key_right {
+            let inner = (rect.width as usize).saturating_sub(2);
+            let key_width = cell_width(&control.key);
+            let label = clip(&control.label, inner.saturating_sub(key_width + 1));
+            let gap = inner.saturating_sub(cell_width(&label) + key_width);
+            vec![
+                Span::raw(" "),
+                Span::styled(label, base),
+                Span::raw(" ".repeat(gap)),
+                key,
+                Span::raw(" "),
+            ]
+        } else {
+            let gap = if control.key.is_empty() || control.label.is_empty() {
+                ""
+            } else {
+                " "
+            };
+            vec![
+                Span::raw(" "),
+                key,
+                Span::raw(gap),
+                Span::styled(control.label.clone(), base),
+                Span::raw(" "),
+            ]
+        };
+        frame.render_widget(
+            Paragraph::new(clip_line(spans, rect.width as usize)).style(base),
             rect,
         );
         self.push_hit(rect, target, 1);
@@ -1348,6 +1873,92 @@ impl App {
             self.hits.push(HitRegion { rect, target, z });
         }
     }
+}
+
+fn header_target(focus_index: usize) -> HitTarget {
+    match focus_index {
+        0 => HitTarget::Close,
+        1 => HitTarget::Help,
+        2 => HitTarget::Theme,
+        _ => HitTarget::Language,
+    }
+}
+
+/// Clips styled spans to `width` terminal cells.
+fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut used = 0;
+    let mut output = Vec::new();
+    for span in spans {
+        if used >= width {
+            break;
+        }
+        let text = clip(&span.content, width - used);
+        used += cell_width(&text);
+        output.push(Span::styled(text, span.style));
+    }
+    Line::from(output)
+}
+
+/// Clips to `width` cells and pads with spaces to exactly that width.
+fn pad(text: &str, width: usize) -> String {
+    let mut output = clip(text, width);
+    let used = cell_width(&output);
+    output.push_str(&" ".repeat(width.saturating_sub(used)));
+    output
+}
+
+/// Word-wraps by rendered cell width; words wider than a line break by grapheme.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let text = sanitize(text);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for word in text.split(' ') {
+        let word_width = cell_width(word);
+        let space = usize::from(!line.is_empty());
+        if used + space + word_width <= width {
+            if space == 1 {
+                line.push(' ');
+            }
+            line.push_str(word);
+            used += space + word_width;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        if word_width <= width {
+            line.push_str(word);
+            used = word_width;
+            continue;
+        }
+        for grapheme in word.graphemes(true) {
+            let next = cell_width(grapheme);
+            if used + next > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push_str(grapheme);
+            used += next;
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+fn inset_x(rect: Rect, amount: u16) -> Rect {
+    Rect::new(
+        rect.x.saturating_add(amount),
+        rect.y,
+        rect.width.saturating_sub(amount.saturating_mul(2)),
+        rect.height,
+    )
 }
 
 fn flatten_details(value: &serde_json::Value, prefix: &str, depth: usize, lines: &mut Vec<String>) {
@@ -1629,11 +2240,11 @@ mod tests {
         }
         for label in [
             "All",
-            "Wait",
-            "Work",
+            "Attention",
+            "Working",
             "Unavailable",
             "Mark seen",
-            "Pane",
+            "Go to pane",
             "Details",
             "Expand",
         ] {
@@ -1666,10 +2277,115 @@ mod tests {
         value["observations"][0]["attention"]["pending"] = json!(false);
         let mut app = App::new(false, Language::English, Theme::Dark);
         app.apply_snapshot(value);
-        let text = app.inspector_text().join("\n");
-        assert!(text.contains("Attention: None"));
+        let entries = app.inspector_entries();
+        assert!(entries.contains(&Entry::Field("Attention", "None".into(), Tone::Muted)));
+        let text = format!("{entries:?}");
         assert!(!text.contains("Unseen"));
         assert!(!text.contains("Seen"));
+    }
+
+    #[test]
+    fn empty_attention_view_claims_nothing_without_current_evidence() {
+        let mut value = snapshot();
+        value["observations"][0]["attention"]["pending"] = json!(false);
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        app.apply_snapshot(value.clone());
+        app.filter = Filter::Attention;
+        app.set_connection(true, None);
+        assert_eq!(app.empty_list_text().0, "No pending requests.");
+        app.set_connection(false, None);
+        assert_eq!(app.empty_list_text().0, "No agents match this view.");
+        value["observations"][0]["native"]["freshness"] = json!("stale");
+        app.apply_snapshot(value);
+        app.set_connection(true, None);
+        assert_eq!(app.empty_list_text().0, "No agents match this view.");
+        app.filter = Filter::All;
+        app.clamp_selection_and_scroll();
+        let entries = app.inspector_entries();
+        assert!(entries.contains(&Entry::Field("Activity", "Working".into(), Tone::Muted)));
+    }
+
+    #[test]
+    fn tiny_view_prefers_minimum_size_over_current_size() {
+        let backend = TestBackend::new(24, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..5)
+            .flat_map(|y| (0..24).map(move |x| (x, y)))
+            .map(|cell| buffer.cell(cell).unwrap().symbol().to_owned())
+            .collect::<String>();
+        assert!(text.contains("Minimum"), "{text}");
+        let narrow = draw_at(4, 9, false, Language::English);
+        assert!(narrow.hits.iter().any(|hit| hit.target == HitTarget::Close));
+    }
+
+    fn screen(width: u16, height: u16, compact: bool) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(compact, Language::English, Theme::Dark);
+        app.apply_snapshot(snapshot());
+        app.set_connection(true, None);
+        app.set_native_available(true);
+        app.details_open = true;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn narrow_inspector_wraps_instead_of_dropping_evidence() {
+        let text = screen(34, 40, true);
+        let joined = text
+            .lines()
+            .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("foreground agent not verified"), "{text}");
+    }
+
+    #[test]
+    fn wrap_respects_cell_width_and_breaks_long_words() {
+        assert_eq!(wrap("alpha beta gamma", 10), vec!["alpha beta", "gamma"]);
+        assert_eq!(wrap("한글한글한글", 4), vec!["한글", "한글", "한글"]);
+        assert_eq!(wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert!(wrap("anything", 0).is_empty());
+    }
+
+    #[test]
+    fn list_columns_align_identity_across_activity_labels() {
+        let mut value = snapshot();
+        let mut idle = value["observations"][0].clone();
+        idle["id"] = json!("zz_idle");
+        idle["native"]["activity"] = json!("idle");
+        idle["attention"]["pending"] = json!(false);
+        value["observations"].as_array_mut().unwrap().push(idle);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        app.apply_snapshot(value);
+        app.set_connection(true, None);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let column = |needle: &str| {
+            (0..24).find_map(|y| {
+                let line = (0..80)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_owned())
+                    .collect::<String>();
+                line.find(needle).map(|byte| line[..byte].chars().count())
+            })
+        };
+        let working = column("Working  ").unwrap();
+        let idle = column("Idle").unwrap();
+        assert_eq!(working, idle, "activity column must align");
     }
 
     #[test]

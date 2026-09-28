@@ -1,31 +1,31 @@
 
-rmux  Agent desk  Observer disconnected                                                l EN   t Dark   ? Help   q Close
+ rmux  Agent desk  Observer disconnected                                              l EN   t Dark   ? Help   q Close
 
- All 16   Attention 3   Working 6   Unavailable 16
+  All 16   Attention 3   Working 6   Unavailable 16
 
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │/ Search agents                                                                                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Agents ──────────────────────────────────────┐ ┌ Evidence inspector ─────────────────────────────────────────────────┐
-│ State unavailable agent-00  1 pending / Unsee│ │Last evidence; observer is offline                                   │
-│ State unavailable agent-01  1 pending / Unsee│ │                                                                     │
-│ State unavailable agent-03  1 pending / Unsee│ │agent-00                                                             │
-│ State unavailable agent-02  None             │ │Activity: Working                                                    │
-│ State unavailable agent-04  None             │ │Attention: Approval request / Unseen                                 │
-│ State unavailable agent-05  None             │ │Approval request: 1 / Question: 0                                    │
-│ State unavailable agent-06  None             │ │                                                                     │
-│ State unavailable agent-07  None             │ │Source: local                                                        │
-│ State unavailable agent-08  None             │ │Session: ses_0                                                       │
-│ State unavailable agent-09  None             │ │Pane: %0                                                             │
-│ State unavailable agent-10  None             │ │Evidence: Last known                                                 │
-│ State unavailable agent-11  None             │ │Observed at: 2026-09-28 04:00:20.221 UTC                             │
-│ State unavailable agent-12  None             │ │Binding: Configured pane; foreground agent not verified              │
-│ State unavailable agent-13  None             │ │Foreground agent verified: No                                        │
-│ State unavailable agent-14  None             │ │                                                                     │
-│ State unavailable agent-15  None             │ │Core / Process: Running (Last known)                                 │
-│                                              │ │Core evidence: Last known                                            │
-│                                              │ │PTY generation: 1                                                    │
+│› agent-00  Last known  Approval 1  Unseen    │ │ Last evidence; observer is offline                                  │
+│  agent-01  Last known  Question 1  Unseen    │ │                                                                     │
+│  agent-03  Last known  Approval 1  Unseen    │ │ agent-00                                                            │
+│  agent-02  Last known  None                  │ │ Activity          Working                                           │
+│  agent-04  Last known  None                  │ │ Attention         Approval request / Unseen                         │
+│  agent-05  Last known  None                  │ │ Approval request  1                                                 │
+│  agent-06  Last known  None                  │ │ Question          0                                                 │
+│  agent-07  Last known  None                  │┃│                                                                     │
+│  agent-08  Last known  None                  │┃│ Native session                                                      │
+│  agent-09  Last known  None                  │┃│ Source            local                                             │
+│  agent-10  Last known  None                  │ │ Session           ses_0                                             │
+│  agent-11  Last known  None                  │ │ Pane              %0                                                │
+│  agent-12  Last known  None                  │ │ Evidence          Last known                                        │
+│  agent-13  Last known  None                  │ │ Observed at       2026-09-28 05:34:49.311 UTC                       │
+│  agent-14  Last known  None                  │ │ Binding           Configured pane; foreground agent not verified    │
+│  agent-15  Last known  None                  │ │ Foreground agent  Not verified                                      │
+│                                              │ │                                                                     │
+│                                              │ │ Core pane                                                           │
 └──────────────────────────────────────────────┘ └─────────────────────────────────────────────────────────────────────┘
- a Mark seen   g Go to pane   Enter Details   r Retry
+  a Mark seen   g Go to pane   Enter Details   r Retry
 
-observer disconnected
+ observer disconnected
