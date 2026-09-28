@@ -52,6 +52,41 @@
 #define RMUX_BRIDGE_SNAPSHOT_BYTES	(512 * 1024)
 #define RMUX_BRIDGE_SNAPSHOT_BURST	(128 * 1024)
 #define RMUX_BRIDGE_CREDIT_SCALE		1000000ULL
+#define RMUX_BRIDGE_WATCH_PANES		64
+#define RMUX_BRIDGE_WATCH_SLOTS		512
+#define RMUX_BRIDGE_JOURNAL_EVENTS	4096
+#define RMUX_BRIDGE_JOURNAL_VISITS	256
+#define RMUX_BRIDGE_DIRTY_BATCH		64
+#define RMUX_BRIDGE_DIRTY_USEC		250000ULL
+
+enum rmux_bridge_event_reason {
+	RMUX_BRIDGE_SCREEN_DIRTY,
+	RMUX_BRIDGE_RESIZED,
+	RMUX_BRIDGE_PTY_CHANGED,
+	RMUX_BRIDGE_EXITED,
+	RMUX_BRIDGE_REMOVED
+};
+
+struct rmux_bridge_watch_slot {
+	struct window_pane	*wp;
+	u_int			 pane_id;
+	uint64_t		 pty_generation;
+	uint64_t		 screen_generation;
+	uint64_t		 dirty_after;
+	size_t			 subscribers;
+	size_t			 used_position;
+	int			 used;
+	int			 dirty;
+};
+
+struct rmux_bridge_journal_event {
+	uint64_t		 seq;
+	uint64_t		 pty_generation;
+	uint64_t		 screen_generation;
+	u_int			 pane_id;
+	uint16_t		 slot;
+	uint8_t			 reason;
+};
 
 struct rmux_bridge_client {
 	int			 fd;
@@ -64,6 +99,13 @@ struct rmux_bridge_client {
 	u_char			*tx;
 	size_t			 tx_len;
 	size_t			 tx_off;
+	uint64_t		 stream_epoch;
+	uint64_t		 watch_cursor;
+	uint64_t		 watch_bits[RMUX_BRIDGE_WATCH_SLOTS / 64];
+	uint16_t		 watch_slots[RMUX_BRIDGE_WATCH_PANES];
+	size_t			 watch_count;
+	int			 watching;
+	int			 watch_reschedule;
 	struct rmux_bridge_client *next;
 };
 
@@ -80,6 +122,9 @@ struct rmux_bridge_stats {
 	uint64_t inventory_requests;
 	uint64_t snapshots;
 	uint64_t rate_limited;
+	uint64_t events;
+	uint64_t coalesced;
+	uint64_t gaps;
 };
 
 struct rmux_json_builder {
@@ -105,6 +150,22 @@ static size_t			 rmux_bridge_tx_bytes;
 static uint64_t			 rmux_bridge_snapshot_updated;
 static uint64_t			 rmux_bridge_snapshot_credit;
 static uint64_t			 rmux_bridge_snapshot_byte_credit;
+static struct rmux_bridge_watch_slot rmux_bridge_watch_slots[RMUX_BRIDGE_WATCH_SLOTS];
+static uint16_t			 rmux_bridge_used_slots[RMUX_BRIDGE_WATCH_SLOTS];
+static size_t			 rmux_bridge_used_slot_count;
+static size_t			 rmux_bridge_watch_pane_refs;
+static size_t			 rmux_bridge_watch_clients;
+static size_t			 rmux_bridge_pending_dirty;
+static struct rmux_bridge_journal_event rmux_bridge_journal[RMUX_BRIDGE_JOURNAL_EVENTS];
+static size_t			 rmux_bridge_journal_head;
+static size_t			 rmux_bridge_journal_count;
+static uint64_t			 rmux_bridge_event_seq;
+static int			 rmux_bridge_event_exhausted;
+static uint64_t			 rmux_bridge_stream_epoch;
+static int			 rmux_bridge_stream_exhausted;
+static struct event		 rmux_bridge_dirty_event;
+static int			 rmux_bridge_dirty_timer_active;
+static uint64_t			 rmux_bridge_dirty_timer_due;
 static struct rmux_bridge_stats	 rmux_bridge_stats;
 static u_char			 rmux_bridge_codec_pool[RMUX_BRIDGE_CODEC_POOL];
 static char			 rmux_bridge_response[RMUX_BRIDGE_TX_MAX];
@@ -274,12 +335,15 @@ rmux_json_quoted_length(const char *value, size_t length)
 
 static void
 rmux_bridge_client_update(struct rmux_bridge_client *client);
+static void
+rmux_bridge_watch_unsubscribe(struct rmux_bridge_client *client);
 
 static void
 rmux_bridge_client_close(struct rmux_bridge_client *client)
 {
 	struct rmux_bridge_client **previous, *found;
 
+	rmux_bridge_watch_unsubscribe(client);
 	event_del(&client->event);
 	if (event_initialized(&client->timeout_event))
 		event_del(&client->timeout_event);
@@ -474,9 +538,9 @@ rmux_bridge_hello(struct rmux_bridge_client *client, const char *request_id,
 	rmux_json_quote(&builder, rmux_bridge_boot_id,
 	    strlen(rmux_bridge_boot_id));
 	rmux_json_puts(&builder,
-	    ",\"negotiated_version\":{\"major\":1,\"minor\":0},"
+	    ",\"negotiated_version\":{\"major\":1,\"minor\":1},"
 	    "\"capabilities\":{\"inventory\":true,\"snapshot\":true,"
-	    "\"stats\":true,\"watch\":false,\"events\":false,"
+	    "\"stats\":true,\"watch\":true,\"events\":true,"
 	    "\"actions\":false,\"submit\":false},"
 	    "\"limits\":{\"rx_frame\":8192,\"tx_frame\":65536,"
 	    "\"json_depth\":8,\"inventory_page\":64,"
@@ -601,6 +665,454 @@ rmux_bridge_pane_id(yyjson_val *value, u_int *pane_id)
 			return (-1);
 	}
 	*pane_id = number;
+	return (0);
+}
+
+static const char *
+rmux_bridge_reason_string(enum rmux_bridge_event_reason reason)
+{
+	switch (reason) {
+	case RMUX_BRIDGE_SCREEN_DIRTY:
+		return ("screen_dirty");
+	case RMUX_BRIDGE_RESIZED:
+		return ("resized");
+	case RMUX_BRIDGE_PTY_CHANGED:
+		return ("pty_changed");
+	case RMUX_BRIDGE_EXITED:
+		return ("exited");
+	case RMUX_BRIDGE_REMOVED:
+		return ("removed");
+	}
+	return ("removed");
+}
+
+static struct rmux_bridge_watch_slot *
+rmux_bridge_watch_slot(struct window_pane *wp)
+{
+	struct rmux_bridge_watch_slot *slot;
+	size_t index;
+
+	if (wp->rmux_watch_slot == 0)
+		return (NULL);
+	index = wp->rmux_watch_slot - 1;
+	if (index >= RMUX_BRIDGE_WATCH_SLOTS)
+		return (NULL);
+	slot = &rmux_bridge_watch_slots[index];
+	if (!slot->used || slot->wp != wp || slot->pane_id != wp->id)
+		return (NULL);
+	return (slot);
+}
+
+static void
+rmux_bridge_watch_slot_refresh(struct rmux_bridge_watch_slot *slot)
+{
+	if (slot->wp == NULL)
+		return;
+	slot->pty_generation = slot->wp->rmux_pty_generation;
+	slot->screen_generation = slot->wp->rmux_screen_generation;
+}
+
+static void
+rmux_bridge_watch_wake(void)
+{
+	struct rmux_bridge_client *client;
+
+	for (client = rmux_bridge_clients; client != NULL; client = client->next) {
+		if (client->watching && client->tx == NULL)
+			event_active(&client->event, EV_READ, 1);
+	}
+}
+
+static void
+rmux_bridge_watch_fail_closed(void)
+{
+	struct rmux_bridge_client *client, *next;
+
+	for (client = rmux_bridge_clients; client != NULL; client = next) {
+		next = client->next;
+		if (client->watching)
+			rmux_bridge_client_close(client);
+	}
+}
+
+static void
+rmux_bridge_journal_append(struct rmux_bridge_watch_slot *slot,
+    enum rmux_bridge_event_reason reason)
+{
+	struct rmux_bridge_journal_event *record;
+	size_t index;
+
+	if (rmux_bridge_event_exhausted)
+		return;
+	if (rmux_bridge_event_seq == UINT64_MAX) {
+		rmux_bridge_event_exhausted = 1;
+		rmux_bridge_watch_fail_closed();
+		return;
+	}
+	rmux_bridge_watch_slot_refresh(slot);
+	if (rmux_bridge_journal_count < RMUX_BRIDGE_JOURNAL_EVENTS) {
+		index = (rmux_bridge_journal_head +
+		    rmux_bridge_journal_count) % RMUX_BRIDGE_JOURNAL_EVENTS;
+		rmux_bridge_journal_count++;
+	} else {
+		index = rmux_bridge_journal_head;
+		rmux_bridge_journal_head = (rmux_bridge_journal_head + 1) %
+		    RMUX_BRIDGE_JOURNAL_EVENTS;
+	}
+	record = &rmux_bridge_journal[index];
+	record->seq = ++rmux_bridge_event_seq;
+	record->pane_id = slot->pane_id;
+	record->pty_generation = slot->pty_generation;
+	record->screen_generation = slot->screen_generation;
+	record->slot = slot - rmux_bridge_watch_slots;
+	record->reason = reason;
+	rmux_bridge_stats.events++;
+	rmux_bridge_watch_wake();
+}
+
+static void rmux_bridge_dirty_callback(int, short, void *);
+
+static void
+rmux_bridge_dirty_schedule(uint64_t due)
+{
+	struct timeval timeout;
+	uint64_t now, delay;
+
+	if (rmux_bridge_dirty_timer_active &&
+	    due >= rmux_bridge_dirty_timer_due)
+		return;
+	if (rmux_bridge_dirty_timer_active)
+		event_del(&rmux_bridge_dirty_event);
+	now = rmux_bridge_now_usec();
+	delay = due > now ? due - now : 0;
+	timeout.tv_sec = delay / 1000000;
+	timeout.tv_usec = delay % 1000000;
+	evtimer_add(&rmux_bridge_dirty_event, &timeout);
+	rmux_bridge_dirty_timer_active = 1;
+	rmux_bridge_dirty_timer_due = due;
+}
+
+static void
+rmux_bridge_dirty_rearm(void)
+{
+	struct rmux_bridge_watch_slot *slot;
+	uint64_t due = UINT64_MAX;
+	size_t i;
+
+	if (rmux_bridge_dirty_timer_active) {
+		event_del(&rmux_bridge_dirty_event);
+		rmux_bridge_dirty_timer_active = 0;
+	}
+	if (rmux_bridge_pending_dirty == 0)
+		return;
+	for (i = 0; i < rmux_bridge_used_slot_count; i++) {
+		slot = &rmux_bridge_watch_slots[rmux_bridge_used_slots[i]];
+		if (slot->dirty && slot->dirty_after < due)
+			due = slot->dirty_after;
+	}
+	if (due != UINT64_MAX)
+		rmux_bridge_dirty_schedule(due);
+}
+
+static void
+rmux_bridge_dirty_cancel(struct rmux_bridge_watch_slot *slot)
+{
+	if (!slot->dirty)
+		return;
+	slot->dirty = 0;
+	if (rmux_bridge_pending_dirty != 0)
+		rmux_bridge_pending_dirty--;
+	rmux_bridge_stats.coalesced++;
+	rmux_bridge_dirty_rearm();
+}
+
+static void
+rmux_bridge_dirty_callback(__unused int fd, __unused short events,
+    __unused void *data)
+{
+	struct rmux_bridge_watch_slot *slot;
+	uint64_t now = rmux_bridge_now_usec();
+	size_t i, emitted = 0;
+
+	rmux_bridge_dirty_timer_active = 0;
+	for (i = 0; i < rmux_bridge_used_slot_count; i++) {
+		slot = &rmux_bridge_watch_slots[rmux_bridge_used_slots[i]];
+		if (!slot->dirty || slot->dirty_after > now)
+			continue;
+		slot->dirty = 0;
+		if (rmux_bridge_pending_dirty != 0)
+			rmux_bridge_pending_dirty--;
+		slot->dirty_after = now + RMUX_BRIDGE_DIRTY_USEC;
+		rmux_bridge_journal_append(slot, RMUX_BRIDGE_SCREEN_DIRTY);
+		if (++emitted == RMUX_BRIDGE_DIRTY_BATCH ||
+		    rmux_bridge_now_usec() - now >= RMUX_BRIDGE_BATCH_USEC)
+			break;
+	}
+	rmux_bridge_dirty_rearm();
+}
+
+static int
+rmux_bridge_watch_allocate(struct window_pane *wp, uint16_t *index)
+{
+	struct rmux_bridge_watch_slot *slot;
+	size_t i;
+
+	if ((slot = rmux_bridge_watch_slot(wp)) != NULL) {
+		*index = slot - rmux_bridge_watch_slots;
+		return (0);
+	}
+	for (i = 0; i < RMUX_BRIDGE_WATCH_SLOTS; i++) {
+		if (!rmux_bridge_watch_slots[i].used)
+			break;
+	}
+	if (i == RMUX_BRIDGE_WATCH_SLOTS)
+		return (-1);
+	slot = &rmux_bridge_watch_slots[i];
+	memset(slot, 0, sizeof *slot);
+	slot->used = 1;
+	slot->wp = wp;
+	slot->pane_id = wp->id;
+	slot->pty_generation = wp->rmux_pty_generation;
+	slot->screen_generation = wp->rmux_screen_generation;
+	slot->used_position = rmux_bridge_used_slot_count;
+	rmux_bridge_used_slots[rmux_bridge_used_slot_count++] = i;
+	wp->rmux_watch_slot = i + 1;
+	*index = i;
+	return (0);
+}
+
+static void
+rmux_bridge_watch_slot_release(uint16_t index)
+{
+	struct rmux_bridge_watch_slot *slot = &rmux_bridge_watch_slots[index];
+	struct rmux_bridge_watch_slot *moved;
+	uint16_t moved_index;
+	size_t position;
+
+	if (!slot->used || slot->subscribers != 0)
+		return;
+	rmux_bridge_dirty_cancel(slot);
+	if (slot->wp != NULL && slot->wp->rmux_watch_slot == index + 1)
+		slot->wp->rmux_watch_slot = 0;
+	position = slot->used_position;
+	rmux_bridge_used_slot_count--;
+	if (position != rmux_bridge_used_slot_count) {
+		moved_index = rmux_bridge_used_slots[rmux_bridge_used_slot_count];
+		rmux_bridge_used_slots[position] = moved_index;
+		moved = &rmux_bridge_watch_slots[moved_index];
+		moved->used_position = position;
+	}
+	memset(slot, 0, sizeof *slot);
+}
+
+static void
+rmux_bridge_watch_unsubscribe(struct rmux_bridge_client *client)
+{
+	struct rmux_bridge_watch_slot *slot;
+	size_t i;
+	uint16_t index;
+
+	if (!client->watching)
+		return;
+	client->watching = 0;
+	if (rmux_bridge_watch_clients != 0)
+		rmux_bridge_watch_clients--;
+	for (i = 0; i < client->watch_count; i++) {
+		index = client->watch_slots[i];
+		slot = &rmux_bridge_watch_slots[index];
+		if (slot->subscribers != 0)
+			slot->subscribers--;
+		if (rmux_bridge_watch_pane_refs != 0)
+			rmux_bridge_watch_pane_refs--;
+		rmux_bridge_watch_slot_release(index);
+	}
+	client->watch_count = 0;
+	memset(client->watch_bits, 0, sizeof client->watch_bits);
+	if (rmux_bridge_watch_clients == 0) {
+		rmux_bridge_journal_head = 0;
+		rmux_bridge_journal_count = 0;
+	}
+}
+
+static int
+rmux_bridge_watch(struct rmux_bridge_client *client, const char *request_id,
+    size_t request_id_length, yyjson_val *root)
+{
+	struct rmux_json_builder builder = {
+	    rmux_bridge_response, 0, sizeof rmux_bridge_response, 0
+	};
+	struct window_pane *panes[RMUX_BRIDGE_WATCH_PANES], *wp;
+	struct rmux_bridge_watch_slot *slot;
+	yyjson_val *value, *pane_ids, *item;
+	u_int ids[RMUX_BRIDGE_WATCH_PANES];
+	uint16_t index;
+	uint64_t epoch, fence;
+	size_t count, i, j, new_slots = 0;
+
+	if (client->watching)
+		return (rmux_bridge_error(client, request_id, request_id_length,
+		    "stream_active", "connection already has an active watch"));
+	value = yyjson_obj_get(root, "expected_core_boot_id");
+	if (!yyjson_is_str(value) ||
+	    yyjson_get_len(value) != strlen(rmux_bridge_boot_id) ||
+	    memcmp(yyjson_get_str(value), rmux_bridge_boot_id,
+	    strlen(rmux_bridge_boot_id)) != 0)
+		return (rmux_bridge_error(client, request_id, request_id_length,
+		    "boot_mismatch", "core boot id does not match"));
+	pane_ids = yyjson_obj_get(root, "pane_ids");
+	if (!yyjson_is_arr(pane_ids) || (count = yyjson_arr_size(pane_ids)) == 0 ||
+	    count > RMUX_BRIDGE_WATCH_PANES)
+		return (rmux_bridge_error(client, request_id, request_id_length,
+		    "invalid_pane_ids", "pane_ids must contain 1 to 64 panes"));
+	if (rmux_bridge_revision_exhausted || rmux_bridge_event_exhausted ||
+	    rmux_bridge_stream_exhausted)
+		return (rmux_bridge_error(client, request_id, request_id_length,
+		    "generation_exhausted", "watch sequence cannot be reused"));
+	for (i = 0; i < count; i++) {
+		item = yyjson_arr_get(pane_ids, i);
+		if (rmux_bridge_pane_id(item, &ids[i]) != 0)
+			return (rmux_bridge_error(client, request_id,
+			    request_id_length, "invalid_pane_id",
+			    "pane_ids entries must have the form %N"));
+		for (j = 0; j < i; j++) {
+			if (ids[j] == ids[i])
+				return (rmux_bridge_error(client, request_id,
+				    request_id_length, "duplicate_pane_id",
+				    "pane_ids entries must be unique"));
+		}
+		wp = window_pane_find_by_id(ids[i]);
+		if (wp == NULL)
+			return (rmux_bridge_error(client, request_id,
+			    request_id_length, "target_gone",
+			    "watched pane does not exist"));
+		if (wp->rmux_generation_exhausted)
+			return (rmux_bridge_error(client, request_id,
+			    request_id_length, "generation_exhausted",
+			    "pane generations cannot be reused"));
+		panes[i] = wp;
+		if (rmux_bridge_watch_slot(wp) == NULL)
+			new_slots++;
+	}
+	if (new_slots > RMUX_BRIDGE_WATCH_SLOTS - rmux_bridge_used_slot_count)
+		return (rmux_bridge_error(client, request_id, request_id_length,
+		    "observation_capacity_exceeded",
+		    "global watched pane capacity is exhausted"));
+	if (rmux_bridge_stream_epoch == UINT64_MAX) {
+		rmux_bridge_stream_exhausted = 1;
+		return (rmux_bridge_error(client, request_id, request_id_length,
+		    "generation_exhausted", "stream epoch cannot be reused"));
+	}
+	epoch = rmux_bridge_stream_epoch + 1;
+	fence = rmux_bridge_event_seq;
+	rmux_json_puts(&builder,
+	    "{\"v\":1,\"kind\":\"watch\",\"request_id\":");
+	rmux_json_quote(&builder, request_id, request_id_length);
+	rmux_json_printf(&builder,
+	    ",\"core_boot_id\":\"%s\",\"stream_epoch\":\"%llu\","
+	    "\"fence_seq\":\"%llu\",\"scope_revision\":\"%llu\","
+	    "\"complete\":true,\"panes\":[", rmux_bridge_boot_id,
+	    (unsigned long long)epoch, (unsigned long long)fence,
+	    (unsigned long long)rmux_bridge_revision);
+	for (i = 0; i < count; i++) {
+		wp = panes[i];
+		if (i != 0)
+			rmux_json_puts(&builder, ",");
+		rmux_json_printf(&builder,
+		    "{\"pane_id\":\"%%%u\",\"pty_generation\":\"%llu\","
+		    "\"screen_generation\":\"%llu\",\"width\":%u,"
+		    "\"height\":%u,\"dead\":%s}", wp->id,
+		    (unsigned long long)wp->rmux_pty_generation,
+		    (unsigned long long)wp->rmux_screen_generation,
+		    screen_size_x(&wp->base), screen_size_y(&wp->base),
+		    (wp->flags & (PANE_EXITED|PANE_DESTROYED)) ? "true" : "false");
+	}
+	rmux_json_puts(&builder, "]}");
+	if (builder.failed)
+		return (-1);
+
+	client->watching = 1;
+	client->stream_epoch = epoch;
+	client->watch_cursor = fence;
+	rmux_bridge_stream_epoch = epoch;
+	rmux_bridge_watch_clients++;
+	for (i = 0; i < count; i++) {
+		if (rmux_bridge_watch_allocate(panes[i], &index) != 0) {
+			rmux_bridge_watch_unsubscribe(client);
+			return (-1);
+		}
+		slot = &rmux_bridge_watch_slots[index];
+		slot->subscribers++;
+		rmux_bridge_watch_pane_refs++;
+		client->watch_slots[client->watch_count++] = index;
+		client->watch_bits[index / 64] |= 1ULL << (index % 64);
+	}
+	if (rmux_bridge_queue_builder(client, &builder) != 0) {
+		rmux_bridge_watch_unsubscribe(client);
+		return (-1);
+	}
+	return (0);
+}
+
+static int
+rmux_bridge_watch_pump(struct rmux_bridge_client *client)
+{
+	struct rmux_json_builder builder = {
+	    rmux_bridge_response, 0, sizeof rmux_bridge_response, 0
+	};
+	struct rmux_bridge_journal_event *record;
+	uint64_t first, last, next;
+	size_t offset, index, visits = 0;
+
+	client->watch_reschedule = 0;
+	if (!client->watching || client->tx != NULL ||
+	    rmux_bridge_journal_count == 0)
+		return (0);
+	first = rmux_bridge_journal[rmux_bridge_journal_head].seq;
+	last = rmux_bridge_event_seq;
+	if (client->watch_cursor < first - 1) {
+		rmux_json_printf(&builder,
+		    "{\"v\":1,\"kind\":\"gap\",\"core_boot_id\":\"%s\","
+		    "\"stream_epoch\":\"%llu\",\"after_seq\":\"%llu\","
+		    "\"first_available_seq\":\"%llu\",\"last_seq\":\"%llu\","
+		    "\"code\":\"resync_required\"}", rmux_bridge_boot_id,
+		    (unsigned long long)client->stream_epoch,
+		    (unsigned long long)client->watch_cursor,
+		    (unsigned long long)first, (unsigned long long)last);
+		rmux_bridge_stats.gaps++;
+		if (rmux_bridge_queue_builder(client, &builder) != 0)
+			return (-1);
+		client->close_after_write = 1;
+		return (0);
+	}
+	while (client->watch_cursor < last &&
+	    visits < RMUX_BRIDGE_JOURNAL_VISITS) {
+		next = client->watch_cursor + 1;
+		offset = next - first;
+		if (offset >= rmux_bridge_journal_count)
+			break;
+		index = (rmux_bridge_journal_head + offset) %
+		    RMUX_BRIDGE_JOURNAL_EVENTS;
+		record = &rmux_bridge_journal[index];
+		client->watch_cursor = record->seq;
+		visits++;
+		if ((client->watch_bits[record->slot / 64] &
+		    (1ULL << (record->slot % 64))) == 0)
+			continue;
+		rmux_json_printf(&builder,
+		    "{\"v\":1,\"kind\":\"event\",\"core_boot_id\":\"%s\","
+		    "\"stream_epoch\":\"%llu\",\"event_seq\":\"%llu\","
+		    "\"pane_id\":\"%%%u\",\"pty_generation\":\"%llu\","
+		    "\"screen_generation\":\"%llu\",\"reason\":\"%s\"}",
+		    rmux_bridge_boot_id,
+		    (unsigned long long)client->stream_epoch,
+		    (unsigned long long)record->seq, record->pane_id,
+		    (unsigned long long)record->pty_generation,
+		    (unsigned long long)record->screen_generation,
+		    rmux_bridge_reason_string(record->reason));
+		return (rmux_bridge_queue_builder(client, &builder));
+	}
+	if (client->watch_cursor < last)
+		client->watch_reschedule = 1;
 	return (0);
 }
 
@@ -806,17 +1318,24 @@ rmux_bridge_stats_response(struct rmux_bridge_client *client,
 	rmux_json_printf(&builder,
 	    ",\"core_boot_id\":\"%s\",\"revision\":\"%llu\","
 	    "\"revision_exhausted\":%s,\"clients\":%zu,"
-	    "\"tx_queued_bytes\":%zu,\"counters\":{"
+	    "\"tx_queued_bytes\":%zu,\"watched_panes\":%zu,"
+	    "\"watch_subscriptions\":%zu,\"journal_events\":%zu,"
+	    "\"pending_dirty\":%zu,\"flush_timer_active\":%s,"
+	    "\"counters\":{"
 	    "\"connects\":\"%llu\",\"disconnects\":\"%llu\","
 	    "\"rx_frames\":\"%llu\",\"tx_frames\":\"%llu\","
 	    "\"rx_bytes\":\"%llu\",\"tx_bytes\":\"%llu\","
 	    "\"requests\":\"%llu\",\"rejected\":\"%llu\","
 	    "\"protocol_errors\":\"%llu\","
 	    "\"inventory_requests\":\"%llu\",\"snapshots\":\"%llu\","
-	    "\"rate_limited\":\"%llu\"}}",
+	    "\"rate_limited\":\"%llu\",\"events\":\"%llu\","
+	    "\"coalesced\":\"%llu\",\"gaps\":\"%llu\"}}",
 	    rmux_bridge_boot_id, (unsigned long long)rmux_bridge_revision,
 	    rmux_bridge_revision_exhausted ? "true" : "false",
 	    rmux_bridge_client_count, rmux_bridge_tx_bytes,
+	    rmux_bridge_used_slot_count, rmux_bridge_watch_clients,
+	    rmux_bridge_journal_count, rmux_bridge_pending_dirty,
+	    rmux_bridge_dirty_timer_active ? "true" : "false",
 	    (unsigned long long)rmux_bridge_stats.connects,
 	    (unsigned long long)rmux_bridge_stats.disconnects,
 	    (unsigned long long)rmux_bridge_stats.rx_frames,
@@ -828,7 +1347,10 @@ rmux_bridge_stats_response(struct rmux_bridge_client *client,
 	    (unsigned long long)rmux_bridge_stats.protocol_errors,
 	    (unsigned long long)rmux_bridge_stats.inventory_requests,
 	    (unsigned long long)rmux_bridge_stats.snapshots,
-	    (unsigned long long)rmux_bridge_stats.rate_limited);
+	    (unsigned long long)rmux_bridge_stats.rate_limited,
+	    (unsigned long long)rmux_bridge_stats.events,
+	    (unsigned long long)rmux_bridge_stats.coalesced,
+	    (unsigned long long)rmux_bridge_stats.gaps);
 	return (rmux_bridge_queue_builder(client, &builder));
 }
 
@@ -848,6 +1370,9 @@ rmux_bridge_process(struct rmux_bridge_client *client, u_char *payload,
 	};
 	static const char *const stats_fields[] = {
 	    "v", "kind", "request_id"
+	};
+	static const char *const watch_fields[] = {
+	    "v", "kind", "request_id", "expected_core_boot_id", "pane_ids"
 	};
 	yyjson_alc	 allocator;
 	yyjson_doc	*document;
@@ -901,6 +1426,10 @@ rmux_bridge_process(struct rmux_bridge_client *client, u_char *payload,
 			goto out;
 		}
 		result = rmux_bridge_hello(client, request_id, request_id_length);
+	} else if (client->watching) {
+		result = rmux_bridge_error(client, request_id, request_id_length,
+		    "stream_active", "watch connection does not accept requests");
+		client->close_after_write = 1;
 	} else if (yyjson_equals_str(kind, "inventory")) {
 		if (rmux_bridge_schema(root, inventory_fields,
 		    nitems(inventory_fields), &code) != 0) {
@@ -918,6 +1447,15 @@ rmux_bridge_process(struct rmux_bridge_client *client, u_char *payload,
 			goto out;
 		}
 		result = rmux_bridge_snapshot(client, request_id,
+		    request_id_length, root);
+	} else if (yyjson_equals_str(kind, "watch")) {
+		if (rmux_bridge_schema(root, watch_fields,
+		    nitems(watch_fields), &code) != 0) {
+			result = rmux_bridge_error(client, request_id,
+			    request_id_length, code, "watch schema rejected");
+			goto out;
+		}
+		result = rmux_bridge_watch(client, request_id,
 		    request_id_length, root);
 	} else if (yyjson_equals_str(kind, "stats")) {
 		if (rmux_bridge_schema(root, stats_fields,
@@ -1015,6 +1553,11 @@ rmux_bridge_client_callback(int fd, short events, void *data)
 		rmux_bridge_client_close(client);
 		return;
 	}
+	if (client->tx == NULL && client->watching &&
+	    rmux_bridge_watch_pump(client) != 0) {
+		rmux_bridge_client_close(client);
+		return;
+	}
 	if ((events & EV_READ) && client->tx == NULL &&
 	    frames < RMUX_BRIDGE_BATCH_FRAMES &&
 	    rmux_bridge_now_usec() - started < RMUX_BRIDGE_BATCH_USEC) {
@@ -1043,6 +1586,10 @@ rmux_bridge_client_callback(int fd, short events, void *data)
 	}
 	rmux_bridge_client_deadline(client);
 	rmux_bridge_client_update(client);
+	if (client->watch_reschedule && client->tx == NULL) {
+		client->watch_reschedule = 0;
+		event_active(&client->event, EV_READ, 1);
+	}
 }
 
 static void
@@ -1173,6 +1720,20 @@ rmux_bridge_start(void)
 	    RMUX_BRIDGE_CREDIT_SCALE;
 	rmux_bridge_snapshot_byte_credit = RMUX_BRIDGE_SNAPSHOT_BURST *
 	    RMUX_BRIDGE_CREDIT_SCALE;
+	memset(rmux_bridge_watch_slots, 0, sizeof rmux_bridge_watch_slots);
+	rmux_bridge_used_slot_count = 0;
+	rmux_bridge_watch_pane_refs = 0;
+	rmux_bridge_watch_clients = 0;
+	rmux_bridge_pending_dirty = 0;
+	rmux_bridge_journal_head = 0;
+	rmux_bridge_journal_count = 0;
+	rmux_bridge_event_seq = 0;
+	rmux_bridge_event_exhausted = 0;
+	rmux_bridge_stream_epoch = 0;
+	rmux_bridge_stream_exhausted = 0;
+	rmux_bridge_dirty_timer_active = 0;
+	rmux_bridge_dirty_timer_due = 0;
+	evtimer_set(&rmux_bridge_dirty_event, rmux_bridge_dirty_callback, NULL);
 	rmux_bridge_enabled = 1;
 	event_set(&rmux_bridge_event, rmux_bridge_fd, EV_READ|EV_PERSIST,
 	    rmux_bridge_accept, NULL);
@@ -1208,6 +1769,10 @@ rmux_bridge_stop(void)
 	rmux_bridge_fd = -1;
 	while ((client = rmux_bridge_clients) != NULL)
 		rmux_bridge_client_close(client);
+	if (rmux_bridge_dirty_timer_active) {
+		event_del(&rmux_bridge_dirty_event);
+		rmux_bridge_dirty_timer_active = 0;
+	}
 	if (lstat(rmux_bridge_path, &sb) == 0 &&
 	    sb.st_dev == rmux_bridge_socket_dev &&
 	    sb.st_ino == rmux_bridge_socket_ino)
@@ -1219,6 +1784,7 @@ rmux_bridge_stop(void)
 void
 rmux_bridge_pane_created(struct window_pane *wp)
 {
+	wp->rmux_watch_slot = 0;
 	if (!rmux_bridge_enabled)
 		return;
 	wp->rmux_pty_generation = 0;
@@ -1231,49 +1797,108 @@ rmux_bridge_pane_created(struct window_pane *wp)
 void
 rmux_bridge_pane_destroyed(struct window_pane *wp)
 {
+	struct rmux_bridge_watch_slot *slot;
+
 	if (!rmux_bridge_enabled)
 		return;
+	if ((slot = rmux_bridge_watch_slot(wp)) != NULL) {
+		rmux_bridge_dirty_cancel(slot);
+		rmux_bridge_journal_append(slot, RMUX_BRIDGE_REMOVED);
+		slot->wp = NULL;
+		wp->rmux_watch_slot = 0;
+	}
 	if (rmux_bridge_bump(&rmux_bridge_revision) != 0)
 		rmux_bridge_revision_exhausted = wp->rmux_generation_exhausted = 1;
+	if (rmux_bridge_revision_exhausted)
+		rmux_bridge_watch_fail_closed();
 }
 
 void
 rmux_bridge_pane_state_changed(struct window_pane *wp)
 {
+	struct rmux_bridge_watch_slot *slot;
+
 	if (!rmux_bridge_enabled)
 		return;
+	if ((slot = rmux_bridge_watch_slot(wp)) != NULL) {
+		rmux_bridge_dirty_cancel(slot);
+		rmux_bridge_journal_append(slot, RMUX_BRIDGE_EXITED);
+	}
 	if (rmux_bridge_bump(&rmux_bridge_revision) != 0)
 		rmux_bridge_revision_exhausted = wp->rmux_generation_exhausted = 1;
+	if (rmux_bridge_revision_exhausted)
+		rmux_bridge_watch_fail_closed();
 }
 
 void
 rmux_bridge_pty_changed(struct window_pane *wp)
 {
+	struct rmux_bridge_watch_slot *slot;
+	int exhausted = 0;
+
 	if (!rmux_bridge_enabled)
 		return;
 	if (rmux_bridge_bump(&wp->rmux_pty_generation) != 0 ||
 	    rmux_bridge_bump(&wp->rmux_screen_generation) != 0)
-		wp->rmux_generation_exhausted = 1;
+		exhausted = wp->rmux_generation_exhausted = 1;
+	if (exhausted)
+		rmux_bridge_watch_fail_closed();
+	else if ((slot = rmux_bridge_watch_slot(wp)) != NULL) {
+		rmux_bridge_dirty_cancel(slot);
+		rmux_bridge_journal_append(slot, RMUX_BRIDGE_PTY_CHANGED);
+	}
 	if (rmux_bridge_bump(&rmux_bridge_revision) != 0)
 		rmux_bridge_revision_exhausted = wp->rmux_generation_exhausted = 1;
+	if (rmux_bridge_revision_exhausted)
+		rmux_bridge_watch_fail_closed();
 }
 
 void
 rmux_bridge_output_changed(struct window_pane *wp)
 {
+	struct rmux_bridge_watch_slot *slot;
+	uint64_t now;
+
 	if (!rmux_bridge_enabled)
 		return;
-	if (rmux_bridge_bump(&wp->rmux_screen_generation) != 0)
+	if (rmux_bridge_bump(&wp->rmux_screen_generation) != 0) {
 		wp->rmux_generation_exhausted = 1;
+		rmux_bridge_watch_fail_closed();
+		return;
+	}
+	if ((slot = rmux_bridge_watch_slot(wp)) == NULL)
+		return;
+	slot->screen_generation = wp->rmux_screen_generation;
+	if (slot->dirty) {
+		rmux_bridge_stats.coalesced++;
+		return;
+	}
+	now = rmux_bridge_now_usec();
+	slot->dirty = 1;
+	if (slot->dirty_after < now)
+		slot->dirty_after = now;
+	rmux_bridge_pending_dirty++;
+	rmux_bridge_dirty_schedule(slot->dirty_after);
 }
 
 void
 rmux_bridge_geometry_changed(struct window_pane *wp)
 {
+	struct rmux_bridge_watch_slot *slot;
+	int exhausted = 0;
+
 	if (!rmux_bridge_enabled)
 		return;
 	if (rmux_bridge_bump(&wp->rmux_screen_generation) != 0)
-		wp->rmux_generation_exhausted = 1;
+		exhausted = wp->rmux_generation_exhausted = 1;
+	if (exhausted)
+		rmux_bridge_watch_fail_closed();
+	else if ((slot = rmux_bridge_watch_slot(wp)) != NULL) {
+		rmux_bridge_dirty_cancel(slot);
+		rmux_bridge_journal_append(slot, RMUX_BRIDGE_RESIZED);
+	}
 	if (rmux_bridge_bump(&rmux_bridge_revision) != 0)
 		rmux_bridge_revision_exhausted = wp->rmux_generation_exhausted = 1;
+	if (rmux_bridge_revision_exhausted)
+		rmux_bridge_watch_fail_closed();
 }

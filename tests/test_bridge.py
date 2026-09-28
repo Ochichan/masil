@@ -102,8 +102,8 @@ def main() -> None:
                 "inventory": True,
                 "snapshot": True,
                 "stats": True,
-                "watch": False,
-                "events": False,
+                "watch": True,
+                "events": True,
                 "actions": False,
                 "submit": False,
             }

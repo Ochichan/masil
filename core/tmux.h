@@ -1374,6 +1374,7 @@ struct window_pane {
 	uint64_t	 rmux_pty_generation;
 	uint64_t	 rmux_screen_generation;
 	int		 rmux_generation_exhausted;
+	uint16_t	 rmux_watch_slot;
 	time_t		 last_output_time;
 	time_t		 last_prompt_time;
 	time_t		 cmd_start_time;

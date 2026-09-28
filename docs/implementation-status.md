@@ -61,6 +61,8 @@ RMUX_BRIDGE_SOCKET="$rmux_runtime/observe.sock" \
 
 parent directory는 현재 UID 소유이고 group/other 접근이 없어야 한다. socket은 0600, 연결자는 같은 UID로 제한한다. 관찰 protocol은 [구현 계약](core-observation.md)에 정리했다. 읽기 전용으로 제공하므로 prompt 전송이나 승인 성공을 반환하는 경로는 없다.
 
+서버가 실행 중일 때 별도 terminal에서 `./bin/rmux-agent --socket PATH watch %0`으로 실시간 변경 알림을 받을 수 있다. 연결당 최대 64개 pane, 전체 512개 관찰 대상을 허용한다. 변경 없는 pane은 polling하지 않는다. 느린 구독자가 이력을 놓치면 gap/EOF로 알리고 새 baseline이 필요하다. 사용법·상한은 [관찰 계약](core-observation.md), 실행 결과는 [M2 검증](validation/2026-09-28-watch.md)에 있다.
+
 ## 검증 상태와 다음 작업
 
 - [x] 전체 고정 terminal source, provenance, local build.
@@ -71,7 +73,8 @@ parent directory는 현재 UID 소유이고 group/other 접근이 없어야 한�
 - [x] 설치된 Herdr 0.8.2와 stock baseline의 1·15·50-pane 실제 비교 및 원시 결과 보존.
 - [ ] upstream 메뉴 redraw golden fixture 공통 실패의 원인 확정.
 - [ ] Linux/BSD와 실제 IME·clipboard·SSH·중첩 terminal 행렬 검증.
-- [ ] watch/event/gap, provider adapter, agentd와 나머지 관리 계층.
+- [x] 선택 scope의 watch/event/gap, dirty 병합, 느린 구독자 정리, Rust streaming CLI.
+- [ ] provider adapter, agentd와 나머지 관리 계층.
 
 upstream suite는 최초 전체 실행과 실패 항목 재검증을 합쳐 두 제품 각각 163/164 통과했다. `screen-redraw-menus.sh`는 stock에서도 같은 fixture 차이가 남는다. 정규화·재검증 조건과 원시 결과는 [검증 기록](validation/2026-09-28-core.md)에 있다. 전체 플랫폼의 완전 호환이나 출시 gate 통과를 주장하지 않는다.
 

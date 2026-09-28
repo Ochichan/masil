@@ -1,6 +1,6 @@
 # IPC와 작업 결과 계약
 
-이 문서는 최종 wire protocol v1의 설계다. 현재 실행 가능한 부분은 [코어 관찰 IPC](../core-observation.md)의 hello/inventory/snapshot/stats다. watch·event·action·durable 관리 요청은 아직 제공하지 않는다. native tmux CLI·control mode·socket protocol은 이 계약으로 대체하지 않는다. 자원 상한은 [성능 예산](performance.md)의 이름을 참조한다.
+이 문서는 최종 wire protocol v1의 설계다. 현재 실행 가능한 부분은 [코어 관찰 IPC](../core-observation.md)의 hello/inventory/snapshot/stats 및 선택 scope의 watch/event/gap이다. action·durable 관리 요청은 아직 제공하지 않는다. native tmux CLI·control mode·socket protocol은 이 계약으로 대체하지 않는다. 자원 상한은 [성능 예산](performance.md)의 이름을 참조한다.
 
 ## 1. 연결과 encoding
 

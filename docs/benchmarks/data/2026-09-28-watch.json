@@ -1,0 +1,1334 @@
+{
+  "started_at_utc": "2026-09-28T01:16:41.498223+00:00",
+  "budget_eligible": false,
+  "binary": {
+    "path": "/Users/ochi/Documents/Projects/rmux/bin/rmux",
+    "sha256": "30eb68ffa907e99c798ea34741d5c59fdb6101773122469697f68f28a78387de",
+    "version_output": "tmux next-3.9",
+    "version_exit_code": 0
+  },
+  "script_sha256": "07fd453e1cc6f1a8354a4afe9b5d7fb0815600446fbbccc6031ddc33e441ac0b",
+  "seconds_per_condition": 5.0,
+  "conditions": [
+    {
+      "panes": 1,
+      "watch": false,
+      "mode": "idle",
+      "interval": {
+        "wall_seconds": 5.072174625005573,
+        "roles": {
+          "attached_client": {
+            "pids": [],
+            "rss_kib_end_sum": 0,
+            "rss_kib_sample_max_sum": 0,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": []
+          },
+          "server": {
+            "pids": [
+              5530
+            ],
+            "rss_kib_end_sum": 4064,
+            "rss_kib_sample_max_sum": 4064,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": [
+              {
+                "pid": 5530,
+                "ppid": 1,
+                "rss_kib": 4064,
+                "cpu_percent_ps": 0.0,
+                "cpu_time_seconds": 0.01,
+                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-4bllx7ws/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py idle --sidechannel /tmp/rmx-bench-4bllx7ws/fixture-0.jsonl --nonce 0-5f57ccc38f59"
+              }
+            ]
+          }
+        }
+      },
+      "inner_geometry": [
+        {
+          "columns": 93,
+          "rows": 39
+        }
+      ],
+      "events_received": 0,
+      "isolation": {
+        "private_root": "/tmp/rmx-bench-4bllx7ws",
+        "socket": "/tmp/rmx-bench-4bllx7ws/tmux.sock",
+        "socket_within_private_root": true,
+        "config": "/dev/null"
+      }
+    },
+    {
+      "panes": 1,
+      "watch": true,
+      "mode": "idle",
+      "interval": {
+        "wall_seconds": 5.049884833046235,
+        "roles": {
+          "attached_client": {
+            "pids": [],
+            "rss_kib_end_sum": 0,
+            "rss_kib_sample_max_sum": 0,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": []
+          },
+          "server": {
+            "pids": [
+              7923
+            ],
+            "rss_kib_end_sum": 4224,
+            "rss_kib_sample_max_sum": 4224,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": [
+              {
+                "pid": 7923,
+                "ppid": 1,
+                "rss_kib": 4224,
+                "cpu_percent_ps": 0.0,
+                "cpu_time_seconds": 0.01,
+                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-1wfaqwsk/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py idle --sidechannel /tmp/rmx-bench-1wfaqwsk/fixture-0.jsonl --nonce 0-578b89a982c9"
+              }
+            ]
+          }
+        }
+      },
+      "inner_geometry": [
+        {
+          "columns": 93,
+          "rows": 39
+        }
+      ],
+      "events_received": 0,
+      "isolation": {
+        "private_root": "/tmp/rmx-bench-1wfaqwsk",
+        "socket": "/tmp/rmx-bench-1wfaqwsk/tmux.sock",
+        "socket_within_private_root": true,
+        "config": "/dev/null"
+      },
+      "stats": {
+        "v": 1,
+        "kind": "stats",
+        "request_id": "stats",
+        "core_boot_id": "63af23aa-3bf1-4aaa-b0f0-801ec46a356c",
+        "revision": "3",
+        "revision_exhausted": false,
+        "clients": 2,
+        "tx_queued_bytes": 0,
+        "watched_panes": 1,
+        "watch_subscriptions": 1,
+        "journal_events": 0,
+        "pending_dirty": 0,
+        "flush_timer_active": false,
+        "counters": {
+          "connects": "2",
+          "disconnects": "0",
+          "rx_frames": "4",
+          "tx_frames": "3",
+          "rx_bytes": "293",
+          "tx_bytes": "1097",
+          "requests": "3",
+          "rejected": "0",
+          "protocol_errors": "0",
+          "inventory_requests": "0",
+          "snapshots": "0",
+          "rate_limited": "0",
+          "events": "0",
+          "coalesced": "0",
+          "gaps": "0"
+        }
+      }
+    },
+    {
+      "panes": 1,
+      "watch": false,
+      "mode": "output",
+      "interval": {
+        "wall_seconds": 5.815528374980204,
+        "roles": {
+          "attached_client": {
+            "pids": [],
+            "rss_kib_end_sum": 0,
+            "rss_kib_sample_max_sum": 0,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": []
+          },
+          "server": {
+            "pids": [
+              10251
+            ],
+            "rss_kib_end_sum": 4064,
+            "rss_kib_sample_max_sum": 4064,
+            "cpu_seconds_delta": 0.13999999999999999,
+            "average_percent_of_one_core": 2.4073478964063444,
+            "ps_end": [
+              {
+                "pid": 10251,
+                "ppid": 1,
+                "rss_kib": 4064,
+                "cpu_percent_ps": 0.1,
+                "cpu_time_seconds": 0.15,
+                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-jp_b00qg/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py output --sidechannel /tmp/rmx-bench-jp_b00qg/fixture-0.jsonl --nonce 0-e018d2b5e1c4 --bytes 5242880 --rate-bytes-per-second 1048576 --start-at-ns 0 --output-style inplace --start-gate /tmp/rmx-bench-jp_b00qg/output.start"
+              }
+            ]
+          }
+        }
+      },
+      "inner_geometry": [
+        {
+          "columns": 93,
+          "rows": 39
+        }
+      ],
+      "events_received": 0,
+      "isolation": {
+        "private_root": "/tmp/rmx-bench-jp_b00qg",
+        "socket": "/tmp/rmx-bench-jp_b00qg/tmux.sock",
+        "socket_within_private_root": true,
+        "config": "/dev/null"
+      },
+      "completed_bytes": 5242880
+    },
+    {
+      "panes": 1,
+      "watch": true,
+      "mode": "output",
+      "interval": {
+        "wall_seconds": 5.842222417006269,
+        "roles": {
+          "attached_client": {
+            "pids": [],
+            "rss_kib_end_sum": 0,
+            "rss_kib_sample_max_sum": 0,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": []
+          },
+          "server": {
+            "pids": [
+              12659
+            ],
+            "rss_kib_end_sum": 4224,
+            "rss_kib_sample_max_sum": 4240,
+            "cpu_seconds_delta": 0.13999999999999999,
+            "average_percent_of_one_core": 2.3963483415569824,
+            "ps_end": [
+              {
+                "pid": 12659,
+                "ppid": 1,
+                "rss_kib": 4224,
+                "cpu_percent_ps": 0.1,
+                "cpu_time_seconds": 0.15,
+                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-g68qizyp/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py output --sidechannel /tmp/rmx-bench-g68qizyp/fixture-0.jsonl --nonce 0-d1ec11b29e8f --bytes 5242880 --rate-bytes-per-second 1048576 --start-at-ns 0 --output-style inplace --start-gate /tmp/rmx-bench-g68qizyp/output.start"
+              }
+            ]
+          }
+        }
+      },
+      "inner_geometry": [
+        {
+          "columns": 93,
+          "rows": 39
+        }
+      ],
+      "events_received": 21,
+      "isolation": {
+        "private_root": "/tmp/rmx-bench-g68qizyp",
+        "socket": "/tmp/rmx-bench-g68qizyp/tmux.sock",
+        "socket_within_private_root": true,
+        "config": "/dev/null"
+      },
+      "completed_bytes": 5242880,
+      "stats": {
+        "v": 1,
+        "kind": "stats",
+        "request_id": "stats",
+        "core_boot_id": "bac3b283-45fa-4dc8-9ed0-b17bdc9e4794",
+        "revision": "3",
+        "revision_exhausted": false,
+        "clients": 2,
+        "tx_queued_bytes": 0,
+        "watched_panes": 1,
+        "watch_subscriptions": 1,
+        "journal_events": 21,
+        "pending_dirty": 0,
+        "flush_timer_active": false,
+        "counters": {
+          "connects": "2",
+          "disconnects": "0",
+          "rx_frames": "4",
+          "tx_frames": "24",
+          "rx_bytes": "293",
+          "tx_bytes": "5345",
+          "requests": "3",
+          "rejected": "0",
+          "protocol_errors": "0",
+          "inventory_requests": "0",
+          "snapshots": "0",
+          "rate_limited": "0",
+          "events": "21",
+          "coalesced": "5100",
+          "gaps": "0"
+        }
+      }
+    },
+    {
+      "panes": 50,
+      "watch": false,
+      "mode": "idle",
+      "interval": {
+        "wall_seconds": 5.060546917025931,
+        "roles": {
+          "attached_client": {
+            "pids": [],
+            "rss_kib_end_sum": 0,
+            "rss_kib_sample_max_sum": 0,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": []
+          },
+          "server": {
+            "pids": [
+              15053
+            ],
+            "rss_kib_end_sum": 4544,
+            "rss_kib_sample_max_sum": 4544,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": [
+              {
+                "pid": 15053,
+                "ppid": 1,
+                "rss_kib": 4544,
+                "cpu_percent_ps": 0.0,
+                "cpu_time_seconds": 0.1,
+                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-0fzzwp5z/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py idle --sidechannel /tmp/rmx-bench-0fzzwp5z/fixture-0.jsonl --nonce 0-a8b4fc8ae8de"
+              }
+            ]
+          }
+        }
+      },
+      "inner_geometry": [
+        {
+          "columns": 93,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        }
+      ],
+      "events_received": 0,
+      "isolation": {
+        "private_root": "/tmp/rmx-bench-0fzzwp5z",
+        "socket": "/tmp/rmx-bench-0fzzwp5z/tmux.sock",
+        "socket_within_private_root": true,
+        "config": "/dev/null"
+      }
+    },
+    {
+      "panes": 50,
+      "watch": true,
+      "mode": "idle",
+      "interval": {
+        "wall_seconds": 5.094862291996833,
+        "roles": {
+          "attached_client": {
+            "pids": [],
+            "rss_kib_end_sum": 0,
+            "rss_kib_sample_max_sum": 0,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": []
+          },
+          "server": {
+            "pids": [
+              17645
+            ],
+            "rss_kib_end_sum": 4656,
+            "rss_kib_sample_max_sum": 4656,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": [
+              {
+                "pid": 17645,
+                "ppid": 1,
+                "rss_kib": 4656,
+                "cpu_percent_ps": 0.0,
+                "cpu_time_seconds": 0.1,
+                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-7fyjbdkr/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py idle --sidechannel /tmp/rmx-bench-7fyjbdkr/fixture-0.jsonl --nonce 0-a9c08b90d88c"
+              }
+            ]
+          }
+        }
+      },
+      "inner_geometry": [
+        {
+          "columns": 93,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        }
+      ],
+      "events_received": 0,
+      "isolation": {
+        "private_root": "/tmp/rmx-bench-7fyjbdkr",
+        "socket": "/tmp/rmx-bench-7fyjbdkr/tmux.sock",
+        "socket_within_private_root": true,
+        "config": "/dev/null"
+      },
+      "stats": {
+        "v": 1,
+        "kind": "stats",
+        "request_id": "stats",
+        "core_boot_id": "32e76a37-e0c6-49f9-b277-df07076cb3ec",
+        "revision": "199",
+        "revision_exhausted": false,
+        "clients": 2,
+        "tx_queued_bytes": 0,
+        "watched_panes": 50,
+        "watch_subscriptions": 1,
+        "journal_events": 0,
+        "pending_dirty": 0,
+        "flush_timer_active": false,
+        "counters": {
+          "connects": "2",
+          "disconnects": "0",
+          "rx_frames": "4",
+          "tx_frames": "3",
+          "rx_bytes": "627",
+          "tx_bytes": "5941",
+          "requests": "3",
+          "rejected": "0",
+          "protocol_errors": "0",
+          "inventory_requests": "0",
+          "snapshots": "0",
+          "rate_limited": "0",
+          "events": "0",
+          "coalesced": "0",
+          "gaps": "0"
+        }
+      }
+    },
+    {
+      "panes": 50,
+      "watch": false,
+      "mode": "output",
+      "interval": {
+        "wall_seconds": 5.821533375012223,
+        "roles": {
+          "attached_client": {
+            "pids": [],
+            "rss_kib_end_sum": 0,
+            "rss_kib_sample_max_sum": 0,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": []
+          },
+          "server": {
+            "pids": [
+              20312
+            ],
+            "rss_kib_end_sum": 4960,
+            "rss_kib_sample_max_sum": 4960,
+            "cpu_seconds_delta": 0.09999999999999999,
+            "average_percent_of_one_core": 1.7177604860813847,
+            "ps_end": [
+              {
+                "pid": 20312,
+                "ppid": 1,
+                "rss_kib": 4960,
+                "cpu_percent_ps": 0.0,
+                "cpu_time_seconds": 0.21,
+                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-ppqxzwwt/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py output --sidechannel /tmp/rmx-bench-ppqxzwwt/fixture-0.jsonl --nonce 0-d70e8f666d04 --bytes 104855 --rate-bytes-per-second 20971 --start-at-ns 0 --output-style inplace --start-gate /tmp/rmx-bench-ppqxzwwt/output.start"
+              }
+            ]
+          }
+        }
+      },
+      "inner_geometry": [
+        {
+          "columns": 93,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        }
+      ],
+      "events_received": 0,
+      "isolation": {
+        "private_root": "/tmp/rmx-bench-ppqxzwwt",
+        "socket": "/tmp/rmx-bench-ppqxzwwt/tmux.sock",
+        "socket_within_private_root": true,
+        "config": "/dev/null"
+      },
+      "completed_bytes": 5242750
+    },
+    {
+      "panes": 50,
+      "watch": true,
+      "mode": "output",
+      "interval": {
+        "wall_seconds": 5.840051666949876,
+        "roles": {
+          "attached_client": {
+            "pids": [],
+            "rss_kib_end_sum": 0,
+            "rss_kib_sample_max_sum": 0,
+            "cpu_seconds_delta": 0.0,
+            "average_percent_of_one_core": 0.0,
+            "ps_end": []
+          },
+          "server": {
+            "pids": [
+              23116
+            ],
+            "rss_kib_end_sum": 5120,
+            "rss_kib_sample_max_sum": 5200,
+            "cpu_seconds_delta": 0.19,
+            "average_percent_of_one_core": 3.2533958744791827,
+            "ps_end": [
+              {
+                "pid": 23116,
+                "ppid": 1,
+                "rss_kib": 5120,
+                "cpu_percent_ps": 0.1,
+                "cpu_time_seconds": 0.3,
+                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-47clzai6/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py output --sidechannel /tmp/rmx-bench-47clzai6/fixture-0.jsonl --nonce 0-04e7a2c5fb6a --bytes 104855 --rate-bytes-per-second 20971 --start-at-ns 0 --output-style inplace --start-gate /tmp/rmx-bench-47clzai6/output.start"
+              }
+            ]
+          }
+        }
+      },
+      "inner_geometry": [
+        {
+          "columns": 93,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        },
+        {
+          "columns": 94,
+          "rows": 39
+        }
+      ],
+      "events_received": 1050,
+      "isolation": {
+        "private_root": "/tmp/rmx-bench-47clzai6",
+        "socket": "/tmp/rmx-bench-47clzai6/tmux.sock",
+        "socket_within_private_root": true,
+        "config": "/dev/null"
+      },
+      "completed_bytes": 5242750,
+      "stats": {
+        "v": 1,
+        "kind": "stats",
+        "request_id": "stats",
+        "core_boot_id": "fd03d602-f1df-4e2d-bd21-1351e60ea5ff",
+        "revision": "199",
+        "revision_exhausted": false,
+        "clients": 2,
+        "tx_queued_bytes": 0,
+        "watched_panes": 50,
+        "watch_subscriptions": 1,
+        "journal_events": 1050,
+        "pending_dirty": 0,
+        "flush_timer_active": false,
+        "counters": {
+          "connects": "2",
+          "disconnects": "0",
+          "rx_frames": "4",
+          "tx_frames": "1053",
+          "rx_bytes": "627",
+          "tx_bytes": "218923",
+          "requests": "3",
+          "rejected": "0",
+          "protocol_errors": "0",
+          "inventory_requests": "0",
+          "snapshots": "0",
+          "rate_limited": "0",
+          "events": "1050",
+          "coalesced": "4150",
+          "gaps": "0"
+        }
+      }
+    }
+  ],
+  "scope": "headless server RSS/CPU only; reader and Python workload children excluded",
+  "output": "inplace ASCII at aggregate approximately 1 MiB/s; PTY write completion",
+  "limits": "one sequential run, short idle, ps 0.01-second CPU resolution; no full budget claim",
+  "completed_at_utc": "2026-09-28T01:17:29.555746+00:00"
+}
