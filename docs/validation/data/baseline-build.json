@@ -1,0 +1,14 @@
+{
+  "source_commit": "94796f6b1182507efac8a272fc309a79e22e58a5",
+  "binary": "/Users/ochi/Documents/Projects/rmux/bin/tmux-baseline",
+  "sha256": "f57587cfb645189e896ea88a312d22b34522fc8d915cacefb69d5e314ab8a761",
+  "compiler": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "cflags": "-O2 -Werror -Wno-macro-redefined -Wno-pointer-sign -Wno-deprecated-declarations",
+  "configure": [
+    "--disable-debug",
+    "--enable-optimizations",
+    "--enable-utf8proc",
+    "--enable-jemalloc"
+  ],
+  "version": "tmux next-3.9"
+}

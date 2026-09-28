@@ -1,0 +1,13 @@
+.build/
+bin/
+target/
+agent/target/
+__pycache__/
+*.pyc
+core/autom4te.cache/
+core/aclocal.m4
+core/configure
+core/config.h.in
+core/config.h.in~
+core/Makefile.in
+core/etc/

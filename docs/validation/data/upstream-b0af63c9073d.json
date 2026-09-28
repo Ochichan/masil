@@ -1,0 +1,26 @@
+[
+  {
+    "binary": "rmux",
+    "script": "terminal-feature-utf8.sh",
+    "status": "passed",
+    "returncode": 0,
+    "process_group": 69707,
+    "normalizations": [
+      "retain private socket directory across nested env -i"
+    ],
+    "seconds": 0.7420728330034763,
+    "log": ".build/regress-b0af63c9073d/logs/rmux/terminal-feature-utf8.sh.log"
+  },
+  {
+    "binary": "tmux-baseline",
+    "script": "terminal-feature-utf8.sh",
+    "status": "passed",
+    "returncode": 0,
+    "process_group": 69705,
+    "normalizations": [
+      "retain private socket directory across nested env -i"
+    ],
+    "seconds": 0.5806069580139592,
+    "log": ".build/regress-b0af63c9073d/logs/tmux-baseline/terminal-feature-utf8.sh.log"
+  }
+]

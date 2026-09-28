@@ -1,0 +1,47 @@
+python3 scripts/build.py
+core-build: .build/logs/core-build.log
+tmux next-3.9 /Users/ochi/Documents/Projects/rmux/bin/rmux
+python3 scripts/build.py --baseline
+baseline-build: .build/logs/baseline-build.log
+tmux next-3.9 /Users/ochi/Documents/Projects/rmux/bin/tmux-baseline
+python3 scripts/build.py --agent
+agent-build: .build/logs/agent-build.log
+python3 -m venv .build/bench-venv
+PIP_DISABLE_PIP_VERSION_CHECK=1 .build/bench-venv/bin/python -m pip install -r tests/performance/requirements.txt
+Requirement already satisfied: pyte==0.8.2 in ./.build/bench-venv/lib/python3.13/site-packages (from -r tests/performance/requirements.txt (line 2)) (0.8.2)
+Requirement already satisfied: wcwidth==0.2.13 in ./.build/bench-venv/lib/python3.13/site-packages (from -r tests/performance/requirements.txt (line 3)) (0.2.13)
+python3 tests/test_compatibility.py
+test_buffers_and_formats (__main__.Compatibility.test_buffers_and_formats) ... ok
+test_control_mode (__main__.Compatibility.test_control_mode) ... ok
+test_default_public_inventory (__main__.Compatibility.test_default_public_inventory) ... ok
+test_editor_defaults (__main__.Compatibility.test_editor_defaults) ... ok
+test_layout_session_links_and_zoom (__main__.Compatibility.test_layout_session_links_and_zoom) ... ok
+test_native_error_semantics_and_alias (__main__.Compatibility.test_native_error_semantics_and_alias) ... ok
+test_native_hook_and_async_queue (__main__.Compatibility.test_native_hook_and_async_queue) ... ok
+test_native_prefix_and_detach (__main__.Compatibility.test_native_prefix_and_detach) ... ok
+test_protocol_product_isolation_and_inheritance (__main__.Compatibility.test_protocol_product_isolation_and_inheritance) ... ok
+test_unicode_capture_and_copy_mode (__main__.Compatibility.test_unicode_capture_and_copy_mode) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.832s
+
+OK
+python3 tests/test_bridge.py
+bridge integration: passed
+forkpty failure injection: passed
+.build/bench-venv/bin/python tests/test_benchmark_harness.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.054s
+
+OK
+cargo test --locked --manifest-path agent/Cargo.toml
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/main.rs (agent/target/debug/deps/rmux_agent-040cfd6c1965c65f)
+
+running 2 tests
+test tests::rejects_nested_duplicate_fields ... ok
+test tests::accepts_unicode_and_enforces_depth ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
