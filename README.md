@@ -2,7 +2,7 @@
 
 rmux는 tmux의 기능과 기본 키 조작을 갖추고, 각 코딩 에이전트의 원래 TUI를 pane 안에서 실행·관리하는 터미널 멀티플렉서다.
 
-현재는 tmux 전체 소스를 기반으로 터미널 코어와 선택적 읽기 전용 관찰 IPC를 구현했다. `bin/rmux`로 session·window·pane·attach/detach·copy mode·control mode를 사용할 수 있다. `rmux-agent watch`로 선택한 pane의 변경·종료·제거와 관찰 누락을 확인할 수 있다. provider별 작업 관리, 승인, 대화 복구, agentd는 다음 단계다.
+현재는 tmux 전체 소스를 기반으로 터미널 코어, 읽기 전용 관찰 IPC, 선택적 경량 agentd를 구현했다. `bin/rmux`로 session·window·pane·attach/detach·copy mode·control mode를 사용할 수 있다. `rmux-agent watch`는 pane 변경·종료·누락을, `serve`는 OpenCode native session의 작업·승인·질문 대기를 관찰한다. prompt 전송, 승인 처리, 대화 복구는 다음 단계다.
 
 ```sh
 make                 # 코어와 선택적 Rust 관찰 CLI
@@ -27,9 +27,9 @@ macOS 초기 비교에서 50-pane idle 서버 RSS는 rmux 4.44 MiB, stock tmux 4
 
 ## 선택한 설계
 
-`rmux`는 tmux의 PTY·VT parser·grid·history·키 처리·renderer를 그대로 소유한다. 장기 설계의 `rmux-agent`는 관찰·관리 명령·SQLite 저장을 담당한다. 현재 Rust CLI는 `hello`, `inventory`, `snapshot`, `stats`, `watch`를 제공한다. 입력과 출력 byte가 Rust나 DB를 거치지 않으며 제품 안에 두 번째 terminal parser를 두지 않는다.
+`rmux`는 tmux의 PTY·VT parser·grid·history·키 처리·renderer를 그대로 소유한다. 장기 설계의 `rmux-agent`는 관찰·관리 명령·SQLite 저장을 담당한다. 현재 Rust CLI는 core 관찰과 명시적으로 시작하는 OpenCode 관찰 daemon을 제공한다. native session과 pane의 연결은 아직 사용자 지정 association이며 현재 TUI identity를 증명하지 않는다. 입력과 출력 byte가 Rust나 DB를 거치지 않으며 제품 안에 두 번째 terminal parser를 두지 않는다.
 
-에이전트 기능을 끄면 추가 Rust process와 정기 polling이 없어야 한다. 켰을 때는 변경된 pane만 bounded snapshot으로 읽고, 느린 관찰·DB·파일 작업이 terminal을 기다리게 하지 않는다. 초기 목표는 agentd RSS 1 agent에서 24 MiB 이하, 50 agents에서 48 MiB 이하이며 core와 provider의 비용은 별도 계측한다. 아직 측정하지 않은 목표다.
+에이전트 기능을 끄면 추가 Rust process와 정기 polling이 없어야 한다. 켰을 때는 변경된 pane만 bounded snapshot으로 읽고, 느린 관찰·DB·파일 작업이 terminal을 기다리게 하지 않는다. 초기 목표는 agentd RSS 1 agent에서 24 MiB 이하, 50 agents에서 48 MiB 이하이며 core와 provider의 비용은 별도 계측한다. [첫 관찰 daemon 측정](docs/validation/2026-09-28-agentd.md)은 관리 기능 전체의 성능 gate와 구분한다.
 
 [아키텍처부터 읽기](docs/architecture.md) → [상세 실행 설계](docs/design/runtime.md) → [성능 예산](docs/design/performance.md) → [구현 순서](docs/design/implementation-plan.md).
 
@@ -39,6 +39,8 @@ macOS 초기 비교에서 50-pane idle 서버 RSS는 rmux 4.44 MiB, stock tmux 4
 | --- | --- |
 | [현재 구현과 실행](docs/implementation-status.md) | 빌드·사용법, 실제 기능과 남은 작업 |
 | [코어 관찰 IPC](docs/core-observation.md) | 구현된 wire protocol·상한·generation·실패 의미 |
+| [OpenCode 관찰 daemon](docs/agent-observation.md) | 시작·조회·중지, 상태와 연결의 한계, 자원 상한 |
+| [관찰 daemon 검증](docs/validation/2026-09-28-agentd.md) | 실제 core 통합·OpenCode smoke·idle 비용 |
 | [실시간 관찰 검증](docs/validation/2026-09-28-watch.md) | watch·용량·누락·backpressure·추가 비용 |
 | [코어 검증 기록](docs/validation/2026-09-28-core.md) | 실제 테스트 결과, upstream 공통 실패와 재검증 |
 | [Herdr 성능 비교](docs/benchmarks/2026-09-28.md) | 조건별 실측과 원시 결과, 해석의 한계 |

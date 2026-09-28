@@ -164,7 +164,11 @@ def main():
     BUILD.mkdir(exist_ok=True)
     env = environment()
     if args.agent:
+        # The Rust observer has no external native-library dependencies. Do not
+        # accidentally link a Conda/sysdeps libiconv with an unresolved @rpath.
+        env.pop('LIBRARY_PATH', None)
         run(['cargo', 'build', '--locked', '--release', '--manifest-path', str(ROOT/'agent/Cargo.toml')], ROOT, env, 'agent-build')
+        run([str(ROOT/'agent/target/release/rmux-agent'), '--version'], ROOT, env, 'agent-smoke')
         (ROOT/'bin').mkdir(exist_ok=True)
         shutil.copy2(ROOT/'agent/target/release/rmux-agent', ROOT/'bin/rmux-agent')
         return

@@ -2,7 +2,7 @@
 
 2026-09-28. tmux의 고정 소스 전체를 실행 가능한 rmux 코어로 도입했다. PTY, VT parser, grid/history, renderer, 키 테이블, command queue, control mode를 유지하고 제품 socket 격리와 읽기 전용 관찰 IPC를 추가했다. 원본 C 소스와 고지는 [core](../core/README), 가져온 파일별 해시는 [UPSTREAM.json](../core/UPSTREAM.json)에 있다.
 
-전체 rmux 제품의 완료 상태는 아니다. provider별 상태 판정, durable prompt 전송, 승인, SQLite, 대화 복구, 원격 관리, worktree job은 아직 구현하지 않았다. 원래 에이전트 TUI를 pane에서 실행하는 일은 일반 terminal child로 지원한다.
+전체 rmux 제품의 완료 상태는 아니다. OpenCode native session의 읽기 전용 상태 관찰과 명시적으로 시작하는 agentd를 추가했다. verified TUI binding, durable prompt 전송, 승인, SQLite, 대화 복구, 원격 관리, worktree job은 아직 구현하지 않았다. 원래 에이전트 TUI를 pane에서 실행하는 일은 일반 terminal child로 지원한다.
 
 ## 빌드와 실행
 
@@ -65,6 +65,8 @@ parent directory는 현재 UID 소유이고 group/other 접근이 없어야 한�
 
 ## 검증 상태와 다음 작업
 
+OpenCode의 native 상태를 관찰하려면 [agentd 실행 안내](agent-observation.md)를 따른다. `serve`는 별도 foreground 프로세스이며 `status`, `agents`, `inspect`, `stop`으로 조회·종료한다. 상태와 pane의 연결은 `explicit_unverified`로 표시하고 TUI의 현재 session이라고 단정하지 않는다. [검증 기록](validation/2026-09-28-agentd.md)에 통합 결과와 idle 비용을 기록한다.
+
 - [x] 전체 고정 terminal source, provenance, local build.
 - [x] socket/protocol 격리와 tmux 기본 공개 동작 비교.
 - [x] bounded read-only inventory/snapshot/stats와 Rust 관찰 CLI.
@@ -74,7 +76,8 @@ parent directory는 현재 UID 소유이고 group/other 접근이 없어야 한�
 - [ ] upstream 메뉴 redraw golden fixture 공통 실패의 원인 확정.
 - [ ] Linux/BSD와 실제 IME·clipboard·SSH·중첩 terminal 행렬 검증.
 - [x] 선택 scope의 watch/event/gap, dirty 병합, 느린 구독자 정리, Rust streaming CLI.
-- [ ] provider adapter, agentd와 나머지 관리 계층.
+- [x] foreground agentd, OpenCode GET/SSE 상태·승인·질문 대기 관찰, source/core freshness 분리.
+- [ ] verified TUI binding, provider 확대, attention UI와 나머지 durable 관리 계층.
 
 upstream suite는 최초 전체 실행과 실패 항목 재검증을 합쳐 두 제품 각각 163/164 통과했다. `screen-redraw-menus.sh`는 stock에서도 같은 fixture 차이가 남는다. 정규화·재검증 조건과 원시 결과는 [검증 기록](validation/2026-09-28-core.md)에 있다. 전체 플랫폼의 완전 호환이나 출시 gate 통과를 주장하지 않는다.
 

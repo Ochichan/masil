@@ -1,4 +1,7 @@
 //! Read-only client for the core observation protocol. No daemon autostart.
+mod daemon;
+mod observation;
+mod opencode;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
@@ -549,11 +552,101 @@ fn parse_watch_arguments(args: &[String]) -> Result<(Option<u64>, Vec<String>), 
     Ok((count, panes.to_vec()))
 }
 
+fn serve_command(socket: &str, args: &[String]) -> Result<i32, String> {
+    let mut core = None;
+    let mut config_path = None;
+    if args.len() != 4 {
+        return Err("serve requires --core CORE_SOCKET --config FILE".into());
+    }
+    for pair in args.chunks_exact(2) {
+        match pair[0].as_str() {
+            "--core" if core.is_none() => core = Some(pair[1].as_str()),
+            "--config" if config_path.is_none() => config_path = Some(pair[1].as_str()),
+            _ => return Err("invalid or repeated serve option".into()),
+        }
+    }
+    let core = core.ok_or("missing --core")?;
+    let file = std::fs::File::open(config_path.ok_or("missing --config")?)
+        .map_err(|_| "cannot open observation config")?;
+    let mut body = Vec::new();
+    file.take(65_537)
+        .read_to_end(&mut body)
+        .map_err(|_| "cannot read observation config")?;
+    if body.len() > 65_536 {
+        return Err("observation config exceeds 64 KiB".into());
+    }
+    let mut config: observation::Config =
+        serde_json::from_slice(&body).map_err(|_| "invalid observation config schema")?;
+    observation::validate(&config)?;
+    for source in &mut config.sources {
+        let path = std::path::Path::new(&source.directory);
+        if !path.is_dir() {
+            return Err("observation directory does not exist".into());
+        }
+        source.directory = path
+            .canonicalize()
+            .map_err(|_| "cannot resolve observation directory")?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "observation directory is not UTF-8")?;
+    }
+    observation::validate(&config)?;
+    daemon::serve(
+        std::path::Path::new(socket),
+        std::path::Path::new(core),
+        config,
+    )
+}
+
+fn manager_query(socket: &str, command: &str, args: &[String]) -> Result<i32, String> {
+    if args.len() != usize::from(command == "inspect") {
+        return Err("incorrect manager query arguments".into());
+    }
+    let mut stream = match UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(error)
+            if command == "status"
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+        {
+            let absent = error.kind() == io::ErrorKind::NotFound;
+            println!(
+                "{}",
+                json!({"v":1,"kind":"status","request_id":"status",
+                "status":if absent {"not_started"} else {"unreachable"}})
+            );
+            return Ok(if absent { 0 } else { 3 });
+        }
+        Err(_) => return Err("manager socket is unavailable".into()),
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    let mut request = json!({"v":1,"kind":command,"request_id":command});
+    if command == "inspect" {
+        request["id"] = args[0].clone().into();
+    }
+    let response = exchange(&mut stream, request)?;
+    if response["kind"] != command && response["kind"] != "error" {
+        return Err("unexpected manager response kind".into());
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&response).map_err(|e| e.to_string())?
+    );
+    Ok(if response["kind"] == "error" { 5 } else { 0 })
+}
+
 fn execute() -> Result<i32, String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args == ["--help"] {
         println!(
-            "rmux-agent 0.1.0 — core observation client\n\nUsage: rmux-agent --socket PATH hello|inventory|snapshot %N|stats\n       rmux-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nExplicit core bridge required: RMUX_BRIDGE_SOCKET=/private/path/observe.sock rmux ...\nNo provider daemon, prompt submission, approval or autostart is implemented."
+            "rmux-agent 0.1.0 — read-only observation\n\nCore socket:\n  rmux-agent --socket PATH hello|inventory|snapshot %N|stats\n  rmux-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nManager socket:\n  rmux-agent --socket PATH serve --core CORE_SOCKET --config FILE\n  rmux-agent --socket PATH status|agents|inspect ID|stop\n\nExplicit core bridge required: RMUX_BRIDGE_SOCKET=/private/path/observe.sock rmux ...\nProvider associations are unverified TUI bindings. No prompt submission, approval, completion claim, or daemon autostart."
         );
         return Ok(0);
     }
@@ -565,6 +658,12 @@ fn execute() -> Result<i32, String> {
         return Err("expected --socket PATH command".into());
     }
     let command = args[2].as_str();
+    if command == "serve" {
+        return serve_command(&args[1], &args[3..]);
+    }
+    if matches!(command, "status" | "agents" | "inspect" | "stop") {
+        return manager_query(&args[1], command, &args[3..]);
+    }
     if !matches!(
         command,
         "hello" | "inventory" | "snapshot" | "stats" | "watch"
