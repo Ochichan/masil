@@ -22,7 +22,8 @@ BASELINE = ROOT / 'bin/tmux-baseline'
 
 def isolated_env(path):
     return {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(path),
-            'SHELL': '/bin/sh', 'TERM': 'xterm-256color', 'LC_CTYPE': 'en_US.UTF-8',
+            'SHELL': '/bin/sh', 'TERM': 'xterm-256color',
+            'LC_CTYPE': 'en_US.UTF-8' if sys.platform == 'darwin' else 'C.UTF-8',
             'TMPDIR': str(path), 'TMUX_TMPDIR': str(path)}
 
 

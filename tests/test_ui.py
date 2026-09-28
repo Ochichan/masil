@@ -9,6 +9,7 @@ import select
 import signal
 import struct
 import subprocess
+import sys
 import termios
 import time
 import unittest
@@ -26,7 +27,7 @@ class Screen(pyte.Screen):
 
 
 class Terminal:
-    def __init__(self, args, env, width=120, height=32):
+    def __init__(self, args, env, width=120, height=32, tty_mode=None):
         self.master, self.slave = pty.openpty()
         self.screen = Screen(width, height)
         self.stream = pyte.Stream(self.screen)
@@ -34,10 +35,14 @@ class Terminal:
         self.output = bytearray()
         self.resize(width, height, signal_child=False)
         self.original = termios.tcgetattr(self.slave)
+        self.tty_mode = tty_mode
+        self.original_permissions = os.fstat(self.slave).st_mode & 0o777
 
         def controlling_terminal():
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            if tty_mode is not None:
+                os.fchmod(0, tty_mode)
 
         self.child = subprocess.Popen([str(arg) for arg in args], stdin=self.slave,
                                       stdout=self.slave, stderr=self.slave, env=env,
@@ -102,6 +107,8 @@ class Terminal:
     def close(self):
         if self.master is None:
             return
+        if self.tty_mode is not None:
+            os.fchmod(self.slave, self.original_permissions)
         if self.child.poll() is None:
             self.child.terminate()
         try:
@@ -198,6 +205,46 @@ class DeskIntegration(AgentdHarness):
         ui.wait()
         self.assertEqual(ui.child.returncode, 0)
 
+    @unittest.skipUnless(sys.platform.startswith("linux") and os.geteuid() != 0,
+                         "Linux non-root PTY pathname-permission regression")
+    def test_inherited_ssh_tty_without_pathname_access(self):
+        self.ready()
+        ui = Terminal([AGENT, "--socket", self.manager, "ui"], self.core.env, tty_mode=0)
+        self.addCleanup(ui.close)
+        ui.until("agent-0")
+        ui.click("Mark seen")
+        wait_for(lambda: self.row()["attention"]["acknowledged"])
+        ui.send("q")
+        ui.wait()
+        self.assertEqual(ui.child.returncode, 0)
+        self.assertEqual(termios.tcgetattr(ui.master), ui.original)
+
+    def test_distinct_input_and_output_terminals_are_rejected_before_raw_mode(self):
+        first_master, first_slave = pty.openpty()
+        second_master, second_slave = pty.openpty()
+        try:
+            original = termios.tcgetattr(first_master)
+
+            def controlling_terminal():
+                os.setsid()
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+            child = subprocess.Popen([AGENT, "--socket", self.manager, "ui"],
+                                     stdin=first_slave, stdout=second_slave, stderr=subprocess.PIPE,
+                                     env=self.core.env, preexec_fn=controlling_terminal)
+            try:
+                _, error = child.communicate(timeout=5)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn(b"terminal", error.lower())
+                self.assertEqual(termios.tcgetattr(first_master), original)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=5)
+        finally:
+            for fd in (first_master, first_slave, second_master, second_slave):
+                os.close(fd)
+
     def native_client(self):
         client = Terminal([RMUX, "-S", self.core.socket, "attach-session", "-t", "main"], self.core.env)
         self.addCleanup(client.close)
@@ -229,6 +276,9 @@ class DeskIntegration(AgentdHarness):
         wait_for(lambda: self.row()["attention"]["acknowledged"], 4)
         self.core.run("send-keys", "-t", pane, "z")
         wait_for(lambda: self.core.text("display-message", "-p", "-t", pane, "#{window_zoomed_flag}").strip() == "1", 5)
+        # Native layout changes precede the helper's completion receipt. Wait
+        # until the UI has released its single-flight action before navigating.
+        wait_for(lambda: "Expanded agent sidebar" in self.core.text("capture-pane", "-p", "-t", pane), 5)
         self.core.run("send-keys", "-t", pane, "g")
         wait_for(lambda: self.core.text("display-message", "-p", "-t", "%0", "#{pane_active}:#{window_zoomed_flag}").strip() == "1:0", 5)
         self.core.run("select-pane", "-t", pane)
@@ -291,13 +341,17 @@ class DeskIntegration(AgentdHarness):
         self.assertEqual(first.returncode, 0, first.stderr)
         old = self.core.text("list-panes", "-t", "main:0", "-f", "#{@rmux-sidebar-owned}", "-F", "#{pane_id}").strip()
         before = self.core.text("display-message", "-p", "-t", old, "#{rmux_pty_generation}")
-        self.core.run("respawn-pane", "-k", "-t", old, "/bin/cat")
+        # Two argv elements select tmux's direct-exec path; a single command
+        # string can retain an intermediary shell as the foreground process.
+        self.core.run("respawn-pane", "-k", "-t", old, "/bin/cat", "-")
         after = self.core.text("display-message", "-p", "-t", old, "#{rmux_pty_generation}")
         self.assertNotEqual(before, after)
         again = self.sidebar()
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn("Created", again.stdout)
         self.assertIn(old, self.core.text("list-panes", "-a", "-F", "#{pane_id}").splitlines())
+        # Wait for the newly forked process to reach exec before querying it.
+        wait_for(lambda: self.core.text("display-message", "-p", "-t", old, "#{pane_current_command}").strip() == "cat")
         self.assertEqual(self.core.text("display-message", "-p", "-t", old, "#{pane_current_command}").strip(), "cat")
 
     def test_sidebar_uses_full_window_and_refuses_narrow_window(self):

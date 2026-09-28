@@ -1,0 +1,47 @@
+test_compatibility
+----------------------------------------------------------------------
+Ran 10 tests in 0.547s
+
+OK
+test_bridge
+bridge integration: passed
+test_watch
+----------------------------------------------------------------------
+Ran 8 tests in 7.714s
+
+OK
+test_watch_cli
+watch CLI integration: passed
+test_agentd
+----------------------------------------------------------------------
+Ran 9 tests in 9.552s
+
+OK
+test_attention
+----------------------------------------------------------------------
+Ran 6 tests in 8.948s
+
+OK
+test_agent_stream_cli
+----------------------------------------------------------------------
+Ran 3 tests in 0.017s
+
+OK
+test_benchmark_harness
+----------------------------------------------------------------------
+Ran 6 tests in 0.058s
+
+OK
+test_ui
+----------------------------------------------------------------------
+Ran 10 tests in 10.707s
+
+OK
+rust-test
+test tests::stream_eof_after_deadline_is_timeout ... ok
+
+test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+clippy
+    Checking rmux-agent v0.1.0 (/home/ochi/.cache/rmux-validation.K2fYQL1P/agent)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.62s

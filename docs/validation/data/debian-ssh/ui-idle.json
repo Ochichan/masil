@@ -1,0 +1,46 @@
+{
+  "kind": "short_ui_idle_probe",
+  "platform": "Linux-6.12.107+deb13-amd64-x86_64-with-glibc2.41",
+  "agent_sha256": "36e49b2f6b2c3d100301ee4b04f44e537b271d099cd4dd6847ee9b1b30da7662",
+  "core_sha256": "888e88ff865589f7d2ea7121c54ccbe42ede8cb358902f19e9acf228c839387f",
+  "provider": "deterministic GET/SSE fixture, no model or provider TUI",
+  "cpu_method": "ps cumulative CPU delta with coarse resolution",
+  "samples": [
+    {
+      "observations": 1,
+      "native_panes": 2,
+      "sources": 1,
+      "viewport": [
+        120,
+        32
+      ],
+      "elapsed_seconds": 5.005124596063979,
+      "ui_rss_bytes": 4415488,
+      "ui_threads": 2,
+      "ui_cpu_seconds": 0.0,
+      "daemon_rss_bytes": 4714496,
+      "daemon_cpu_seconds": 0.0,
+      "idle_terminal_bytes": 0,
+      "idle_http_requests": 0,
+      "sse_connections": 1
+    },
+    {
+      "observations": 50,
+      "native_panes": 2,
+      "sources": 1,
+      "viewport": [
+        120,
+        32
+      ],
+      "elapsed_seconds": 5.005283905076794,
+      "ui_rss_bytes": 5013504,
+      "ui_threads": 2,
+      "ui_cpu_seconds": 0.0,
+      "daemon_rss_bytes": 5767168,
+      "daemon_cpu_seconds": 0.0,
+      "idle_terminal_bytes": 0,
+      "idle_http_requests": 0,
+      "sse_connections": 1
+    }
+  ]
+}

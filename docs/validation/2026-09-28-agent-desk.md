@@ -74,6 +74,6 @@ env -u LIBRARY_PATH cargo clippy --locked --manifest-path agent/Cargo.toml --all
 
 ## 남은 검증 범위
 
-이번 결과를 모든 호스트 터미널의 완전한 마우스·IME 지원으로 일반화하지 않는다. Linux/BSD, 실제 OS IME 조합 확정, SSH·중첩 tmux, 터미널별 clipboard/마우스 override, 장시간 고출력, 접근성 도구와의 조합은 별도 행렬이 필요하다. UI의 한글 문자열 편집·붙여넣기 검증과 OS IME 조합 중 입력 검증은 다르다.
+이번 결과를 모든 호스트 터미널의 완전한 마우스·IME 지원으로 일반화하지 않는다. 후속 [Debian·실제 SSH 검증](2026-09-28-debian-ssh.md)에서 Linux 빌드와 SSH PTY 조작을 확인했다. BSD, 실제 OS IME 조합 확정, SSH 끊김·재접속·중첩 tmux, 터미널별 clipboard/마우스 override, 장시간 고출력, 접근성 도구와의 조합은 별도 행렬이 필요하다. UI의 한글 문자열 편집·붙여넣기 검증과 OS IME 조합 중 입력 검증은 다르다.
 
 provider approval·prompt·완료 판정·대화 복구·foreground session identity 검증은 이번 UI에서 제공하지 않는다. 상세 설계의 장기 목표와 현재 구현 범위를 구분한다.

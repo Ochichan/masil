@@ -158,7 +158,11 @@ fn stream_read_exact(
                 )));
             }
         }
-        match stream.read(&mut buffer[offset..]) {
+        let result = stream.read(&mut buffer[offset..]);
+        if Instant::now() >= deadline {
+            return Err(StreamError::Malformed("stream frame timed out".into()));
+        }
+        match result {
             Ok(0) => {
                 return Err(StreamError::Lost(
                     "unexpected EOF during stream frame".into(),
@@ -166,9 +170,6 @@ fn stream_read_exact(
             }
             Ok(length) => {
                 offset += length;
-                if Instant::now() >= deadline {
-                    return Err(StreamError::Malformed("stream frame timed out".into()));
-                }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error)
@@ -562,7 +563,7 @@ fn serve_command(socket: &str, args: &[String]) -> Result<i32, String> {
     if args.len() != 4 {
         return Err("serve requires --core CORE_SOCKET --config FILE".into());
     }
-    for pair in args.chunks_exact(2) {
+    for pair in args.as_chunks::<2>().0 {
         match pair[0].as_str() {
             "--core" if core.is_none() => core = Some(pair[1].as_str()),
             "--config" if config_path.is_none() => config_path = Some(pair[1].as_str()),
@@ -609,7 +610,7 @@ fn manager_query(socket: &str, command: &str, args: &[String]) -> Result<i32, St
         "attention" if args == ["--all"] => request["all"] = true.into(),
         "ack" if args.len() == 5 => {
             request["id"] = args[0].clone().into();
-            for pair in args[1..].chunks_exact(2) {
+            for pair in args[1..].as_chunks::<2>().0 {
                 let field = match pair[0].as_str() {
                     "--epoch" => "epoch",
                     "--revision" => "revision",
@@ -771,6 +772,46 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    #[test]
+    fn stream_eof_after_deadline_is_timeout() {
+        let (mut stream, peer) = UnixStream::pair().unwrap();
+        let (start_tx, start_rx) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            start_rx.recv().unwrap();
+            thread::sleep(Duration::from_millis(150));
+            drop(peer);
+        });
+
+        let started = Instant::now();
+        start_tx.send(()).unwrap();
+        let mut byte = [0];
+        let result = stream_read_exact(&mut stream, &mut byte, started + Duration::from_millis(50));
+
+        closer.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(StreamError::Malformed(ref message)) if message == "stream frame timed out"
+        ));
+    }
+
+    #[test]
+    fn stream_eof_before_deadline_is_lost() {
+        let (mut stream, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        let mut byte = [0];
+
+        let result = stream_read_exact(
+            &mut stream,
+            &mut byte,
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        assert!(matches!(result, Err(StreamError::Lost(_))));
+    }
+
     #[test]
     fn rejects_nested_duplicate_fields() {
         assert!(serde_json::from_str::<Strict>(r#"{"a":{"x":1,"x":2}}"#).is_err());

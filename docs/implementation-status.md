@@ -6,7 +6,7 @@
 
 ## 빌드와 실행
 
-현재 검증 환경은 macOS arm64다. C compiler, make, Python 3.12 이상, pkg-config, libevent, ncurses/terminfo, utf8proc, jemalloc이 필요하다. Rust CLI를 빌드할 때만 Cargo가 필요하다. 이 환경에 이미 설치된 Homebrew library를 사용했다. 다른 플랫폼은 아직 빌드 검증하지 않았다.
+현재 검증 환경은 macOS arm64와 Debian 13.7 x86_64다. C compiler, make, Python 3.12 이상, pkg-config, libevent, ncurses/terminfo, utf8proc, jemalloc이 필요하다. Rust CLI를 빌드할 때만 Cargo가 필요하다. macOS에서는 기존 Homebrew library를 사용했고, Debian에서는 개발 패키지를 private sysroot에 풀어 빌드했다. [Debian 빌드·실제 SSH 검증](validation/2026-09-28-debian-ssh.md)에 환경과 재현 명령을 기록했다.
 
 ```sh
 make core
@@ -76,7 +76,8 @@ OpenCode의 native 상태를 관찰하려면 [agentd 실행 안내](agent-observ
 - [x] macOS의 terminal 호환·IPC 통합 테스트와 upstream suite 실행.
 - [x] 설치된 Herdr 0.8.2와 stock baseline의 1·15·50-pane 실제 비교 및 원시 결과 보존.
 - [ ] upstream 메뉴 redraw golden fixture 공통 실패의 원인 확정.
-- [ ] Linux/BSD와 실제 IME·clipboard·SSH·중첩 terminal 행렬 검증.
+- [x] Debian x86_64 빌드·프로젝트 검사와 실제 SSH PTY의 관리 화면·마우스·한국어 붙여넣기·native sidebar 검증.
+- [ ] BSD, 실제 OS IME·clipboard·중첩 terminal, SSH 끊김·재접속을 포함한 환경 행렬 검증.
 - [x] 선택 scope의 watch/event/gap, dirty 병합, 느린 구독자 정리, Rust streaming CLI.
 - [x] foreground agentd, OpenCode GET/SSE 상태·승인·질문 대기 관찰, source/core freshness 분리.
 - [x] shared attention 목록과 revision별 메모리 확인, bounded live snapshot CLI. [사용법](attention.md).

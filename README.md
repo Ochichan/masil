@@ -44,6 +44,7 @@ macOS 초기 비교에서 50-pane idle 서버 RSS는 rmux 4.44 MiB, stock tmux 4
 | [현재 구현과 실행](docs/implementation-status.md) | 빌드·사용법, 실제 기능과 남은 작업 |
 | [에이전트 관리 화면](docs/agent-desk.md) | 사이드패널·확대 화면, 마우스·키보드, 영어·한국어 |
 | [UI 상호작용 설계](docs/ui/agent-desk.md) | 화면 구성, 입력 소유권, 상태·복구·반응형 계약 |
+| [Debian·SSH 검증](docs/validation/2026-09-28-debian-ssh.md) | 원격 Linux 빌드, 실제 SSH 마우스·한국어·사이드패널, 수정과 재현 방법 |
 | [코어 관찰 IPC](docs/core-observation.md) | 구현된 wire protocol·상한·generation·실패 의미 |
 | [OpenCode 관찰 daemon](docs/agent-observation.md) | 시작·조회·중지, 상태와 연결의 한계, 자원 상한 |
 | [대기 요청 확인과 live 목록](docs/attention.md) | 미확인 목록, revision별 shared ack, snapshot stream |

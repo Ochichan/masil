@@ -3,7 +3,11 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     fs::{File, OpenOptions},
     io::{self, IsTerminal, Write},
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    mem::MaybeUninit,
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::fs::OpenOptionsExt,
+    },
     time::{Duration, Instant},
 };
 
@@ -11,6 +15,96 @@ const ENTER: &[u8] =
     b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h";
 const LEAVE: &[u8] =
     b"\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l";
+
+struct TtyIdentity {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+    special_device: libc::dev_t,
+    session: libc::pid_t,
+    #[cfg(target_os = "linux")]
+    terminal_device: libc::c_uint,
+}
+
+fn tty_identity(fd: RawFd, description: &str) -> Result<TtyIdentity, String> {
+    if unsafe { libc::fcntl(fd, libc::F_GETFL) } < 0 {
+        return Err(format!(
+            "cannot inspect {description}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let mut status = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, status.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "cannot identify {description}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let status = unsafe { status.assume_init() };
+    if status.st_mode & libc::S_IFMT != libc::S_IFCHR {
+        return Err(format!("{description} is not a character terminal"));
+    }
+    let session = unsafe { libc::tcgetsid(fd) };
+    if session <= 0 {
+        return Err(format!(
+            "cannot identify the session for {description}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    let terminal_device = {
+        let mut device = 0;
+        if unsafe { libc::ioctl(fd, libc::TIOCGDEV, &mut device) } != 0 {
+            return Err(format!(
+                "cannot identify the device for {description}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        device
+    };
+    Ok(TtyIdentity {
+        device: status.st_dev,
+        inode: status.st_ino,
+        special_device: status.st_rdev,
+        session,
+        #[cfg(target_os = "linux")]
+        terminal_device,
+    })
+}
+
+fn same_terminal(left: &TtyIdentity, right: &TtyIdentity) -> bool {
+    if left.session != right.session {
+        return false;
+    }
+    let same_node = left.device == right.device
+        && left.inode == right.inode
+        && left.special_device == right.special_device;
+    #[cfg(target_os = "linux")]
+    {
+        same_node || left.terminal_device == right.terminal_device
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // A session can have only one controlling terminal. This also handles
+        // /dev/tty, whose node identity may differ from the underlying tty.
+        same_node || left.session == right.session
+    }
+}
+
+fn open_terminal(path: &str) -> Result<File, String> {
+    let open = |path| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(path)
+    };
+    match open(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => open("/dev/tty")
+            .map_err(|fallback| format!("cannot open the controlling terminal: {fallback}")),
+        Err(error) => Err(format!("cannot open the UI terminal: {error}")),
+    }
+}
 
 pub(super) struct TtyWriter(File);
 impl Write for TtyWriter {
@@ -103,12 +197,26 @@ impl Session {
         let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
             .to_str()
             .map_err(|_| "invalid terminal path")?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(name)
-            .map_err(|e| e.to_string())?;
+        let stdin = tty_identity(libc::STDIN_FILENO, "UI stdin terminal")?;
+        let stdout = tty_identity(libc::STDOUT_FILENO, "UI stdout terminal")?;
+        if !same_terminal(&stdin, &stdout) {
+            return Err("ui stdin and stdout refer to different terminals".into());
+        }
+        let process_session = unsafe { libc::getsid(0) };
+        if process_session <= 0 {
+            return Err(format!(
+                "cannot identify the UI process session: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if stdin.session != process_session || stdout.session != process_session {
+            return Err("ui stdin and stdout are not the controlling terminal".into());
+        }
+        let file = open_terminal(name)?;
+        let opened = tty_identity(file.as_raw_fd(), "opened UI terminal")?;
+        if !same_terminal(&stdout, &opened) || opened.session != process_session {
+            return Err("opened UI terminal does not match stdin and stdout".into());
+        }
         let copy = file.try_clone().map_err(|e| e.to_string())?;
         let mut guard = Guard {
             writer: TtyWriter(file),
