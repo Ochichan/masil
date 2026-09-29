@@ -17,12 +17,18 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use unicode_width::UnicodeWidthStr;
 
 const VERSION: u32 = 1;
 /// Snapshots kept of each kind; older ones are removed after a save.
 const KEEP: usize = 20;
 /// Snapshots listed in the restore menu.
 const MENU_ITEMS: usize = 12;
+const MENU_BORDER_ROWS: usize = 2;
+const MENU_BASE_ROWS: usize = 2; // Save and its separator.
+const MENU_PAGING_ROWS: usize = 3; // Separator plus newer and older links.
+const MENU_BORDER_COLUMNS: usize = 4;
+const MENU_HOTKEY_COLUMNS: usize = 4; // Space plus "(1)".
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SESSIONS: usize = 256;
 const MAX_PANES: usize = 4096;
@@ -101,7 +107,7 @@ struct Options {
 
 fn usage() -> String {
     "usage: masil-agent session [--socket MASIL_SOCKET] [--client CLIENT] \
-     save [--auto]|list|restore [NAME]|menu|autosave"
+     save [--auto]|list|restore [NAME]|menu [PAGE]|autosave"
         .into()
 }
 
@@ -260,9 +266,22 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
                 ),
             ))
         }
-        ["menu"] => {
+        ["menu"] | ["menu", _] => {
             let client = options.client.as_deref().ok_or("menu requires --client")?;
-            menu(server, &options.socket, client, korean)?;
+            let page = match words.get(1) {
+                None => 0,
+                Some(value) => value
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|page| page.checked_sub(1))
+                    .ok_or_else(|| {
+                        text(
+                            "Invalid restore menu page",
+                            "잘못된 불러오기 메뉴 페이지입니다",
+                        )
+                    })?,
+            };
+            menu(server, &options.socket, client, korean, page)?;
             Ok((0, None))
         }
         ["autosave"] => autosave(server, &options.socket).map(|code| (code, None)),
@@ -1287,49 +1306,269 @@ fn run_self(socket: &str, client: &str, args: &[&str]) -> Result<String, String>
     ))
 }
 
-fn menu(server: &Server, socket: &str, client: &str, korean: bool) -> Result<(), String> {
-    let text = |en: &'static str, ko: &'static str| if korean { ko } else { en };
-    let dir = snapshot_dir()?;
-    let mut args: Vec<String> = ["display-menu", "-c", client, "-x", "C", "-y", "C", "-T"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MenuGeometry {
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MenuPage {
+    start: usize,
+    end: usize,
+    newer: bool,
+    older: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MenuPageError {
+    TooShort,
+    OutOfRange,
+}
+
+struct MenuSnapshot {
+    name: String,
+    created_at_ms: u64,
+    kind: String,
+    sessions: usize,
+    panes: usize,
+}
+
+/// Reads both sides of the actual drawing area. A shared window can be larger
+/// than one client, while a status column can make its window smaller.
+fn parse_menu_geometry(value: &str) -> Option<MenuGeometry> {
+    let fields = fields(value.trim_end_matches('\n'), 4)?;
+    let dimensions = fields
         .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
-    args.push(format!(
-        "#[align=centre]{}",
-        text("Restore sessions", "세션 불러오기")
-    ));
+        .map(|field| field.parse::<usize>().ok().filter(|value| *value > 0))
+        .collect::<Option<Vec<_>>>()?;
+    Some(MenuGeometry {
+        width: dimensions[0].min(dimensions[2]),
+        height: dimensions[1].min(dimensions[3]),
+    })
+}
+
+fn parse_client_target(listing: &str, client: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let fields = fields(line, 3)?;
+        let session = fields[1].strip_prefix('$')?;
+        let pane = fields[2].strip_prefix('%')?;
+        (fields[0] == client
+            && !session.is_empty()
+            && session.bytes().all(|byte| byte.is_ascii_digit())
+            && !pane.is_empty()
+            && pane.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| format!("{}:.{}", fields[1], fields[2]))
+    })
+}
+
+/// Resolves the pane from the requested client itself. The agent may have
+/// inherited TMUX_PANE from another session, so command target defaults are
+/// not reliable here.
+fn client_target(server: &Server, client: &str) -> Result<String, String> {
+    // The session qualifier also disambiguates windows linked to other sessions.
+    let format = ["#{client_name}", "#{session_id}", "#{pane_id}"].join(&SEP.to_string());
+    let listing = masil(server, &["list-clients", "-F", &format])?;
+    parse_client_target(&listing, client).ok_or_else(|| "client target unavailable".into())
+}
+
+fn menu_geometry(server: &Server, client: &str, target: &str) -> Result<MenuGeometry, String> {
+    let separator = SEP.to_string();
+    let format = [
+        "#{masil_viewport_width}",
+        "#{masil_viewport_height}",
+        "#{window_width}",
+        "#{window_height}",
+    ]
+    .join(&separator);
+    let value = masil(
+        server,
+        &["display-message", "-c", client, "-t", target, "-p", &format],
+    )?;
+    parse_menu_geometry(&value).ok_or_else(|| "invalid client geometry".into())
+}
+
+/// Chooses a stable page size. Middle pages reserve both navigation rows, so
+/// moving through the list never creates a menu taller than the window.
+fn menu_page(total: usize, height: usize, page: usize) -> Result<MenuPage, MenuPageError> {
+    let no_page_rows = height.saturating_sub(MENU_BORDER_ROWS + MENU_BASE_ROWS);
+    if total <= no_page_rows.min(MENU_ITEMS) {
+        if page != 0 {
+            return Err(MenuPageError::OutOfRange);
+        }
+        return Ok(MenuPage {
+            start: 0,
+            end: total,
+            newer: false,
+            older: false,
+        });
+    }
+    let page_size = height
+        .saturating_sub(MENU_BORDER_ROWS + MENU_BASE_ROWS + MENU_PAGING_ROWS)
+        .min(MENU_ITEMS);
+    if page_size == 0 {
+        return Err(MenuPageError::TooShort);
+    }
+    let pages = total.div_ceil(page_size);
+    if page >= pages {
+        return Err(MenuPageError::OutOfRange);
+    }
+    let start = page * page_size;
+    let end = (start + page_size).min(total);
+    Ok(MenuPage {
+        start,
+        end,
+        newer: page > 0,
+        older: end < total,
+    })
+}
+
+fn fits(text: &str, width: usize) -> bool {
+    // menu_add_item currently compares UTF-8 bytes before trimming by cells.
+    // Satisfy both measures so Korean labels are not unexpectedly cut.
+    text.len() <= width && UnicodeWidthStr::width(text) <= width
+}
+
+/// Keeps the detailed wording on ordinary terminals and falls back through
+/// compact, still human-readable labels without exposing the storage name.
+fn snapshot_menu_label(
+    time: &str,
+    kind: &str,
+    sessions: usize,
+    panes: usize,
+    korean: bool,
+    width: usize,
+) -> Option<String> {
+    let localized_kind = if kind == "auto" {
+        if korean { "자동" } else { "auto" }
+    } else if korean {
+        "수동"
+    } else {
+        "saved"
+    };
+    let full = if korean {
+        format!("{time}  {localized_kind}  세션 {sessions} · pane {panes}")
+    } else {
+        format!(
+            "{time}  {localized_kind}  {}, {}",
+            plural(sessions, "session"),
+            plural(panes, "pane")
+        )
+    };
+    let medium = if korean {
+        format!("{time}  {localized_kind}  세션 {sessions} · {panes}p")
+    } else {
+        format!("{time}  {localized_kind}  {sessions}s · {panes}p")
+    };
+    let compact = format!("{time} · {sessions}/{panes}");
+    [full, medium, compact, time.to_owned()]
+        .into_iter()
+        .find(|label| fits(label, width))
+}
+
+fn nav_label<'a>(wide: &'a str, compact: &'a str, width: usize) -> &'a str {
+    if fits(wide, width) { wide } else { compact }
+}
+
+fn menu(
+    server: &Server,
+    socket: &str,
+    client: &str,
+    korean: bool,
+    requested_page: usize,
+) -> Result<(), String> {
+    let text = |en: &'static str, ko: &'static str| if korean { ko } else { en };
+    let target = client_target(server, client).map_err(|_| {
+        text(
+            "Could not find the requesting terminal",
+            "요청한 터미널을 찾지 못했습니다",
+        )
+        .to_owned()
+    })?;
+    let geometry = menu_geometry(server, client, &target).map_err(|_| {
+        text(
+            "Could not read the terminal size",
+            "터미널 크기를 확인하지 못했습니다",
+        )
+        .to_owned()
+    })?;
+    let title = text("Restore sessions", "세션 불러오기");
+    let minimum_width = UnicodeWidthStr::width(title) + MENU_BORDER_COLUMNS;
+    if geometry.width < minimum_width || geometry.height < 5 {
+        return Err(text(
+            "Terminal is too small for the restore menu",
+            "세션 불러오기 메뉴를 열기에는 터미널이 너무 작습니다",
+        )
+        .into());
+    }
+    let dir = snapshot_dir()?;
+    let snapshots = list_snapshots(&dir)?
+        .into_iter()
+        .filter_map(|name| {
+            let snapshot = load(&dir.join(format!("{name}.json"))).ok()?;
+            let (sessions, panes) = counts(&snapshot);
+            Some(MenuSnapshot {
+                name,
+                created_at_ms: snapshot.created_at_ms,
+                kind: snapshot.kind,
+                sessions,
+                panes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let page = menu_page(snapshots.len(), geometry.height, requested_page).map_err(|error| {
+        match error {
+            MenuPageError::TooShort => text(
+                "Terminal is too short for the restore menu",
+                "세션 불러오기 메뉴를 열기에는 터미널 높이가 부족합니다",
+            ),
+            MenuPageError::OutOfRange => text(
+                "Restore menu page is no longer available",
+                "불러오기 메뉴 페이지가 더 이상 없습니다",
+            ),
+        }
+        .to_owned()
+    })?;
+    let mut args: Vec<String> = [
+        "display-menu",
+        "-M",
+        "-c",
+        client,
+        "-t",
+        &target,
+        "-x",
+        "#{e|+:#{window_offset_x},#{e|/:#{e|-:#{masil_viewport_width},#{popup_width}},2}}",
+        "-y",
+        "#{e|+:#{window_offset_y},#{e|/:#{e|+:#{masil_viewport_height},#{popup_height}},2}}",
+        "-T",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    args.push(format!("#[align=centre]{title}"));
     args.push(text("Save now", "지금 저장").into());
     args.push("C-s".into());
     args.push(run_self(socket, client, &["save"])?);
     args.push(String::new());
-    let names = list_snapshots(&dir)?;
-    let mut shown = 0;
-    for name in names.iter().take(MENU_ITEMS * 2) {
-        if shown == MENU_ITEMS {
-            break;
-        }
-        let Ok(snapshot) = load(&dir.join(format!("{name}.json"))) else {
-            continue;
-        };
-        let (sessions, panes) = counts(&snapshot);
-        let kind = if snapshot.kind == "auto" {
-            text("auto", "자동")
-        } else {
-            text("saved", "수동")
-        };
-        let label = if korean {
-            format!(
-                "{}  {kind}  세션 {sessions} · pane {panes}",
-                local_time(snapshot.created_at_ms)
+    let label_width = geometry
+        .width
+        .saturating_sub(MENU_BORDER_COLUMNS + MENU_HOTKEY_COLUMNS);
+    for (shown, snapshot) in snapshots[page.start..page.end].iter().enumerate() {
+        let label = snapshot_menu_label(
+            &local_time(snapshot.created_at_ms),
+            &snapshot.kind,
+            snapshot.sessions,
+            snapshot.panes,
+            korean,
+            label_width,
+        )
+        .ok_or_else(|| {
+            text(
+                "Terminal is too narrow for the restore menu",
+                "세션 불러오기 메뉴를 열기에는 터미널 너비가 부족합니다",
             )
-        } else {
-            format!(
-                "{}  {kind}  {}, {}",
-                local_time(snapshot.created_at_ms),
-                plural(sessions, "session"),
-                plural(panes, "pane")
-            )
-        };
+            .to_owned()
+        })?;
         // Labels are formats; keep a literal #.
         args.push(label.replace('#', "##"));
         args.push(if shown < 9 {
@@ -1337,16 +1576,47 @@ fn menu(server: &Server, socket: &str, client: &str, korean: bool) -> Result<(),
         } else {
             String::new()
         });
-        args.push(run_self(socket, client, &["restore", name])?);
-        shown += 1;
+        args.push(run_self(socket, client, &["restore", &snapshot.name])?);
     }
-    if shown == 0 {
-        args.push(format!(
-            "-{}",
-            text("No saved sessions", "저장된 세션이 없습니다")
-        ));
+    if snapshots.is_empty() {
+        let empty = nav_label(
+            text("No saved sessions", "저장된 세션이 없습니다"),
+            text("None saved", "저장 없음"),
+            geometry.width.saturating_sub(MENU_BORDER_COLUMNS + 1),
+        );
+        args.push(format!("-{empty}"));
         args.push(String::new());
         args.push(String::new());
+    }
+    if page.newer || page.older {
+        args.push(String::new());
+        let nav_width = geometry.width.saturating_sub(MENU_BORDER_COLUMNS);
+        if page.newer {
+            let page_number = requested_page.to_string();
+            args.push(
+                nav_label(
+                    text("‹ Newer snapshots", "‹ 최신 저장본"),
+                    text("‹ Newer", "‹ 최신"),
+                    nav_width,
+                )
+                .into(),
+            );
+            args.push(String::new());
+            args.push(run_self(socket, client, &["menu", &page_number])?);
+        }
+        if page.older {
+            let page_number = (requested_page + 2).to_string();
+            args.push(
+                nav_label(
+                    text("Older snapshots ›", "이전 저장본 ›"),
+                    text("Older ›", "이전 ›"),
+                    nav_width,
+                )
+                .into(),
+            );
+            args.push(String::new());
+            args.push(run_self(socket, client, &["menu", &page_number])?);
+        }
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     masil(server, &refs).map(|_| ())
@@ -1498,6 +1768,89 @@ mod tests {
             shell_line(&["vim".into(), "a b.txt".into()]),
             "vim 'a b.txt'"
         );
+    }
+
+    #[test]
+    fn restore_menu_geometry_uses_the_smaller_drawing_area() {
+        assert_eq!(
+            parse_menu_geometry("48\u{1f}12\u{1f}44\u{1f}11\n"),
+            Some(MenuGeometry {
+                width: 44,
+                height: 11,
+            })
+        );
+        assert_eq!(parse_menu_geometry("48\u{1f}x\u{1f}44\u{1f}11\n"), None);
+        assert_eq!(parse_menu_geometry("48\u{1f}12\u{1f}0\u{1f}11\n"), None);
+    }
+
+    #[test]
+    fn restore_menu_target_comes_from_the_named_client() {
+        let listing = "/dev/ttys001\u{1f}$0\u{1f}%9\n/dev/ttys002\u{1f}$1\u{1f}%9\n";
+        assert_eq!(
+            parse_client_target(listing, "/dev/ttys002").as_deref(),
+            Some("$1:.%9")
+        );
+        assert_eq!(parse_client_target(listing, "/dev/ttys003"), None);
+        assert_eq!(
+            parse_client_target("/dev/ttys002\u{1f}$1\u{1f}$9\n", "/dev/ttys002"),
+            None
+        );
+    }
+
+    #[test]
+    fn restore_menu_pages_fit_and_keep_every_snapshot_reachable() {
+        assert_eq!(
+            menu_page(8, 12, 0),
+            Ok(MenuPage {
+                start: 0,
+                end: 8,
+                newer: false,
+                older: false,
+            })
+        );
+        assert_eq!(
+            menu_page(13, 12, 0),
+            Ok(MenuPage {
+                start: 0,
+                end: 5,
+                newer: false,
+                older: true,
+            })
+        );
+        assert_eq!(
+            menu_page(13, 12, 1),
+            Ok(MenuPage {
+                start: 5,
+                end: 10,
+                newer: true,
+                older: true,
+            })
+        );
+        assert_eq!(
+            menu_page(13, 12, 2),
+            Ok(MenuPage {
+                start: 10,
+                end: 13,
+                newer: true,
+                older: false,
+            })
+        );
+        assert_eq!(menu_page(13, 12, 3), Err(MenuPageError::OutOfRange));
+        assert_eq!(menu_page(4, 7, 0), Err(MenuPageError::TooShort));
+    }
+
+    #[test]
+    fn restore_menu_labels_preserve_detail_then_compact_by_real_width() {
+        let wide = snapshot_menu_label("09-30 12:34", "manual", 1, 1, false, 80).unwrap();
+        assert_eq!(wide, "09-30 12:34  saved  1 session, 1 pane");
+        let narrow = snapshot_menu_label("09-30 12:34", "manual", 12, 34, false, 11).unwrap();
+        assert_eq!(narrow, "09-30 12:34");
+        assert!(snapshot_menu_label("09-30 12:34", "manual", 1, 1, false, 10).is_none());
+
+        let korean = snapshot_menu_label("09-30 12:34", "manual", 1, 1, true, 40).unwrap();
+        assert!(fits(&korean, 40));
+        assert!(korean.contains("수동"));
+        assert!(korean.len() <= 40);
     }
 
     #[test]

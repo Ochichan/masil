@@ -420,8 +420,12 @@ menu_key(struct client *c, struct menu_data *md, struct key_event *event)
 			if (!move && MOUSE_RELEASE(m->b))
 				goto chosen;
 		} else {
-			if (!MOUSE_WHEEL(m->b) && !MOUSE_DRAG(m->b))
+			/* A submenu may open before the parent click is released. */
+			if (!MOUSE_WHEEL(m->b) && !MOUSE_DRAG(m->b) &&
+			    !MOUSE_RELEASE(m->b)) {
+				md->choice = m->y - (md->py + border);
 				goto chosen;
+			}
 		}
 		md->choice = m->y - (md->py + border);
 		if (md->choice != old)

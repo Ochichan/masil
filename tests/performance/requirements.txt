@@ -1,3 +1,0 @@
-# Measurement-only VT screen reconstruction; never linked into masil.
-pyte==0.8.2
-wcwidth==0.2.13

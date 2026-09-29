@@ -15,3 +15,8 @@ core/etc/
 *.md
 /docs/
 /.impeccable/
+# Test, smoke, benchmark and capture tools stay local.
+/tests/
+/core/regress/
+/core/fuzz/
+/scripts/test_*.py

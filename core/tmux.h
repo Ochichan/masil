@@ -2650,6 +2650,10 @@ extern int cfg_quiet;
 /* masil-ui.c */
 extern int masil_ui_enabled;
 void	 masil_ui_load(struct client *, int);
+
+/* masil-agent-name.c */
+const char	*masil_agent_name(int);
+
 void	start_cfg(void);
 int	load_cfg(const char *, struct client *, struct cmdq_item *,
             struct cmd_find_state *, int, struct cmdq_item **);

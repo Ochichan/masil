@@ -2363,6 +2363,40 @@ format_cb_masil_core_boot_id(__unused struct format_tree *ft)
 	return (xstrdup(masil_bridge_get_boot_id()));
 }
 
+/* Callback for masil_pane_agent_name. */
+static void *
+format_cb_masil_pane_agent_name(struct format_tree *ft)
+{
+	const char	*name;
+
+	if (ft->wp == NULL || (name = masil_agent_name(ft->wp->fd)) == NULL)
+		return (xstrdup(""));
+	return (xstrdup(name));
+}
+
+/* The requesting client's visible window area, excluding its status bar. */
+static void *
+format_cb_masil_viewport_width(struct format_tree *ft)
+{
+	u_int	ox, oy, sx, sy;
+
+	if (ft->c == NULL || ft->c->session == NULL)
+		return (NULL);
+	tty_window_offset(&ft->c->tty, &ox, &oy, &sx, &sy);
+	return (format_printf("%u", sx));
+}
+
+static void *
+format_cb_masil_viewport_height(struct format_tree *ft)
+{
+	u_int	ox, oy, sx, sy;
+
+	if (ft->c == NULL || ft->c->session == NULL)
+		return (NULL);
+	tty_window_offset(&ft->c->tty, &ox, &oy, &sx, &sy);
+	return (format_printf("%u", sy));
+}
+
 /* Callback for masil_foreground_pgid. */
 static void *
 format_cb_masil_foreground_pgid(struct format_tree *ft)
@@ -3835,8 +3869,17 @@ static const struct format_table_entry format_table[] = {
 	{ "masil_osc_progress", FORMAT_TABLE_STRING,
 	  format_cb_masil_osc_progress
 	},
+	{ "masil_pane_agent_name", FORMAT_TABLE_STRING,
+	  format_cb_masil_pane_agent_name
+	},
 	{ "masil_pty_generation", FORMAT_TABLE_STRING,
 	  format_cb_masil_pty_generation
+	},
+	{ "masil_viewport_height", FORMAT_TABLE_STRING,
+	  format_cb_masil_viewport_height
+	},
+	{ "masil_viewport_width", FORMAT_TABLE_STRING,
+	  format_cb_masil_viewport_width
 	},
 	{ "mouse_all_flag", FORMAT_TABLE_STRING,
 	  format_cb_mouse_all_flag
