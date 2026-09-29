@@ -12,7 +12,7 @@ Developers running several original coding-agent TUIs alongside shells. They nee
 
 ## Product Purpose
 
-rmux combines tmux's terminal multiplexing with optional agent observation. Terminal input/output stays in the C core. The Rust observer tracks explicitly configured native sessions and reports only evidence it has verified.
+rmux combines tmux's terminal multiplexing with optional agent observation and management. Terminal input/output stays in the C core. Native management identifies foreground agents and provides guarded pane actions; the separate OpenCode observer tracks explicitly configured native sessions. Both report only the stage their evidence supports.
 
 ## Operating Context
 
@@ -22,8 +22,9 @@ The user selected an always-visible side panel with an on-demand full management
 
 - The current core supports native tmux session/window/pane behavior and mouse defaults.
 - agentd provides current OpenCode observations, shared in-memory attention acknowledgement and bounded full-state streaming. Confirmation in rmux is not provider approval.
-- Native-session/pane associations remain unverified. No prompt submission, provider approval or completion claim is available.
-- UI reads the existing manager protocol. It must not place a renderer or parser in the agents' terminal byte path or add idle provider polling.
+- Native management provides 24-provider discovery, launch, rename, screen reads, explicit key delivery, draft buffers, guarded prompt submission with retry receipts, state waits, scoped hook reports, saved list views and native resume snapshots with durable restore receipts.
+- Native-session/pane associations remain unverified. Prompt delivery is not provider acceptance; provider approval and task-success claims remain unavailable.
+- The observer UI reads the manager protocol. The native UI polls bounded native metadata only while open and caches unchanged screen detection. Neither places a renderer or parser in the agents' terminal byte path or polls provider APIs at idle.
 - Performance and terminal restoration are product requirements. Resize, lost mouse release, disconnected daemon and stale evidence must have defined behavior.
 - A shared native side pane affects the tmux window layout for every attached client. Opening it is explicit; it must never be created by a status query or ordinary rmux startup.
 

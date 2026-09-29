@@ -32,7 +32,9 @@ UI, CLI, API는 동일한 단계와 근거를 사용한다. 성공 여부 하나
 
 응답 단절 이후에는 기존 결과와 현재 provider 상태를 먼저 확인한다. 전달 여부가 불명확하면 `unknown`으로 남기고 자동 재전송하지 않는다. provider의 중복 제거 보장이나 미전달 증거가 있는 재시도는 그 범위를 기록한다. 외부 CLI에 대한 exactly-once 실행을 약속하지 않는다.
 
-관리 submit은 입력 소비 시 native request/revision을 원자적으로 검증하거나 동시 native 입력을 조정하는 integration reservation이 있을 때만 제공한다. composer readiness나 화면 관찰만으로는 확인 직후 화면이 바뀌는 경합을 막을 수 없다. 보장이 없으면 draft 준비와 사용자의 직접 제출만 제공한다. 신뢰 선택·권한 승인·일반 질문·composer를 구분하지 못하면 Enter를 합성하지 않는다. 승인 응답도 유효한 native request ID와 선택지를 소비 시 검증한다. 상태 재감지나 연결 복구가 자동 승인으로 이어져서는 안 된다.
+2026-09-29 사용자의 명시적 결정으로 `agent prompt`와 화면의 Send prompt에는 Herdr 방식의 제출을 허용한다. 현재 idle 관찰, 전경 provider, server boot·PTY·전경 process group·run·native session metadata·관찰 revision·화면 output generation·제목·progress를 확인하고 native 명령 큐에서 다시 검사한 뒤 paste와 Enter를 전달한다. blocked·working·unknown 상태에는 제출하지 않는다. copy mode·pane 동기화 중에는 거절하며, paste 실패 시 후속 Enter와 delivered 기록을 중단한다. 여러 줄이나 Tab이 있으면 bracketed paste가 켜져 있어야 한다. 이는 provider 내부 입력 소비의 원자성이나 prompt 수락을 보장하지 않으므로 전달 단계까지만 표시한다.
+
+재시도와 특정 receipt 조회에는 원래 run을 명시한다. prompt에는 run별 단조 증가 operation 번호와 요청 내용의 SHA-256, pending/delivered receipt를 남긴다. 최근 16개 receipt를 조회할 수 있고 만료된 번호는 다시 실행하지 않는다. 같은 번호의 다른 내용은 거절하며 pending이 남으면 새로운 자동 제출도 막는다. provider 승인 응답은 여전히 유효한 native request ID와 선택지를 소비 시 검증해야 한다. 상태 재감지나 연결 복구가 자동 승인으로 이어져서는 안 된다.
 
 ## R-03. 상태는 해당 실행의 근거로 판단한다
 

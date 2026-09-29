@@ -61,7 +61,7 @@ native TUI의 승인은 항상 남는다. 공통 승인 UI는 유효한 request 
 
 interrupt 요청, `C-c` key 전달, 프로세스 terminate/kill은 서로 다른 조작이다. 조작 후 확인된 상태를 보고하고, 결과가 불명확하면 pending/unknown으로 남긴다. 재접속만으로 prompt·승인·위험한 조작을 자동 반복하지 않는다.
 
-R-01의 operation receipt로 결과를 재조회하고, 같은 key의 재요청과 의도적인 새 입력을 구분한다. 처리 로그가 늦다는 이유만으로 유실로 판정하지 않는다. 자동 submit은 native 요청 검증 또는 동시 입력을 조정하는 reservation이 있어야 한다. composer readiness만 관찰하면 draft 준비까지만 제공한다. 사용자가 직접 원래 TUI에 보내는 Enter는 tmux 입력 계약대로 처리한다.
+R-01의 operation receipt로 결과를 재조회하고, 같은 key의 재요청과 의도적인 새 입력을 구분한다. 처리 로그가 늦다는 이유만으로 유실로 판정하지 않는다. 일반적인 자동 submit은 native 요청 검증 또는 동시 입력을 조정하는 reservation을 요구한다. 2026-09-29 사용자가 선택한 예외로 `agent prompt`는 [R-02](reliability.md#r-02-모르는-결과-때문에-중복-입력하거나-승인하지-않는다)에 정의한 idle·전경·실행 identity·화면 근거 검사와 run별 receipt를 거쳐 paste와 Enter를 전달한다. provider 수락이나 자동 승인은 제공하지 않는다. 사용자가 직접 원래 TUI에 보내는 Enter는 tmux 입력 계약대로 처리한다.
 
 wait는 특정 target·run/turn의 수명을 따른다. pane 직접 종료뿐 아니라 window/session 삭제로 실제 대상이 제거되는 경로에서도 종료 이유를 반환한다. link나 client만 제거되고 대상이 살아 있는 경우는 구분한다. R-04는 timeout·삭제·완료 경합과 관찰 단절의 처리를 정의한다.
 

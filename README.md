@@ -2,7 +2,7 @@
 
 rmux는 tmux의 기능과 기본 키 조작을 갖추고, 각 코딩 에이전트의 원래 TUI를 pane 안에서 실행·관리하는 터미널 멀티플렉서다.
 
-현재는 tmux 전체 소스를 기반으로 터미널 코어, 읽기 전용 관찰 IPC, 선택적 경량 agentd를 구현했다. `bin/rmux`로 session·window·pane·attach/detach·copy mode·control mode를 사용할 수 있다. `rmux-agent watch`는 pane 변경·종료·누락을, `serve`는 OpenCode native session의 작업·승인·질문 대기를 관찰한다. prompt 전송, 승인 처리, 대화 복구는 다음 단계다.
+tmux 전체 소스를 기반으로 터미널 코어, 관찰 IPC, 선택적 OpenCode agentd와 native Agent 관리를 제공한다. `bin/rmux`로 session·window·pane·attach/detach·copy mode·control mode를 사용할 수 있다. `rmux-agent agent`는 24종 provider 식별, 원래 TUI 실행, 조회·이름·이동·상태 대기·prompt 전달과 native resume를 제공한다. [Agent 관리와 Herdr 비교 범위](docs/managed-agents.md)를 참고한다. provider 수락과 승인 응답은 별도로 구분하며 자동 승인하지 않는다.
 
 `attention`은 승인·질문 대기 목록을, `ack`는 daemon 수명 동안 클라이언트들이 공유하는 확인 표시를 제공한다. `watch-agents`로 전체 목록의 최신 상태를 계속 받을 수 있다. 확인 명령은 provider 요청을 승인하지 않는다.
 
@@ -47,6 +47,10 @@ macOS 초기 비교에서 50-pane idle 서버 RSS는 rmux 4.44 MiB, stock tmux 4
 | [마우스 UI와 설정 화면](docs/mouse-ui.md) | 기본 UI 레이어, 버튼·메뉴, 상태줄 위치와 사이드바, 설정 화면, 적용 순서 |
 | [마우스 UI 설계](docs/design/mouse-ui-layer.md) | Herdr 대조, 레이어 적재, 세로 상태줄의 코어 변경과 검증 |
 | [에이전트 관리 화면](docs/agent-desk.md) | 사이드패널·확대 화면, 마우스·키보드, 영어·한국어 |
+| [Native Agent 관리](docs/managed-agents.md) | provider 감지, 실행·조회·키·대기, Herdr parity 범위 |
+| [Agent integration](docs/agent-integrations.md) | 선택적 native session/lifecycle callback과 export |
+| [Agent 저장과 재개](docs/agent-restore.md) | snapshot·항목별 복구·중복 실행 방지 |
+| [Agent 목록 보기](docs/agent-views.md) | provider·상태·workspace 필터와 정렬 저장 |
 | [UI 상호작용 설계](docs/ui/agent-desk.md) | 화면 구성, 입력 소유권, 상태·복구·반응형 계약 |
 | [Debian·SSH 검증](docs/validation/2026-09-28-debian-ssh.md) | 원격 Linux 빌드, 실제 SSH 마우스·한국어·사이드패널, 수정과 재현 방법 |
 | [코어 관찰 IPC](docs/core-observation.md) | 구현된 wire protocol·상한·generation·실패 의미 |
@@ -78,3 +82,5 @@ macOS 초기 비교에서 50-pane idle 서버 RSS는 rmux 4.44 MiB, stock tmux 4
 핵심 선택은 [코어/agentd 분리 ADR](docs/adr/0001-tmux-core-rust-agentd.md)와 [durable 관리 요청 ADR](docs/adr/0002-durable-management-intent.md)에 기록했다.
 
 tmux의 초기 비교 기준은 로컬 클론의 `94796f6b1182507efac8a272fc309a79e22e58a5`, `next-3.9` 개발판이다. 기준을 고정한 것은 검증을 재현하기 위해서다. 이후 tmux 기능과 기본값 변화도 추적한다.
+
+여러 서버의 Agent를 한 목록에서 관리하려면 [Agent endpoints](docs/agent-endpoints.md)를 등록한다. SSH 인증·호스트 키 확인은 기존 OpenSSH 설정을 사용한다.
