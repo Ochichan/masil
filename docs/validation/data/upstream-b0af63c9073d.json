@@ -1,6 +1,6 @@
 [
   {
-    "binary": "rmux",
+    "binary": "masil",
     "script": "terminal-feature-utf8.sh",
     "status": "passed",
     "returncode": 0,
@@ -9,7 +9,7 @@
       "retain private socket directory across nested env -i"
     ],
     "seconds": 0.7420728330034763,
-    "log": ".build/regress-b0af63c9073d/logs/rmux/terminal-feature-utf8.sh.log"
+    "log": ".build/regress-b0af63c9073d/logs/masil/terminal-feature-utf8.sh.log"
   },
   {
     "binary": "tmux-baseline",

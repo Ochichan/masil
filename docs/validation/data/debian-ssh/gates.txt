@@ -43,5 +43,5 @@ test tests::stream_eof_after_deadline_is_timeout ... ok
 test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
 
 clippy
-    Checking rmux-agent v0.1.0 (/home/ochi/.cache/rmux-validation.K2fYQL1P/agent)
+    Checking masil-agent v0.1.0 (/home/ochi/.cache/masil-validation.K2fYQL1P/agent)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.62s

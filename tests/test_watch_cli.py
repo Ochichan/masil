@@ -18,7 +18,7 @@ from typing import Callable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENT = Path(os.environ.get("RMUX_AGENT", ROOT / "bin" / "rmux-agent"))
+AGENT = Path(os.environ.get("MASIL_AGENT", ROOT / "bin" / "masil-agent"))
 BOOT_ID = "12345678-1234-4123-8123-123456789abc"
 Handler = Callable[[socket.socket, dict[str, object]], None]
 

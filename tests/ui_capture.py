@@ -12,7 +12,7 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 from test_agentd import AgentdHarness, AGENT
-from test_compatibility import RMUX
+from test_compatibility import MASIL
 from test_ui import Terminal
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,8 +112,8 @@ def main():
         capture(terminals[0],"disconnected")
         (OUTPUT/"capture.json").write_text(json.dumps({
             "agent_sha256":hashlib.sha256(AGENT.read_bytes()).hexdigest(),
-            "core_sha256":hashlib.sha256(RMUX.read_bytes()).hexdigest(),
-            "source":"real rmux-agent PTYs with private core/agentd and deterministic provider fixture",
+            "core_sha256":hashlib.sha256(MASIL.read_bytes()).hexdigest(),
+            "source":"real masil-agent PTYs with private core/agentd and deterministic provider fixture",
             "renderer":"pyte terminal cell grid to Pillow; ANSI/text/cell JSON retained",
             "text_export":"Trailing padding omitted; complete geometry retained in cell JSON and ANSI",
             "fonts":["Menlo 18px", "Apple SD Gothic Neo 18px for CJK"],

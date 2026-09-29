@@ -1,6 +1,6 @@
 # Native Agent 관리와 원격 통합 검증
 
-macOS arm64에서 로컬 rmux 기준 commit `b579a15e22f991f2385dc6c42de347ffe839367e`에 대한 변경을 검증했다. Herdr 비교 기준은 `0d5d6f1f317e238c8297076bc6ab5c3a0cd56283`이다. 기존 Herdr checkout과 사용자 provider 설정은 수정하지 않았다.
+macOS arm64에서 로컬 masil 기준 commit `b579a15e22f991f2385dc6c42de347ffe839367e`에 대한 변경을 검증했다. Herdr 비교 기준은 `0d5d6f1f317e238c8297076bc6ab5c3a0cd56283`이다. 기존 Herdr checkout과 사용자 provider 설정은 수정하지 않았다.
 
 ## 구현과 비교 범위
 
@@ -17,7 +17,7 @@ macOS arm64에서 로컬 rmux 기준 commit `b579a15e22f991f2385dc6c42de347ffe83
 - provider callback의 자식 session·과거 sequence·다른 run을 거절한다. session 검증에 사용한 snapshot 그대로 최종 native CAS를 실행한다.
 - JS/TS hook의 ENOENT/EPIPE가 provider를 죽이지 않는다. 설정 없는 callback과 큰 payload는 프로세스를 만들지 않는다.
 - restore는 native 서버 lock과 canonical snapshot lock을 함께 사용한다. 두 서버와 경로 alias가 같은 파일을 동시에 복구하거나 save로 덮지 못한다.
-- 같은 이름·pane ID를 가진 두 실제 rmux 서버 사이에서 prompt가 올바른 endpoint로만 간다. 끊긴 서버를 조회해도 다시 시작하지 않는다.
+- 같은 이름·pane ID를 가진 두 실제 masil 서버 사이에서 prompt가 올바른 endpoint로만 간다. 끊긴 서버를 조회해도 다시 시작하지 않는다.
 - 로컬 서버를 SIGSTOP해도 원격 행은 계속 갱신된다. CLI SIGTERM·비동기 취소·timeout은 transport 프로세스 그룹과 하위 프로세스를 정리한다.
 - 원격 연결은 실제 native PTY로 열고 detach 뒤 provider가 살아 있는지 확인한다. 기존 client의 session/window 선택을 바꾸는 attach는 거절한다.
 - 연결 pane을 respawn하거나 원격 client가 다른 pane으로 이동하면 과거 연결을 재사용하지 않는다. 새 연결은 실제 remote client lease를 확인한 뒤 성공으로 표시한다.
@@ -27,7 +27,7 @@ macOS arm64에서 로컬 rmux 기준 commit `b579a15e22f991f2385dc6c42de347ffe83
 
 메뉴의 표시 창과 명령 대상을 분리했다. 상태줄에서 비활성 창을 우클릭해도 현재 보이는 창 위에 메뉴가 표시되며, 명령은 원래 대상에 적용된다. tiled/floating pane 출력은 메뉴를 덮지 않는다. 메뉴 대상이 삭제되면 crash나 다른 창으로의 대체 실행 없이 거절한다.
 
-상태줄 네 위치, 계속 출력하는 pane, floating pane, 비활성 대상, 대상 삭제를 실제 mouse/PTY 회귀 검사에 포함했다. upstream `menu-mouse.sh`와 `mode-tree-menu-position.sh`도 rmux와 baseline에서 통과했다. 별도 upstream `screen-redraw-menus` snapshot은 rmux의 현재 표시 창 정책 때문에 `menu-target-window-noborder`에서 다르고, baseline도 `menu-over-split`에서 기존 snapshot과 다르다. 이 snapshot suite를 통과했다고 분류하지 않았고 기대 파일을 덮어쓰지 않았다.
+상태줄 네 위치, 계속 출력하는 pane, floating pane, 비활성 대상, 대상 삭제를 실제 mouse/PTY 회귀 검사에 포함했다. upstream `menu-mouse.sh`와 `mode-tree-menu-position.sh`도 masil과 baseline에서 통과했다. 별도 upstream `screen-redraw-menus` snapshot은 masil의 현재 표시 창 정책 때문에 `menu-target-window-noborder`에서 다르고, baseline도 `menu-over-split`에서 기존 snapshot과 다르다. 이 snapshot suite를 통과했다고 분류하지 않았고 기대 파일을 덮어쓰지 않았다.
 
 ## 검증 도구와 근거
 

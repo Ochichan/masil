@@ -1,18 +1,18 @@
 # 저장한 에이전트 목록 보기
 
-에이전트 목록과 관리 화면은 같은 native rmux 서버에 저장한 view를 사용한다. view는 tmux global option `@rmux-agent-view`에 versioned JSON을 hex로 인코딩해 저장한다. shell 문자열로 평가하지 않으며 별도 daemon이나 설정 파일이 필요하지 않다.
+에이전트 목록과 관리 화면은 같은 native masil 서버에 저장한 view를 사용한다. view는 tmux global option `@masil-agent-view`에 versioned JSON을 hex로 인코딩해 저장한다. shell 문자열로 평가하지 않으며 별도 daemon이나 설정 파일이 필요하지 않다.
 
 ```sh
-rmux-agent agent view get
-rmux-agent agent view set --provider codex --state blocked --workspace work --sort priority
-rmux-agent agent view clear
+masil-agent agent view get
+masil-agent agent view set --provider codex --state blocked --workspace work --sort priority
+masil-agent agent view clear
 ```
 
 `view set` 옵션은 반복할 수 있다.
 
 | 옵션 | 값 |
 | --- | --- |
-| `--provider` | rmux가 지원하는 provider ID 또는 alias. 저장할 때 canonical ID로 바꾼다. |
+| `--provider` | masil이 지원하는 provider ID 또는 alias. 저장할 때 canonical ID로 바꾼다. |
 | `--state` | `idle`, `working`, `blocked`, `unknown`, `exited` |
 | `--workspace` | 최대 128바이트의 정확한 workspace 이름. 정규식이나 glob이 아니다. |
 | `--sort` | `priority`, `name`, `provider`, `workspace` 중 하나 |

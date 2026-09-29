@@ -160,4 +160,4 @@ worktree 생성·삭제·준비는 resource key별로 직렬화한다. 전체 en
 
 job 취소는 `requested → acknowledged → stopped/too_late/unsupported`를 구분한다. 외부 process 종료와 자식 process 정리를 확인하고 이미 수행한 파일 변경을 취소만으로 복구했다고 표시하지 않는다. timeout은 job 포기를 뜻하지 않는다. 조회와 명시적 취소가 남는다.
 
-rmux가 생성하고 소유권을 기록한 worktree만 관리 삭제 대상으로 삼는다. 경로 identity가 바뀌면 중단한다. symlink 교체·다른 checkout·사용자 수정 파일을 지우는 문제는 빠른 삭제보다 우선 검증한다. 긴 디렉터리 탐색은 helper에서 수행하고 pane 전환과 다른 agent 상태 조회는 계속 처리한다.
+masil이 생성하고 소유권을 기록한 worktree만 관리 삭제 대상으로 삼는다. 경로 identity가 바뀌면 중단한다. symlink 교체·다른 checkout·사용자 수정 파일을 지우는 문제는 빠른 삭제보다 우선 검증한다. 긴 디렉터리 탐색은 helper에서 수행하고 pane 전환과 다른 agent 상태 조회는 계속 처리한다.

@@ -1,9 +1,9 @@
 python3 scripts/build.py
 core-build: .build/logs/core-build.log
-tmux next-3.9 /Users/ochi/Documents/Projects/rmux/bin/rmux
+tmux next-3.9 /Users/ochi/Documents/Projects/masil/bin/masil
 python3 scripts/build.py --baseline
 baseline-build: .build/logs/baseline-build.log
-tmux next-3.9 /Users/ochi/Documents/Projects/rmux/bin/tmux-baseline
+tmux next-3.9 /Users/ochi/Documents/Projects/masil/bin/tmux-baseline
 python3 scripts/build.py --agent
 agent-build: .build/logs/agent-build.log
 agent-smoke: .build/logs/agent-smoke.log
@@ -60,7 +60,7 @@ Ran 6 tests in 0.053s
 OK
 cargo test --locked --manifest-path agent/Cargo.toml
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
-     Running unittests src/main.rs (agent/target/debug/deps/rmux_agent-06298a9aa3d76367)
+     Running unittests src/main.rs (agent/target/debug/deps/masil_agent-06298a9aa3d76367)
 
 running 18 tests
 test observation::tests::missing_evidence_is_not_false_absence_or_current_activity ... ok

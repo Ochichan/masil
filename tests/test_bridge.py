@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end checks for the opt-in rmux observation bridge."""
+"""End-to-end checks for the opt-in masil observation bridge."""
 
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RMUX = ROOT / "bin" / "rmux"
+MASIL = ROOT / "bin" / "masil"
 TEST_ROOT = ROOT / ".build" / f"bridge-test-{uuid.uuid4().hex}"
 BRIDGE = TEST_ROOT / "bridge.sock"
-NATIVE_LABEL = f"rmux-bridge-{uuid.uuid4().hex}"
+NATIVE_LABEL = f"masil-bridge-{uuid.uuid4().hex}"
 
 
-def run_rmux(*args: str, env: dict[str, str] | None = None) -> str:
-    command = [str(RMUX), "-L", NATIVE_LABEL, *args]
+def run_masil(*args: str, env: dict[str, str] | None = None) -> str:
+    command = [str(MASIL), "-L", NATIVE_LABEL, *args]
     completed = subprocess.run(
         command,
         cwd=ROOT,
@@ -83,14 +83,14 @@ def expect_error(response: dict[str, object], code: str) -> None:
 
 
 def main() -> None:
-    assert RMUX.is_file(), f"missing binary: {RMUX}"
+    assert MASIL.is_file(), f"missing binary: {MASIL}"
     TEST_ROOT.mkdir(parents=True, mode=0o700)
     os.chmod(TEST_ROOT, 0o700)
     environment = os.environ.copy()
-    environment["RMUX_BRIDGE_SOCKET"] = str(BRIDGE)
+    environment["MASIL_BRIDGE_SOCKET"] = str(BRIDGE)
 
     try:
-        run_rmux("-f", "/dev/null", "new-session", "-d", "-s", "bridge", "-x", "80", "-y", "24", env=environment)
+        run_masil("-f", "/dev/null", "new-session", "-d", "-s", "bridge", "-x", "80", "-y", "24", env=environment)
         wait_for_socket()
         assert (BRIDGE.stat().st_mode & 0o777) == 0o600
 
@@ -120,8 +120,8 @@ def main() -> None:
             first_screen = int(first["screen_generation"])
             first_pty = int(first["pty_generation"])
 
-            run_rmux("send-keys", "-t", pane_id, "-l", "printf 'bridge-utf8-Ω\\n'")
-            run_rmux("send-keys", "-t", pane_id, "Enter")
+            run_masil("send-keys", "-t", pane_id, "-l", "printf 'bridge-utf8-Ω\\n'")
+            run_masil("send-keys", "-t", pane_id, "Enter")
             deadline = time.monotonic() + 3
             while True:
                 output = request(connection, "snapshot", "snapshot-output", pane_id=pane_id)
@@ -133,12 +133,12 @@ def main() -> None:
             assert int(output["screen_generation"]) > first_screen
             assert int(output["pty_generation"]) == first_pty
 
-            run_rmux("copy-mode", "-t", pane_id)
+            run_masil("copy-mode", "-t", pane_id)
             copy_snapshot = request(connection, "snapshot", "snapshot-copy", pane_id=pane_id)
             assert "bridge-utf8-Ω" in copy_snapshot["text"]
 
             before_reset = int(copy_snapshot["screen_generation"])
-            run_rmux("send-keys", "-R", "-t", pane_id)
+            run_masil("send-keys", "-R", "-t", pane_id)
             after_reset = request(connection, "snapshot", "snapshot-reset", pane_id=pane_id)
             assert int(after_reset["screen_generation"]) > before_reset
             expect_error(
@@ -152,7 +152,7 @@ def main() -> None:
                 "screen_generation_mismatch",
             )
 
-            run_rmux("resize-window", "-t", "bridge:0", "-x", "300", "-y", "50")
+            run_masil("resize-window", "-t", "bridge:0", "-x", "300", "-y", "50")
             resized = request(connection, "snapshot", "snapshot-resize", pane_id=pane_id)
             assert resized["width"] == 300 and resized["height"] == 50
             assert resized["source"]["rows"] == 32
@@ -163,7 +163,7 @@ def main() -> None:
             assert len(resized["text"].encode()) <= 16384
 
             old_pty = resized["pty_generation"]
-            run_rmux("respawn-pane", "-k", "-t", pane_id)
+            run_masil("respawn-pane", "-k", "-t", pane_id)
             respawned = request(connection, "snapshot", "snapshot-respawn", pane_id=pane_id)
             assert int(respawned["pty_generation"]) > int(old_pty)
             expect_error(
@@ -199,9 +199,9 @@ def main() -> None:
 
             before_exit = request(connection, "inventory", "inventory-before-exit")
             before_exit_revision = int(before_exit["revision"])
-            run_rmux("set-option", "-p", "-t", pane_id, "remain-on-exit", "on")
-            run_rmux("send-keys", "-t", pane_id, "-l", "exit")
-            run_rmux("send-keys", "-t", pane_id, "Enter")
+            run_masil("set-option", "-p", "-t", pane_id, "remain-on-exit", "on")
+            run_masil("send-keys", "-t", pane_id, "-l", "exit")
+            run_masil("send-keys", "-t", pane_id, "Enter")
             deadline = time.monotonic() + 3
             while True:
                 exited = request(connection, "inventory", "inventory-exited")
@@ -215,8 +215,8 @@ def main() -> None:
             # A silent exit mutates the base grid only through the native
             # remain-on-exit banner, without any PTY output to mark it dirty.
             trigger = TEST_ROOT / "silent-exit"
-            run_rmux("set-option", "-gw", "remain-on-exit", "on")
-            silent_id = run_rmux(
+            run_masil("set-option", "-gw", "remain-on-exit", "on")
+            silent_id = run_masil(
                 "new-window", "-d", "-P", "-F", "#{pane_id}",
                 sys.executable, "-c",
                 "import pathlib,time; p=pathlib.Path(" + repr(str(trigger)) + "); "
@@ -226,7 +226,7 @@ def main() -> None:
             silent_before = request(connection, "snapshot", "silent-before", pane_id=silent_id)
             trigger.touch()
             deadline = time.monotonic() + 3
-            while run_rmux("display-message", "-p", "-t", silent_id, "#{pane_dead}").strip() != "1":
+            while run_masil("display-message", "-p", "-t", silent_id, "#{pane_dead}").strip() != "1":
                 if time.monotonic() >= deadline:
                     raise AssertionError("silent child did not exit")
                 time.sleep(0.03)
@@ -270,7 +270,7 @@ def main() -> None:
         print("bridge integration: passed")
     finally:
         subprocess.run(
-            [str(RMUX), "-L", NATIVE_LABEL, "kill-server"],
+            [str(MASIL), "-L", NATIVE_LABEL, "kill-server"],
             cwd=ROOT,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

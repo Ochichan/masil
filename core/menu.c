@@ -124,7 +124,7 @@ menu_add_item(struct menu *menu, const struct menu_item *item,
 	}
 	max_width = c->tty.sx - status_column_size(c) - 4;
 
-	/* rmux: measure cells, not bytes, so wide text is not cut early. */
+	/* masil: measure cells, not bytes, so wide text is not cut early. */
 	slen = strlen(s);
 	if (*s != '-' && item->key != KEYC_UNKNOWN && item->key != KEYC_NONE) {
 		key = key_string_lookup_key(item->key, 0);
@@ -145,7 +145,7 @@ menu_add_item(struct menu *menu, const struct menu_item *item,
 		max_width--;
 		suffix = ">";
 	}
-	/* rmux: keep the start of the text; the ">" marks the cut end. */
+	/* masil: keep the start of the text; the ">" marks the cut end. */
 	trimmed = format_trim_right(s, max_width);
 	if (key != NULL) {
 		xasprintf(&name, "%s%s#[default] #[align=right](%s)",

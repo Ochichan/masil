@@ -92,7 +92,7 @@ cmd_display_menu_args_parse(struct args *args, u_int idx, __unused char **cause)
 }
 
 /*
- * rmux: the UI layer keeps mouse menus open after the opening click, like -O,
+ * masil: the UI layer keeps mouse menus open after the opening click, like -O,
  * without replacing tmux's default menu bindings.
  */
 static int
@@ -103,10 +103,10 @@ cmd_display_menu_stays_open(struct client *tc)
 
 	if (tc->session == NULL)
 		return (0);
-	o = options_get(tc->session->options, "@rmux-menu-stay-open");
+	o = options_get(tc->session->options, "@masil-menu-stay-open");
 	if (o == NULL)
 		return (0);
-	value = options_get_string(tc->session->options, "@rmux-menu-stay-open");
+	value = options_get_string(tc->session->options, "@masil-menu-stay-open");
 	return (strcmp(value, "on") == 0 || strcmp(value, "1") == 0);
 }
 
@@ -157,7 +157,7 @@ cmd_display_menu_get_menu_pos(struct client *tc, struct cmdq_item *item,
 	position = options_get_number(s->options, "status-position");
 	if (status_column_size(tc) != 0) {
 		/*
-		 * rmux: in a left or right status column, open beside the
+		 * masil: in a left or right status column, open beside the
 		 * window's row, against the column edge.
 		 */
 		for (line = 0; line < tc->status.ncolumn; line++) {

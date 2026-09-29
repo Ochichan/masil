@@ -4,15 +4,15 @@
 
 ## 1. 비용을 나누는 기준
 
-비교 대상은 같은 pinned tmux, compiler, build feature, OS, terminal, history limit, pane geometry와 출력 workload다. rmux의 비용은 다음과 같이 보고한다.
+비교 대상은 같은 pinned tmux, compiler, build feature, OS, terminal, history limit, pane geometry와 출력 workload다. masil의 비용은 다음과 같이 보고한다.
 
 ```text
 사용자 전체 footprint
-  = native core/client + rmux 추가 관리
+  = native core/client + masil 추가 관리
   + agent/provider runtime + SSH/terminal + 해당 작업의 child process
 
-rmux 추가 관리
-  = core 확장 증분 + agentd + rmux helper + SQLite/IPC buffer
+masil 추가 관리
+  = core 확장 증분 + agentd + masil helper + SQLite/IPC buffer
 ```
 
 provider 메모리를 제외한 수치를 전체 메모리처럼 발표하지 않는다. shared page가 중복되는 RSS 합산의 한계도 적고, Linux에서는 PSS, macOS에서는 physical footprint를 함께 기록한다. 파일 cache, mmap, child process, stack reservation과 resident 사용량을 구분한다.
@@ -21,7 +21,7 @@ provider 메모리를 제외한 수치를 전체 메모리처럼 발표하지 �
 
 ## 2. Extension hard limit 초안
 
-이 표는 rmux가 추가로 할당하는 자원의 초기 기본 상한이다. 기존 tmux의 pane/client/history/clipboard 크기를 제한하는 표가 아니다. 설정으로 높이는 경우 영향받는 합계와 admission 정책도 다시 계산한다.
+이 표는 masil이 추가로 할당하는 자원의 초기 기본 상한이다. 기존 tmux의 pane/client/history/clipboard 크기를 제한하는 표가 아니다. 설정으로 높이는 경우 영향받는 합계와 admission 정책도 다시 계산한다.
 
 | 이름 | 기본값 | 포화 시 |
 | --- | --- | --- |
@@ -81,7 +81,7 @@ CPU 100%는 **logical core 하나를 계속 사용하는 것**으로 표기한�
 
 ## 4. 목표 지표
 
-수치의 적용 fixture는 다음 절의 S0~S8이다. reference hardware의 CPU·RAM·storage·OS·전원 모드를 결과에 고정한다. network/provider 응답 시간은 rmux 내부 처리 지연과 분리한다.
+수치의 적용 fixture는 다음 절의 S0~S8이다. reference hardware의 CPU·RAM·storage·OS·전원 모드를 결과에 고정한다. network/provider 응답 시간은 masil 내부 처리 지연과 분리한다.
 
 | ID | 후보 통과 목표 | 측정 범위 |
 | --- | --- | --- |
@@ -100,7 +100,7 @@ CPU 100%는 **logical core 하나를 계속 사용하는 것**으로 표기한�
 | B-13 | screen fallback 감지 p95 ≤500 ms active, ≤2초 background | 완전한 snapshot, 해당 rate 범위의 workload. 포화 시 stale 지표 필수 |
 | B-14 | job cancel 요청 접수 p99 ≤25 ms, cooperative helper 종료 p95 ≤2초 | 불가역 단계는 too_late/unsupported로 분류 |
 | B-15 | agentd warm start 후 50개 live identity 동기화 p95 ≤250 ms | provider native reconcile 대기는 별도. stale→ready 범위 명시 |
-| B-16 | release 바이너리 크기: rmux ≤stock+1 MiB, rmux-agent ≤15 MiB | 같은 strip/link 조건, 지원 feature 목록 포함 |
+| B-16 | release 바이너리 크기: masil ≤stock+1 MiB, masil-agent ≤15 MiB | 같은 strip/link 조건, 지원 feature 목록 포함 |
 
 `max` 형태의 회귀 한도는 측정 noise보다 작은 수치를 과장하지 않기 위한 절대 허용치를 포함한다. 표본 분산이 한도보다 크면 통과가 아니라 측정 불충분이다. B-04/B-16이 실패하면 기능 제거에 앞서 dependency feature·allocation·cache와 build 설정을 점검한다.
 

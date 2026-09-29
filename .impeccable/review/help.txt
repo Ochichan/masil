@@ -1,5 +1,5 @@
 
- rmux  Agent desk┌ Agent desk help ─────────────────────────────────────────────────────── Esc Close ─┐ Help   q Close
+ masil  Agent desk┌ Agent desk help ─────────────────────────────────────────────────────── Esc Close ─┐ Help  q Close
                  │ FIND AND INSPECT                                                                   │
   All 16   Attent│ ↑/↓ or j/k    Move through agents                                                  │
                  │ Home/End      First or last agent                                                  │

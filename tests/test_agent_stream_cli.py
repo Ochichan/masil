@@ -30,7 +30,7 @@ def snapshot(revision="1"):
 class ProjectionCLI(unittest.TestCase):
     def execute(self, frames, count=None):
         failures = []
-        with tempfile.TemporaryDirectory(prefix="rmx-stream-", dir="/tmp") as temp:
+        with tempfile.TemporaryDirectory(prefix="msl-stream-", dir="/tmp") as temp:
             path = Path(temp) / "manager.sock"
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
                 listener.bind(str(path))

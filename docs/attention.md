@@ -7,10 +7,10 @@ OpenCode 관찰 daemon에 `attention`, `ack`, `watch-agents`를 추가했다. �
 먼저 [OpenCode 관찰 daemon](agent-observation.md)을 시작한다.
 
 ```sh
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" attention
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" attention --all
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" watch-agents
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" watch-agents --count 3
+./bin/masil-agent --socket "$masil_runtime/manager.sock" attention
+./bin/masil-agent --socket "$masil_runtime/manager.sock" attention --all
+./bin/masil-agent --socket "$masil_runtime/manager.sock" watch-agents
+./bin/masil-agent --socket "$masil_runtime/manager.sock" watch-agents --count 3
 ```
 
 `attention`의 `items`는 fresh인 native session 중 아직 확인하지 않은 approval/question 항목이다. `--all`은 확인한 pending 항목도 포함한다. `unavailable`에는 연결 확인 중·연결 손실·native session 부재 때문에 현재 pending 여부를 판단할 수 없는 관찰 대상이 들어간다. `items`가 비어 있어도 `unavailable`이 있으면 전체가 대기 중이 아니라고 결론 내릴 수 없다.
@@ -19,7 +19,7 @@ OpenCode 관찰 daemon에 `attention`, `ack`, `watch-agents`를 추가했다. �
 
 ```sh
 # E와 R을 attention 응답의 epoch 및 items[i].attention.revision으로 바꾼다.
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" ack backend --epoch E --revision R
+./bin/masil-agent --socket "$masil_runtime/manager.sock" ack backend --epoch E --revision R
 ```
 
 같은 revision에 대한 재확인은 같은 결과다. provider 요청은 계속 pending이며, `agents`, `inspect`, `attention --all`에서 확인 표시와 원래 승인/질문 상태를 함께 볼 수 있다. 새 pending 요청을 관찰하면 확인 표시를 해제한다. 부모·자식 session은 별도 항목이며 child 대기를 parent에 합산하지 않는다.

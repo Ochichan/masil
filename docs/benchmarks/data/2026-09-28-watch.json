@@ -2,7 +2,7 @@
   "started_at_utc": "2026-09-28T01:16:41.498223+00:00",
   "budget_eligible": false,
   "binary": {
-    "path": "/Users/ochi/Documents/Projects/rmux/bin/rmux",
+    "path": "/Users/ochi/Documents/Projects/masil/bin/masil",
     "sha256": "30eb68ffa907e99c798ea34741d5c59fdb6101773122469697f68f28a78387de",
     "version_output": "tmux next-3.9",
     "version_exit_code": 0
@@ -40,7 +40,7 @@
                 "rss_kib": 4064,
                 "cpu_percent_ps": 0.0,
                 "cpu_time_seconds": 0.01,
-                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-4bllx7ws/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py idle --sidechannel /tmp/rmx-bench-4bllx7ws/fixture-0.jsonl --nonce 0-5f57ccc38f59"
+                "command": "/Users/ochi/Documents/Projects/masil/bin/masil -S /tmp/msl-bench-4bllx7ws/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/masil/tests/performance/fixture.py idle --sidechannel /tmp/msl-bench-4bllx7ws/fixture-0.jsonl --nonce 0-5f57ccc38f59"
               }
             ]
           }
@@ -54,8 +54,8 @@
       ],
       "events_received": 0,
       "isolation": {
-        "private_root": "/tmp/rmx-bench-4bllx7ws",
-        "socket": "/tmp/rmx-bench-4bllx7ws/tmux.sock",
+        "private_root": "/tmp/msl-bench-4bllx7ws",
+        "socket": "/tmp/msl-bench-4bllx7ws/tmux.sock",
         "socket_within_private_root": true,
         "config": "/dev/null"
       }
@@ -90,7 +90,7 @@
                 "rss_kib": 4224,
                 "cpu_percent_ps": 0.0,
                 "cpu_time_seconds": 0.01,
-                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-1wfaqwsk/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py idle --sidechannel /tmp/rmx-bench-1wfaqwsk/fixture-0.jsonl --nonce 0-578b89a982c9"
+                "command": "/Users/ochi/Documents/Projects/masil/bin/masil -S /tmp/msl-bench-1wfaqwsk/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/masil/tests/performance/fixture.py idle --sidechannel /tmp/msl-bench-1wfaqwsk/fixture-0.jsonl --nonce 0-578b89a982c9"
               }
             ]
           }
@@ -104,8 +104,8 @@
       ],
       "events_received": 0,
       "isolation": {
-        "private_root": "/tmp/rmx-bench-1wfaqwsk",
-        "socket": "/tmp/rmx-bench-1wfaqwsk/tmux.sock",
+        "private_root": "/tmp/msl-bench-1wfaqwsk",
+        "socket": "/tmp/msl-bench-1wfaqwsk/tmux.sock",
         "socket_within_private_root": true,
         "config": "/dev/null"
       },
@@ -172,7 +172,7 @@
                 "rss_kib": 4064,
                 "cpu_percent_ps": 0.1,
                 "cpu_time_seconds": 0.15,
-                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-jp_b00qg/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py output --sidechannel /tmp/rmx-bench-jp_b00qg/fixture-0.jsonl --nonce 0-e018d2b5e1c4 --bytes 5242880 --rate-bytes-per-second 1048576 --start-at-ns 0 --output-style inplace --start-gate /tmp/rmx-bench-jp_b00qg/output.start"
+                "command": "/Users/ochi/Documents/Projects/masil/bin/masil -S /tmp/msl-bench-jp_b00qg/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/masil/tests/performance/fixture.py output --sidechannel /tmp/msl-bench-jp_b00qg/fixture-0.jsonl --nonce 0-e018d2b5e1c4 --bytes 5242880 --rate-bytes-per-second 1048576 --start-at-ns 0 --output-style inplace --start-gate /tmp/msl-bench-jp_b00qg/output.start"
               }
             ]
           }
@@ -186,8 +186,8 @@
       ],
       "events_received": 0,
       "isolation": {
-        "private_root": "/tmp/rmx-bench-jp_b00qg",
-        "socket": "/tmp/rmx-bench-jp_b00qg/tmux.sock",
+        "private_root": "/tmp/msl-bench-jp_b00qg",
+        "socket": "/tmp/msl-bench-jp_b00qg/tmux.sock",
         "socket_within_private_root": true,
         "config": "/dev/null"
       },
@@ -223,7 +223,7 @@
                 "rss_kib": 4224,
                 "cpu_percent_ps": 0.1,
                 "cpu_time_seconds": 0.15,
-                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-g68qizyp/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py output --sidechannel /tmp/rmx-bench-g68qizyp/fixture-0.jsonl --nonce 0-d1ec11b29e8f --bytes 5242880 --rate-bytes-per-second 1048576 --start-at-ns 0 --output-style inplace --start-gate /tmp/rmx-bench-g68qizyp/output.start"
+                "command": "/Users/ochi/Documents/Projects/masil/bin/masil -S /tmp/msl-bench-g68qizyp/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/masil/tests/performance/fixture.py output --sidechannel /tmp/msl-bench-g68qizyp/fixture-0.jsonl --nonce 0-d1ec11b29e8f --bytes 5242880 --rate-bytes-per-second 1048576 --start-at-ns 0 --output-style inplace --start-gate /tmp/msl-bench-g68qizyp/output.start"
               }
             ]
           }
@@ -237,8 +237,8 @@
       ],
       "events_received": 21,
       "isolation": {
-        "private_root": "/tmp/rmx-bench-g68qizyp",
-        "socket": "/tmp/rmx-bench-g68qizyp/tmux.sock",
+        "private_root": "/tmp/msl-bench-g68qizyp",
+        "socket": "/tmp/msl-bench-g68qizyp/tmux.sock",
         "socket_within_private_root": true,
         "config": "/dev/null"
       },
@@ -306,7 +306,7 @@
                 "rss_kib": 4544,
                 "cpu_percent_ps": 0.0,
                 "cpu_time_seconds": 0.1,
-                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-0fzzwp5z/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py idle --sidechannel /tmp/rmx-bench-0fzzwp5z/fixture-0.jsonl --nonce 0-a8b4fc8ae8de"
+                "command": "/Users/ochi/Documents/Projects/masil/bin/masil -S /tmp/msl-bench-0fzzwp5z/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/masil/tests/performance/fixture.py idle --sidechannel /tmp/msl-bench-0fzzwp5z/fixture-0.jsonl --nonce 0-a8b4fc8ae8de"
               }
             ]
           }
@@ -516,8 +516,8 @@
       ],
       "events_received": 0,
       "isolation": {
-        "private_root": "/tmp/rmx-bench-0fzzwp5z",
-        "socket": "/tmp/rmx-bench-0fzzwp5z/tmux.sock",
+        "private_root": "/tmp/msl-bench-0fzzwp5z",
+        "socket": "/tmp/msl-bench-0fzzwp5z/tmux.sock",
         "socket_within_private_root": true,
         "config": "/dev/null"
       }
@@ -552,7 +552,7 @@
                 "rss_kib": 4656,
                 "cpu_percent_ps": 0.0,
                 "cpu_time_seconds": 0.1,
-                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-7fyjbdkr/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py idle --sidechannel /tmp/rmx-bench-7fyjbdkr/fixture-0.jsonl --nonce 0-a9c08b90d88c"
+                "command": "/Users/ochi/Documents/Projects/masil/bin/masil -S /tmp/msl-bench-7fyjbdkr/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/masil/tests/performance/fixture.py idle --sidechannel /tmp/msl-bench-7fyjbdkr/fixture-0.jsonl --nonce 0-a9c08b90d88c"
               }
             ]
           }
@@ -762,8 +762,8 @@
       ],
       "events_received": 0,
       "isolation": {
-        "private_root": "/tmp/rmx-bench-7fyjbdkr",
-        "socket": "/tmp/rmx-bench-7fyjbdkr/tmux.sock",
+        "private_root": "/tmp/msl-bench-7fyjbdkr",
+        "socket": "/tmp/msl-bench-7fyjbdkr/tmux.sock",
         "socket_within_private_root": true,
         "config": "/dev/null"
       },
@@ -830,7 +830,7 @@
                 "rss_kib": 4960,
                 "cpu_percent_ps": 0.0,
                 "cpu_time_seconds": 0.21,
-                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-ppqxzwwt/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py output --sidechannel /tmp/rmx-bench-ppqxzwwt/fixture-0.jsonl --nonce 0-d70e8f666d04 --bytes 104855 --rate-bytes-per-second 20971 --start-at-ns 0 --output-style inplace --start-gate /tmp/rmx-bench-ppqxzwwt/output.start"
+                "command": "/Users/ochi/Documents/Projects/masil/bin/masil -S /tmp/msl-bench-ppqxzwwt/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/masil/tests/performance/fixture.py output --sidechannel /tmp/msl-bench-ppqxzwwt/fixture-0.jsonl --nonce 0-d70e8f666d04 --bytes 104855 --rate-bytes-per-second 20971 --start-at-ns 0 --output-style inplace --start-gate /tmp/msl-bench-ppqxzwwt/output.start"
               }
             ]
           }
@@ -1040,8 +1040,8 @@
       ],
       "events_received": 0,
       "isolation": {
-        "private_root": "/tmp/rmx-bench-ppqxzwwt",
-        "socket": "/tmp/rmx-bench-ppqxzwwt/tmux.sock",
+        "private_root": "/tmp/msl-bench-ppqxzwwt",
+        "socket": "/tmp/msl-bench-ppqxzwwt/tmux.sock",
         "socket_within_private_root": true,
         "config": "/dev/null"
       },
@@ -1077,7 +1077,7 @@
                 "rss_kib": 5120,
                 "cpu_percent_ps": 0.1,
                 "cpu_time_seconds": 0.3,
-                "command": "/Users/ochi/Documents/Projects/rmux/bin/rmux -S /tmp/rmx-bench-47clzai6/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/rmux/tests/performance/fixture.py output --sidechannel /tmp/rmx-bench-47clzai6/fixture-0.jsonl --nonce 0-04e7a2c5fb6a --bytes 104855 --rate-bytes-per-second 20971 --start-at-ns 0 --output-style inplace --start-gate /tmp/rmx-bench-47clzai6/output.start"
+                "command": "/Users/ochi/Documents/Projects/masil/bin/masil -S /tmp/msl-bench-47clzai6/tmux.sock -f /dev/null new-session -d -s bench -x 93 -y 39 /usr/local/bin/python3 /Users/ochi/Documents/Projects/masil/tests/performance/fixture.py output --sidechannel /tmp/msl-bench-47clzai6/fixture-0.jsonl --nonce 0-04e7a2c5fb6a --bytes 104855 --rate-bytes-per-second 20971 --start-at-ns 0 --output-style inplace --start-gate /tmp/msl-bench-47clzai6/output.start"
               }
             ]
           }
@@ -1287,8 +1287,8 @@
       ],
       "events_received": 1050,
       "isolation": {
-        "private_root": "/tmp/rmx-bench-47clzai6",
-        "socket": "/tmp/rmx-bench-47clzai6/tmux.sock",
+        "private_root": "/tmp/msl-bench-47clzai6",
+        "socket": "/tmp/msl-bench-47clzai6/tmux.sock",
         "socket_within_private_root": true,
         "config": "/dev/null"
       },

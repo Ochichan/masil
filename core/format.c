@@ -33,7 +33,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
-#include "rmux-bridge.h"
+#include "masil-bridge.h"
 
 /*
  * Build a list of key-value pairs and use them to expand #{key} entries in a
@@ -1391,7 +1391,7 @@ format_cb_mouse_status_line(struct format_tree *ft)
 		return (NULL);
 
 	if (ft->m.incolumn) {
-		/* rmux: the row of a left or right status column. */
+		/* masil: the row of a left or right status column. */
 		y = ft->m.y;
 	} else if (ft->m.statusat == 0 && ft->m.y < ft->m.statuslines) {
 		y = ft->m.y;
@@ -1417,7 +1417,7 @@ format_cb_mouse_status_range(struct format_tree *ft)
 		return (NULL);
 
 	if (ft->m.incolumn) {
-		/* rmux: a left or right status column. */
+		/* masil: a left or right status column. */
 		sr = status_get_column_range(ft->c, ft->m.colx, ft->m.y);
 	} else if (ft->m.statusat == 0 && ft->m.y < ft->m.statuslines) {
 		x = ft->m.x;
@@ -2347,25 +2347,25 @@ format_cb_pane_output_generation(struct format_tree *ft)
 	return (NULL);
 }
 
-/* Callback for rmux_bracketed_paste. */
+/* Callback for masil_bracketed_paste. */
 static void *
-format_cb_rmux_bracketed_paste(struct format_tree *ft)
+format_cb_masil_bracketed_paste(struct format_tree *ft)
 {
 	if (ft->wp == NULL)
 		return (NULL);
 	return (format_printf("%d", !!(ft->wp->screen->mode & MODE_BRACKETPASTE)));
 }
 
-/* Callback for rmux_core_boot_id. */
+/* Callback for masil_core_boot_id. */
 static void *
-format_cb_rmux_core_boot_id(__unused struct format_tree *ft)
+format_cb_masil_core_boot_id(__unused struct format_tree *ft)
 {
-	return (xstrdup(rmux_bridge_get_boot_id()));
+	return (xstrdup(masil_bridge_get_boot_id()));
 }
 
-/* Callback for rmux_foreground_pgid. */
+/* Callback for masil_foreground_pgid. */
 static void *
-format_cb_rmux_foreground_pgid(struct format_tree *ft)
+format_cb_masil_foreground_pgid(struct format_tree *ft)
 {
 	pid_t	 pgid;
 
@@ -2377,24 +2377,24 @@ format_cb_rmux_foreground_pgid(struct format_tree *ft)
 	return (format_printf("%ld", (long)pgid));
 }
 
-/* Callback for rmux_osc_progress. */
+/* Callback for masil_osc_progress. */
 static void *
-format_cb_rmux_osc_progress(struct format_tree *ft)
+format_cb_masil_osc_progress(struct format_tree *ft)
 {
 	if (ft->wp == NULL)
 		return (NULL);
-	return (xstrdup(ft->wp->base.rmux_osc_progress));
+	return (xstrdup(ft->wp->base.masil_osc_progress));
 }
 
-/* Callback for rmux_pty_generation. */
+/* Callback for masil_pty_generation. */
 static void *
-format_cb_rmux_pty_generation(struct format_tree *ft)
+format_cb_masil_pty_generation(struct format_tree *ft)
 {
-	if (*rmux_bridge_get_boot_id() == '\0' || ft->wp == NULL ||
-	    ft->wp->rmux_generation_exhausted)
+	if (*masil_bridge_get_boot_id() == '\0' || ft->wp == NULL ||
+	    ft->wp->masil_generation_exhausted)
 		return (xstrdup(""));
 	return (format_printf("%llu",
-	    (unsigned long long)ft->wp->rmux_pty_generation));
+	    (unsigned long long)ft->wp->masil_pty_generation));
 }
 
 /* Callback for pane_last_prompt_time. */
@@ -3823,6 +3823,21 @@ static const struct format_table_entry format_table[] = {
 	{ "last_window_index", FORMAT_TABLE_STRING,
 	  format_cb_last_window_index
 	},
+	{ "masil_bracketed_paste", FORMAT_TABLE_STRING,
+	  format_cb_masil_bracketed_paste
+	},
+	{ "masil_core_boot_id", FORMAT_TABLE_STRING,
+	  format_cb_masil_core_boot_id
+	},
+	{ "masil_foreground_pgid", FORMAT_TABLE_STRING,
+	  format_cb_masil_foreground_pgid
+	},
+	{ "masil_osc_progress", FORMAT_TABLE_STRING,
+	  format_cb_masil_osc_progress
+	},
+	{ "masil_pty_generation", FORMAT_TABLE_STRING,
+	  format_cb_masil_pty_generation
+	},
 	{ "mouse_all_flag", FORMAT_TABLE_STRING,
 	  format_cb_mouse_all_flag
 	},
@@ -4059,21 +4074,6 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "pid", FORMAT_TABLE_STRING,
 	  format_cb_pid
-	},
-	{ "rmux_bracketed_paste", FORMAT_TABLE_STRING,
-	  format_cb_rmux_bracketed_paste
-	},
-	{ "rmux_core_boot_id", FORMAT_TABLE_STRING,
-	  format_cb_rmux_core_boot_id
-	},
-	{ "rmux_foreground_pgid", FORMAT_TABLE_STRING,
-	  format_cb_rmux_foreground_pgid
-	},
-	{ "rmux_osc_progress", FORMAT_TABLE_STRING,
-	  format_cb_rmux_osc_progress
-	},
-	{ "rmux_pty_generation", FORMAT_TABLE_STRING,
-	  format_cb_rmux_pty_generation
 	},
 	{ "scroll_region_lower", FORMAT_TABLE_STRING,
 	  format_cb_scroll_region_lower

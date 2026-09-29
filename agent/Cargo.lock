@@ -700,6 +700,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "masil-agent"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "futures-util",
+ "libc",
+ "ratatui",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -986,25 +1005,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
-]
-
-[[package]]
-name = "rmux-agent"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "futures-util",
- "libc",
- "ratatui",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
- "unicode-segmentation",
- "unicode-width",
 ]
 
 [[package]]

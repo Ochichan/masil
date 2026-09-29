@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 
-from test_compatibility import ROOT, RMUX, Server
+from test_compatibility import ROOT, MASIL, Server
 
 
 def exact(connection, count):
@@ -34,7 +34,7 @@ def main():
     if sys.platform != 'darwin':
         print('forkpty failure injection: unsupported on this test platform')
         return 77
-    with tempfile.TemporaryDirectory(prefix='rmx-fault-', dir='/tmp') as directory:
+    with tempfile.TemporaryDirectory(prefix='msl-fault-', dir='/tmp') as directory:
         directory = Path(directory)
         library = directory / 'forkpty.dylib'
         marker = directory / 'fail'
@@ -42,9 +42,9 @@ def main():
         subprocess.run(['clang', '-dynamiclib', '-Wall', '-Wextra', '-Werror',
                         '-o', str(library), str(ROOT/'tests/faults/forkpty.c')], check=True)
         env = {'DYLD_INSERT_LIBRARIES': str(library),
-               'RMUX_TEST_FAIL_FORKPTY_FILE': str(marker),
-               'RMUX_BRIDGE_SOCKET': str(bridge)}
-        with Server(RMUX, ['/bin/sleep', '60'], env) as server:
+               'MASIL_TEST_FAIL_FORKPTY_FILE': str(marker),
+               'MASIL_BRIDGE_SOCKET': str(bridge)}
+        with Server(MASIL, ['/bin/sleep', '60'], env) as server:
             with socket.socket(socket.AF_UNIX) as connection:
                 connection.settimeout(3)
                 connection.connect(str(bridge))

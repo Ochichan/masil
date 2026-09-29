@@ -21,7 +21,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_PATH = ROOT / "tests" / "performance" / "benchmark.py"
 FIXTURE_PATH = ROOT / "tests" / "performance" / "fixture.py"
-SPEC = importlib.util.spec_from_file_location("rmux_benchmark", BENCHMARK_PATH)
+SPEC = importlib.util.spec_from_file_location("masil_benchmark", BENCHMARK_PATH)
 assert SPEC and SPEC.loader
 benchmark = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = benchmark
@@ -30,7 +30,7 @@ SPEC.loader.exec_module(benchmark)
 
 class BenchmarkHelpersTest(unittest.TestCase):
     def test_herdr_environment_is_fresh_allowlisted_and_rooted(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="rmx-bench-test-", dir="/tmp"))
+        root = Path(tempfile.mkdtemp(prefix="msl-bench-test-", dir="/tmp"))
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         old = os.environ.get("HERDR_SESSION")
         os.environ["HERDR_SESSION"] = "must-not-leak"
@@ -76,7 +76,7 @@ class BenchmarkHelpersTest(unittest.TestCase):
 
 class FixtureTest(unittest.TestCase):
     def test_attached_marker_survives_differential_redraw_and_private_dsr(self) -> None:
-        directory = Path(tempfile.mkdtemp(prefix="rmx-bench-test-", dir="/tmp"))
+        directory = Path(tempfile.mkdtemp(prefix="msl-bench-test-", dir="/tmp"))
         self.addCleanup(lambda: shutil.rmtree(directory, ignore_errors=True))
         program = (
             "import os,tty; tty.setraw(0); "
@@ -96,7 +96,7 @@ class FixtureTest(unittest.TestCase):
         self.assertNotIn(b"FIRST_NEW_MARKER", client.buffer)
 
     def test_raw_fixture_reports_geometry_and_unique_echo(self) -> None:
-        directory = Path(tempfile.mkdtemp(prefix="rmx-bench-test-", dir="/tmp"))
+        directory = Path(tempfile.mkdtemp(prefix="msl-bench-test-", dir="/tmp"))
         self.addCleanup(lambda: shutil.rmtree(directory, ignore_errors=True))
         sidechannel = directory / "events.jsonl"
         master, slave = pty.openpty()
@@ -123,7 +123,7 @@ class FixtureTest(unittest.TestCase):
         ready = benchmark.wait_for_event([sidechannel], "ready", 3.0)[0]
         self.assertEqual((ready["columns"], ready["rows"]), (120, 40))
         os.write(master, b"token\n")
-        expected = b"@@RMUX_BENCH_ECHO:unit:746f6b656e@@"
+        expected = b"@@MASIL_BENCH_ECHO:unit:746f6b656e@@"
         output = bytearray()
         deadline = time.monotonic() + 3.0
         while expected not in output and time.monotonic() < deadline:

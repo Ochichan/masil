@@ -1,14 +1,14 @@
 # 에이전트 통합의 최종 목표
 
-공통 결과·실패 처리의 정의는 [신뢰성 계약](reliability.md)을 따른다. 제공된 Herdr 조사 사례는 요구의 근거이며, 해당 문제가 rmux에서 재현됐다는 뜻이 아니다.
+공통 결과·실패 처리의 정의는 [신뢰성 계약](reliability.md)을 따른다. 제공된 Herdr 조사 사례는 요구의 근거이며, 해당 문제가 masil에서 재현됐다는 뜻이 아니다.
 
 ## 원래 TUI를 유지하는 계약
 
-rmux는 pane 안에서 에이전트의 원래 TUI를 실행한다. 원래 composer, transcript, 도구 출력, 승인·질문, slash command, 모델 선택, native session 전환을 사용할 수 있어야 한다.
+masil은 pane 안에서 에이전트의 원래 TUI를 실행한다. 원래 composer, transcript, 도구 출력, 승인·질문, slash command, 모델 선택, native session 전환을 사용할 수 있어야 한다.
 
 PTY는 화면·입력 경로이고, provider adapter는 같은 실행의 식별·관찰·제어 경로다. 상태 정보를 얻기 위해 두 번째 headless agent를 실행하고 이를 원래 TUI의 상태로 표시하지 않는다.
 
-T3 Code의 Codex app-server, Claude SDK, ACP 연동은 원래 TUI를 보여 주는 방식과 다르다. rmux는 그 공통 계약을 참고하되, 시작·연결·프로세스 소유권은 원래 TUI 요구에 맞게 검증한다. OpenCode처럼 같은 backend session을 여러 client가 볼 수 있어도 같은 terminal 화면을 공유하는 것은 아니다.
+T3 Code의 Codex app-server, Claude SDK, ACP 연동은 원래 TUI를 보여 주는 방식과 다르다. masil은 그 공통 계약을 참고하되, 시작·연결·프로세스 소유권은 원래 TUI 요구에 맞게 검증한다. OpenCode처럼 같은 backend session을 여러 client가 볼 수 있어도 같은 terminal 화면을 공유하는 것은 아니다.
 
 ## 최종 기능
 
@@ -85,11 +85,11 @@ R-08에 따라 복구는 대상별 결과를 제공한다. 느린 shell 준비, 
 | Claude Code | 이 Herdr 체크아웃의 integration은 세션 식별을 보고한다. T3의 Agent SDK 경로는 원래 TUI와 다르다. | native TUI·hook 조합의 실제 lifecycle/approval/resume 범위 |
 | 기타 provider | 일반 PTY 실행과 공통 adapter 계약을 적용할 수 있다. | provider마다 버전·연동 방식·capability를 별도 확인 |
 
-이는 rmux의 지원 완료표가 아니다. 원래 TUI 실행은 넓게 허용하고, 구조화된 통합 지원은 증거와 함께 추가한다. 조사한 소스 위치는 [참조 문서](reference/README.md)에 있다.
+이는 masil의 지원 완료표가 아니다. 원래 TUI 실행은 넓게 허용하고, 구조화된 통합 지원은 증거와 함께 추가한다. 조사한 소스 위치는 [참조 문서](reference/README.md)에 있다.
 
 ## tmux와 함께 성립해야 하는 조건
 
-에이전트 목록이나 알림을 위해 기본 키를 재배정하지 않는다. 별도 `rmux-agent` CLI와 `Prefix :`의 `run-shell -b` 경로로 접근하고, 사용자가 전용 binding을 추가할 수 있다. agent mode를 꺼도 [tmux 호환 계약](tmux-compatibility.md)의 모든 기능이 남는다.
+에이전트 목록이나 알림을 위해 기본 키를 재배정하지 않는다. 별도 `masil-agent` CLI와 `Prefix :`의 `run-shell -b` 경로로 접근하고, 사용자가 전용 binding을 추가할 수 있다. agent mode를 꺼도 [tmux 호환 계약](tmux-compatibility.md)의 모든 기능이 남는다.
 
 에이전트가 없는 shell pane, 같은 pane에서 agent 종료 후 shell 복귀, 중첩 SSH, 여러 client의 서로 다른 focus를 포함해 검증한다. 한 agent의 감지 오류나 느린 integration이 terminal 입출력과 다른 pane을 멈추게 하지 않는다.
 

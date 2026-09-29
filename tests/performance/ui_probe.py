@@ -11,7 +11,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_agentd import AGENT, AgentdHarness
-from test_compatibility import RMUX, wait_for
+from test_compatibility import MASIL, wait_for
 from test_ui import Terminal
 from benchmark import process_sample
 
@@ -66,7 +66,7 @@ def main():
         parser.error("seconds must be 1..30")
     result={"kind":"short_ui_idle_probe","platform":platform.platform(),
             "agent_sha256":hashlib.sha256(AGENT.read_bytes()).hexdigest(),
-            "core_sha256":hashlib.sha256(RMUX.read_bytes()).hexdigest(),
+            "core_sha256":hashlib.sha256(MASIL.read_bytes()).hexdigest(),
             "provider":"deterministic GET/SSE fixture, no model or provider TUI",
             "cpu_method":"ps cumulative CPU delta with coarse resolution",
             "samples":[measure(count,args.seconds) for count in (1,50)]}

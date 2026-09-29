@@ -4,7 +4,7 @@
 
 ## 구현 범위
 
-`ui`는 Ratatui/Crossterm 관리 화면, `sidebar`는 기존 rmux 창에 직접 여는 34열 pane이다. 확대는 owned pane의 tmux zoom을 사용한다. 이 버전의 tmux 팝업은 창 전체가 공유하는 modal이므로 사용하지 않는다. 메뉴와 도움말은 UI 안에서 처리한다.
+`ui`는 Ratatui/Crossterm 관리 화면, `sidebar`는 기존 masil 창에 직접 여는 34열 pane이다. 확대는 owned pane의 tmux zoom을 사용한다. 이 버전의 tmux 팝업은 창 전체가 공유하는 modal이므로 사용하지 않는다. 메뉴와 도움말은 UI 안에서 처리한다.
 
 에이전트 목록·검색·필터·상세·확인 표시·pane 이동, 클릭·더블클릭·우클릭·휠·스크롤바·구분선 드래그, 영어·한국어, 세 가지 테마를 구현했다. 기본 tmux 명령 92개와 키·옵션을 유지했다. 코어에는 boot/PTY identity를 읽는 format 두 개만 추가했다.
 
@@ -26,7 +26,7 @@
 - 마우스 버튼을 누른 뒤 밖에서 놓으면 확인하지 않는다. 정상 클릭은 backend의 공유 확인 상태를 바꾼다. provider POST는 발생하지 않는다.
 - UI 메뉴를 닫는 클릭은 뒤쪽 동작으로 전달되지 않는다. 연결이 끊기면 행을 남기고 확인·이동을 비활성화한다.
 - 한글·중문 bracketed paste, 검색 지우기, 영어·한국어 전환, 작은 창으로 변경, 일반 종료와 SIGTERM 후 termios·alternate screen·mouse/paste 모드 복원을 검사했다.
-- SGR 마우스 입력을 실제 rmux 클라이언트에 보내 사이드패널의 Mark seen까지 도달시켰다.
+- SGR 마우스 입력을 실제 masil 클라이언트에 보내 사이드패널의 Mark seen까지 도달시켰다.
 - 사이드패널 재사용, 확대·원래 pane으로 이동, 종료, 상속된 remain-on-exit, 다른 코어 거절, 공유·읽기 전용 클라이언트 거절, respawn된 과거 패널 보존을 검사했다.
 - 두 클라이언트가 같은 session을 볼 때 보이지 않는 창으로 이동하려는 요청도 거절했다. 대상 window뿐 아니라 session의 공유 상태도 명령 실행 시 검사한다.
 - 기존 40열 pane만 줄이지 않고 창 전체에서 사이드패널을 분할한다. 80열 창은 거절하며 실행 경계의 최소 너비 식도 숫자로 비교한다.

@@ -4,7 +4,7 @@
 
 ## 1. Native terminal 경로
 
-기준 tmux의 PTY read callback은 pipe/control 경로와 parser를 처리하고 read를 다시 열 시점을 기존 flow control에 맡긴다. rmux observer는 `window_pane_get_new_data`의 소비자나 control-output offset 소유자로 등록하지 않는다. 느린 observer 때문에 원래 PTY read가 밀리는 구조를 피하기 위해서다.
+기준 tmux의 PTY read callback은 pipe/control 경로와 parser를 처리하고 read를 다시 열 시점을 기존 flow control에 맡긴다. masil observer는 `window_pane_get_new_data`의 소비자나 control-output offset 소유자로 등록하지 않는다. 느린 observer 때문에 원래 PTY read가 밀리는 구조를 피하기 위해서다.
 
 `input_parse_buffer`가 cell을 바꾸고 `screen_write_stop`까지 끝낸 뒤 관찰용 dirty를 표시한다. parsing 중 OSC callback에서 즉시 snapshot을 만들지 않는다. 한 번의 escape sequence 처리 도중 상태를 완성된 화면처럼 읽지 않는다.
 
@@ -28,7 +28,7 @@ copy mode나 다른 mode에서 `wp->screen`은 사용자가 보는 mode 화면�
 
 copy mode에서 스크롤한 위치나 선택 변경은 native UI 상태다. base 화면이 바뀌지 않았다면 agent detector를 다시 돌릴 이유가 없다. observer가 base를 읽기 위해 사용자의 copy mode를 종료하거나 selection을 수정하지 않는다.
 
-binding epoch의 권위는 rmux managed launch wrapper 또는 검증된 integration의 frontend 시작/종료 handshake다. 동일 shell의 PTY/PID만으로 A 실행, shell 복귀, B 실행의 전환을 증명할 수 없다. 검증된 전환에서 이전 run token을 폐기하고 새 frontend run과 native session을 연결한다. native engine이 계속 살아 있어도 종료된 TUI frontend의 binding은 유지하지 않는다.
+binding epoch의 권위는 masil managed launch wrapper 또는 검증된 integration의 frontend 시작/종료 handshake다. 동일 shell의 PTY/PID만으로 A 실행, shell 복귀, B 실행의 전환을 증명할 수 없다. 검증된 전환에서 이전 run token을 폐기하고 새 frontend run과 native session을 연결한다. native engine이 계속 살아 있어도 종료된 TUI frontend의 binding은 유지하지 않는다.
 
 수동 실행·foreground 전환을 해당 integration으로 확인할 수 없으면 `unbound/unknown`으로 표시하고 managed submit을 끈다. 늦게 온 이전 hook이나 title/cwd 유사성으로 새 binding을 확정하지 않는다. 일반 TUI 실행과 직접 입력은 그대로 사용할 수 있다.
 
@@ -111,11 +111,11 @@ truncated snapshot에서 보이지 않는 marker는 `없음`이 아니라 `확�
 
 ## 8. 입력, IME, clipboard
 
-tmux의 key decoder·extended key·escape-time·prefix·paste·copy mode 기본값은 기준 그대로다. core 앞에 Rust key parser나 전역 key hook을 두지 않는다. 원래 TUI와 rmux 자체 menu 입력을 각각 한글/중국어/일본어·AltGr·modifier 조합으로 검증한다.
+tmux의 key decoder·extended key·escape-time·prefix·paste·copy mode 기본값은 기준 그대로다. core 앞에 Rust key parser나 전역 key hook을 두지 않는다. 원래 TUI와 masil 자체 menu 입력을 각각 한글/중국어/일본어·AltGr·modifier 조합으로 검증한다.
 
 관리 prompt는 binary-safe payload와 explicit encoding을 사용한다. Enter를 문자열 끝에 덧붙이면 제출이 된다는 가정은 금지한다. bracketed paste 지원과 native submit capability는 별개다. 입력 크기를 넘으면 접수 전에 거절하며 일부만 보내고 성공을 반환하지 않는다.
 
-copy mode와 selection은 upstream 동작을 우선 보존한다. 추가 UI redraw나 animation 때문에 선택을 새로 만들지 않는다. 기준 tmux에서도 재현되는 결함이면 compatibility 결과와 rmux reliability gap을 둘 다 기록하고 명시적인 수정으로 다룬다. baseline이 같다는 사실만으로 R-06을 통과시키지 않는다.
+copy mode와 selection은 upstream 동작을 우선 보존한다. 추가 UI redraw나 animation 때문에 선택을 새로 만들지 않는다. 기준 tmux에서도 재현되는 결함이면 compatibility 결과와 masil reliability gap을 둘 다 기록하고 명시적인 수정으로 다룬다. baseline이 같다는 사실만으로 R-06을 통과시키지 않는다.
 
 clipboard 결과는 buffer 저장, OSC 52/helper 요청, 확인 가능한 OS clipboard 결과로 나눈다. nested tmux/SSH에서 응답 수단이 없으면 전송 요청까지만 표시한다. 원격 파일 attachment는 로컬 경로를 그대로 넣지 않고 업로드/원격 접근 확인 뒤 native attachment ref를 만든다. 실패하면 placeholder 입력을 agent에 보내지 않는다.
 
@@ -123,9 +123,9 @@ link 클릭은 client별 한 action으로 중복 제거하고 URL scheme과 원�
 
 ## 9. 추가 UI 비용
 
-기본 화면과 status는 바꾸지 않는다. agent 목록은 요청 시 cached projection에서 page/filter로 만든다. opt-in status format은 `rmux_` namespace의 cache callback으로 값만 읽는다. format expansion에서 DB·provider·shell을 호출하지 않는다.
+기본 화면과 status는 바꾸지 않는다. agent 목록은 요청 시 cached projection에서 page/filter로 만든다. opt-in status format은 `masil_` namespace의 cache callback으로 값만 읽는다. format expansion에서 DB·provider·shell을 호출하지 않는다.
 
-상태 변경은 영향받는 client의 status redraw만 요청하고 짧은 coalescing window를 둔다. tmux user option `@rmux_*`를 매 token마다 갱신하지 않는다. 현재 upstream option 변경 경로는 전역 style/redraw 처리를 유발할 수 있다.
+상태 변경은 영향받는 client의 status redraw만 요청하고 짧은 coalescing window를 둔다. tmux user option `@masil_*`를 매 token마다 갱신하지 않는다. 현재 upstream option 변경 경로는 전역 style/redraw 처리를 유발할 수 있다.
 
 menu는 client-owned다. 지속 목록 pane은 native shared pane이므로 같은 window를 보는 사용자에게도 보인다. 기본 키를 추가하거나 이 목록 때문에 다른 pane을 자동 축소하지 않는다. narrow terminal에서는 page/filter가 계속 가능해야 한다.
 

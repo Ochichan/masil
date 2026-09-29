@@ -1,5 +1,5 @@
 
-rmux  Agent desk  Observer connected                                                   l EN   t Dark   ? Help   q Close
+masil  Agent desk  Observer connected                                                  l EN   t Dark   ? Help   q Close
 
  All 2   Attention 1   Working 1   Unavailable 0
 
@@ -29,4 +29,4 @@ rmux  Agent desk  Observer connected                                            
 
 Expanded agent sidebar
 Shared window layout
-[main] 0:rmux-agent*Z 1:cat                                                                     "debian" 13:34 28-Sep-26
+[main] 0:masil-agent*Z 1:cat                                                                    "debian" 13:34 28-Sep-26

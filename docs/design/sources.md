@@ -1,6 +1,6 @@
 # 기술 선택의 근거
 
-조사 기준일은 2026-09-28이다. 로컬 source 사실, official library 문서, rmux의 설계 판단을 구분한다. 아래 링크는 성능 목표를 달성했다는 증거가 아니다. library version은 구현 시 lockfile과 build 기록으로 고정한다.
+조사 기준일은 2026-09-28이다. 로컬 source 사실, official library 문서, masil의 설계 판단을 구분한다. 아래 링크는 성능 목표를 달성했다는 증거가 아니다. library version은 구현 시 lockfile과 build 기록으로 고정한다.
 
 ## 1. tmux의 실제 실행 경로
 
@@ -14,7 +14,7 @@
 | mode가 pane의 표시 screen을 바꿀 수 있음 | [window.c:1722](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/window.c#L1722), [window-copy.c:392](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/window-copy.c#L392) | snapshot은 원래 base grid 사용 |
 | active grid에는 history offset이 있고 alternate screen 전이가 있음 | [grid.c:31](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/grid.c#L31), [screen.c:692](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/screen.c#L692) | active rows와 screen generation 검증 |
 | pane-created가 layout 최종 선택보다 앞서며, pane-resized는 resize 후 보고 | [spawn.c:590](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/spawn.c#L590), [window.c:1655](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/window.c#L1655) | lifecycle event와 완성된 snapshot을 구분 |
-| foreground run-shell은 client queue를 기다리게 함 | [cmd-run-shell.c:125](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/cmd-run-shell.c#L125), [cmd-queue.c:719](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/cmd-queue.c#L719) | rmux helper 예시는 run-shell -b |
+| foreground run-shell은 client queue를 기다리게 함 | [cmd-run-shell.c:125](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/cmd-run-shell.c#L125), [cmd-queue.c:719](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/cmd-queue.c#L719) | masil helper 예시는 run-shell -b |
 | active pane/current window는 window/session 공유 상태 | [cmd-select-pane.c:64](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/cmd-select-pane.c#L64), [cmd-switch-client.c:149](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/cmd-switch-client.c#L149) | client-only focus의 공유 충돌 명시 |
 | native spawn의 chdir 실패에는 대체 경로가 있음 | [spawn.c:469](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/spawn.c#L469) | managed child에서 별도 strict cwd |
 | tty queue와 실제 write, slow client discard는 다른 단계 | [tty.c:221](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/tty.c#L221), [tty.c:639](https://github.com/tmux/tmux/blob/94796f6b1182507efac8a272fc309a79e22e58a5/tty.c#L639) | physical display 성공을 주장하지 않음 |
@@ -40,7 +40,7 @@ WAL은 동시에 writer 하나를 허용하고, 긴 reader는 checkpoint 진행�
 
 WAL에서 FULL은 commit의 sync를 요청한다. NORMAL과 전원/OS 장애 durability가 같다고 취급하지 않는다. macOS의 fullfsync 계열 설정도 별도다. [synchronous](https://sqlite.org/pragma.html#pragma_synchronous), [fullfsync](https://sqlite.org/pragma.html#pragma_fullfsync), [checkpoint_fullfsync](https://sqlite.org/pragma.html#pragma_checkpoint_fullfsync).
 
-공식 문서는 WAL reset bug가 3.7.0~3.51.2에 존재했을 가능성과 동시 write/checkpoint 조건을 설명하며 3.51.3 및 일부 backport 수정을 제시한다. 구현 dependency는 수정 포함 여부를 확인해 고정한다. [WAL reset bug](https://sqlite.org/wal.html#the_wal_reset_bug), [3.51.3 release](https://sqlite.org/releaselog/3_51_3.html). 이 기록은 현재 rmux에 취약 dependency가 설치됐다는 뜻이 아니다.
+공식 문서는 WAL reset bug가 3.7.0~3.51.2에 존재했을 가능성과 동시 write/checkpoint 조건을 설명하며 3.51.3 및 일부 backport 수정을 제시한다. 구현 dependency는 수정 포함 여부를 확인해 고정한다. [WAL reset bug](https://sqlite.org/wal.html#the_wal_reset_bug), [3.51.3 release](https://sqlite.org/releaselog/3_51_3.html). 이 기록은 현재 masil에 취약 dependency가 설치됐다는 뜻이 아니다.
 
 ## 4. C JSON codec
 
@@ -56,6 +56,6 @@ regex의 단일 search와 match 반복 열거는 최악 비용이 다를 수 있
 
 ## 6. Source가 결정하지 않는 것
 
-C core + Rust agentd 분리, FULL admission 순서, 관찰 area·Hz·pool 상한, RSS/latency 목표는 rmux의 설계 선택이다. upstream의 benchmark나 제공된 Herdr 사례에서 이 숫자를 얻은 것이 아니다. [성능 matrix](performance.md)를 실행해 검증한다.
+C core + Rust agentd 분리, FULL admission 순서, 관찰 area·Hz·pool 상한, RSS/latency 목표는 masil의 설계 선택이다. upstream의 benchmark나 제공된 Herdr 사례에서 이 숫자를 얻은 것이 아니다. [성능 matrix](performance.md)를 실행해 검증한다.
 
 작은 native runtime이 JavaScript runtime보다 이 제품에서 얼마나 빠를지는 아직 측정하지 않았다. 현재 선택의 근거는 runtime 이름 자체가 아니라 raw output 중복 처리 제거, 기본 기능의 지연 활성화, shared-state 소유권, bounded 작업량이다.

@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
-#include "rmux-bridge.h"
+#include "masil-bridge.h"
 
 /*
  * Set up the environment and create a new window and pane or a new pane.
@@ -319,7 +319,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 			return (NULL);
 		}
 		/* Invalidate the old PTY before teardown, even if the fork fails. */
-		rmux_bridge_pty_changed(sc->wp0);
+		masil_bridge_pty_changed(sc->wp0);
 		if (sc->wp0->event != NULL) {
 			bufferevent_free(sc->wp0->event);
 			sc->wp0->event = NULL;
@@ -479,7 +479,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 
 	/* Fork the new process. */
 	if (~sc->flags & SPAWN_RESPAWN)
-		rmux_bridge_pty_changed(new_wp);
+		masil_bridge_pty_changed(new_wp);
 	new_wp->pid = fdforkpty(ptm_fd, &new_wp->fd, new_wp->tty, NULL, &ws);
 	if (new_wp->pid == -1) {
 		xasprintf(cause, "fork failed: %s", strerror(errno));

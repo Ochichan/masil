@@ -1,0 +1,108 @@
++ PATH=/bin:/usr/bin
++ TERM=screen
++ LC_ALL=C.UTF-8
++ export TERM LC_ALL
++ '[' -z /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil ']'
++ TMUX=
++ TMUX2=
++ SETUP=0
++ RESULTS=screen-redraw-results
+++ mktemp
++ TMP=/var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.GweeArU2BS
+++ mktemp
++ TMP2=/var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.G6bOtyoQTa
++ trap cleanup 0 1 15
++ C='sh -c '\''i=0; while [ $i -lt 13 ]; do printf "MENU%02d abcdefghij\n" $i; i=$((i + 1)); done; exec sleep 100'\'''
++ setup 40 14
++ '[' -n '' ']'
++ '[' -n '' ']'
++ SETUP=1
++ TMUX='/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null'
++ TMUX2='/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null'
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null new -d -x40 -y14 'sh -c '\''i=0; while [ $i -lt 13 ]; do printf "MENU%02d abcdefghij\n" $i; i=$((i + 1)); done; exec sleep 100'\'''
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null set -g status off
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null set -g window-size manual
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null resizew -x40 -y14
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null setw menu-style fg=colour250,bg=colour235
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null setw menu-selected-style fg=colour16,bg=colour220
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null setw menu-border-style fg=colour45,bg=colour235
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null new -d -x40 -y14
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null set -g status off
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null set -g window-size manual
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null set -g default-terminal tmux-256color
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null send -l '/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null attach'
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null send Enter
++ sleep 1
++ menu -x6 -y8
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null display-menu -T Menu -C 1 -x6 -y8 'Alpha item' a '' 'Beta item' b '' '' '' '' 'Gamma item' g ''
++ sleep 1
++ compare menu-basic
++ sleep 1
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null capturep -pe
++ trim
++ awk '
+		{ lines[NR] = $0 }
+		END {
+			n = NR
+			while (n > 0 && lines[n] == "")
+				n--
+			for (i = 1; i <= n; i++)
+				print lines[i]
+		}
+	' /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.GweeArU2BS
++ mv /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.G6bOtyoQTa /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.GweeArU2BS
++ '[' -n '' ']'
++ cmp -s /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.GweeArU2BS screen-redraw-results/menu-basic.result
++ setup 40 14
++ '[' -n '/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null' ']'
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-1 -f/dev/null kill-server
++ '[' -n '/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null' ']'
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-1 -f/dev/null kill-server
++ SETUP=2
++ TMUX='/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null'
++ TMUX2='/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null'
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null new -d -x40 -y14 'sh -c '\''i=0; while [ $i -lt 13 ]; do printf "MENU%02d abcdefghij\n" $i; i=$((i + 1)); done; exec sleep 100'\'''
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null set -g status off
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null set -g window-size manual
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null resizew -x40 -y14
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null setw menu-style fg=colour250,bg=colour235
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null setw menu-selected-style fg=colour16,bg=colour220
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null setw menu-border-style fg=colour45,bg=colour235
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null new -d -x40 -y14
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null set -g status off
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null set -g window-size manual
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null set -g default-terminal tmux-256color
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null send -l '/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null attach'
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null send Enter
++ sleep 1
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null splitw -h 'sh -c '\''i=0; while [ $i -lt 13 ]; do printf "MENU%02d abcdefghij\n" $i; i=$((i + 1)); done; exec sleep 100'\'''
++ menu -x8 -y9
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null display-menu -T Menu -C 1 -x8 -y9 'Alpha item' a '' 'Beta item' b '' '' '' '' 'Gamma item' g ''
++ sleep 1
++ compare menu-over-split
++ sleep 1
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null capturep -pe
++ trim
++ awk '
+		{ lines[NR] = $0 }
+		END {
+			n = NR
+			while (n > 0 && lines[n] == "")
+				n--
+			for (i = 1; i <= n; i++)
+				print lines[i]
+		}
+	' /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.GweeArU2BS
++ mv /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.G6bOtyoQTa /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.GweeArU2BS
++ '[' -n '' ']'
++ cmp -s /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.GweeArU2BS screen-redraw-results/menu-over-split.result
++ fail 'scene menu-over-split differs from screen-redraw-results/menu-over-split.result'
++ echo 'scene menu-over-split differs from screen-redraw-results/menu-over-split.result'
+scene menu-over-split differs from screen-redraw-results/menu-over-split.result
++ exit 1
++ cleanup
++ rm -f /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.GweeArU2BS /var/folders/1s/kq3txztn40jcc08k_2nvymk40000gn/T/tmp.G6bOtyoQTa
++ '[' -n '/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null' ']'
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestA1685-2 -f/dev/null kill-server
++ '[' -n '/Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null' ']'
++ /Users/ochi/Documents/Projects/masil/.build/regress-faa3788fa9e7/bin/masil -LtestB1685-2 -f/dev/null kill-server

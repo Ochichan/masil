@@ -123,7 +123,7 @@ layout_set_previous(struct window *w)
 	return (layout);
 }
 
-/* rmux: whether a pane is tiled, not floating alone or in a group. */
+/* masil: whether a pane is tiled, not floating alone or in a group. */
 static int
 layout_set_is_tiled(struct window_pane *wp)
 {
@@ -131,7 +131,7 @@ layout_set_is_tiled(struct window_pane *wp)
 }
 
 /*
- * rmux: the cell a preset links for a pane. A floating group is linked once,
+ * masil: the cell a preset links for a pane. A floating group is linked once,
  * as a whole, when its first pane is seen.
  */
 static struct layout_cell *
@@ -148,7 +148,7 @@ layout_set_pane_cell(struct window_pane *wp)
 }
 
 /*
- * rmux: take floating groups out of the tree so freeing its nodes keeps them;
+ * masil: take floating groups out of the tree so freeing its nodes keeps them;
  * they are linked again with the other floating cells. Other pane cells lose
  * their parent, which is about to be freed.
  */

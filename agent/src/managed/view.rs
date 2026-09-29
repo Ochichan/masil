@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-const OPTION: &str = "@rmux-agent-view";
+const OPTION: &str = "@masil-agent-view";
 const VERSION: u32 = 1;
 const MAX_WORKSPACES: usize = 64;
 const STATES: [&str; 5] = ["idle", "working", "blocked", "unknown", "exited"];

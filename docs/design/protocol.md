@@ -7,7 +7,7 @@
 | 연결 | 역할 | 수명 |
 | --- | --- | --- |
 | core ↔ agentd | 선택한 object의 수명·snapshot·guarded action·요약 cache | core boot마다 인증된 coordinator 하나 |
-| rmux-agent CLI ↔ agentd | 관리 요청, 결과 조회, wait, 사용자 확인 | 요청 또는 wait 동안 |
+| masil-agent CLI ↔ agentd | 관리 요청, 결과 조회, wait, 사용자 확인 | 요청 또는 wait 동안 |
 | provider integration ↔ agentd | 해당 run의 hook·native event | 가능한 경우 연결 재사용 |
 | remote metadata bridge ↔ agentd | 원격 environment의 관리 정보 | 명시적으로 연결한 동안 |
 
@@ -40,7 +40,7 @@ provider hook에는 run별 token과 허용 event 범위를 부여한다. token�
 | object_ref | boot ID + 종류 + native ID + object generation. 제거 후 재사용 혼동 금지 |
 | pty_generation | 같은 pane의 respawn/PTY 교체 때 증가 |
 | binding_epoch | 같은 PTY shell에서 agent가 끝나고 새 agent가 실행되는 경우도 구분 |
-| run_id / native_session_ref | rmux 실행 수명과 provider 대화 ID. 서로 대체 불가 |
+| run_id / native_session_ref | masil 실행 수명과 provider 대화 ID. 서로 대체 불가 |
 | client_ref | boot ID + 연결 ID + attach generation |
 | screen_generation | 출력·resize·reflow·reset·alternate screen 전환을 모두 반영 |
 | stream_epoch / event_seq | 관찰 stream 재설정과 그 안의 순서 |
@@ -155,7 +155,7 @@ event gap/연결 상실 후 검증할 수 없으면 `observation_lost`로 wait�
 
 ## 9. CLI와 종료 코드 초안
 
-`rmux-agent launch`, `observe`, `status`, `prompt`, `approval`, `wait`, `focus`, `ack`, `restore`, `job`, `doctor`를 별도 executable에 둔다. 이것은 subcommand 설계 목록이며 이미 지원되는 CLI 안내가 아니다. tmux의 명령 축약 namespace에는 추가하지 않는다.
+`masil-agent launch`, `observe`, `status`, `prompt`, `approval`, `wait`, `focus`, `ack`, `restore`, `job`, `doctor`를 별도 executable에 둔다. 이것은 subcommand 설계 목록이며 이미 지원되는 CLI 안내가 아니다. tmux의 명령 축약 namespace에는 추가하지 않는다.
 
 machine output은 schema version·operation ID·receipt·error code가 있는 JSON이다. CLI exit 0은 호출자가 지정한 기다림 단계가 확인됐다는 뜻이다. 기본 단계는 `accepted_durable`이며 `--wait-for started/ended` 같은 명시적 조건과 함께 출력한다. 일반 조회는 조회 성공을 뜻한다. 사람용 출력도 `접수됨`과 `작업 시작됨`을 구분한다.
 
@@ -163,7 +163,7 @@ machine output은 schema version·operation ID·receipt·error code가 있는 JS
 
 ## 10. 원격 전송
 
-터미널 attach는 native SSH PTY와 native rmux client 경로다. metadata bridge는 별도 비대화형 SSH 연결에서 framed stream을 전달한다. 서로의 backpressure가 같은 application queue를 공유하지 않는다.
+터미널 attach는 native SSH PTY와 native masil client 경로다. metadata bridge는 별도 비대화형 SSH 연결에서 framed stream을 전달한다. 서로의 backpressure가 같은 application queue를 공유하지 않는다.
 
 SSH 명령에는 고정된 helper 진입점만 두고 cwd·prompt·파일 경로는 stdin frame으로 전달한다. 원격 shell quoting으로 payload를 구성하지 않는다. 인증 재요청은 해당 environment의 상태와 인증 안내로 반환한다. status 조회나 reconnect가 사용자가 중지한 원격 server/agentd를 다시 시작하지 않는다.
 

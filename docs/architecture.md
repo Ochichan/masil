@@ -1,4 +1,4 @@
-# rmux 성능 중심 아키텍처
+# masil 성능 중심 아키텍처
 
 상태: 2026-09-28 설계 선택. 사용자가 언어·기술 스택 선정을 위임한 조건에서 선택했다. 이후 터미널 코어와 읽기 전용 관찰 IPC를 구현했다. [실제 구현 범위](implementation-status.md)와 [검증 기록](validation/2026-09-28-core.md)을 별도로 관리한다. 이 문서의 agentd·저장·관리 설계와 예산은 여전히 구현 및 검증 목표다.
 
@@ -6,9 +6,9 @@
 
 **tmux C/libevent 코어를 작은 patch 집합으로 확장하고, 에이전트 제어·관찰·저장은 필요할 때 시작하는 Rust 프로세스로 분리한다.**
 
-- `rmux`: pinned tmux fork의 native client/server. PTY, key table, VT parser, grid/history, layout, terminal 출력과 tmux 명령을 소유한다.
-- `rmux-agent`: 하나의 Rust 실행 파일. CLI 요청, hook 보고, 그리고 `serve` 역할의 장기 실행 관리 프로세스로 사용한다. 이후 문서에서는 장기 실행 역할을 agentd라고 부른다.
-- 에이전트 프로그램은 기존 설치본을 그대로 PTY에서 실행한다. provider마다 별도의 rmux 터미널 parser나 rendering runtime을 만들지 않는다.
+- `masil`: pinned tmux fork의 native client/server. PTY, key table, VT parser, grid/history, layout, terminal 출력과 tmux 명령을 소유한다.
+- `masil-agent`: 하나의 Rust 실행 파일. CLI 요청, hook 보고, 그리고 `serve` 역할의 장기 실행 관리 프로세스로 사용한다. 이후 문서에서는 장기 실행 역할을 agentd라고 부른다.
+- 에이전트 프로그램은 기존 설치본을 그대로 PTY에서 실행한다. provider마다 별도의 masil 터미널 parser나 rendering runtime을 만들지 않는다.
 - agentd가 없거나 정지해도 tmux 기능과 원래 agent TUI 입출력은 유지된다. 추가 상태는 stale/unknown으로 바뀌고 추가 제어는 명시적으로 거절하거나 대기 상태를 보여 준다.
 
 ### 선택한 스택
@@ -22,7 +22,7 @@
 | 내부 control IPC | Unix stream socket, 길이 제한 frame, C yyjson / Rust serde_json | 저빈도 의미 이벤트만 전달. 고정 pool·depth·중복 key 검증. C/Rust 공유 heap 없음 |
 | 제공자 연결 | 재사용하는 hook/plugin socket 또는 동일 native session의 HTTP/SSE 등 | 토큰별 새 프로세스·full transcript 동기화·두 번째 headless engine을 만들지 않음 |
 | 공통 UI | tmux의 menu/mode와 cached metadata | 기본 status/key 동작을 유지. 새 UI는 사용자가 열 때 동작하고 지속 animation을 두지 않음 |
-| 원격 | 기존 OpenSSH + 원격 native rmux attach, 필요한 경우 별도 metadata bridge | 원래 터미널 경로를 Rust/JSON으로 relay하지 않음. 조회가 원격 server를 재시작하지 않음 |
+| 원격 | 기존 OpenSSH + 원격 native masil attach, 필요한 경우 별도 metadata bridge | 원래 터미널 경로를 Rust/JSON으로 relay하지 않음. 조회가 원격 server를 재시작하지 않음 |
 | 빌드 | tmux build 유지 + 별도 Cargo build | 하나의 언어로 통합하기 위한 전면 재작성보다 upstream 비교와 변경 격리가 우선 |
 
 구체적인 crate/library version은 구현을 시작할 때 official source와 지원 OS에서 확인해 고정한다. 기존 소스의 version과 새로 선택할 dependency version을 혼동하지 않는다.
@@ -46,17 +46,17 @@ stock wrapper 비교가 같은 계약과 성능을 더 작은 변경으로 충�
 
 ```mermaid
 flowchart TB
-  U[사용자의 host terminal] <--> C[rmux client/server · C/libevent]
+  U[사용자의 host terminal] <--> C[masil client/server · C/libevent]
   C <--> P[PTY · 원래 agent TUI / shell]
   C --> G[기존 VT parser · grid/history · renderer]
   G --> U
-  C <-->|작은 의미 이벤트·요청한 snapshot| A[rmux-agent serve · Rust]
+  C <-->|작은 의미 이벤트·요청한 snapshot| A[masil-agent serve · Rust]
   H[같은 실행의 hook / plugin / provider API] <--> A
   A <-->|명령·관찰·확인 기록| D[전용 SQLite writer]
   A --> J[필요할 때만 실행하는 파일·Git·SSH 작업]
 ```
 
-도식의 rmux client/server는 upstream의 실제 tty 소유권을 그대로 따른다. 새 client renderer를 추가한다는 뜻이 아니다. core가 client terminal로 출력한 사실과 host terminal이 물리 화면에 그렸다는 사실도 구분한다.
+도식의 masil client/server는 upstream의 실제 tty 소유권을 그대로 따른다. 새 client renderer를 추가한다는 뜻이 아니다. core가 client terminal로 출력한 사실과 host terminal이 물리 화면에 그렸다는 사실도 구분한다.
 
 ### 입력 경로
 
@@ -72,7 +72,7 @@ PTY parse batch 완료와 resize·reflow·reset·alternate screen 전환에서 �
 
 ### 관리 요청 경로
 
-`rmux-agent` 요청 → 대상·권한·operation ID 검증 → durable 접수 → dispatch 가능 여부 확인 → durable dispatch 의도 → 실제 효과 → 확인된 결과 기록이다. fsync 지연은 이 경로의 접수·효과 시작에만 영향을 주고 직접 typing에는 영향을 주지 않는다.
+`masil-agent` 요청 → 대상·권한·operation ID 검증 → durable 접수 → dispatch 가능 여부 확인 → durable dispatch 의도 → 실제 효과 → 확인된 결과 기록이다. fsync 지연은 이 경로의 접수·효과 시작에만 영향을 주고 직접 typing에는 영향을 주지 않는다.
 
 ## 4. 불변식
 
@@ -87,17 +87,17 @@ PTY parse batch 완료와 resize·reflow·reset·alternate screen 전환에서 �
 | I-07 | 상태 관찰이 불가능해도 원래 TUI는 작동한다. unsupported와 idle을 구분한다. |
 | I-08 | agentd의 thread·timer·worker 수를 logical CPU 수나 pane 수에 선형으로 늘리지 않는다. |
 | I-09 | 복구·confirmation·snapshot은 대상별 결과와 확인 단계가 있다. |
-| I-10 | 자원 한도를 위해 기존 tmux history·buffer·client 기능을 조용히 축소하지 않는다. 한도는 rmux 추가 처리에 적용한다. |
+| I-10 | 자원 한도를 위해 기존 tmux history·buffer·client 기능을 조용히 축소하지 않는다. 한도는 masil 추가 처리에 적용한다. |
 
 ## 5. 호환 실행과 확장 접근
 
 tmux의 `cmd_table`, 기본 옵션 이름 lookup, 308개 기본 binding은 upstream을 유지한다. `agent-*`를 기존 command registry에 추가하지 않는다. 기존 명령의 짧은 prefix가 새 명령 때문에 모호해지는 것을 막기 위해서다.
 
-에이전트 명령은 별도 실행 파일 `rmux-agent`에 둔다. command prompt에서는 기존 `run-shell -b`로 접근해 helper 대기를 client 키 처리 앞에 놓지 않는다. 기본 단축키는 추가하지 않으며 사용자가 원하는 키에 이 경로를 bind할 수 있다. 실제 옵션 문법은 [protocol 문서](design/protocol.md)에 정의한 동작을 구현할 때 고정한다.
+에이전트 명령은 별도 실행 파일 `masil-agent`에 둔다. command prompt에서는 기존 `run-shell -b`로 접근해 helper 대기를 client 키 처리 앞에 놓지 않는다. 기본 단축키는 추가하지 않으며 사용자가 원하는 키에 이 경로를 bind할 수 있다. 실제 옵션 문법은 [protocol 문서](design/protocol.md)에 정의한 동작을 구현할 때 고정한다.
 
-tmux를 하드코딩한 script에는 rmux 환경에서만 선택적으로 활성화하는 `tmux` 호환 진입점을 제공한다. system tmux 실행 파일을 덮어쓰지 않는다. 기본 tmux config·plugin의 동작과 `TMUX`/`TMUX_PANE`의 대상 관계를 별도 검증한다. 패키지 이름·선택한 server namespace만으로 stock tmux와 socket을 섞지 않는다.
+tmux를 하드코딩한 script에는 masil 환경에서만 선택적으로 활성화하는 `tmux` 호환 진입점을 제공한다. system tmux 실행 파일을 덮어쓰지 않는다. 기본 tmux config·plugin의 동작과 `TMUX`/`TMUX_PANE`의 대상 관계를 별도 검증한다. 패키지 이름·선택한 server namespace만으로 stock tmux와 socket을 섞지 않는다.
 
-rmux 전용 설정은 별도 agent 설정에 둔다. 추가 metadata format은 명확한 `rmux_` namespace를 사용하고 agent 확장을 켠 경우의 추가 정보임을 문서화한다. 기존 format 값이나 option abbreviation은 바꾸지 않는다.
+masil 전용 설정은 별도 agent 설정에 둔다. 추가 metadata format은 명확한 `masil_` namespace를 사용하고 agent 확장을 켠 경우의 추가 정보임을 문서화한다. 기존 format 값이나 option abbreviation은 바꾸지 않는다.
 
 ## 6. Module과 소유권
 

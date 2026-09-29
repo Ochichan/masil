@@ -18,7 +18,7 @@
 
 이 설정은 기존 global config를 제거하는 보장을 뜻하지 않는다. 검증 시에는 HOME과 XDG config/data/state/cache도 임시 directory로 분리하고 project config·기본 plugin을 끈다. 사용자 설정을 자동으로 덮어쓰거나 설치하지 않는다.
 
-plugin은 같은 TUI process에서 `process.env`를 읽거나 `node:net`의 UDS로 연결할 수 있다. 실제 rmux wire format은 4-byte big-endian 길이 + JSON이다. 그러나 private socket과 same-UID 검사는 **어느 pane/PTY에 속한 frontend인지 증명하지 않는다**.
+plugin은 같은 TUI process에서 `process.env`를 읽거나 `node:net`의 UDS로 연결할 수 있다. 실제 masil wire format은 4-byte big-endian 길이 + JSON이다. 그러나 private socket과 same-UID 검사는 **어느 pane/PTY에 속한 frontend인지 증명하지 않는다**.
 
 ## 다음 binding 구현의 통과 조건
 

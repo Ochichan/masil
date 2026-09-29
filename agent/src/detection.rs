@@ -55,10 +55,10 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Loads the 22 bundled manifests and any local rmux overrides.
+    /// Loads the 22 bundled manifests and any local masil overrides.
     ///
-    /// Overrides live in `$XDG_CONFIG_HOME/rmux/agent-detection`, falling
-    /// back to `~/.config/rmux/agent-detection`. A present invalid override
+    /// Overrides live in `$XDG_CONFIG_HOME/masil/agent-detection`, falling
+    /// back to `~/.config/masil/agent-detection`. A present invalid override
     /// fails the load rather than silently weakening detection.
     pub fn load() -> Result<Self, String> {
         let mut engine = Self::load_bundled()?;
@@ -953,16 +953,16 @@ fn unknown_explanation(
 
 fn override_directory() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(path).join("rmux").join("agent-detection"));
+        return Some(PathBuf::from(path).join("masil").join("agent-detection"));
     }
     if cfg!(windows)
         && let Some(path) = std::env::var_os("APPDATA")
     {
-        return Some(PathBuf::from(path).join("rmux").join("agent-detection"));
+        return Some(PathBuf::from(path).join("masil").join("agent-detection"));
     }
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|path| path.join(".config").join("rmux").join("agent-detection"))
+        .map(|path| path.join(".config").join("masil").join("agent-detection"))
 }
 
 fn read_override(path: &std::path::Path) -> Result<Vec<u8>, String> {

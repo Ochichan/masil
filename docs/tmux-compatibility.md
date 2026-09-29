@@ -2,7 +2,7 @@
 
 ## 범위와 기준
 
-tmux에서 가능한 기능을 rmux에서도 모두 제공한다. 호환 대상은 익숙한 단축키 몇 개가 아니라 터미널 동작, 명령과 출력, 설정, 자동화, client 연결, control mode까지 포함하는 사용자 관찰 가능 동작이다.
+tmux에서 가능한 기능을 masil에서도 모두 제공한다. 호환 대상은 익숙한 단축키 몇 개가 아니라 터미널 동작, 명령과 출력, 설정, 자동화, client 연결, control mode까지 포함하는 사용자 관찰 가능 동작이다.
 
 초기 기준은 tmux `94796f6b1182507efac8a272fc309a79e22e58a5`, `configure.ac`의 `next-3.9`다. 이 개발판에 있는 floating pane과 새 layout 관련 기능도 범위에 포함한다. 기준 파일과 목록은 [참조 문서](reference/README.md)에 기록한다.
 
@@ -13,12 +13,12 @@ tmux에서 가능한 기능을 rmux에서도 모두 제공한다. 호환 대상�
 1. 같은 초기 상태·설정·터미널 조건에서 같은 조작을 하면 같은 의미의 결과가 나와야 한다.
 2. 명령 이름·alias·인자·flag·target·기본값·실패 조건·exit status를 유지한다.
 3. 기계가 읽는 출력과 이벤트는 필드·escaping·순서·블록 경계를 유지한다. timestamp, PID, socket 경로 등 실행마다 다른 값은 관계를 보존해 비교한다.
-4. 사람이 조작하는 화면은 키 안내, 선택, focus, mode, pane geometry, terminal cell 내용을 포함해 비교한다. rmux 고유의 탐색 UI는 허용하되, 같은 pane 영역에서의 터미널 동작과 사용자 지정 status/format의 의미를 유지한다. 기능 존재 여부만 확인하지 않는다.
+4. 사람이 조작하는 화면은 키 안내, 선택, focus, mode, pane geometry, terminal cell 내용을 포함해 비교한다. masil 고유의 탐색 UI는 허용하되, 같은 pane 영역에서의 터미널 동작과 사용자 지정 status/format의 의미를 유지한다. 기능 존재 여부만 확인하지 않는다.
 5. 원래 tmux가 OS나 terminal capability에 따라 제한하는 기능은 같은 조건에서 비교한다. 환경 의존성은 기능 삭제의 근거가 아니다.
-6. 더 안전하거나 편리해 보인다는 이유로 기본 의미를 조용히 바꾸지 않는다. rmux 확장은 명시한 추가 동작으로 제공한다.
-7. `-f` 없이 시작하면 [rmux UI 레이어](mouse-ui.md)를 사용자 설정보다 먼저 적용한다. 레이어는 옵션 값과 기본 바인딩이 없는 키(`MouseDown1Control0`~`6`, pane 제목의 `MouseUp1Control3`·`MouseDrag1Control3`, prefix 뒤 `C-s`·`C-r`)만 바꾸며, 옵션 표·키 표의 기본값은 그대로다. 같은 조건의 stock tmux와 비교할 때는 `-f`로 시작한다. `status-position`의 `left`, `right`는 rmux 확장 값이다. `split-window -G`도 rmux 확장이다. floating pane을 floating 묶음 안에서 나누며, 묶음은 한 덩어리로 움직이고 크기가 바뀌고 앞으로 나온다. 묶음이 없는 창에서 floating·tiling 명령은 stock tmux와 같게 동작한다.
+6. 더 안전하거나 편리해 보인다는 이유로 기본 의미를 조용히 바꾸지 않는다. masil 확장은 명시한 추가 동작으로 제공한다.
+7. `-f` 없이 시작하면 [masil UI 레이어](mouse-ui.md)를 사용자 설정보다 먼저 적용한다. 레이어는 옵션 값과 기본 바인딩이 없는 키(`MouseDown1Control0`~`6`, pane 제목의 `MouseUp1Control3`·`MouseDrag1Control3`, prefix 뒤 `C-s`·`C-r`)만 바꾸며, 옵션 표·키 표의 기본값은 그대로다. 같은 조건의 stock tmux와 비교할 때는 `-f`로 시작한다. `status-position`의 `left`, `right`는 masil 확장 값이다. `split-window -G`도 masil 확장이다. floating pane을 floating 묶음 안에서 나누며, 묶음은 한 덩어리로 움직이고 크기가 바뀌고 앞으로 나온다. 묶음이 없는 창에서 floating·tiling 명령은 stock tmux와 같게 동작한다.
 
-[신뢰성 계약](reliability.md)의 단계별 응답은 rmux 추가 기능에 적용한다. 예를 들어 호환 `send-keys`의 성공은 기존 tmux 의미를 유지하며, 이를 agent의 prompt 수락으로 확대하지 않는다. 추가 관찰 경로로 provider 수락을 확인할 수 있어도 기존 exit status나 control-mode 출력에 임의의 field를 삽입하지 않는다.
+[신뢰성 계약](reliability.md)의 단계별 응답은 masil 추가 기능에 적용한다. 예를 들어 호환 `send-keys`의 성공은 기존 tmux 의미를 유지하며, 이를 agent의 prompt 수락으로 확대하지 않는다. 추가 관찰 경로로 provider 수락을 확인할 수 있어도 기존 exit status나 control-mode 출력에 임의의 field를 삽입하지 않는다.
 
 ## 필수 기능군
 
@@ -59,9 +59,9 @@ tmux에서 가능한 기능을 rmux에서도 모두 제공한다. 호환 대상�
 
 ## CLI, 설정, plugin의 호환
 
-- `rmux` 진입점에서 tmux 명령 문법과 조작 의미를 제공한다.
-- `.tmux.conf`, 추가 source 파일, `@user-option`, format/hook, shell command 조합을 해석할 수 있어야 한다. 실제 탐색 경로와 우선순위는 기준 동작 및 명시적인 rmux 확장 규칙으로 문서화한다.
-- `tmux`를 하드코딩한 기존 스크립트도 rmux 환경을 조작할 수 있는 호환 진입점이 필요하다. 선택적 전용 경로의 shim을 제공하는 [배포 설계](design/implementation-plan.md)를 따르며, 설치된 tmux 실행 파일을 조용히 덮어쓰지 않는다. 절대 경로로 stock tmux를 호출하는 script는 명시적 설정이 필요하다.
+- `masil` 진입점에서 tmux 명령 문법과 조작 의미를 제공한다.
+- `.tmux.conf`, 추가 source 파일, `@user-option`, format/hook, shell command 조합을 해석할 수 있어야 한다. 실제 탐색 경로와 우선순위는 기준 동작 및 명시적인 masil 확장 규칙으로 문서화한다.
+- `tmux`를 하드코딩한 기존 스크립트도 masil 환경을 조작할 수 있는 호환 진입점이 필요하다. 선택적 전용 경로의 shim을 제공하는 [배포 설계](design/implementation-plan.md)를 따르며, 설치된 tmux 실행 파일을 조용히 덮어쓰지 않는다. 절대 경로로 stock tmux를 호출하는 script는 명시적 설정이 필요하다.
 - `TMUX`, `TMUX_PANE` 등 기존 도구가 읽는 식별 정보를 검증한다. 값만 흉내 내고 다른 server를 조작하게 해서는 안 된다.
 - `plugin 지원`이라는 표시는 설치 도구가 켜진다는 뜻이 아니라 plugin이 쓰는 공개 명령·옵션·format·hook·키의 효과가 맞는다는 뜻이다. 구체적인 plugin/version별 결과를 별도로 남긴다.
 
@@ -73,13 +73,13 @@ tmux에서 가능한 기능을 rmux에서도 모두 제공한다. 호환 대상�
 
 Windows native 지원은 tmux 호환 요구와 별도의 제품 결정이다. 추가하더라도 기존 Unix 계약을 축소하지 않는다.
 
-Windows terminal·IME·WSL에서 SSH로 Unix rmux를 사용하는 client 경로는 native Windows server 지원과 별개로 추적한다. terminal의 키 보고 설정, 중첩 tmux/byobu, 입력 언어, client와 server의 버전 차이를 분리해 기록한다. 같은 증상의 모든 환경을 하나의 결함으로 일반화하지 않는다.
+Windows terminal·IME·WSL에서 SSH로 Unix masil을 사용하는 client 경로는 native Windows server 지원과 별개로 추적한다. terminal의 키 보고 설정, 중첩 tmux/byobu, 입력 언어, client와 server의 버전 차이를 분리해 기록한다. 같은 증상의 모든 환경을 하나의 결함으로 일반화하지 않는다.
 
 ## 사용자 동작과 내부 구현의 경계
 
 tmux와 같은 코드·언어·자료구조를 사용할 의무는 없다. 다만 내부 선택으로 공개 동작의 누락이나 차이를 정당화할 수 없다.
 
-기존 tmux 바이너리가 rmux 내부 socket에 직접 접속하는 binary protocol 혼용은 초기 지원으로 선언하지 않는다. 공개 CLI/control mode와 기존 자동화는 rmux 진입점으로 작동해야 한다. 원래 tmux client와 직접 연결된다고 주장하려면 별도 상호운용 검증이 필요하다.
+기존 tmux 바이너리가 masil 내부 socket에 직접 접속하는 binary protocol 혼용은 초기 지원으로 선언하지 않는다. 공개 CLI/control mode와 기존 자동화는 masil 진입점으로 작동해야 한다. 원래 tmux client와 직접 연결된다고 주장하려면 별도 상호운용 검증이 필요하다.
 
 ## 기준 변경과 호환성 주장
 

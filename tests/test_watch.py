@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 
-from test_compatibility import RMUX, Server, wait_for
+from test_compatibility import MASIL, Server, wait_for
 
 
 class Peer:
@@ -70,9 +70,9 @@ class Peer:
 
 class WatchIntegration(unittest.TestCase):
     def setUp(self):
-        self.server = Server(RMUX, command=["/bin/cat"])
+        self.server = Server(MASIL, command=["/bin/cat"])
         self.bridge = self.server.path / "observe.sock"
-        self.server.env["RMUX_BRIDGE_SOCKET"] = str(self.bridge)
+        self.server.env["MASIL_BRIDGE_SOCKET"] = str(self.bridge)
         self.server.__enter__()
         self.addCleanup(self.server.__exit__)
         wait_for(self.bridge.exists)
@@ -179,7 +179,7 @@ class WatchIntegration(unittest.TestCase):
         self.assertFalse(quiet.ready(.2))
 
     def test_rust_cli_receives_real_core_event(self):
-        agent = RMUX.with_name("rmux-agent")
+        agent = MASIL.with_name("masil-agent")
         child = subprocess.Popen(
             [str(agent), "--socket", str(self.bridge), "watch", "--count", "1", self.pane],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

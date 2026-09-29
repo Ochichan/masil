@@ -1,5 +1,5 @@
 ---
-name: rmux Agent Desk
+name: masil Agent Desk
 description: A terminal-native attention desk that keeps evidence beside the panes it describes.
 colors:
   dark-canvas: "#0c1016"
@@ -26,13 +26,13 @@ colors:
   light-track: "#becacf"
 ---
 
-# Design System: rmux Agent Desk
+# Design System: masil Agent Desk
 
 ## Overview
 
 **Creative North Star: "Evidence Before Action"**
 
-The rmux agent desk keeps agent attention beside the terminal panes it describes. Its stable list, evidence inspector, and guarded actions let a user find a waiting agent, inspect what rmux knows, mark the selected agent's displayed request set as seen, and request navigation to a configured pane.
+The masil agent desk keeps agent attention beside the terminal panes it describes. Its stable list, evidence inspector, and guarded actions let a user find a waiting agent, inspect what masil knows, mark the selected agent's displayed request set as seen, and request navigation to a configured pane.
 
 The interface uses a compact terminal cell grid, charcoal surfaces, quiet borders, and a restrained teal accent. Every status keeps a text label. The design does not infer completion, approval, or a verified foreground agent from incomplete evidence.
 
@@ -74,7 +74,7 @@ The default dark theme uses charcoal layers and a single teal accent. The light 
 
 The product inherits the host terminal's font and cell metrics. It does not select or bundle a typeface, and it does not assume pixel sizes.
 
-Normal terminal text carries most content. Bold marks the rmux title, selected identity, selected controls, and high-priority state labels. Help group labels and the raw supplemental-details label use uppercase text. English and Korean share the same hierarchy.
+Normal terminal text carries most content. Bold marks the masil title, selected identity, selected controls, and high-priority state labels. Help group labels and the raw supplemental-details label use uppercase text. English and Korean share the same hierarchy.
 
 **The Cell Width Rule.** Clipping, cursor placement, and control width use rendered Unicode cell width. Search editing moves by grapheme and rejects control characters.
 
@@ -88,7 +88,7 @@ At 100 columns by 24 rows or larger, the list and inspector appear side by side 
 
 The native side panel targets 34 columns. In compact mode below 60 columns, the header shows identity and connection on its first row and its controls on the second, rows use two lines, and filters and actions use two labeled columns across two rows when height permits. Below 18 rows, header, filters, search, actions, and footer each compress to one row. Below 28 columns or 9 rows, the desk shows only the minimum-size message and a working Close control.
 
-Native zoom is a tmux pane operation owned by the sidebar. Expand and Restore change the tmux layout while the same rmux model, filters, selection, and action rules remain active.
+Native zoom is a tmux pane operation owned by the sidebar. Expand and Restore change the tmux layout while the same masil model, filters, selection, and action rules remain active.
 
 **The Rendered Geometry Rule.** Each draw records only visible, clipped cell rectangles as hit targets. Resize clears old hit geometry and cancels press, drag, hover, and double-click state.
 
@@ -174,14 +174,14 @@ The terminal session owns alternate screen, raw input, cursor visibility, mouse 
 
 ## Native Agent Management UI
 
-The shipped native management view reuses the desk's header, filters, Unicode search, identity-stable list, evidence inspector, action strip, context menu, themes, terminal restoration and responsive layouts. It switches the data source from agentd observations to the native `Manager` only for `rmux-agent agent ui` and its explicit sidebar.
+The shipped native management view reuses the desk's header, filters, Unicode search, identity-stable list, evidence inspector, action strip, context menu, themes, terminal restoration and responsive layouts. It switches the data source from agentd observations to the native `Manager` only for `masil-agent agent ui` and its explicit sidebar.
 
 The view owns one asynchronous inventory query at a time and schedules it once per second only while open. A projection comparison prevents unchanged inventory from triggering a redraw. Native actions run in bounded background tasks so pane reads and process operations do not block keyboard or mouse input.
 
-Managed rows use **Needs input** for an untyped blocked state and **Returned idle** when a previously working run becomes idle. Both use shared acknowledgement revisions; neither asserts a question, approval, completion, or task success. Approval and Question stay at zero unless typed evidence exists. Start and resume receipts say that provider or native-session acceptance is unverified. Draft preparation names the `rmux-agent-draft` tmux buffer and explicitly says it was neither pasted nor submitted.
+Managed rows use **Needs input** for an untyped blocked state and **Returned idle** when a previously working run becomes idle. Both use shared acknowledgement revisions; neither asserts a question, approval, completion, or task success. Approval and Question stay at zero unless typed evidence exists. Start and resume receipts say that provider or native-session acceptance is unverified. Draft preparation names the `masil-agent-draft` tmux buffer and explicitly says it was neither pasted nor submitted.
 
 The managed action menu contains New agent, Go to pane, Details, Rename, Resume session, Prepare draft, Interrupt, Read screen and Close pane. Start, rename and draft use cell-grid forms. Interrupt and close require confirmations. Every form and confirmation consumes background input and exposes matching keyboard and mouse controls above the desk's existing highest overlay layer.
 
-The optional 34-column management sidebar is created only by the explicit `agent sidebar` command. A per-pane marker binds it to the encoded native socket; repeated opening in the same window selects the live owned pane. Creation refuses an already zoomed window, and Expand rechecks the marker before toggling native pane zoom. The rmux menu opens the full management view in an ordinary native window and adds no default key binding.
+The optional 34-column management sidebar is created only by the explicit `agent sidebar` command. A per-pane marker binds it to the encoded native socket; repeated opening in the same window selects the live owned pane. Creation refuses an already zoomed window, and Expand rechecks the marker before toggling native pane zoom. The masil menu opens the full management view in an ordinary native window and adds no default key binding.
 
 원격 Agent 목록은 같은 관리 화면에 endpoint::name으로 표시한다. 서버별 연결 상태를 지속 표시하고 stale 행의 조작을 비활성화한다. 원격 새 실행에는 서버와 원격 cwd를 명시하며, 원래 TUI는 별도 native 연결 창에서 연다.

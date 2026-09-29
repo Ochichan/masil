@@ -13,16 +13,16 @@ import tempfile
 import time
 import unittest
 
-from test_compatibility import RMUX, ROOT, Server, wait_for
+from test_compatibility import MASIL, ROOT, Server, wait_for
 
 
-AGENT = Path(os.environ.get("RMUX_AGENT", ROOT / "bin/rmux-agent"))
+AGENT = Path(os.environ.get("MASIL_AGENT", ROOT / "bin/masil-agent"))
 
 
 class AgentEndpoints(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.fixture = Path(tempfile.mkdtemp(prefix="rmux-endpoint-provider-"))
+        cls.fixture = Path(tempfile.mkdtemp(prefix="masil-endpoint-provider-"))
         subprocess.run(
             [
                 "cc",
@@ -42,17 +42,17 @@ class AgentEndpoints(unittest.TestCase):
         shutil.rmtree(cls.fixture)
 
     def setUp(self):
-        self.local = Server(RMUX)
-        self.remote = Server(RMUX)
+        self.local = Server(MASIL)
+        self.remote = Server(MASIL)
         self.local.__enter__()
         self.addCleanup(self.local.__exit__)
         self.remote.__enter__()
         self.addCleanup(self.remote.__exit__)
         self.config = self.local.path / "config"
-        rmux_config = self.config / "rmux"
-        rmux_config.mkdir(parents=True, mode=0o700)
-        rmux_config.chmod(0o700)
-        detection = rmux_config / "agent-detection"
+        masil_config = self.config / "masil"
+        masil_config.mkdir(parents=True, mode=0o700)
+        masil_config.chmod(0o700)
+        detection = masil_config / "agent-detection"
         detection.mkdir(mode=0o700)
         (detection / "codex.toml").write_text(
             """id = "codex"
@@ -133,7 +133,7 @@ contains = ["STATE:idle"]
         added = self.add_endpoint()
         self.assertEqual(added["endpoint"]["id"], "remote")
         self.assertTrue(added["endpoint"]["enabled"])
-        path = self.config / "rmux/endpoints.json"
+        path = self.config / "masil/endpoints.json"
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
 
@@ -148,7 +148,7 @@ contains = ["STATE:idle"]
         self.assertEqual(self.cli("endpoints", "list")["endpoints"], [])
 
     def test_bad_configuration_identity_and_protocol_are_rejected(self):
-        path = self.config / "rmux/endpoints.json"
+        path = self.config / "masil/endpoints.json"
         path.write_text('{"version":1,"endpoints":[],"unknown":true}')
         path.chmod(0o600)
         invalid = self.cli("endpoints", "list", check=False)

@@ -12,7 +12,7 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RMUX = ROOT / "bin" / "rmux"
+MASIL = ROOT / "bin" / "masil"
 
 
 class NativeIdentity(unittest.TestCase):
@@ -22,13 +22,13 @@ class NativeIdentity(unittest.TestCase):
         self.path = Path(tempfile.mkdtemp(prefix="native-identity-", dir=build))
         self.socket = self.path / "server.sock"
         self.env = os.environ.copy()
-        self.env.pop("RMUX_BRIDGE_SOCKET", None)
+        self.env.pop("MASIL_BRIDGE_SOCKET", None)
         self.addCleanup(shutil.rmtree, self.path, ignore_errors=True)
-        self.addCleanup(lambda: self.rmux("kill-server", check=False))
+        self.addCleanup(lambda: self.masil("kill-server", check=False))
 
-    def rmux(self, *args, check=True):
+    def masil(self, *args, check=True):
         return subprocess.run(
-            [str(RMUX), "-S", str(self.socket), "-f", "/dev/null", *args],
+            [str(MASIL), "-S", str(self.socket), "-f", "/dev/null", *args],
             cwd=ROOT,
             env=self.env,
             check=check,
@@ -38,12 +38,12 @@ class NativeIdentity(unittest.TestCase):
         )
 
     def start(self):
-        self.rmux("new-session", "-d", "-s", "identity")
+        self.masil("new-session", "-d", "-s", "identity")
 
     def identity(self):
-        output = self.rmux(
+        output = self.masil(
             "display-message", "-p",
-            "#{rmux_core_boot_id} #{rmux_pty_generation}",
+            "#{masil_core_boot_id} #{masil_pty_generation}",
         ).stdout.strip()
         boot_id, generation = output.split()
         parsed = uuid.UUID(boot_id)
@@ -63,7 +63,7 @@ class NativeIdentity(unittest.TestCase):
         }
         self.assertEqual(sockets, {self.socket})
 
-        self.rmux("respawn-pane", "-k", "-t", "identity:0")
+        self.masil("respawn-pane", "-k", "-t", "identity:0")
         respawn_boot_id, respawn_generation = self.identity()
         self.assertEqual(respawn_boot_id, boot_id)
         self.assertGreater(respawn_generation, generation)
@@ -71,7 +71,7 @@ class NativeIdentity(unittest.TestCase):
     def test_server_restart_gets_a_new_boot_id(self):
         self.start()
         first_boot_id, _ = self.identity()
-        self.rmux("kill-server")
+        self.masil("kill-server")
 
         self.start()
         second_boot_id, _ = self.identity()

@@ -1,4 +1,4 @@
-/* Test-only macOS interposer. Never linked into or shipped with rmux. */
+/* Test-only macOS interposer. Never linked into or shipped with masil. */
 #include <sys/types.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -9,7 +9,7 @@ static pid_t
 fail_selected_forkpty(int *master, char *name, struct termios *term,
     struct winsize *size)
 {
-	const char *marker = getenv("RMUX_TEST_FAIL_FORKPTY_FILE");
+	const char *marker = getenv("MASIL_TEST_FAIL_FORKPTY_FILE");
 
 	if (marker != NULL && access(marker, F_OK) == 0) {
 		errno = EAGAIN;

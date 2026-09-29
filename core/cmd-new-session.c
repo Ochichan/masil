@@ -252,7 +252,7 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 		sx = c->tty.sx;
 		sy = c->tty.sy;
 		if (options_get_number(global_s_options, "status")) {
-			/* rmux: a left or right status column takes width. */
+			/* masil: a left or right status column takes width. */
 			position = options_get_number(global_s_options,
 			    "status-position");
 			width = status_column_default_width();

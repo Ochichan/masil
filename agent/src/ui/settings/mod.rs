@@ -1,5 +1,5 @@
-//! `rmux-agent settings`: a terminal settings screen for the rmux UI layer.
-//! It runs in an rmux popup, saves choices to settings.conf and applies them
+//! `masil-agent settings`: a terminal settings screen for the masil UI layer.
+//! It runs in a masil popup, saves choices to settings.conf and applies them
 //! to the running server at once.
 
 pub(crate) mod catalog;
@@ -130,11 +130,11 @@ impl App {
                 }
             }
         }
-        self.language = match self.values.get("@rmux-lang").map(String::as_str) {
+        self.language = match self.values.get("@masil-lang").map(String::as_str) {
             Some("ko") => Language::Korean,
             _ => Language::English,
         };
-        self.theme = match self.values.get("@rmux-theme").map(String::as_str) {
+        self.theme = match self.values.get("@masil-theme").map(String::as_str) {
             Some("light") => Theme::Light,
             Some("terminal" | "tmux") => Theme::Terminal,
             _ => Theme::Dark,
@@ -178,10 +178,10 @@ impl App {
                 Tone::Warn,
                 match language {
                     Language::English => {
-                        format!("Applied {what} until rmux stops; not saved: {error}")
+                        format!("Applied {what} until masil stops; not saved: {error}")
                     }
                     Language::Korean => {
-                        format!("{what}: rmux를 끌 때까지 적용됩니다. 저장 실패: {error}")
+                        format!("{what}: masil을 끌 때까지 적용됩니다. 저장 실패: {error}")
                     }
                 },
             ),
@@ -189,10 +189,10 @@ impl App {
                 Tone::Warn,
                 match language {
                     Language::English => {
-                        format!("Saved {what}. The rmux UI is off, so the screen is unchanged.")
+                        format!("Saved {what}. The masil UI is off, so the screen is unchanged.")
                     }
                     Language::Korean => {
-                        format!("{what} 저장함. rmux UI가 꺼져 있어 화면은 그대로입니다.")
+                        format!("{what} 저장함. masil UI가 꺼져 있어 화면은 그대로입니다.")
                     }
                 },
             ),
@@ -227,12 +227,12 @@ impl App {
         let outcome = server::set_layer(&self.server, self.path.as_deref(), on);
         self.reload();
         let what = if on {
-            text(self.language, "rmux UI on", "rmux UI 켜짐").to_owned()
+            text(self.language, "masil UI on", "masil UI 켜짐").to_owned()
         } else {
             text(
                 self.language,
-                "rmux UI off; tmux defaults and your tmux.conf are back",
-                "rmux UI 꺼짐. tmux 기본값과 tmux.conf를 다시 적용했습니다",
+                "masil UI off; tmux defaults and your tmux.conf are back",
+                "masil UI 꺼짐. tmux 기본값과 tmux.conf를 다시 적용했습니다",
             )
             .to_owned()
         };
@@ -244,8 +244,8 @@ impl App {
         self.reload();
         let what = text(
             self.language,
-            "every rmux setting is back to its default",
-            "모든 rmux 설정을 기본값으로 되돌렸습니다",
+            "every masil setting is back to its default",
+            "모든 masil 설정을 기본값으로 되돌렸습니다",
         )
         .to_owned();
         self.receipt(outcome, what);
@@ -506,7 +506,7 @@ impl App {
         );
         let title = vec![
             Span::styled(
-                " rmux ",
+                " masil ",
                 Style::default()
                     .fg(palette.accent)
                     .add_modifier(Modifier::BOLD),
@@ -711,10 +711,10 @@ impl App {
                             Tone::Warn,
                             match language {
                                 Language::English => format!(
-                                    "Your tmux configuration sets {effective}; choosing here overrides it until rmux restarts."
+                                    "Your tmux configuration sets {effective}; choosing here overrides it until masil restarts."
                                 ),
                                 Language::Korean => format!(
-                                    "tmux 설정 파일이 {effective}로 정합니다. 여기서 고르면 rmux를 다시 시작할 때까지 덮어씁니다."
+                                    "tmux 설정 파일이 {effective}로 정합니다. 여기서 고르면 masil을 다시 시작할 때까지 덮어씁니다."
                                 ),
                             },
                         ));
@@ -723,13 +723,13 @@ impl App {
                 }
                 Row::Layer => text(
                     language,
-                    "Off restores tmux defaults, removes rmux buttons and re-reads your tmux.conf.",
-                    "끄면 tmux 기본값으로 돌아가고 rmux 버튼을 없애며 tmux.conf를 다시 읽습니다.",
+                    "Off restores tmux defaults, removes masil buttons and re-reads your tmux.conf.",
+                    "끄면 tmux 기본값으로 돌아가고 masil 버튼을 없애며 tmux.conf를 다시 읽습니다.",
                 ),
                 Row::Reset => text(
                     language,
-                    "Removes saved choices; the rmux defaults apply at once.",
-                    "저장한 선택을 지우고 rmux 기본값을 바로 적용합니다.",
+                    "Removes saved choices; the masil defaults apply at once.",
+                    "저장한 선택을 지우고 masil 기본값을 바로 적용합니다.",
                 ),
             };
             let mut lines = wrap(help, inner.width as usize)
@@ -774,7 +774,7 @@ impl App {
             let selected = focused && index == self.row;
             let label = match row {
                 Row::Setting(setting) => setting.label(language),
-                Row::Layer => text(language, "rmux UI layer", "rmux UI 레이어"),
+                Row::Layer => text(language, "masil UI layer", "masil UI 레이어"),
                 Row::Reset => text(language, "Reset", "초기화"),
             };
             if y >= inner.y as i32 {
@@ -854,7 +854,11 @@ impl App {
                 })
                 .collect(),
             Row::Reset => vec![(
-                text(language, "Reset all rmux settings", "모든 rmux 설정 초기화"),
+                text(
+                    language,
+                    "Reset all masil settings",
+                    "모든 masil 설정 초기화",
+                ),
                 Hit::Row(index),
                 false,
             )],
@@ -964,7 +968,7 @@ fn flow(widths: &[u16], width: u16) -> (Vec<(u16, u16)>, u16) {
 }
 
 fn usage() -> String {
-    "usage: rmux-agent settings [--socket RMUX_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get]".into()
+    "usage: masil-agent settings [--socket MASIL_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get]".into()
 }
 
 /// Runs the settings screen, or applies choices without a screen when any
@@ -1077,7 +1081,7 @@ mod tests {
             assert!(!group.label(Language::Korean).is_empty());
         }
         for setting in SETTINGS {
-            assert!(setting.key.starts_with("@rmux-"));
+            assert!(setting.key.starts_with("@masil-"));
             assert!(!setting.help(Language::Korean).is_empty());
         }
     }

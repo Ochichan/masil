@@ -417,7 +417,7 @@ impl Fleet {
                 "list-panes",
                 "-a",
                 "-F",
-                "#{pane_id}\t#{rmux_pty_generation}\t#{pane_dead}\t#{@rmux-agent-connection}",
+                "#{pane_id}\t#{masil_pty_generation}\t#{pane_dead}\t#{@masil-agent-connection}",
             ])
             .await?;
         let mut target = None;
@@ -450,7 +450,7 @@ impl Fleet {
                 "-d".into(),
                 "-P".into(),
                 "-F".into(),
-                "#{pane_id}\t#{rmux_pty_generation}".into(),
+                "#{pane_id}\t#{masil_pty_generation}".into(),
                 "-n".into(),
                 format!("{}:{}", endpoint.id, agent.name),
             ];
@@ -507,7 +507,7 @@ impl Fleet {
                     "-p",
                     "-t",
                     fields[0],
-                    "@rmux-agent-connection",
+                    "@masil-agent-connection",
                     &format!("{marker}:{}:{lease}", fields[1]),
                 ])
                 .await?;

@@ -235,7 +235,7 @@ struct redraw_draw_ctx {
 	struct window_pane	*marked;
 
 	u_int			 status_lines;
-	u_int			 xoff; /* rmux: left status column width */
+	u_int			 xoff; /* masil: left status column width */
 	enum pane_lines		 pane_lines;
 	struct grid_cell	 default_gc;
 
@@ -518,7 +518,7 @@ redraw_data_has_pane(struct redraw_span_data *data, struct window_pane *wp)
 	return (0);
 }
 
-/* rmux: whether a border cell belongs to a pane in the same floating group. */
+/* masil: whether a border cell belongs to a pane in the same floating group. */
 static int
 redraw_data_has_group(struct redraw_span_data *data, struct window_pane *wp)
 {
@@ -543,7 +543,7 @@ redraw_data_has_group(struct redraw_span_data *data, struct window_pane *wp)
 /*
  * Mark one border cell. If a non-border cell is marked as a border, replace
  * it. If it is already a border and this is not a floating pane, merge the
- * border mask and pane ownership. rmux: panes of one floating group also
+ * border mask and pane ownership. masil: panes of one floating group also
  * merge the separators they share.
  */
 static void
@@ -1798,7 +1798,7 @@ redraw_draw(struct client *c, struct window_pane *wp, int flags)
 
 	if ((flags & REDRAW_STATUS) && (cols = status_column_size(c)) != 0) {
 		/*
-		 * rmux: draw the status column. A message or prompt overlays
+		 * masil: draw the status column. A message or prompt overlays
 		 * the last row across the whole width, as with no status line.
 		 */
 		cx = status_column_at(c);

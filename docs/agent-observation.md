@@ -1,6 +1,6 @@
 # OpenCode session 관찰
 
-M3의 첫 구현 범위다. `rmux-agent serve`는 OpenCode의 native HTTP/SSE 상태와 rmux pane의 생존 정보를 메모리에 모은다. 기본 터미널 실행에는 필요하지 않으며 조회 명령으로 자동 시작되지 않는다. tmux 기본 키는 그대로다.
+M3의 첫 구현 범위다. `masil-agent serve`는 OpenCode의 native HTTP/SSE 상태와 masil pane의 생존 정보를 메모리에 모은다. 기본 터미널 실행에는 필요하지 않으며 조회 명령으로 자동 시작되지 않는다. tmux 기본 키는 그대로다.
 
 ## 시작과 조회
 
@@ -26,13 +26,13 @@ core 관찰 socket을 켠 서버가 먼저 필요하다. [코어 관찰 실행 �
 인증을 사용하는 서버에는 source의 `username`과 `password_env`를 추가한다. username 기본값은 `opencode`다. `password_env`는 비밀번호가 들어 있는 환경변수의 **이름**이다. endpoint에 비밀번호를 넣지 않는다. 요청 인증에만 쓰며 응답·로그·config 파일에 비밀번호를 복사하지 않는다.
 
 ```sh
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" serve \
-  --core "$rmux_runtime/observe.sock" --config sources.json
+./bin/masil-agent --socket "$masil_runtime/manager.sock" serve \
+  --core "$masil_runtime/observe.sock" --config sources.json
 # 다른 terminal에서:
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" status
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" agents
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" inspect backend
-./bin/rmux-agent --socket "$rmux_runtime/manager.sock" stop
+./bin/masil-agent --socket "$masil_runtime/manager.sock" status
+./bin/masil-agent --socket "$masil_runtime/manager.sock" agents
+./bin/masil-agent --socket "$masil_runtime/manager.sock" inspect backend
+./bin/masil-agent --socket "$masil_runtime/manager.sock" stop
 ```
 
 `serve`는 foreground 실행이다. `stop`·SIGINT·SIGTERM은 관찰 daemon만 종료한다. core, pane의 TUI, OpenCode 서버는 계속 실행된다. config는 시작할 때 읽고 변경되지 않는다. 대상 변경은 daemon을 종료하고 새 config로 다시 시작한다.

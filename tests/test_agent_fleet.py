@@ -9,7 +9,7 @@ import time
 import unittest
 import test_managed_agents as fixtures
 from test_managed_agents import AGENT
-from test_compatibility import Server, RMUX, wait_for, attached
+from test_compatibility import Server, MASIL, wait_for, attached
 from test_ui import Terminal
 
 
@@ -27,7 +27,7 @@ class Fleet(unittest.TestCase):
         self.base.setUp()
         self.addCleanup(self.base.doCleanups)
         self.base.start()
-        self.remote = Server(RMUX)
+        self.remote = Server(MASIL)
         self.remote.__enter__()
         self.addCleanup(self.remote.__exit__)
         self.command('endpoints', 'add', 'lab', '--socket', str(self.remote.socket),
@@ -98,13 +98,13 @@ class Fleet(unittest.TestCase):
             ui.send('g')
 
             def connections():
-                lines = self.base.server.text('list-panes', '-a', '-F', '#{pane_id}\t#{@rmux-agent-connection}').splitlines()
+                lines = self.base.server.text('list-panes', '-a', '-F', '#{pane_id}\t#{@masil-agent-connection}').splitlines()
                 return [line.split('\t')[0] for line in lines if len(line.split('\t')) == 2 and line.split('\t')[1]]
 
             wait_for(lambda: len(connections()) == 1, 5)
             old = connections()[0]
             wait_for(lambda: 'STATE:idle' in self.base.server.text('capture-pane', '-p', '-t', old), 5)
-            wait_for(lambda: 'rmux-agent-lease-' in self.remote.text('show-options', '-g'), 5)
+            wait_for(lambda: 'masil-agent-lease-' in self.remote.text('show-options', '-g'), 5)
             ui.send('g')
             ui.until('Selected pane')
             self.assertEqual(connections(), [old])

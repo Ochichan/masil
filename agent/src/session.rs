@@ -1,4 +1,4 @@
-//! `rmux-agent session`: snapshots of the server's sessions, windows and pane
+//! `masil-agent session`: snapshots of the server's sessions, windows and pane
 //! layouts, and their restore. A restored pane starts a shell in its saved
 //! directory; allowed programs run again and coding agents with a native
 //! session resume it.
@@ -31,7 +31,7 @@ const MAX_LAYOUT: usize = 512 * 1024;
 const MAX_ARGS: usize = 256;
 const AUTOSAVE_MINUTES: u64 = 15;
 const AUTOSAVE_CHECK: Duration = Duration::from_secs(30);
-/// Programs a restore starts again when no @rmux-restore-commands is set.
+/// Programs a restore starts again when no @masil-restore-commands is set.
 const DEFAULT_COMMANDS: &[&str] = &[
     "vi", "vim", "nvim", "view", "emacs", "nano", "micro", "hx", "helix", "less", "more", "man",
     "tail", "top", "htop", "btop",
@@ -100,7 +100,7 @@ struct Options {
 }
 
 fn usage() -> String {
-    "usage: rmux-agent session [--socket RMUX_SOCKET] [--client CLIENT] \
+    "usage: masil-agent session [--socket MASIL_SOCKET] [--client CLIENT] \
      save [--auto]|list|restore [NAME]|menu|autosave"
         .into()
 }
@@ -134,7 +134,7 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
 
 /// Runs a command; returns the exit code and a report for standard output.
 fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), String> {
-    let korean = server.global("@rmux-lang", Scope::Session).as_deref() == Some("ko");
+    let korean = server.global("@masil-lang", Scope::Session).as_deref() == Some("ko");
     let text = |en: &str, ko: &str| {
         if korean { ko.to_owned() } else { en.to_owned() }
     };
@@ -290,7 +290,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             .ok()
             .and_then(|value| value.split(',').next().map(str::to_owned))
             .filter(|path| !path.is_empty())
-            .ok_or("run this inside rmux or pass --socket PATH")?,
+            .ok_or("run this inside masil or pass --socket PATH")?,
     };
     if let Some(client) = &client
         && (client.is_empty() || client.len() > MAX_TEXT || client.chars().any(char::is_control))
@@ -305,9 +305,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
     })
 }
 
-/// Runs an rmux command. A value ending in ';' would end the command, so
+/// Runs a masil command. A value ending in ';' would end the command, so
 /// that ';' is escaped.
-fn rmux(server: &Server, args: &[&str]) -> Result<String, String> {
+fn masil(server: &Server, args: &[&str]) -> Result<String, String> {
     let args: Vec<String> = args
         .iter()
         .map(|arg| match arg.strip_suffix(';') {
@@ -323,7 +323,7 @@ fn rmux(server: &Server, args: &[&str]) -> Result<String, String> {
 fn tell(server: &Server, client: Option<&str>, message: &str) {
     match client {
         Some(client) => {
-            let _ = rmux(server, &["display-message", "-c", client, "-l", message]);
+            let _ = masil(server, &["display-message", "-c", client, "-l", message]);
         }
         None => eprintln!("{message}"),
     }
@@ -359,7 +359,7 @@ fn fields(line: &str, count: usize) -> Option<Vec<&str>> {
 /// would run again.
 fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
     let format = |parts: &[&str]| parts.join(&SEP.to_string());
-    let sessions = rmux(
+    let sessions = masil(
         server,
         &[
             "list-sessions",
@@ -371,7 +371,7 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
             ]),
         ],
     )?;
-    let windows = rmux(
+    let windows = masil(
         server,
         &[
             "list-windows",
@@ -386,7 +386,7 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
             ]),
         ],
     )?;
-    let panes = rmux(
+    let panes = masil(
         server,
         &[
             "list-panes",
@@ -400,7 +400,7 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
                 "#{pane_active}",
                 "#{pane_current_path}",
                 "#{pane_pid}",
-                "#{rmux_foreground_pgid}",
+                "#{masil_foreground_pgid}",
                 "#{pane_title}",
                 "#{host}",
             ]),
@@ -512,7 +512,7 @@ fn safe_argv(argv: &[String]) -> bool {
 }
 
 fn allowed_commands(server: &Server) -> HashSet<String> {
-    match server.global("@rmux-restore-commands", Scope::Session) {
+    match server.global("@masil-restore-commands", Scope::Session) {
         Some(value) => value.split_whitespace().map(str::to_owned).collect(),
         None => DEFAULT_COMMANDS.iter().map(|s| (*s).to_owned()).collect(),
     }
@@ -645,7 +645,7 @@ fn snapshot_dir() -> Result<PathBuf, String> {
                 .map(|home| home.join(".local/share"))
         })
         .ok_or("no home directory")?;
-    let dir = base.join("rmux/sessions");
+    let dir = base.join("masil/sessions");
     fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     let metadata = fs::symlink_metadata(&dir).map_err(|error| error.to_string())?;
     // SAFETY: geteuid has no preconditions.
@@ -920,7 +920,7 @@ const SHELLS: &[&str] = &[
 /// default shell at its prompt, no scrollback, the cursor near the top and
 /// created in the last few minutes. Only such a session is replaced.
 fn pristine(server: &Server, name: &str) -> bool {
-    let Ok(output) = rmux(
+    let Ok(output) = masil(
         server,
         &[
             "list-panes",
@@ -928,7 +928,7 @@ fn pristine(server: &Server, name: &str) -> bool {
             "-t",
             &format!("={name}"),
             "-F",
-            "#{pane_pid} #{rmux_foreground_pgid} #{session_windows} #{history_size} \
+            "#{pane_pid} #{masil_foreground_pgid} #{session_windows} #{history_size} \
              #{cursor_y} #{session_created} #{pane_current_command} #{b:default-shell} \
              #{pane_start_command}",
         ],
@@ -983,7 +983,7 @@ fn has_children(pid: i32) -> bool {
 }
 
 fn restore(server: &Server, snapshot: &Snapshot, client: Option<&str>) -> Result<Report, String> {
-    let existing: HashSet<String> = rmux(server, &["list-sessions", "-F", "#{session_name}"])
+    let existing: HashSet<String> = masil(server, &["list-sessions", "-F", "#{session_name}"])
         .unwrap_or_default()
         .lines()
         .map(str::to_owned)
@@ -1028,7 +1028,7 @@ fn restore(server: &Server, snapshot: &Snapshot, client: Option<&str>) -> Result
         if let Some(client) = client
             && preferred.as_deref() == Some(session.name.as_str())
         {
-            let _ = rmux(
+            let _ = masil(
                 server,
                 &["switch-client", "-c", client, "-t", &format!("={name}")],
             );
@@ -1037,7 +1037,7 @@ fn restore(server: &Server, snapshot: &Snapshot, client: Option<&str>) -> Result
             // Replace the just-started session if it is still untouched and
             // no client uses it; otherwise both stay.
             let old = format!("={}", session.name);
-            let attached = rmux(
+            let attached = masil(
                 server,
                 &[
                     "display-message",
@@ -1049,8 +1049,8 @@ fn restore(server: &Server, snapshot: &Snapshot, client: Option<&str>) -> Result
             )
             .unwrap_or_default();
             if attached.trim() == "0" && pristine(server, &session.name) {
-                let _ = rmux(server, &["kill-session", "-t", &old]);
-                let _ = rmux(
+                let _ = masil(server, &["kill-session", "-t", &old]);
+                let _ = masil(
                     server,
                     &[
                         "rename-session",
@@ -1098,7 +1098,7 @@ fn restore_session(
         let cwd = directory(&window.panes[0].cwd);
         if number == 0 {
             let (width, height) = layout_size(&window.layout).unwrap_or((80, 24));
-            rmux(
+            masil(
                 server,
                 &[
                     "new-session",
@@ -1115,7 +1115,7 @@ fn restore_session(
                     &height.max(5).to_string(),
                 ],
             )?;
-            let first = rmux(
+            let first = masil(
                 server,
                 &[
                     "display-message",
@@ -1126,7 +1126,7 @@ fn restore_session(
                 ],
             )?;
             if first.trim() != window.index.to_string() {
-                rmux(
+                masil(
                     server,
                     &[
                         "move-window",
@@ -1138,7 +1138,7 @@ fn restore_session(
                 )?;
             }
         } else {
-            rmux(
+            masil(
                 server,
                 &[
                     "new-window",
@@ -1154,7 +1154,7 @@ fn restore_session(
         }
         // Extra panes start floating; the saved layout places every pane.
         for pane in &window.panes[1..] {
-            rmux(
+            masil(
                 server,
                 &[
                     "new-pane",
@@ -1171,7 +1171,7 @@ fn restore_session(
             )?;
         }
         if window.layout.is_empty()
-            || rmux(
+            || masil(
                 server,
                 &["select-layout", "-t", &target(window), &window.layout],
             )
@@ -1179,7 +1179,7 @@ fn restore_session(
         {
             // Without the saved layout the extra panes are tiled.
             report.layout_fallbacks += 1;
-            let floating = rmux(
+            let floating = masil(
                 server,
                 &[
                     "list-panes",
@@ -1192,12 +1192,12 @@ fn restore_session(
             .unwrap_or_default();
             for line in floating.lines() {
                 if let Some(id) = line.strip_suffix(" 1") {
-                    let _ = rmux(server, &["join-pane", "-d", "-s", id, "-t", id]);
+                    let _ = masil(server, &["join-pane", "-d", "-s", id, "-t", id]);
                 }
             }
-            let _ = rmux(server, &["select-layout", "-t", &target(window), "tiled"]);
+            let _ = masil(server, &["select-layout", "-t", &target(window), "tiled"]);
         }
-        let ids: Vec<String> = rmux(
+        let ids: Vec<String> = masil(
             server,
             &["list-panes", "-t", &target(window), "-F", "#{pane_id}"],
         )?
@@ -1208,7 +1208,7 @@ fn restore_session(
         for (pane, id) in window.panes.iter().zip(&ids) {
             report.panes += 1;
             if !pane.title.is_empty() {
-                let _ = rmux(
+                let _ = masil(
                     server,
                     &["select-pane", "-t", id, "-T", &literal(&pane.title)],
                 );
@@ -1219,8 +1219,8 @@ fn restore_session(
                 .filter(|_| pane.origin.is_empty() || started.insert(pane.origin.clone()))
             {
                 let line = shell_line(argv);
-                if rmux(server, &["send-keys", "-t", id, "-l", "--", &line]).is_ok()
-                    && rmux(server, &["send-keys", "-t", id, "Enter"]).is_ok()
+                if masil(server, &["send-keys", "-t", id, "-l", "--", &line]).is_ok()
+                    && masil(server, &["send-keys", "-t", id, "Enter"]).is_ok()
                 {
                     report.commands += 1;
                 }
@@ -1230,13 +1230,13 @@ fn restore_session(
             }
         }
         if let Some(id) = active {
-            let _ = rmux(server, &["select-pane", "-t", &id]);
+            let _ = masil(server, &["select-pane", "-t", &id]);
             if window.zoomed {
-                let _ = rmux(server, &["resize-pane", "-Z", "-t", &id]);
+                let _ = masil(server, &["resize-pane", "-Z", "-t", &id]);
             }
         }
     }
-    let _ = rmux(
+    let _ = masil(
         server,
         &[
             "select-window",
@@ -1349,7 +1349,7 @@ fn menu(server: &Server, socket: &str, client: &str, korean: bool) -> Result<(),
         args.push(String::new());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    rmux(server, &refs).map(|_| ())
+    masil(server, &refs).map(|_| ())
 }
 
 // ---------------------------------------------------------------- autosave
@@ -1407,9 +1407,9 @@ fn autosave_lock(dir: &Path, socket: &str) -> Result<Option<File>, String> {
     Ok(Some(file))
 }
 
-/// Saves automatically every @rmux-autosave minutes while this server lives.
+/// Saves automatically every @masil-autosave minutes while this server lives.
 /// One saver runs per socket; it stops when no server answers there or the
-/// rmux UI layer is turned off, and waits while @rmux-autosave is off or 0.
+/// masil UI layer is turned off, and waits while @masil-autosave is off or 0.
 fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
     let dir = snapshot_dir()?;
     let Some(_lock) = autosave_lock(&dir, socket)? else {
@@ -1420,12 +1420,12 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
         std::thread::sleep(AUTOSAVE_CHECK);
         // A server restarted on the same socket is saved by this saver; its
         // own saver found the lock taken.
-        let Ok(state) = rmux(
+        let Ok(state) = masil(
             server,
             &[
                 "display-message",
                 "-p",
-                "#{@rmux-agent}\u{1f}#{@rmux-ui}\u{1f}#{@rmux-autosave}",
+                "#{@masil-agent}\u{1f}#{@masil-ui}\u{1f}#{@masil-autosave}",
             ],
         ) else {
             // A slow reply is no reason to stop; a socket nobody listens on is.
@@ -1438,7 +1438,7 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
         let [agent, ui, value] = fields.as_slice() else {
             continue;
         };
-        // The core sets @rmux-agent only when it loads the layer.
+        // The core sets @masil-agent only when it loads the layer.
         if agent.is_empty() || *ui == "off" {
             return Ok(0);
         }

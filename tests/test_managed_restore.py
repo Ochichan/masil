@@ -9,7 +9,7 @@ import stat
 import subprocess
 import unittest
 
-from test_compatibility import RMUX, Server, wait_for
+from test_compatibility import MASIL, Server, wait_for
 from test_managed_agents import AGENT, ManagedAgents as _ManagedAgents
 
 
@@ -80,7 +80,7 @@ class ManagedRestore(_ManagedAgents):
         serialized = snapshot.read_text()
         self.assertNotIn('STATE:idle', serialized)
         self.assertNotIn('evidence', serialized)
-        self.assertNotIn('RMUX_AGENT_', serialized)
+        self.assertNotIn('MASIL_AGENT_', serialized)
 
         invalid = self.snapshot('invalid.json')
         document['version'] = 99
@@ -226,7 +226,7 @@ class ManagedRestore(_ManagedAgents):
         snapshot_before = snapshot.read_bytes()
         self.close_and_wait('builder')
 
-        second = Server(RMUX)
+        second = Server(MASIL)
         second.__enter__()
         self.addCleanup(second.__exit__)
         alias_directory = self.server.path / 'alias'

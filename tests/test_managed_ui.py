@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Native management UI behavior in an isolated PTY and rmux server."""
+"""Native management UI behavior in an isolated PTY and masil server."""
 import termios
 import subprocess
 from pathlib import Path
 
-from test_compatibility import RMUX, Server, attached, wait_for
+from test_compatibility import MASIL, Server, attached, wait_for
 from test_managed_agents import AGENT, ManagedAgents
 from test_ui import Terminal
 
@@ -85,7 +85,7 @@ class ManagedUi(ManagedAgents):
         ui.until('Prepare draft')
         ui.send('\x1b[200~hello 한국어\x1b[201~\r')
         ui.until('it was not pasted or submitted')
-        self.assertEqual(self.server.text('show-buffer', '-b', 'rmux-agent-draft'), 'hello 한국어')
+        self.assertEqual(self.server.text('show-buffer', '-b', 'masil-agent-draft'), 'hello 한국어')
         ui.send('q')
         ui.wait()
         self.assertEqual(ui.child.returncode, 0)
@@ -168,7 +168,7 @@ class ManagedUi(ManagedAgents):
         ui.wait()
 
     def test_fleet_routes_by_endpoint_and_retains_offline_rows(self):
-        remote = Server(RMUX)
+        remote = Server(MASIL)
         remote.__enter__()
         self.addCleanup(remote.__exit__)
         local = self.start('builder')
@@ -229,8 +229,8 @@ class ManagedUi(ManagedAgents):
         ui.wait()
 
     def test_new_dialog_rejects_replaced_endpoint_configuration(self):
-        original = Server(RMUX)
-        replacement = Server(RMUX)
+        original = Server(MASIL)
+        replacement = Server(MASIL)
         original.__enter__()
         replacement.__enter__()
         self.addCleanup(original.__exit__)
@@ -280,7 +280,7 @@ class ManagedUi(ManagedAgents):
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertIn('Created agent management sidebar', first.stdout)
             panes = self.server.text('list-panes', '-t', 'main:0', '-F',
-                                     '#{pane_id}\t#{@rmux-managed-sidebar}').splitlines()
+                                     '#{pane_id}\t#{@masil-managed-sidebar}').splitlines()
             owned = [line.split('\t')[0] for line in panes if line.split('\t')[1]]
             self.assertEqual(len(owned), 1)
 

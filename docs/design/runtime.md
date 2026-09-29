@@ -6,7 +6,7 @@
 
 | 구성 | 정상 수명 | 기본 실행 자원 |
 | --- | --- | --- |
-| rmux native client/server | tmux와 동일 | 기존 C/libevent 실행 모델. terminal 기능 때문에 새 Rust runtime을 시작하지 않음 |
+| masil native client/server | tmux와 동일 | 기존 C/libevent 실행 모델. terminal 기능 때문에 새 Rust runtime을 시작하지 않음 |
 | agentd | agent 기능을 명시적으로 활성화한 environment에서만 | Tokio current-thread loop 1개, SQLite writer thread 1개 |
 | blocking pool | DNS 등 불가피한 blocking 호출 시만 | 최대 2 thread. 호출 전 별도의 bounded admission 적용 |
 | Git·삭제·전송 helper | 해당 job 수행 중만 | 기본 동시 2 process. OS CPU 수와 무관 |
@@ -18,8 +18,8 @@
 
 ## 2. 기본 시작과 지연 활성화
 
-1. `rmux`는 기준 tmux의 config·socket·session 시작 규칙을 따른다. C 확장의 private bridge listener는 대기할 수 있지만 agentd·DB·provider probe를 시작하지 않는다.
-2. `rmux-agent status` 같은 조회는 agentd가 없으면 `not_started`를 반환한다. 조회가 daemon·agent·인증 browser를 시작하지 않는다.
+1. `masil`은 기준 tmux의 config·socket·session 시작 규칙을 따른다. C 확장의 private bridge listener는 대기할 수 있지만 agentd·DB·provider probe를 시작하지 않는다.
+2. `masil-agent status` 같은 조회는 agentd가 없으면 `not_started`를 반환한다. 조회가 daemon·agent·인증 browser를 시작하지 않는다.
 3. 사용자의 `launch`, `observe enable`, 명시적 `serve` 또는 허용한 restore 실행이 agentd를 시작한다. 같은 core boot에 대해 한 agentd만 붙도록 OS lock과 handshake를 사용한다.
 4. agentd는 DB 복구, core inventory 동기화, provider 연결 순서로 준비한다. native terminal은 이 과정을 기다리지 않는다.
 5. agentd restart는 실제 core inventory와 기존 provider session을 재확인한다. 저장된 launch 요청을 자동으로 실행 목록에 올리지 않는다.
@@ -30,7 +30,7 @@ core는 bridge disconnect에서 추가 summary를 즉시 stale로 만든다. 연
 
 ## 3. C 코어의 변경 면적
 
-tmux 소스를 독립 엔진처럼 재편하지 않는다. upstream 영역은 layout을 유지하고, 새 코드는 별도 `rmux-*.c/h` 파일로 묶는다. 기존 파일에는 의미 있는 관찰·수명 지점에서 짧은 호출만 추가한다.
+tmux 소스를 독립 엔진처럼 재편하지 않는다. upstream 영역은 layout을 유지하고, 새 코드는 별도 `masil-*.c/h` 파일로 묶는다. 기존 파일에는 의미 있는 관찰·수명 지점에서 짧은 호출만 추가한다.
 
 | 지점 | 추가할 일 | 넣지 않을 일 |
 | --- | --- | --- |
@@ -54,11 +54,11 @@ Rust loop는 ready queue를 한 번에 끝까지 비우지 않는다. control, n
 
 ## 5. 명령 대기와 terminal 입력의 분리
 
-rmux가 제공하는 binding·메뉴·command prompt 예시는 반드시 **`run-shell -b`**로 helper를 시작한다. foreground `run-shell`은 tmux의 invoking client command queue를 기다리게 하므로 긴 `rmux-agent wait`나 fsync가 그 client의 키 처리 앞에 놓일 수 있다.
+masil이 제공하는 binding·메뉴·command prompt 예시는 반드시 **`run-shell -b`**로 helper를 시작한다. foreground `run-shell`은 tmux의 invoking client command queue를 기다리게 하므로 긴 `masil-agent wait`나 fsync가 그 client의 키 처리 앞에 놓일 수 있다.
 
 core bridge의 guarded action도 그 client의 일반 command queue 끝에 대기 작업으로 넣지 않는다. extension 전용 queue에서 순수 검증과 짧은 core 상태 변경만 수행한다. 필요한 upstream primitive를 재사용하되 `CMD_RETURN_WAIT`를 invoking client에 전파하지 않는다. 기존 명령 실행이 비동기인 경우 extension operation의 continuation으로 보관한다.
 
-사용자가 직접 foreground `run-shell`, `wait-for` 등을 실행했을 때의 원래 tmux 대기는 유지한다. `terminal hot path를 막지 않는다`는 원칙은 rmux가 추가로 만드는 대기를 금지하는 조건이다.
+사용자가 직접 foreground `run-shell`, `wait-for` 등을 실행했을 때의 원래 tmux 대기는 유지한다. `terminal hot path를 막지 않는다`는 원칙은 masil이 추가로 만드는 대기를 금지하는 조건이다.
 
 ## 6. Interface 정의
 
@@ -109,7 +109,7 @@ writer와 worker의 결과는 bounded completion channel로 돌아온다. 작업
 
 ## 7. Strict cwd launch
 
-기준 tmux의 native spawn은 `chdir` 실패 시 home 또는 `/`로 fallback한다. 이 동작은 native tmux 명령에서 유지한다. rmux의 관리 launch/restore에는 별도의 내부 `strict_cwd` 실행 문맥을 둔다.
+기준 tmux의 native spawn은 `chdir` 실패 시 home 또는 `/`로 fallback한다. 이 동작은 native tmux 명령에서 유지한다. masil의 관리 launch/restore에는 별도의 내부 `strict_cwd` 실행 문맥을 둔다.
 
 관리 child는 실행 직전에 요청 디렉터리를 열고 그 directory FD를 기준으로 `fchdir`·identity 확인을 한다. 실패하면 대체 디렉터리에서 agent를 실행하지 않고 오류를 전용 pipe로 보고한다. preflight 성공만으로 부모가 launch 성공을 반환하지 않는다. 검사와 실행 사이의 삭제·permission 변경·symlink 교체를 검사한다.
 
@@ -123,7 +123,7 @@ writer와 worker의 결과는 bounded completion channel로 돌아온다. 작업
 
 tmux의 active pane은 window에, current window는 session에 속한다. 같은 session 또는 linked window를 보는 여러 client에서는 `select-pane`가 모두의 화면에 영향을 줄 수 있다.
 
-rmux의 client-target focus는 action 직전에 영향받을 client를 같은 core loop에서 계산한다. 다른 client의 선택까지 변하면 `shared_focus_conflict`를 반환한다. 사용자가 공유 범위 변경을 명시한 경우에만 그 범위로 실행한다. 새 독립 per-client pane 선택 모델을 몰래 추가하지 않는다.
+masil의 client-target focus는 action 직전에 영향받을 client를 같은 core loop에서 계산한다. 다른 client의 선택까지 변하면 `shared_focus_conflict`를 반환한다. 사용자가 공유 범위 변경을 명시한 경우에만 그 범위로 실행한다. 새 독립 per-client pane 선택 모델을 몰래 추가하지 않는다.
 
 기본 agent 목록은 client-owned menu로 제공한다. pane-owned mode를 특정 client만 보는 UI처럼 사용하지 않는다. 긴 목록은 page/filter와 cached summary로 처리한다. 지속적인 overview가 필요하면 사용자가 만든 일반 pane을 사용하고 tmux의 공유 pane 의미를 알린다.
 

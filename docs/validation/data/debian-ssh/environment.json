@@ -29,9 +29,9 @@
   "source_base_commit": "c03a2b4",
   "source_note": "Base archive plus the changes recorded by the source hashes below.",
   "sha256": {
-    "bin/rmux": "888e88ff865589f7d2ea7121c54ccbe42ede8cb358902f19e9acf228c839387f",
+    "bin/masil": "888e88ff865589f7d2ea7121c54ccbe42ede8cb358902f19e9acf228c839387f",
     "bin/tmux-baseline": "c1a040c5b0a8f88e82975099b60fa90e4567eefe9a8478a914e329be505c596f",
-    "bin/rmux-agent": "36e49b2f6b2c3d100301ee4b04f44e537b271d099cd4dd6847ee9b1b30da7662",
+    "bin/masil-agent": "36e49b2f6b2c3d100301ee4b04f44e537b271d099cd4dd6847ee9b1b30da7662",
     "agent/src/main.rs": "5c3584e628e209aaf2087c280189c14a0212d6115e74d89e7b8b24f8cfdb9877",
     "agent/src/ui/terminal.rs": "ef854501999573f72b8a5ec587d4d3f077b83bdb1682d34d6fa96d602bb3fac6",
     "agent/Cargo.lock": "5b4684b0f0530fbb35956c11dd58325d34b8d837906041bb236a47d4c9bcbd39",

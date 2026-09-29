@@ -27,7 +27,7 @@
 #include <time.h>
 
 #include "tmux.h"
-#include "rmux-bridge.h"
+#include "masil-bridge.h"
 
 /*
  * Based on the description by Paul Williams at:
@@ -939,7 +939,7 @@ input_reset(struct input_ctx *ictx, int clear)
 			screen_write_start(sctx, &wp->base);
 		screen_write_reset(sctx);
 		screen_write_stop(sctx);
-		rmux_bridge_output_changed(wp);
+		masil_bridge_output_changed(wp);
 	}
 
 	input_clear(ictx);
@@ -1072,7 +1072,7 @@ input_parse_buffer(struct window_pane *wp, const u_char *buf, size_t len)
 
 	input_parse(ictx, buf, len);
 	screen_write_stop(sctx);
-	rmux_bridge_output_changed(wp);
+	masil_bridge_output_changed(wp);
 }
 
 /* Parse given input for screen. */
@@ -3036,11 +3036,11 @@ input_osc_9(struct input_ctx *ictx, const char *p)
 	size_t			 length = strlen(p);
 
 	/* Preserve bounded agent evidence independently of progress rendering. */
-	if (length >= 3 && length < sizeof ictx->ctx.s->rmux_osc_progress &&
+	if (length >= 3 && length < sizeof ictx->ctx.s->masil_osc_progress &&
 	    p[0] == '4' && p[1] == ';' && p[2] >= '0' && p[2] <= '4' &&
 	    strspn(p, "0123456789;-") == length)
-		strlcpy(ictx->ctx.s->rmux_osc_progress, p,
-		    sizeof ictx->ctx.s->rmux_osc_progress);
+		strlcpy(ictx->ctx.s->masil_osc_progress, p,
+		    sizeof ictx->ctx.s->masil_osc_progress);
 
 	if (*pb++ != '4')
 		return;

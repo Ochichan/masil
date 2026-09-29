@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible PTY benchmarks for rmux, pinned tmux, and Herdr 0.8.2.
+"""Reproducible PTY benchmarks for masil, pinned tmux, and Herdr 0.8.2.
 
 Smoke mode is a bounded harness check, not a performance-budget pass.  Use
 ``--profile full`` for the minimum sample counts and durations documented in
@@ -371,7 +371,7 @@ class ProductInstance:
         self.inner_rows = inner_rows
         self.hidden_inner_columns = hidden_inner_columns
         self.output_style = "scroll"
-        self.root = Path(tempfile.mkdtemp(prefix="rmx-bench-", dir="/tmp"))
+        self.root = Path(tempfile.mkdtemp(prefix="msl-bench-", dir="/tmp"))
         os.chmod(self.root, 0o700)
         self.client: AttachedClient | None = None
         self.server_pid: int | None = None
@@ -582,8 +582,8 @@ def herdr_environment(root: Path) -> dict[str, str]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "SHELL": "/bin/sh",
-        "USER": "rmux-bench",
-        "LOGNAME": "rmux-bench",
+        "USER": "masil-bench",
+        "LOGNAME": "masil-bench",
     }
     if set(env) - HERDR_ALLOWED_ENV:
         raise BenchmarkError(f"Herdr environment contains non-allowlisted keys: {set(env) - HERDR_ALLOWED_ENV}")
@@ -733,7 +733,7 @@ class HerdrInstance(ProductInstance):
                 "--cwd",
                 str(self.root),
                 "--label",
-                "rmux-benchmark",
+                "masil-benchmark",
                 "--no-focus",
             ).stdout,
             "herdr workspace create",
@@ -857,8 +857,8 @@ class HerdrInstance(ProductInstance):
 
 
 def make_instance(product: str, args: argparse.Namespace) -> ProductInstance:
-    if product == "rmux":
-        instance = TmuxInstance(product, args.rmux, args.timeout, args.inner_columns, args.inner_rows, args.hidden_inner_columns)
+    if product == "masil":
+        instance = TmuxInstance(product, args.masil, args.timeout, args.inner_columns, args.inner_rows, args.hidden_inner_columns)
     elif product == "tmux-baseline":
         instance = TmuxInstance(product, args.baseline, args.timeout, args.inner_columns, args.inner_rows, args.hidden_inner_columns)
     elif product == "herdr-0.8.2":
@@ -1040,11 +1040,11 @@ def input_rtt_benchmark(product: str, args: argparse.Namespace) -> dict[str, Any
         instance.start(1, "interactive", attach=True)
         assert instance.client is not None
         ready = instance.fixtures[0]
-        instance.client.wait_marker(f"@@RMUX_BENCH_READY:{ready.nonce}:".encode(), args.timeout)
+        instance.client.wait_marker(f"@@MASIL_BENCH_READY:{ready.nonce}:".encode(), args.timeout)
         instance.client.buffer.clear()
         for _ in range(args.rtt_samples):
             token = secrets.token_hex(8).encode("ascii")
-            expected = b"@@RMUX_BENCH_ECHO:" + ready.nonce.encode() + b":" + token.hex().encode() + b"@@"
+            expected = b"@@MASIL_BENCH_ECHO:" + ready.nonce.encode() + b":" + token.hex().encode() + b"@@"
             sent = monotonic_ns()
             instance.client.send(token + b"\n")
             observed = instance.client.wait_marker(expected, args.timeout)
@@ -1153,8 +1153,8 @@ def parse_pane_counts(value: str) -> list[int]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=("smoke", "full"), default="smoke")
-    parser.add_argument("--products", default="rmux,tmux-baseline,herdr-0.8.2")
-    parser.add_argument("--rmux", type=Path, default=ROOT / "bin" / "rmux")
+    parser.add_argument("--products", default="masil,tmux-baseline,herdr-0.8.2")
+    parser.add_argument("--masil", type=Path, default=ROOT / "bin" / "masil")
     parser.add_argument("--baseline", type=Path, default=ROOT / "bin" / "tmux-baseline")
     parser.add_argument("--herdr", type=Path, default=Path("/Users/ochi/.local/bin/herdr"))
     parser.add_argument("--pane-counts", type=parse_pane_counts, default=parse_pane_counts("1,15,50"))
@@ -1191,7 +1191,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if any(getattr(args, key) <= 0 for key in ("inner_columns", "inner_rows", "hidden_inner_columns", "startup_samples", "rtt_samples", "idle_seconds", "throughput_seconds", "throughput_repeats", "aggregate_rate_bytes_per_second", "burst_bytes", "timeout")):
         parser.error("sample counts, durations, rate, and timeout must be positive")
 
-    allowed_products = {"rmux", "tmux-baseline", "herdr-0.8.2"}
+    allowed_products = {"masil", "tmux-baseline", "herdr-0.8.2"}
     args.products = [item.strip() for item in args.products.split(",") if item.strip()]
     unknown = set(args.products) - allowed_products
     if unknown:
@@ -1201,7 +1201,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    binaries = {"rmux": args.rmux, "tmux-baseline": args.baseline, "herdr-0.8.2": args.herdr}
+    binaries = {"masil": args.masil, "tmux-baseline": args.baseline, "herdr-0.8.2": args.herdr}
     missing = [f"{product}: {binaries[product]}" for product in args.products if not binaries[product].is_file()]
     if missing:
         raise SystemExit("missing benchmark binaries: " + ", ".join(missing))

@@ -52,11 +52,11 @@ class Consumer:
 
 
 def measure(panes, enabled, mode, seconds):
-    instance = benchmark.TmuxInstance("rmux", benchmark.ROOT / "bin/rmux", 10, 93, 39, 94)
+    instance = benchmark.TmuxInstance("masil", benchmark.ROOT / "bin/masil", 10, 93, 39, 94)
     instance.output_style = "inplace"
     bridge = instance.root / "observe.sock"
     if enabled:
-        instance.env["RMUX_BRIDGE_SOCKET"] = str(bridge)
+        instance.env["MASIL_BRIDGE_SOCKET"] = str(bridge)
     consumer = None
     try:
         rate = max(1, 1048576 // panes) if mode == "output" else 0
@@ -108,7 +108,7 @@ def main():
     if args.seconds <= 0:
         parser.error("seconds must be positive")
     report = {"started_at_utc": datetime.now(timezone.utc).isoformat(), "budget_eligible": False,
-              "binary": benchmark.product_metadata("rmux", benchmark.ROOT / "bin/rmux"),
+              "binary": benchmark.product_metadata("masil", benchmark.ROOT / "bin/masil"),
               "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "seconds_per_condition": args.seconds, "conditions": [],
               "scope": "headless server RSS/CPU only; reader and Python workload children excluded",

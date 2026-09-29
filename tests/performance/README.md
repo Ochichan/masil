@@ -1,13 +1,13 @@
 # Performance harness
 
-`benchmark.py` compares the built `bin/rmux`, the pinned `bin/tmux-baseline`,
+`benchmark.py` compares the built `bin/masil`, the pinned `bin/tmux-baseline`,
 and the installed Herdr 0.8.2 binary using the same deterministic Python PTY
 fixture. It writes raw JSON when `--output` is supplied and otherwise writes
 JSON to stdout.
 
 Run `make benchmark-env` once, then use `.build/bench-venv/bin/python` in the
 commands below. The local environment pins pyte 0.8.2 and wcwidth 0.2.13 for
-measurement only. Neither dependency is included in rmux. pyte reconstructs
+measurement only. Neither dependency is included in masil. pyte reconstructs
 the host screen so differential redraws count as responses. The RTT timestamp
 is taken at the read that supplies the completed marker, before parser or log
 work. See [pyte documentation](https://pyte.readthedocs.io/en/latest/).
@@ -18,7 +18,7 @@ performance-budget claim:
 ```sh
 .build/bench-venv/bin/python tests/performance/benchmark.py \
   --profile smoke \
-  --output /tmp/rmux-benchmark-smoke.json
+  --output /tmp/masil-benchmark-smoke.json
 ```
 
 For a useful comparative run with qualifying startup and throughput sample
@@ -33,7 +33,7 @@ artifact will continue to say `budget_eligible: false`:
   --idle-seconds 30 \
   --throughput-seconds 60 \
   --throughput-repeats 3 \
-  --output /tmp/rmux-benchmark-comparative.json
+  --output /tmp/masil-benchmark-comparative.json
 ```
 
 The full profile enforces at least 100 startup samples, 1,000 attached RTT
@@ -45,18 +45,18 @@ itself mean that a performance budget passed; the JSON leaves
 ```sh
 .build/bench-venv/bin/python tests/performance/benchmark.py \
   --profile full \
-  --output /tmp/rmux-benchmark-full.json
+  --output /tmp/masil-benchmark-full.json
 ```
 
 The Herdr adapter starts only a foreground server with a fresh allowlisted
 environment. `HOME`, every XDG directory, the config, and both socket paths are
-inside a private `/tmp/rmx-bench-*` directory. Inherited `HERDR_SESSION`,
+inside a private `/tmp/msl-bench-*` directory. Inherited `HERDR_SESSION`,
 `HERDR_REMOTE`, and `TMUX` are absent. Cleanup addresses that private socket;
 there is no `killall`, `pkill`, or unqualified stop of a user instance.
 
 The host attachment remains 120×40. The installed Herdr 0.8.2 reports a 93×39
 inner terminal for its active root pane and 94×39 for panes on hidden tabs.
-rmux and tmux use matching manual window sizes for active and hidden windows,
+masil and tmux use matching manual window sizes for active and hidden windows,
 so the unused host area on those clients and Herdr's sidebar remain product UI
 cost while corresponding workload grids are identical. `--inner-columns`,
 `--hidden-inner-columns`, and `--inner-rows` change the required grids; a run

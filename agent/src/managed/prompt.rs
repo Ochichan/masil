@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 
-const OPTION: &str = "@rmux-agent-prompt-receipts";
+const OPTION: &str = "@masil-agent-prompt-receipts";
 const MAX_RETAINED: usize = 16;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -138,7 +138,7 @@ impl Manager {
                     "-p",
                     "-t",
                     &agent.pane_id,
-                    "#{rmux_bracketed_paste}",
+                    "#{masil_bracketed_paste}",
                 ])
                 .await?
                 .trim()
@@ -148,7 +148,7 @@ impl Manager {
                 "multiline prompt requires native bracketed paste; prepare a draft instead".into(),
             );
         }
-        let buffer = format!("rmux-prompt-{}", nonce()?);
+        let buffer = format!("masil-prompt-{}", nonce()?);
         self.native
             .tmux(
                 ["load-buffer", "-b", &buffer, "-"]
@@ -195,7 +195,7 @@ impl Manager {
             vec![
                 "display-message".into(),
                 "-p".into(),
-                "rmux-prompt-delivered".into(),
+                "masil-prompt-delivered".into(),
             ],
         ];
         // Check the evidence used by detection at the command queue boundary.
@@ -211,12 +211,12 @@ impl Manager {
             ),
             format!("#{{==:#{{pane_title}},{}}}", format_literal(&current.title)),
             format!(
-                "#{{==:#{{rmux_osc_progress}},{}}}",
+                "#{{==:#{{masil_osc_progress}},{}}}",
                 format_literal(&current.progress)
             ),
         ];
         if needs_bracket {
-            conditions.push("#{==:#{rmux_bracketed_paste},1}".into());
+            conditions.push("#{==:#{masil_bracketed_paste},1}".into());
         }
         let result = self
             .guarded_input_condition(&current, commands, Some(&and(&conditions)))

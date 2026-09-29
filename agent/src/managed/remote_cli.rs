@@ -367,7 +367,7 @@ pub(super) fn open_native(socket: &str, args: &[String]) -> Result<i32, String> 
         .spawn()
         .map_err(|e| format!("could not attach native terminal: {e}"))?;
     let pid = child.id().to_string();
-    let option = format!("@rmux-agent-lease-{lease}");
+    let option = format!("@masil-agent-lease-{lease}");
     let registered = runtime.block_on(async {
         let until = Instant::now() + Duration::from_secs(3);
         loop {
@@ -402,7 +402,7 @@ pub(super) async fn connection_status(
     lease: &str,
 ) -> Result<Value, String> {
     validate_lease(lease)?;
-    let option = format!("@rmux-agent-lease-{lease}");
+    let option = format!("@masil-agent-lease-{lease}");
     let raw = manager.command(&["show-options", "-gqv", &option]).await?;
     let value: Value =
         super::decode(raw.trim()).ok_or("native connection is starting or no longer exists")?;

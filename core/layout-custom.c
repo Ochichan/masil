@@ -74,7 +74,7 @@ struct layout_parse_cell_ctx {
 	int			 last;
 	int			 index;
 	int			 zindex;
-	struct layout_cell	*group;	/* rmux: floating group, if any */
+	struct layout_cell	*group;	/* masil: floating group, if any */
 };
 
 /* Layout parse context. */
@@ -88,7 +88,7 @@ struct layout_parse_ctx {
 	int				  capacity;	/* number allocated */
 	struct layout_parse_cell_ctx	 *cctxs;
 
-	struct layout_cell		 *group;	/* rmux: group parsed */
+	struct layout_cell		 *group;	/* masil: group parsed */
 	int				  group_zindex;
 };
 
@@ -315,7 +315,7 @@ bad:
 }
 
 /*
- * Get a floating cell's z-index in the layout being dumped. rmux: a floating
+ * Get a floating cell's z-index in the layout being dumped. masil: a floating
  * group has one z-index; its members are not counted separately.
  */
 static u_int
@@ -386,7 +386,7 @@ layout_append_v2(struct layout_cell *lc, struct layout_string *ls)
 	layout_string_write(ls, "{\"t\":\"%c\",\"w\":%u,\"h\":%u,\"x\":%d"
 	    ",\"y\":%d", c, lc->g.sx, lc->g.sy, lc->g.xoff, lc->g.yoff);
 	if (type != LAYOUT_WINDOWPANE) {
-		/* rmux: a floating group carries the z-index of its panes. */
+		/* masil: a floating group carries the z-index of its panes. */
 		if (lc->flags & LAYOUT_CELL_FLOATING) {
 			z = layout_cell_zindex(lc);
 			layout_string_write(ls, ",\"z\":%u", z);
@@ -591,7 +591,7 @@ layout_check(struct layout_cell *lc)
 	case LAYOUT_LEFTRIGHT:
 		TAILQ_FOREACH(lcchild, &lc->cells, entry) {
 			if (!layout_cell_in_tiling(lcchild)) {
-				/* rmux: a floating group is checked alone. */
+				/* masil: a floating group is checked alone. */
 				if (lcchild->type != LAYOUT_WINDOWPANE &&
 				    !layout_check(lcchild))
 					return (0);
@@ -722,7 +722,7 @@ layout_parse(struct window *w, const char *input, char **cause)
 	/* Preserve floating panes for version 1. */
 	if (pctx.version == 1) {
 		TAILQ_FOREACH(wp, &w->panes, entry) {
-			/* rmux: keep a floating group whole. */
+			/* masil: keep a floating group whole. */
 			lcchild = layout_float_root(wp->layout_cell);
 			if (lcchild == NULL || lcchild->parent == NULL)
 				continue;
@@ -826,7 +826,7 @@ layout_assign_fallback(struct window *w, struct layout_cell *lcroot)
 
 	wp = TAILQ_FIRST(&w->panes);
 	while (wp != NULL) {
-		/* rmux: a floating group is linked once, as a whole. */
+		/* masil: a floating group is linked once, as a whole. */
 		lc = layout_float_root(wp->layout_cell);
 		if (lc != NULL && lc->parent == NULL) {
 			lc->parent = lcroot;
@@ -1110,7 +1110,7 @@ layout_parse_json_layout(struct json_node *node, struct layout_cell *lcparent,
 			goto fail;
 		}
 
-		/* rmux: a node with a z-index is a floating group. */
+		/* masil: a node with a z-index is a floating group. */
 		if (json_find(node, "z") != NULL) {
 			if (pctx->group != NULL) {
 				*cause = xstrdup("floating group inside a "

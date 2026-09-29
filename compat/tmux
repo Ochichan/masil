@@ -1,4 +1,4 @@
 #!/bin/sh
 # Opt-in PATH entry only. Never replace the system tmux executable.
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
-exec "$root/bin/rmux" "$@"
+exec "$root/bin/masil" "$@"

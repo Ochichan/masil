@@ -240,7 +240,7 @@ pub fn run(socket: &str, args: &[String]) -> Result<i32, String> {
         value = match receive_stream(&mut stream) {
             Ok(value) => value,
             Err(StreamError::Lost(reason)) => {
-                eprintln!("rmux-agent: agent observation lost: {reason}");
+                eprintln!("masil-agent: agent observation lost: {reason}");
                 return Ok(3);
             }
             Err(StreamError::Malformed(reason)) => return Err(reason),

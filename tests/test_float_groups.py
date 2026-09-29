@@ -5,7 +5,7 @@ import json
 import random
 import unittest
 
-from test_compatibility import BASELINE, RMUX, Server
+from test_compatibility import BASELINE, MASIL, Server
 
 PANES = '#{pane_id} #{pane_floating_flag} #{pane_left} #{pane_top} #{pane_width} #{pane_height}'
 
@@ -116,7 +116,7 @@ class FloatServer(Server):
         # The layout string must restore the same tree. Upstream tmux leaves
         # zero-size nodes when every pane under them floats, and can tile a
         # pane into a full window past its minimum size; neither parses.
-        # The Differential test holds rmux to upstream for those cases.
+        # The Differential test holds masil to upstream for those cases.
         if '"w":0,' in text or '"h":0,' in text or layout.main_problems:
             return layout
         self.run('select-layout', text)
@@ -128,7 +128,7 @@ class FloatServer(Server):
 
 class Groups(unittest.TestCase):
     def server(self):
-        server = FloatServer(RMUX)
+        server = FloatServer(MASIL)
         server.__enter__()
         self.addCleanup(server.__exit__)
         return server
@@ -235,7 +235,7 @@ class Edges(unittest.TestCase):
     """Paths the design review flagged as easy to get wrong."""
 
     def server(self):
-        server = FloatServer(RMUX)
+        server = FloatServer(MASIL)
         server.__enter__()
         self.addCleanup(server.__exit__)
         return server
@@ -481,7 +481,7 @@ class Stress(unittest.TestCase):
     def test_random_sequences_keep_a_valid_tree(self):
         for seed in range(6):
             rng = random.Random(seed)
-            with FloatServer(RMUX) as s:
+            with FloatServer(MASIL) as s:
                 history = []
                 for number in range(120):
                     args = self.step(s, rng)
@@ -491,14 +491,14 @@ class Stress(unittest.TestCase):
 
 
 class Differential(unittest.TestCase):
-    """Without groups rmux must lay out floating and tiled panes exactly like
+    """Without groups masil must lay out floating and tiled panes exactly like
     upstream tmux, including upstream's own edge cases."""
 
     def test_stock_sequences_match_upstream(self):
         stress = Stress()
         for seed in range(8):
             rng = random.Random(1000 + seed)
-            with FloatServer(RMUX) as ours, FloatServer(BASELINE) as theirs:
+            with FloatServer(MASIL) as ours, FloatServer(BASELINE) as theirs:
                 history = []
                 for number in range(120):
                     args = stress.step(ours, rng)

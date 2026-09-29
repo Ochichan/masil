@@ -16,7 +16,7 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-RMUX = ROOT / 'bin/rmux'
+MASIL = ROOT / 'bin/masil'
 BASELINE = ROOT / 'bin/tmux-baseline'
 
 
@@ -29,7 +29,7 @@ def isolated_env(path):
 
 class Server:
     def __init__(self, binary, command=None, extra_env=None):
-        self.temp = tempfile.TemporaryDirectory(prefix='rmx-test-', dir='/tmp')
+        self.temp = tempfile.TemporaryDirectory(prefix='msl-test-', dir='/tmp')
         self.path = Path(self.temp.name)
         self.socket = self.path / 'core.sock'
         self.binary = str(binary)
@@ -94,25 +94,25 @@ def attached(server):
 
 class Compatibility(unittest.TestCase):
     def test_default_public_inventory(self):
-        with Server(BASELINE) as base, Server(RMUX) as rmux:
+        with Server(BASELINE) as base, Server(MASIL) as masil:
             queries = [('list-commands',), ('list-keys', '-a'),
                        ('show-options', '-g'), ('show-options', '-gw'), ('show-options', '-gs')]
-            # split-window -G (floating groups) is a documented rmux extension.
+            # split-window -G (floating groups) is a documented masil extension.
             extension = ('[-bdefGhIklPvWZ]', '[-bdefhIklPvWZ]')
             for query in queries:
                 with self.subTest(query=query):
-                    self.assertEqual(base.text(*query), rmux.text(*query).replace(*extension))
-            self.assertEqual(len(rmux.text('list-commands').splitlines()), 92)
-            self.assertEqual(rmux.text('show-options', '-gv', 'prefix').strip(), 'C-b')
+                    self.assertEqual(base.text(*query), masil.text(*query).replace(*extension))
+            self.assertEqual(len(masil.text('list-commands').splitlines()), 92)
+            self.assertEqual(masil.text('show-options', '-gv', 'prefix').strip(), 'C-b')
 
     def test_editor_defaults(self):
         for editor in ('/usr/bin/vi', '/usr/bin/emacs'):
-            with self.subTest(editor=editor), Server(BASELINE, extra_env={'EDITOR': editor}) as b, Server(RMUX, extra_env={'EDITOR': editor}) as r:
+            with self.subTest(editor=editor), Server(BASELINE, extra_env={'EDITOR': editor}) as b, Server(MASIL, extra_env={'EDITOR': editor}) as r:
                 self.assertEqual(b.text('show-options', '-gwv', 'mode-keys'),
                                  r.text('show-options', '-gwv', 'mode-keys'))
 
     def test_layout_session_links_and_zoom(self):
-        with Server(BASELINE) as b, Server(RMUX) as r:
+        with Server(BASELINE) as b, Server(MASIL) as r:
             actions = [('split-window', '-h', '-t', 'main:0', '/bin/sh'),
                        ('split-window', '-v', '-t', '%0', '/bin/sh'),
                        ('select-layout', '-t', 'main:0', 'tiled'),
@@ -128,7 +128,7 @@ class Compatibility(unittest.TestCase):
                                  r.text('list-panes', '-a', '-F', '#{session_name}:#{window_index}:#{pane_id}:#{pane_width}x#{pane_height}:#{window_zoomed_flag}'))
 
     def test_buffers_and_formats(self):
-        with Server(BASELINE) as b, Server(RMUX) as r:
+        with Server(BASELINE) as b, Server(MASIL) as r:
             content = '한글 테스트\n中文 日本語\ncombining e\u0301\tend\n'
             for server in (b, r):
                 path = server.path / 'buffer'
@@ -141,16 +141,16 @@ class Compatibility(unittest.TestCase):
                 self.assertEqual(b.text('display-message', '-p', fmt), r.text('display-message', '-p', fmt))
 
     def test_unicode_capture_and_copy_mode(self):
-        code = "import sys,time;print('RMUX_READY 한글 中文 e\\u0301',flush=True);time.sleep(30)"
-        with Server(BASELINE, [sys.executable, '-u', '-c', code]) as b, Server(RMUX, [sys.executable, '-u', '-c', code]) as r:
+        code = "import sys,time;print('MASIL_READY 한글 中文 e\\u0301',flush=True);time.sleep(30)"
+        with Server(BASELINE, [sys.executable, '-u', '-c', code]) as b, Server(MASIL, [sys.executable, '-u', '-c', code]) as r:
             for server in (b, r):
-                wait_for(lambda: 'RMUX_READY' in server.text('capture-pane', '-p'))
+                wait_for(lambda: 'MASIL_READY' in server.text('capture-pane', '-p'))
                 server.run('copy-mode')
                 self.assertEqual(server.text('display-message', '-p', '#{pane_in_mode}').strip(), '1')
             self.assertEqual(b.text('capture-pane', '-p'), r.text('capture-pane', '-p'))
 
     def test_native_prefix_and_detach(self):
-        for binary in (BASELINE, RMUX):
+        for binary in (BASELINE, MASIL):
             with self.subTest(binary=binary.name), Server(binary) as server:
                 with attached(server) as (master, child):
                     os.write(master, b'\x02c')
@@ -160,7 +160,7 @@ class Compatibility(unittest.TestCase):
                 self.assertEqual(len(server.text('list-windows').splitlines()), 2)
 
     def test_control_mode(self):
-        for binary in (BASELINE, RMUX):
+        for binary in (BASELINE, MASIL):
             with self.subTest(binary=binary.name), Server(binary) as server:
                 child = subprocess.Popen([server.binary, '-S', str(server.socket), '-C', 'attach-session', '-t', 'main'],
                                          env=server.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -182,7 +182,7 @@ class Compatibility(unittest.TestCase):
                     child.communicate(timeout=3)
 
     def test_protocol_product_isolation_and_inheritance(self):
-        with Server(BASELINE) as b, Server(RMUX) as r:
+        with Server(BASELINE) as b, Server(MASIL) as r:
             for own, foreign in ((r, b), (b, r)):
                 env = own.env | {'TMUX': str(foreign.socket) + ',1,0'}
                 result = subprocess.run([own.binary, 'kill-server'], env=env,
@@ -197,7 +197,7 @@ class Compatibility(unittest.TestCase):
             self.assertEqual(result.stdout.strip(), 'main')
 
     def test_native_hook_and_async_queue(self):
-        with Server(BASELINE) as b, Server(RMUX) as r:
+        with Server(BASELINE) as b, Server(MASIL) as r:
             for server in (b, r):
                 server.run('set-hook', '-g', 'after-new-window', 'set-option -g @hook seen')
                 server.run('new-window', '-d', '/bin/sh')
@@ -205,7 +205,7 @@ class Compatibility(unittest.TestCase):
             self.assertEqual(b.text('show-hooks', '-g'), r.text('show-hooks', '-g'))
 
     def test_native_error_semantics_and_alias(self):
-        with Server(BASELINE) as b, Server(RMUX) as r:
+        with Server(BASELINE) as b, Server(MASIL) as r:
             for action in [('select-pane', '-t', '%999'), ('definitely-not-a-command',),
                            ('set-option', '-g', 'not-an-option', 'x'), ('lsp', '-F', '#{pane_id}')]:
                 left, right = b.run(*action, check=False), r.run(*action, check=False)
@@ -214,7 +214,7 @@ class Compatibility(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    for binary in (RMUX, BASELINE):
+    for binary in (MASIL, BASELINE):
         if not binary.is_file():
             raise SystemExit(f'Build first: missing {binary}')
     unittest.main(verbosity=2)

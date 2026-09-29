@@ -17,7 +17,7 @@ import unittest
 import pyte
 
 from test_agentd import AGENT, AgentdHarness
-from test_compatibility import RMUX, Server, wait_for
+from test_compatibility import MASIL, Server, wait_for
 
 
 class Screen(pyte.Screen):
@@ -246,7 +246,7 @@ class DeskIntegration(AgentdHarness):
                 os.close(fd)
 
     def native_client(self):
-        client = Terminal([RMUX, "-S", self.core.socket, "attach-session", "-t", "main"], self.core.env)
+        client = Terminal([MASIL, "-S", self.core.socket, "attach-session", "-t", "main"], self.core.env)
         self.addCleanup(client.close)
         wait_for(lambda: bool(self.core.text("list-clients", "-F", "#{client_name}").strip()))
         client.drain(.2)
@@ -262,7 +262,7 @@ class DeskIntegration(AgentdHarness):
         self.core.run("set-option", "-g", "remain-on-exit", "on")
         first = self.sidebar("--lang", "en")
         self.assertEqual(first.returncode, 0, first.stderr)
-        pane = self.core.text("list-panes", "-t", "main:0", "-f", "#{@rmux-sidebar-owned}", "-F", "#{pane_id}").strip()
+        pane = self.core.text("list-panes", "-t", "main:0", "-f", "#{@masil-sidebar-owned}", "-F", "#{pane_id}").strip()
         self.assertTrue(pane.startswith("%"), first.stdout)
         self.assertEqual(self.core.text("display-message", "-p", "-t", "main:0", "#{pane_id}").strip(), "%0")
         again = self.sidebar()
@@ -296,13 +296,13 @@ class DeskIntegration(AgentdHarness):
         ui.until("Selected the configured pane")
         ui.send("l")
         ui.send("c")
-        wait_for(lambda: "rmux-agent-id" in self.core.text("list-buffers", "-F", "#{buffer_name}"), 5)
+        wait_for(lambda: "masil-agent-id" in self.core.text("list-buffers", "-F", "#{buffer_name}"), 5)
         ui.until("복사했습니다")
-        self.assertEqual(self.core.text("show-buffer", "-b", "rmux-agent-id").strip(), "agent-1")
-        other = Server(RMUX)
-        other.env["RMUX_BRIDGE_SOCKET"] = str(other.path / "observe.sock")
+        self.assertEqual(self.core.text("show-buffer", "-b", "masil-agent-id").strip(), "agent-1")
+        other = Server(MASIL)
+        other.env["MASIL_BRIDGE_SOCKET"] = str(other.path / "observe.sock")
         with other:
-            peer = Terminal([RMUX,"-S",other.socket,"attach-session","-t","main"], other.env)
+            peer = Terminal([MASIL,"-S",other.socket,"attach-session","-t","main"], other.env)
             try:
                 wait_for(lambda: bool(other.text("list-clients", "-F", "#{client_name}").strip()))
                 wrong = subprocess.run([AGENT,"--socket",self.manager,"sidebar","--core-native",other.socket],
@@ -339,12 +339,12 @@ class DeskIntegration(AgentdHarness):
         self.native_client()
         first = self.sidebar()
         self.assertEqual(first.returncode, 0, first.stderr)
-        old = self.core.text("list-panes", "-t", "main:0", "-f", "#{@rmux-sidebar-owned}", "-F", "#{pane_id}").strip()
-        before = self.core.text("display-message", "-p", "-t", old, "#{rmux_pty_generation}")
+        old = self.core.text("list-panes", "-t", "main:0", "-f", "#{@masil-sidebar-owned}", "-F", "#{pane_id}").strip()
+        before = self.core.text("display-message", "-p", "-t", old, "#{masil_pty_generation}")
         # Two argv elements select tmux's direct-exec path; a single command
         # string can retain an intermediary shell as the foreground process.
         self.core.run("respawn-pane", "-k", "-t", old, "/bin/cat", "-")
-        after = self.core.text("display-message", "-p", "-t", old, "#{rmux_pty_generation}")
+        after = self.core.text("display-message", "-p", "-t", old, "#{masil_pty_generation}")
         self.assertNotEqual(before, after)
         again = self.sidebar()
         self.assertEqual(again.returncode, 0, again.stderr)
@@ -362,7 +362,7 @@ class DeskIntegration(AgentdHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         width = int(self.core.text("display-message", "-p", "-t", narrow, "#{pane_width}"))
         self.assertGreaterEqual(width, 20, "sidebar split shrank only the 40-column target")
-        panel = self.core.text("list-panes", "-t", "main:0", "-f", "#{@rmux-sidebar-owned}", "-F", "#{pane_id}").strip()
+        panel = self.core.text("list-panes", "-t", "main:0", "-f", "#{@masil-sidebar-owned}", "-F", "#{pane_id}").strip()
         self.core.run("kill-pane", "-t", panel)
         client.resize(80, 24)
         wait_for(lambda: int(self.core.text("display-message", "-p", "-t", "%0", "#{window_width}")) == 80)

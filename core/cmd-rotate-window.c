@@ -106,7 +106,7 @@ cmd_rotate_window_exec(struct cmd *self, struct cmdq_item *item)
 			wp = TAILQ_FIRST(&w->panes);
 	}
 
-	/* rmux: panes moved into a floating group join its z-index run. */
+	/* masil: panes moved into a floating group join its z-index run. */
 	window_zindex_fix_groups(w);
 	window_set_active_pane(w, wp, 1);
 	cmd_find_from_winlink_pane(current, wl, wp, 0);

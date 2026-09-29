@@ -23,7 +23,7 @@
 
 ## Rust CLI
 
-`rmux-agent --socket PATH watch [--count N] %0 [%1 ...]`를 제공한다. ACK와 event를 NDJSON으로 즉시 flush한다. count는 event 개수이며 기본은 계속 관찰한다. 조용한 stream은 3초 timeout으로 종료하지 않는다. frame을 받기 시작하면 기존 bounded frame/parse 검증을 적용한다.
+`masil-agent --socket PATH watch [--count N] %0 [%1 ...]`를 제공한다. ACK와 event를 NDJSON으로 즉시 flush한다. count는 event 개수이며 기본은 계속 관찰한다. 조용한 stream은 3초 timeout으로 종료하지 않는다. frame을 받기 시작하면 기존 bounded frame/parse 검증을 적용한다.
 
 watch ACK와 event의 boot/epoch, 숫자 문자열, pane scope, monotonic sequence를 검증한다. gap 또는 예상치 않은 EOF는 관찰 상실을 표시하고 exit 3, malformed protocol은 exit 2다. 자동 재접속으로 gap을 숨기지 않는다. stdout pipe가 닫히면 정상 정리한다. 기존 명령의 동작과 exit 의미는 유지한다.
 

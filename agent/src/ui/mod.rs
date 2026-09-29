@@ -28,7 +28,7 @@ use tokio::{
 
 // Keep the terminal build's direction reference auditable in the stripped
 // executable through an explicit CLI, without putting design metadata in UI.
-pub(crate) const DESIGN_CONTRACT: &str = "rmux agent desk, Operate; user-pinned sidebar plus native zoom; seed e2f9e8dc; docs/ui/agent-desk.md";
+pub(crate) const DESIGN_CONTRACT: &str = "masil agent desk, Operate; user-pinned sidebar plus native zoom; seed e2f9e8dc; docs/ui/agent-desk.md";
 
 pub(crate) fn run_managed(socket: &str, args: &[String], sidebar: bool) -> Result<i32, String> {
     managed::run(socket, args, sidebar)
@@ -150,8 +150,8 @@ fn native_receipt(language: Language, tag: &str) -> String {
         ),
         "restored" => ("Restored window layout", "창 분할을 복원했습니다"),
         "copied" => (
-            "Copied ID to tmux buffer rmux-agent-id",
-            "tmux 버퍼 rmux-agent-id에 ID를 복사했습니다",
+            "Copied ID to tmux buffer masil-agent-id",
+            "tmux 버퍼 masil-agent-id에 ID를 복사했습니다",
         ),
         _ => (
             "Unknown native action response",

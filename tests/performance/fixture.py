@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic PTY child used by the rmux performance harness."""
+"""Deterministic PTY child used by the masil performance harness."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def configure_terminal() -> None:
 
 def announce_ready(sidechannel: Path, nonce: str) -> None:
     columns, rows = terminal_size()
-    marker = f"@@RMUX_BENCH_READY:{nonce}:{columns}x{rows}@@\r\n".encode("ascii")
+    marker = f"@@MASIL_BENCH_READY:{nonce}:{columns}x{rows}@@\r\n".encode("ascii")
     write_all(1, marker)
     report(sidechannel, "ready", nonce=nonce, columns=columns, rows=rows, pid=os.getpid())
 
@@ -94,7 +94,7 @@ def interactive(args: argparse.Namespace) -> None:
             if token == b"QUIT":
                 return
             safe = token.hex().encode("ascii")
-            marker = b"@@RMUX_BENCH_ECHO:" + args.nonce.encode("ascii") + b":" + safe + b"@@\r\n"
+            marker = b"@@MASIL_BENCH_ECHO:" + args.nonce.encode("ascii") + b":" + safe + b"@@\r\n"
             write_all(1, marker)
 
 
@@ -110,7 +110,7 @@ def output(args: argparse.Namespace) -> None:
             time.sleep(0.001)
     elif args.start_at_ns:
         wait_until(args.start_at_ns)
-    marker = f"@@RMUX_BENCH_DONE:{args.nonce}@@\r\n".encode("ascii")
+    marker = f"@@MASIL_BENCH_DONE:{args.nonce}@@\r\n".encode("ascii")
     if args.bytes < len(marker):
         raise SystemExit(f"--bytes must be at least {len(marker)}")
 

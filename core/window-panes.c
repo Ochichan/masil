@@ -334,7 +334,7 @@ window_panes_mark_borders_cell(u_char *map, struct layout_cell *lc, u_int osx,
 		return;
 
 	TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-		/* rmux: floating groups are drawn as floating panes. */
+		/* masil: floating groups are drawn as floating panes. */
 		if (lcchild->flags & LAYOUT_CELL_FLOATING)
 			continue;
 		window_panes_mark_borders_cell(map, lcchild, osx, osy, dsx,
@@ -513,7 +513,7 @@ window_panes_mark_border_joins_cell(u_char *map, struct layout_cell *lc,
 		return;
 
 	TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-		/* rmux: floating groups are drawn as floating panes. */
+		/* masil: floating groups are drawn as floating panes. */
 		if (lcchild->flags & LAYOUT_CELL_FLOATING)
 			continue;
 		window_panes_mark_border_joins_cell(map, lcchild, osx, osy,

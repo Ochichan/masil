@@ -12,16 +12,16 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_agentd import AGENT, Provider, manager_query
 from test_attention import WatchPeer
-from test_compatibility import RMUX, Server, wait_for
+from test_compatibility import MASIL, Server, wait_for
 from benchmark import process_sample
 
 
 def measure(count, seconds, subscribers):
-    with Server(RMUX, command=["/bin/cat"]) as core:
+    with Server(MASIL, command=["/bin/cat"]) as core:
         # Start a distinct private core with observation enabled from creation.
         core.run("kill-server")
         bridge = core.path / "observe.sock"
-        core.env["RMUX_BRIDGE_SOCKET"] = str(bridge)
+        core.env["MASIL_BRIDGE_SOCKET"] = str(bridge)
         core.run("new-session", "-d", "-s", "main", "/bin/cat")
         panes = ["%0"] + [core.text("new-window", "-d", "-E", "-P", "-F", "#{pane_id}").strip()
                            for _ in range(count - 1)]
@@ -100,7 +100,7 @@ def main():
     result = {
         "kind": "short_idle_probe", "platform": platform.platform(),
         "agent_sha256": hashlib.sha256(AGENT.read_bytes()).hexdigest(),
-        "core_sha256": hashlib.sha256(RMUX.read_bytes()).hexdigest(),
+        "core_sha256": hashlib.sha256(MASIL.read_bytes()).hexdigest(),
         "provider": "deterministic local HTTP/SSE fixture; no model or TUI",
         "cpu_method": "ps cumulative CPU delta; short interval and coarse timer resolution",
         "samples": [measure(count, args.seconds, args.subscribers) for count in (1, 50)],

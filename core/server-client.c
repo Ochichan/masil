@@ -736,7 +736,7 @@ server_client_check_mouse_in_pane(struct window_pane *wp, int px, int py,
 }
 
 /*
- * rmux: move a tty x to the window area beside a status column of width cols
+ * masil: move a tty x to the window area beside a status column of width cols
  * starting at colat. Positions in or beyond the column clamp to its edge.
  */
 static u_int
@@ -769,7 +769,7 @@ server_client_check_mouse(struct client *c, struct key_event *event)
 	enum key_code_mouse_location	 loc = KEYC_MOUSE_LOCATION_NOWHERE;
 
 	/*
-	 * rmux: a replayed click was already moved beside a status column;
+	 * masil: a replayed click was already moved beside a status column;
 	 * start again from the terminal position.
 	 */
 	if (m->colshifted) {
@@ -865,7 +865,7 @@ have_event:
 	m->ignore = ignore;
 
 	/*
-	 * rmux: with a left or right status column, an event in the column
+	 * masil: with a left or right status column, an event in the column
 	 * uses the column rows. Every other position moves to window-area
 	 * coordinates here so later consumers of m->x and m->lx are unchanged.
 	 * A drag already in progress stays in the window area.
@@ -1674,7 +1674,7 @@ server_client_handle_menu_key(struct client *c, struct key_event *event)
 	colat = status_column_at(c);
 	if (KEYC_IS_MOUSE(event->key) && cols != 0 &&
 	    new_event.m.x >= (u_int)colat && new_event.m.x < colat + cols) {
-		/* rmux: the status column is outside any menu. */
+		/* masil: the status column is outside any menu. */
 		m = &new_event.m;
 		m->x = m->y = UINT_MAX;
 	} else if (KEYC_IS_MOUSE(event->key)) {
@@ -1762,7 +1762,7 @@ server_client_handle_key0(struct client *c, struct key_event *event,
 		if (server_client_handle_menu_key(c, event))
 			return (0);
 		if (c->prompt != NULL) {
-			/* rmux: the prompt row spans the terminal width. */
+			/* masil: the prompt row spans the terminal width. */
 			memcpy(&pm, &event->m, sizeof pm);
 			if (pm.colshifted) {
 				pm.x = pm.rawx;
@@ -1790,7 +1790,7 @@ server_client_handle_key0(struct client *c, struct key_event *event,
 		if (wp != NULL &&
 		    window_pane_has_prompt(wp) &&
 		    window_pane_is_visible(wp)) {
-			/* rmux: pane prompts use window-area coordinates. */
+			/* masil: pane prompts use window-area coordinates. */
 			memcpy(&pm, &event->m, sizeof pm);
 			if (pm.colshifted) {
 				pm.x = pm.rawx;

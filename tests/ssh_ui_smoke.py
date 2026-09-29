@@ -48,7 +48,7 @@ def fixture(mode):
             if opened.returncode:
                 raise RuntimeError(opened.stderr)
             sidebar = harness.core.text("list-panes", "-t", "main:0", "-f",
-                                        "#{@rmux-sidebar-owned}", "-F", "#{pane_id}").strip()
+                                        "#{@masil-sidebar-owned}", "-F", "#{pane_id}").strip()
             harness.core.run("select-pane", "-t", sidebar)
         child.wait(timeout=90)
         size = os.get_terminal_size(1)
@@ -71,7 +71,7 @@ def fixture(mode):
                 child.wait(timeout=4)
         if not harness.doCleanups():
             raise RuntimeError("SSH fixture cleanup failed")
-    print("RMUX_SSH_RESULT " + json.dumps(result), flush=True)
+    print("MASIL_SSH_RESULT " + json.dumps(result), flush=True)
 
 
 def verify(host, remote_root, output):
@@ -82,7 +82,7 @@ def verify(host, remote_root, output):
         raise ValueError("remote root must be an absolute path")
     output.mkdir(parents=True, exist_ok=True)
     reports = []
-    with tempfile.TemporaryDirectory(prefix="rmux-ssh-client-") as local_root:
+    with tempfile.TemporaryDirectory(prefix="masil-ssh-client-") as local_root:
         for mode in ("desk", "native"):
             command = "cd " + shlex.quote(remote_root) + " && " + shlex.join([
                 "env", "LC_ALL=C.UTF-8", "TERM=xterm-256color", "python3",
@@ -122,7 +122,7 @@ def verify(host, remote_root, output):
                     ui.send("\x02d")  # Native detach, through the real SSH PTY.
                 ui.wait(timeout=10)
                 ui.drain()
-                match = re.search(rb"RMUX_SSH_RESULT (\{[^\r\n]+\})", ui.output)
+                match = re.search(rb"MASIL_SSH_RESULT (\{[^\r\n]+\})", ui.output)
                 if not match:
                     raise AssertionError(f"No fixture result, SSH exit={ui.child.returncode}: {ui.text}")
                 report = json.loads(match.group(1))

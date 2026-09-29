@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "generatedAt": "2026-09-28T04:01:07Z",
-  "title": "Design System: rmux Agent Desk",
+  "title": "Design System: masil Agent Desk",
   "extensions": {
     "breakpoints": [
       {
@@ -38,7 +38,7 @@
   "components": [],
   "narrative": {
     "northStar": "Evidence Before Action",
-    "overview": "The rmux agent desk keeps agent attention beside the terminal panes it describes. Its stable list, evidence inspector, and guarded actions let a user find a waiting agent, inspect what rmux knows, mark the selected agent's displayed request set as seen, and request navigation to a configured pane.\n\nThe interface uses a compact terminal cell grid, charcoal surfaces, quiet borders, and a restrained teal accent. Every status keeps a text label. The design does not infer completion, approval, or a verified foreground agent from incomplete evidence.",
+    "overview": "The masil agent desk keeps agent attention beside the terminal panes it describes. Its stable list, evidence inspector, and guarded actions let a user find a waiting agent, inspect what masil knows, mark the selected agent's displayed request set as seen, and request navigation to a configured pane.\n\nThe interface uses a compact terminal cell grid, charcoal surfaces, quiet borders, and a restrained teal accent. Every status keeps a text label. The design does not infer completion, approval, or a verified foreground agent from incomplete evidence.",
     "keyCharacteristics": [
       "A terminal-native list and inspector share one observation model.",
       "Dark, light, and host-terminal themes keep the same semantic roles.",

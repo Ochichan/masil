@@ -1,15 +1,15 @@
-# rmux 용어
+# masil 용어
 
-rmux는 tmux 방식의 터미널 작업 공간에 에이전트의 작업 상태와 조작을 추가한다. 터미널 구성과 에이전트 대화를 구분해 부른다.
+masil은 tmux 방식의 터미널 작업 공간에 에이전트의 작업 상태와 조작을 추가한다. 터미널 구성과 에이전트 대화를 구분해 부른다.
 
 ## 터미널 구성
 
 **Environment**:
-연결 대상 rmux server와 그 server가 접근하는 실행·파일 작업 환경이다. client가 있는 머신과 다를 수 있다.
+연결 대상 masil server와 그 server가 접근하는 실행·파일 작업 환경이다. client가 있는 머신과 다를 수 있다.
 _Avoid_: client의 로컬 환경과의 혼용
 
 **Server**:
-터미널 세션과 실행 중인 작업을 관리하는 rmux 인스턴스다.
+터미널 세션과 실행 중인 작업을 관리하는 masil 인스턴스다.
 _Avoid_: 모델 서버, provider
 
 **Client**:
@@ -33,7 +33,7 @@ window 연결 목록을 함께 관리하는 tmux session들의 묶음이다.
 _Avoid_: 에이전트 팀
 
 **Workspace**:
-에이전트 작업이 참조하는 프로젝트 디렉터리나 checkout을 나타내는 rmux의 추가 개념이다.
+에이전트 작업이 참조하는 프로젝트 디렉터리나 checkout을 나타내는 masil의 추가 개념이다.
 _Avoid_: tmux session의 새 이름
 
 **Worktree**:
@@ -43,7 +43,7 @@ _Avoid_: branch 자체, pane
 ## 에이전트 작업
 
 **Provider**:
-rmux가 실행하거나 연동하는 코딩 에이전트 제품이다. 여기서 Codex·Claude Code·OpenCode는 provider이고, 그 안에서 선택하는 모델은 별개다.
+masil이 실행하거나 연동하는 코딩 에이전트 제품이다. 여기서 Codex·Claude Code·OpenCode는 provider이고, 그 안에서 선택하는 모델은 별개다.
 _Avoid_: 모델 공급 API와의 혼용
 
 **Agent session**:
@@ -87,7 +87,7 @@ _Avoid_: 모든 idle 상태
 _Avoid_: approval, 모든 client의 읽음 상태
 
 **Operation receipt**:
-rmux의 특정 관리 요청이 어느 단계까지 확인됐는지 나타내는 기록이다. 요청 접수, 전달, provider 수락, 실행, 종료는 서로 다른 사실이다.
+masil의 특정 관리 요청이 어느 단계까지 확인됐는지 나타내는 기록이다. 요청 접수, 전달, provider 수락, 실행, 종료는 서로 다른 사실이다.
 _Avoid_: 외부 작업 완료의 포괄적인 success
 
 **Operation key**:

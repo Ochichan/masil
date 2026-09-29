@@ -19,21 +19,21 @@ const MAX_SCRIPT: usize = 64 * 1024;
 const MAX_COPY: usize = 64 * 1024;
 const SIDEBAR_WIDTH: &str = "34";
 const MIN_WINDOW_WIDTH: u32 = 100;
-const REJECTED: &str = "rmux-native-rejected";
-const MARKED: &str = "rmux-native-marked";
-const COPIED: &str = "rmux-native-copied";
-const FOCUSED: &str = "rmux-native-focused";
-const FOCUSED_RESTORED: &str = "rmux-native-focused-restored";
-const OPT_OWNED: &str = "@rmux-sidebar-owned";
-const OPT_BOOT: &str = "@rmux-sidebar-core-boot";
-const OPT_MANAGER: &str = "@rmux-sidebar-manager";
-const OPT_GENERATION: &str = "@rmux-sidebar-pty-generation";
+const REJECTED: &str = "masil-native-rejected";
+const MARKED: &str = "masil-native-marked";
+const COPIED: &str = "masil-native-copied";
+const FOCUSED: &str = "masil-native-focused";
+const FOCUSED_RESTORED: &str = "masil-native-focused-restored";
+const OPT_OWNED: &str = "@masil-sidebar-owned";
+const OPT_BOOT: &str = "@masil-sidebar-core-boot";
+const OPT_MANAGER: &str = "@masil-sidebar-manager";
+const OPT_GENERATION: &str = "@masil-sidebar-pty-generation";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const CLIENT_FORMAT: &str =
     "#{client_name}\t#{client_readonly}\t#{client_control_mode}\t#{pane_id}\t#{window_id}";
-const TARGET_FORMAT: &str = "#{rmux_core_boot_id}\t#{rmux_pty_generation}\t#{pane_id}\t#{window_id}\t#{window_width}\t#{window_zoomed_flag}\t#{pane_zoomed_flag}\t#{window_modal_pane}\t#{window_active_clients}\t#{pane_dead}";
-const OWNED_FORMAT: &str = "#{rmux_core_boot_id}\t#{rmux_pty_generation}\t#{pane_id}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_zoomed_flag}\t#{window_modal_pane}\t#{window_active_clients}\t#{pane_dead}\t#{@rmux-sidebar-owned}\t#{@rmux-sidebar-core-boot}\t#{@rmux-sidebar-manager}\t#{@rmux-sidebar-pty-generation}";
+const TARGET_FORMAT: &str = "#{masil_core_boot_id}\t#{masil_pty_generation}\t#{pane_id}\t#{window_id}\t#{window_width}\t#{window_zoomed_flag}\t#{pane_zoomed_flag}\t#{window_modal_pane}\t#{window_active_clients}\t#{pane_dead}";
+const OWNED_FORMAT: &str = "#{masil_core_boot_id}\t#{masil_pty_generation}\t#{pane_id}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_zoomed_flag}\t#{window_modal_pane}\t#{window_active_clients}\t#{pane_dead}\t#{@masil-sidebar-owned}\t#{@masil-sidebar-core-boot}\t#{@masil-sidebar-manager}\t#{@masil-sidebar-pty-generation}";
 
 #[derive(Clone, Debug)]
 pub struct Context {
@@ -228,7 +228,7 @@ impl Context {
             "-d".to_owned(),
             "-P".to_owned(),
             "-F".to_owned(),
-            "#{pane_id}\t#{rmux_pty_generation}".to_owned(),
+            "#{pane_id}\t#{masil_pty_generation}".to_owned(),
             "-t".to_owned(),
             target.pane_id.clone(),
             "--".to_owned(),
@@ -302,7 +302,7 @@ impl Context {
         if managed {
             marker_commands.insert(
                 0,
-                set_marker(&pane_id, "@rmux-managed-sidebar", &manager_marker),
+                set_marker(&pane_id, "@masil-managed-sidebar", &manager_marker),
             );
         }
         let marked = self
@@ -501,7 +501,7 @@ impl Context {
                     "#{==:1,#{window_zoomed_flag}}".into(),
                     "#{==:1,#{pane_zoomed_flag}}".into(),
                 ),
-                "rmux-native-restored",
+                "masil-native-restored",
                 ZoomOutcome::Restored,
             )
         } else {
@@ -510,7 +510,7 @@ impl Context {
                     "#{==:0,#{window_zoomed_flag}}".into(),
                     "#{==:0,#{pane_zoomed_flag}}".into(),
                 ),
-                "rmux-native-expanded",
+                "masil-native-expanded",
                 ZoomOutcome::Expanded,
             )
         };
@@ -568,7 +568,7 @@ impl Context {
             vec![
                 "load-buffer".into(),
                 "-b".into(),
-                "rmux-agent-id".into(),
+                "masil-agent-id".into(),
                 path_text(&temporary.path, "temporary buffer")?.into(),
             ],
             vec!["display-message".into(), "-p".into(), COPIED.into()],
@@ -602,7 +602,7 @@ impl Context {
                 ),
             ),
         );
-        let cleaned = "rmux-native-dead-cleaned";
+        let cleaned = "masil-native-dead-cleaned";
         let commands = vec![
             vec!["display-message".into(), "-p".into(), cleaned.into()],
             vec!["kill-pane".into(), "-t".into(), pane_id.into()],
@@ -744,7 +744,7 @@ impl Context {
             ),
         );
         let format = format!(
-            "#{{pane_id}}\t#{{rmux_pty_generation}}\t#{{{OPT_GENERATION}}}\t#{{pane_dead}}"
+            "#{{pane_id}}\t#{{masil_pty_generation}}\t#{{{OPT_GENERATION}}}\t#{{pane_dead}}"
         );
         let output = self
             .tmux(
@@ -854,7 +854,7 @@ impl Context {
         require_window(window_id)?;
         let directory = private_parent(&self.socket)?;
         let path = directory.join(format!(
-            ".rmux-sidebar-{}.lock",
+            ".masil-sidebar-{}.lock",
             window_id.trim_start_matches('@')
         ));
         let file = OpenOptions::new()
@@ -884,7 +884,7 @@ impl Context {
         let directory = private_parent(&self.socket)?;
         for _ in 0..32 {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = directory.join(format!(".rmux-buffer-{}-{sequence}", std::process::id()));
+            let path = directory.join(format!(".masil-buffer-{}-{sequence}", std::process::id()));
             match OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1019,7 +1019,7 @@ pub(crate) fn native_executable() -> Result<PathBuf, String> {
     let directory = current
         .parent()
         .ok_or_else(|| "current executable has no parent directory".to_string())?;
-    Ok(directory.join("rmux"))
+    Ok(directory.join("masil"))
 }
 
 fn private_parent(socket: &Path) -> Result<PathBuf, String> {
@@ -1092,9 +1092,9 @@ fn and(left: String, right: String) -> String {
 
 fn core_guard(boot: &str, generation: &str) -> String {
     and(
-        format!("#{{==:{boot},#{{rmux_core_boot_id}}}}"),
+        format!("#{{==:{boot},#{{masil_core_boot_id}}}}"),
         and(
-            format!("#{{==:{generation},#{{rmux_pty_generation}}}}"),
+            format!("#{{==:{generation},#{{masil_pty_generation}}}}"),
             and(
                 "#{<=:#{window_active_clients},1}".into(),
                 "#{==:,#{window_modal_pane}}".into(),
@@ -1376,8 +1376,8 @@ mod tests {
     fn core_guard_is_nested_and_checks_all_boundary_evidence() {
         let guard = core_guard(BOOT, "42");
         assert_eq!(guard.matches("#{&&:").count(), 3);
-        assert!(guard.contains("#{==:01234567-89ab-4def-8123-456789abcdef,#{rmux_core_boot_id}}"));
-        assert!(guard.contains("#{==:42,#{rmux_pty_generation}}"));
+        assert!(guard.contains("#{==:01234567-89ab-4def-8123-456789abcdef,#{masil_core_boot_id}}"));
+        assert!(guard.contains("#{==:42,#{masil_pty_generation}}"));
         assert!(guard.contains("#{<=:#{window_active_clients},1}"));
         assert!(guard.contains("#{==:,#{window_modal_pane}}"));
     }
@@ -1396,10 +1396,10 @@ mod tests {
     #[test]
     fn owned_guard_binds_manager_and_captured_generation() {
         let guard = owned_guard(BOOT, "7", "2f746d702f6d616e61676572");
-        assert!(guard.contains("#{==:1,#{@rmux-sidebar-owned}}"));
-        assert!(guard.contains(&format!("#{{==:{BOOT},#{{@rmux-sidebar-core-boot}}}}")));
-        assert!(guard.contains("#{==:2f746d702f6d616e61676572,#{@rmux-sidebar-manager}}"));
-        assert!(guard.contains("#{==:7,#{@rmux-sidebar-pty-generation}}"));
+        assert!(guard.contains("#{==:1,#{@masil-sidebar-owned}}"));
+        assert!(guard.contains(&format!("#{{==:{BOOT},#{{@masil-sidebar-core-boot}}}}")));
+        assert!(guard.contains("#{==:2f746d702f6d616e61676572,#{@masil-sidebar-manager}}"));
+        assert!(guard.contains("#{==:7,#{@masil-sidebar-pty-generation}}"));
     }
 
     #[test]
@@ -1431,12 +1431,12 @@ mod tests {
             &[vec![
                 "split-window".into(),
                 "--".into(),
-                "/tmp/a b/rmux-agent".into(),
+                "/tmp/a b/masil-agent".into(),
                 "label'; display-message hacked".into(),
             ]],
             REJECTED,
         );
-        assert!(script.contains("'/tmp/a b/rmux-agent'"));
+        assert!(script.contains("'/tmp/a b/masil-agent'"));
         assert!(script.contains("'label'\\''; display-message hacked'"));
         assert_eq!(script.matches("display-message").count(), 2);
     }

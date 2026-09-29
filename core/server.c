@@ -34,7 +34,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
-#include "rmux-bridge.h"
+#include "masil-bridge.h"
 
 /*
  * Main server functions.
@@ -254,12 +254,12 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	evtimer_add(&server_ev_tidy, &tv);
 
 	server_acl_init();
-	rmux_bridge_start();
+	masil_bridge_start();
 
 	server_add_accept(0);
 	proc_loop(server_proc, server_loop);
 
-	rmux_bridge_stop();
+	masil_bridge_stop();
 	job_kill_all();
 	prompt_save_history();
 
@@ -505,7 +505,7 @@ server_child_exited(pid_t pid, int status)
 				log_debug("%%%u exited", wp->id);
 				if (~wp->flags & PANE_EXITED) {
 					wp->flags |= PANE_EXITED;
-					rmux_bridge_pane_state_changed(wp);
+					masil_bridge_pane_state_changed(wp);
 				}
 
 				window_pane_wait_finish(wp);

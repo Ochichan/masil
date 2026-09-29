@@ -1110,7 +1110,7 @@ struct screen {
 
 	struct hyperlinks		*hyperlinks;
 	struct progress_bar		 progress_bar;
-	char				 rmux_osc_progress[32];
+	char				 masil_osc_progress[32];
 };
 
 /* Screen write context. */
@@ -1372,10 +1372,10 @@ struct window_pane {
 	struct spawn_editor_state *editor;
 
 	uint64_t	 output_generation;
-	uint64_t	 rmux_pty_generation;
-	uint64_t	 rmux_screen_generation;
-	int		 rmux_generation_exhausted;
-	uint16_t	 rmux_watch_slot;
+	uint64_t	 masil_pty_generation;
+	uint64_t	 masil_screen_generation;
+	int		 masil_generation_exhausted;
+	uint16_t	 masil_watch_slot;
 	time_t		 last_output_time;
 	time_t		 last_prompt_time;
 	time_t		 cmd_start_time;
@@ -1643,7 +1643,7 @@ struct session {
 
 	int		 statusat;
 	u_int		 statuslines;
-	int		 statuscolumn; /* rmux: STATUS_COLUMN_* */
+	int		 statuscolumn; /* masil: STATUS_COLUMN_* */
 	u_int		 statuswidth;
 
 	struct options	*options;
@@ -1706,7 +1706,7 @@ struct mouse_event {
 	u_int		statuslines;
 
 	/*
-	 * rmux: set when the event landed in a left or right status column;
+	 * masil: set when the event landed in a left or right status column;
 	 * colx is the column-local x. x is then the nearest window-area x.
 	 */
 	int		incolumn;
@@ -1853,7 +1853,7 @@ struct tty {
 	u_int		 mouse_last_y;
 	u_int		 mouse_last_b;
 	int		 mouse_drag_flag;
-	int		 mouse_column_drag; /* rmux */
+	int		 mouse_column_drag; /* masil */
 	u_int		 mouse_drag_x;
 	u_int		 mouse_drag_y;
 	int		 mouse_scrolling_flag;
@@ -2106,12 +2106,12 @@ struct status_line {
 	struct grid_cell	 style;
 	struct style_line_entry entries[STATUS_LINES_LIMIT];
 
-	/* rmux: one entry per row of a left or right status column. */
+	/* masil: one entry per row of a left or right status column. */
 	struct style_line_entry	*column;
 	u_int			 ncolumn;
 };
 
-/* rmux: status-position values beyond tmux's top and bottom. */
+/* masil: status-position values beyond tmux's top and bottom. */
 #define STATUS_POSITION_TOP 0
 #define STATUS_POSITION_BOTTOM 1
 #define STATUS_POSITION_LEFT 2
@@ -2564,7 +2564,7 @@ struct spawn_context {
 #define SPAWN_SPLIT 0x400
 #define SPAWN_MODAL 0x800
 #define SPAWN_FLOATOVERZOOM 0x1000
-#define SPAWN_GROUP 0x2000 /* rmux: split inside a floating group */
+#define SPAWN_GROUP 0x2000 /* masil: split inside a floating group */
 };
 
 /* Paste buffer. */
@@ -2647,9 +2647,9 @@ extern char **cfg_files;
 extern u_int cfg_nfiles;
 extern int cfg_quiet;
 
-/* rmux-ui.c */
-extern int rmux_ui_enabled;
-void	 rmux_ui_load(struct client *, int);
+/* masil-ui.c */
+extern int masil_ui_enabled;
+void	 masil_ui_load(struct client *, int);
 void	start_cfg(void);
 int	load_cfg(const char *, struct client *, struct cmdq_item *,
             struct cmd_find_state *, int, struct cmdq_item **);

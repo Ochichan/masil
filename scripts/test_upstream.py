@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def run_one(binary, script, timeout, run_dir):
     logs = run_dir / 'logs' / binary.name
     logs.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='rmx-reg-', dir='/tmp') as tmp:
+    with tempfile.TemporaryDirectory(prefix='msl-reg-', dir='/tmp') as tmp:
         directory = Path(tmp)
         work = directory / 'regress'
         shutil.copytree(ROOT / 'core/regress', work,
@@ -28,10 +28,10 @@ def run_one(binary, script, timeout, run_dir):
         normalizations = []
         copied = work/script.name
         source_text = copied.read_text()
-        if script.name == 'socket-path.sh' and binary.name == 'rmux':
+        if script.name == 'socket-path.sh' and binary.name == 'masil':
             # The documented product namespace is the only expected difference.
-            source_text = source_text.replace('/tmux-$(id -u)', '/rmux-$(id -u)')
-            normalizations.append('socket namespace tmux-UID -> rmux-UID')
+            source_text = source_text.replace('/tmux-$(id -u)', '/masil-$(id -u)')
+            normalizations.append('socket namespace tmux-UID -> masil-UID')
         if script.name == 'terminal-feature-utf8.sh':
             # The test deliberately clears locale/environment for a nested
             # client; retain only our private socket directory across env -i.
@@ -96,7 +96,7 @@ def main():
     parser.add_argument('--match', default='*.sh')
     args = parser.parse_args()
     scripts = sorted((ROOT/'core/regress').glob(args.match))
-    inputs = [ROOT/'bin/tmux-baseline', ROOT/'bin/rmux']
+    inputs = [ROOT/'bin/tmux-baseline', ROOT/'bin/masil']
     if not all(b.is_file() for b in inputs):
         parser.error('build both binaries first')
     run_dir = ROOT/'.build'/('regress-'+uuid.uuid4().hex[:12])
@@ -125,9 +125,9 @@ def main():
     regressions = []
     for script in scripts:
         pair = {r['binary']:r['status'] for r in results if r['script']==script.name}
-        if pair.get('tmux-baseline')=='passed' and pair.get('rmux')!='passed':
+        if pair.get('tmux-baseline')=='passed' and pair.get('masil')!='passed':
             regressions.append(script.name)
-    print('rmux-only regressions:', regressions)
+    print('masil-only regressions:', regressions)
     # Any failure remains a failing gate, even when also present upstream.
     raise SystemExit(any(r['status']!='passed' for r in results))
 

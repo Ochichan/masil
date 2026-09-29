@@ -374,7 +374,7 @@ pub(crate) fn configure(args: &[String]) -> Result<Value, String> {
         Some(command @ ("remove" | "enable" | "disable")) if args.len() == 2 => {
             configure_update(command, &args[1])
         }
-        _ => Err("endpoints requires list, add ID --socket PATH [--host USER@HOST] [--binary ABSOLUTE_OR_rmux-agent] [--label LABEL], remove ID, enable ID, or disable ID".into()),
+        _ => Err("endpoints requires list, add ID --socket PATH [--host USER@HOST] [--binary ABSOLUTE_OR_masil-agent] [--label LABEL], remove ID, enable ID, or disable ID".into()),
     }
 }
 
@@ -405,7 +405,7 @@ fn configure_add(args: &[String]) -> Result<Value, String> {
         enabled: true,
         socket: socket.ok_or("endpoint add requires --socket PATH")?,
         host,
-        binary: binary.unwrap_or_else(|| "rmux-agent".into()),
+        binary: binary.unwrap_or_else(|| "masil-agent".into()),
     };
     validate_endpoint(&endpoint)?;
     let path = config_path()?;
@@ -458,7 +458,7 @@ fn config_path() -> Result<PathBuf, String> {
                 .map(|home| home.join(".config"))
         })
         .ok_or("endpoint configuration needs an absolute XDG_CONFIG_HOME or HOME")?;
-    Ok(base.join("rmux/endpoints.json"))
+    Ok(base.join("masil/endpoints.json"))
 }
 
 fn validate_endpoints(endpoints: &[Endpoint]) -> Result<(), String> {
@@ -483,8 +483,8 @@ fn validate_endpoint(endpoint: &Endpoint) -> Result<(), String> {
         return Err("endpoint socket must be an absolute path".into());
     }
     validate_text("endpoint binary", &endpoint.binary, 1, 4096)?;
-    if endpoint.binary != "rmux-agent" && !Path::new(&endpoint.binary).is_absolute() {
-        return Err("endpoint binary must be 'rmux-agent' or an absolute path".into());
+    if endpoint.binary != "masil-agent" && !Path::new(&endpoint.binary).is_absolute() {
+        return Err("endpoint binary must be 'masil-agent' or an absolute path".into());
     }
     if let Some(host) = &endpoint.host {
         validate_host(host)?;
@@ -818,9 +818,9 @@ mod tests {
             id: "build".into(),
             label: "Build".into(),
             enabled: true,
-            socket: "/tmp/rmux socket's name".into(),
+            socket: "/tmp/masil socket's name".into(),
             host: host.map(str::to_owned),
-            binary: "/opt/rmux tools/rmux-agent".into(),
+            binary: "/opt/masil tools/masil-agent".into(),
         }
     }
 
@@ -828,13 +828,13 @@ mod tests {
     fn local_command_has_fixed_argv() {
         let command = endpoint(None).command();
         let command = command.as_std();
-        assert_eq!(command.get_program(), "/opt/rmux tools/rmux-agent");
+        assert_eq!(command.get_program(), "/opt/masil tools/masil-agent");
         assert_eq!(
             command
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
-            ["agent", "--socket", "/tmp/rmux socket's name", "rpc"]
+            ["agent", "--socket", "/tmp/masil socket's name", "rpc"]
         );
     }
 
@@ -857,7 +857,7 @@ mod tests {
                 "ConnectTimeout=3",
                 "--",
                 "dev@example.test",
-                "'/opt/rmux tools/rmux-agent' 'agent' '--socket' '/tmp/rmux socket'\"'\"'s name' 'rpc'",
+                "'/opt/masil tools/masil-agent' 'agent' '--socket' '/tmp/masil socket'\"'\"'s name' 'rpc'",
             ]
         );
         assert!(validate_host("dev@example.test;touch /tmp/injected").is_err());
@@ -882,7 +882,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_call_kills_and_reaps_its_process_group() {
         let directory =
-            std::env::temp_dir().join(format!("rmux-endpoint-cancel-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("masil-endpoint-cancel-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
         let script = directory.join("slow-agent");
@@ -899,7 +899,7 @@ mod tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
         let endpoint = Endpoint {
             binary: script.to_string_lossy().into_owned(),
-            socket: "/tmp/unused-rmux.sock".into(),
+            socket: "/tmp/unused-masil.sock".into(),
             ..endpoint(None)
         };
         let call = tokio::spawn(async move { endpoint.call(&Request::List).await });

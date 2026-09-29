@@ -29,7 +29,7 @@ impl Preferences {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
             .filter(|p| p.is_absolute())
-            .map(|p| p.join("rmux/ui.json"));
+            .map(|p| p.join("masil/ui.json"));
         Self::from_path(path)
     }
 
@@ -139,7 +139,7 @@ mod tests {
     use super::*;
     #[test]
     fn invalid_preferences_are_not_overwritten() {
-        let root = std::env::temp_dir().join(format!("rmux-ui-prefs-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("masil-ui-prefs-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("ui.json");
         fs::write(&path, b"{\"version\":999}").unwrap();

@@ -248,13 +248,13 @@ fn target_status(target: &Target) -> Value {
 
 fn export(target: &Target, directory: Option<&String>) -> Result<Value, String> {
     let executable = std::env::current_exe()
-        .map_err(|error| format!("could not resolve rmux-agent executable: {error}"))?;
+        .map_err(|error| format!("could not resolve masil-agent executable: {error}"))?;
     if !executable.is_absolute() {
-        return Err("rmux-agent executable path is not absolute".into());
+        return Err("masil-agent executable path is not absolute".into());
     }
     let executable = executable
         .to_str()
-        .ok_or("rmux-agent executable path is not UTF-8")?;
+        .ok_or("masil-agent executable path is not UTF-8")?;
     let directory = match directory {
         Some(directory) => {
             let path = std::path::PathBuf::from(directory);
@@ -282,7 +282,7 @@ fn export(target: &Target, directory: Option<&String>) -> Result<Value, String> 
         "registration": registration,
         "events": target.events,
         "actions": if target.capability == Capability::Lifecycle { json!(["session", "working", "blocked", "idle"]) } else { json!(["session"]) },
-        "usage": "Write each returned file at its absolute destination and merge the registration fragment only after review. rmux does not install or merge these files.",
+        "usage": "Write each returned file at its absolute destination and merge the registration fragment only after review. masil does not install or merge these files.",
     }))
 }
 
@@ -302,7 +302,7 @@ fn export_artifacts(
 ) -> Result<(Vec<Value>, Value), String> {
     match target.id {
         "pi" | "omp" => {
-            let name = format!("rmux-{}-agent-state.ts", target.id);
+            let name = format!("masil-{}-agent-state.ts", target.id);
             let destination = directory.join(&name);
             Ok((
                 vec![artifact(
@@ -318,7 +318,7 @@ fn export_artifacts(
             ))
         }
         "opencode" | "kilo" => {
-            let name = format!("rmux-{}-agent-state.js", target.id);
+            let name = format!("masil-{}-agent-state.js", target.id);
             let destination = directory.join(&name);
             Ok((
                 vec![artifact(
@@ -329,12 +329,12 @@ fn export_artifacts(
                 json!({
                     "kind": "drop_in_plugin",
                     "path": destination,
-                    "entrypoint": if target.id == "opencode" { "default plugin object and RmuxAgentStatePlugin" } else { "RmuxAgentStatePlugin" },
+                    "entrypoint": if target.id == "opencode" { "default plugin object and MasilAgentStatePlugin" } else { "MasilAgentStatePlugin" },
                 }),
             ))
         }
         "hermes" => {
-            let plugin_dir = directory.join("rmux-agent-state");
+            let plugin_dir = directory.join("masil-agent-state");
             let init = plugin_dir.join("__init__.py");
             let manifest = plugin_dir.join("plugin.yaml");
             Ok((
@@ -343,18 +343,18 @@ fn export_artifacts(
                     artifact(
                         &manifest,
                         "0644",
-                        "name: rmux-agent-state\nversion: \"1.0\"\ndescription: Report Hermes session identity to a managed rmux pane\n",
+                        "name: masil-agent-state\nversion: \"1.0\"\ndescription: Report Hermes session identity to a managed masil pane\n",
                     ),
                 ],
                 json!({
                     "kind": "hermes_plugin_directory",
                     "path": plugin_dir,
-                    "enable": "add rmux-agent-state to Hermes config.yaml plugins",
+                    "enable": "add masil-agent-state to Hermes config.yaml plugins",
                 }),
             ))
         }
         _ => {
-            let name = format!("rmux-{}-hook.sh", target.id);
+            let name = format!("masil-{}-hook.sh", target.id);
             let destination = directory.join(&name);
             let script = shell_bridge(target.id, executable);
             Ok((
@@ -371,7 +371,7 @@ fn artifact(path: &std::path::Path, mode: &str, content: &str) -> Value {
 
 fn shell_bridge(provider: &str, executable: &str) -> String {
     format!(
-        "#!/bin/sh\n# rmux generated bridge for {provider}; provider configuration is not installed.\nset -eu\n[ -n \"${{TMUX_PANE:-}}\" ] || exit 64\n[ -n \"${{RMUX_AGENT_RUN:-}}\" ] || exit 64\nexec {binary} agent integration hook {provider} \"${{1:-}}\"\n",
+        "#!/bin/sh\n# masil generated bridge for {provider}; provider configuration is not installed.\nset -eu\n[ -n \"${{TMUX_PANE:-}}\" ] || exit 64\n[ -n \"${{MASIL_AGENT_RUN:-}}\" ] || exit 64\nexec {binary} agent integration hook {provider} \"${{1:-}}\"\n",
         provider = posix_quote(provider),
         binary = posix_quote(executable),
     )
@@ -400,14 +400,14 @@ fn typescript_extension(provider: &str, executable: &str) -> String {
   });
 "#
     };
-    r#"// rmux generated extension; configuration is not installed.
+    r#"// masil generated extension; configuration is not installed.
 import { spawn } from "node:child_process";
-const RMUX_AGENT = __BINARY__;
+const MASIL_AGENT = __BINARY__;
 const MAX_CALLBACK_BYTES = 256 * 1024;
 function scopeConfigured() {
   const pane = process.env.TMUX_PANE;
-  const run = process.env.RMUX_AGENT_RUN;
-  const socket = process.env.RMUX_AGENT_SOCKET;
+  const run = process.env.MASIL_AGENT_RUN;
+  const socket = process.env.MASIL_AGENT_SOCKET;
   const valid = (value: unknown): value is string => typeof value === "string" &&
     value.length > 0 && value.length <= 1024 && !/[\u0000-\u001f\u007f]/u.test(value);
   return typeof pane === "string" && /^%[0-9]+$/u.test(pane) &&
@@ -418,7 +418,7 @@ function send(action: string, payload: unknown) {
   let body: string | undefined;
   try { body = JSON.stringify(payload ?? {}); } catch { return; }
   if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > MAX_CALLBACK_BYTES) return;
-  const child = spawn(RMUX_AGENT, ["agent", "integration", "hook", "__PROVIDER__", action], {
+  const child = spawn(MASIL_AGENT, ["agent", "integration", "hook", "__PROVIDER__", action], {
     env: process.env, stdio: ["pipe", "ignore", "ignore"], shell: false,
   });
   child.on("error", () => {});
@@ -447,19 +447,19 @@ __LISTENERS__
 fn javascript_plugin(provider: &str, executable: &str) -> String {
     let default_export = if provider == "opencode" {
         r#"
-export default { id: "rmux.opencode", server: RmuxAgentStatePlugin, setup() {} };
+export default { id: "masil.opencode", server: MasilAgentStatePlugin, setup() {} };
 "#
     } else {
         ""
     };
-    r#"// rmux generated plugin; configuration is not installed.
+    r#"// masil generated plugin; configuration is not installed.
 import { spawn } from "node:child_process";
-const RMUX_AGENT = __BINARY__;
+const MASIL_AGENT = __BINARY__;
 const MAX_CALLBACK_BYTES = 256 * 1024;
 function scopeConfigured() {
   const pane = process.env.TMUX_PANE;
-  const run = process.env.RMUX_AGENT_RUN;
-  const socket = process.env.RMUX_AGENT_SOCKET;
+  const run = process.env.MASIL_AGENT_RUN;
+  const socket = process.env.MASIL_AGENT_SOCKET;
   const valid = value => typeof value === "string" && value.length > 0 &&
     value.length <= 1024 && !/[\u0000-\u001f\u007f]/u.test(value);
   return typeof pane === "string" && /^%[0-9]+$/u.test(pane) &&
@@ -472,7 +472,7 @@ function send(payload, action) {
   if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > MAX_CALLBACK_BYTES) return;
   const args = ["agent", "integration", "hook", "__PROVIDER__"];
   if (action) args.push(action);
-  const child = spawn(RMUX_AGENT, args, { env: process.env,
+  const child = spawn(MASIL_AGENT, args, { env: process.env,
     stdio: ["pipe", "ignore", "ignore"], shell: false });
   child.on("error", () => {});
   child.stdin.on("error", () => {});
@@ -483,13 +483,13 @@ function send(payload, action) {
 }
 let rootSessionID;
 const childSessions = new Set();
-export const RmuxAgentStatePlugin = async () => ({
+export const MasilAgentStatePlugin = async () => ({
   "chat.message": async ({ sessionID }) => {
     if (!sessionID || childSessions.has(sessionID)) return;
     const switched = rootSessionID && rootSessionID !== sessionID;
     rootSessionID = sessionID;
-    send({ hook_event_name: switched ? "rmux.session.selected" : "chat.message",
-      rmux_scope: "frontend", sessionID }, switched ? "session" : "working");
+    send({ hook_event_name: switched ? "masil.session.selected" : "chat.message",
+      masil_scope: "frontend", sessionID }, switched ? "session" : "working");
   },
   event: async ({ event }) => {
     const properties = event?.properties ?? {};
@@ -513,12 +513,12 @@ __DEFAULT__
 }
 
 fn hermes_plugin(executable: &str) -> String {
-    r#"# rmux generated Hermes plugin; configuration is not installed.
+    r#"# masil generated Hermes plugin; configuration is not installed.
 import json
 import os
 import subprocess
 
-RMUX_AGENT = __BINARY__
+MASIL_AGENT = __BINARY__
 INTERACTIVE = {"cli", "tui", "desktop", "acp"}
 
 def report(event, **kwargs):
@@ -529,7 +529,7 @@ def report(event, **kwargs):
         return
     payload = json.dumps({"event": event, "session_id": session_id})
     try:
-        subprocess.run([RMUX_AGENT, "agent", "integration", "hook", "hermes", "session"],
+        subprocess.run([MASIL_AGENT, "agent", "integration", "hook", "hermes", "session"],
                        input=payload, text=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        timeout=1, check=False, env=os.environ.copy())
@@ -590,14 +590,14 @@ fn registration_fragment(target: &Target, hook_path: &std::path::Path) -> Value 
                 ("AgentEnd", "idle"),
                 ("Stop", "idle"),
             ];
-            let hooks = actions.into_iter().map(|(event,action)| (event.to_string(),json!([{"type":"command","command":command(action),"timeout":10000,"description":"Report MastraCode state to rmux"}]))).collect::<Map<String,Value>>();
+            let hooks = actions.into_iter().map(|(event,action)| (event.to_string(),json!([{"type":"command","command":command(action),"timeout":10000,"description":"Report MastraCode state to masil"}]))).collect::<Map<String,Value>>();
             json!({"format":"hooks.json fragment","hooks":hooks})
         }
         "agy" => {
-            json!({"format":"hooks.json fragment","hooks":{"rmux":{"PreInvocation":[{"type":"command","command":command("session"),"timeout":10}]}}})
+            json!({"format":"hooks.json fragment","hooks":{"masil":{"PreInvocation":[{"type":"command","command":command("session"),"timeout":10}]}}})
         }
         "grok" => {
-            json!({"format":"dedicated hooks/rmux.json","hooks":{"SessionStart":[nested("session")]}})
+            json!({"format":"dedicated hooks/masil.json","hooks":{"SessionStart":[nested("session")]}})
         }
         "kimi" => {
             let actions = [
@@ -657,7 +657,7 @@ async fn hook(
         .ok_or("hook callback must be a JSON object")?;
     let pane = required_env("TMUX_PANE")?;
     crate::pane_id(&pane)?;
-    let run = required_env("RMUX_AGENT_RUN")?;
+    let run = required_env("MASIL_AGENT_RUN")?;
     let sequence = callback_sequence()?;
     let mapped = map_callback(target, action.filter(|action| !action.is_empty()), payload)?;
 
@@ -721,13 +721,13 @@ fn required_env(name: &str) -> Result<String, String> {
 }
 
 fn callback_sequence() -> Result<u64, String> {
-    if let Ok(value) = std::env::var("RMUX_AGENT_SEQUENCE") {
+    if let Ok(value) = std::env::var("MASIL_AGENT_SEQUENCE") {
         let sequence = value
             .parse::<u64>()
-            .map_err(|_| "RMUX_AGENT_SEQUENCE must be a positive integer")?;
+            .map_err(|_| "MASIL_AGENT_SEQUENCE must be a positive integer")?;
         return (sequence > 0)
             .then_some(sequence)
-            .ok_or_else(|| "RMUX_AGENT_SEQUENCE must be a positive integer".into());
+            .ok_or_else(|| "MASIL_AGENT_SEQUENCE must be a positive integer".into());
     }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -948,7 +948,7 @@ fn map_open_code(
         "session.idle" => Some("idle"),
         "session.created" if provider == "kilo" => None,
         "session.updated" => None,
-        "rmux.session.selected" if root_binding => None,
+        "masil.session.selected" if root_binding => None,
         "session.status" => match status_name(properties).as_deref() {
             Some("idle") => Some("idle"),
             Some("active" | "busy" | "pending" | "retry" | "running" | "streaming" | "working") => {
@@ -998,11 +998,11 @@ fn open_code_provenance(payload: &Map<String, Value>) -> (bool, bool, bool) {
         .or_else(|| callback_event(payload))
         .map(|event| normalize_event(&event))
         .unwrap_or_default();
-    let frontend = first_text(payload, &["rmux_scope"])
-        .or_else(|| first_text(event_object, &["rmux_scope"]))
+    let frontend = first_text(payload, &["masil_scope"])
+        .or_else(|| first_text(event_object, &["masil_scope"]))
         == Some("frontend");
-    let root_binding = frontend && matches!(event.as_str(), "chatmessage" | "rmuxsessionselected");
-    let allow_root_switch = frontend && event == "rmuxsessionselected";
+    let root_binding = frontend && matches!(event.as_str(), "chatmessage" | "masilsessionselected");
+    let allow_root_switch = frontend && event == "masilsessionselected";
     (child, root_binding, allow_root_switch)
 }
 
@@ -1150,7 +1150,7 @@ mod tests {
             target("opencode").unwrap(),
             Some("working"),
             &object(
-                r#"{"hook_event_name":"chat.message","rmux_scope":"frontend","sessionID":"root"}"#,
+                r#"{"hook_event_name":"chat.message","masil_scope":"frontend","sessionID":"root"}"#,
             ),
         )
         .unwrap();
@@ -1160,7 +1160,7 @@ mod tests {
         let selection = map_callback(
             target("opencode").unwrap(),
             Some("session"),
-            &object(r#"{"hook_event_name":"rmux.session.selected","rmux_scope":"frontend","sessionID":"next-root"}"#),
+            &object(r#"{"hook_event_name":"masil.session.selected","masil_scope":"frontend","sessionID":"next-root"}"#),
         )
         .unwrap();
         assert!(selection.root_binding);
@@ -1210,7 +1210,7 @@ mod tests {
         assert!(!script.contains("eval"));
         assert_eq!(exported["installed"], false);
 
-        let plugin = javascript_plugin("opencode", "/missing/rmux-agent");
+        let plugin = javascript_plugin("opencode", "/missing/masil-agent");
         assert!(plugin.contains("scopeConfigured()"));
         assert!(plugin.contains("Buffer.byteLength(body, \"utf8\")"));
         assert!(plugin.contains("child.on(\"error\""));

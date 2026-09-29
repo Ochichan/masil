@@ -86,7 +86,7 @@ start_cfg(void)
 
 	if (cfg_quiet)
 		flags = CMD_PARSE_QUIET;
-	rmux_ui_load(c, flags);
+	masil_ui_load(c, flags);
 	for (i = 0; i < cfg_nfiles; i++)
 		load_cfg(cfg_files[i], c, NULL, NULL, flags, NULL);
 

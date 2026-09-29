@@ -2,9 +2,9 @@
 
 ## 필수 원칙
 
-rmux의 기본 키 설정은 기준 tmux의 기본 키 설정과 같아야 한다. `C-b` prefix만 같고 나머지를 바꾼 구성을 호환 기본값이라고 부르지 않는다.
+masil의 기본 키 설정은 기준 tmux의 기본 키 설정과 같아야 한다. `C-b` prefix만 같고 나머지를 바꾼 구성을 호환 기본값이라고 부르지 않는다.
 
-기준은 [참조 SHA](reference/README.md)의 `key-bindings.c`, `options-table.c`, `tmux.c`, mode별 입력 처리다. [전체 기본 바인딩](reference/tmux-default-bindings.conf)은 C 문자열과 메뉴 매크로를 풀어 소스에서 추출한 것이다. 이 파일은 비교 자료이며 현재 실행 가능한 rmux 설정이라는 뜻은 아니다.
+기준은 [참조 SHA](reference/README.md)의 `key-bindings.c`, `options-table.c`, `tmux.c`, mode별 입력 처리다. [전체 기본 바인딩](reference/tmux-default-bindings.conf)은 C 문자열과 메뉴 매크로를 풀어 소스에서 추출한 것이다. 이 파일은 비교 자료이며 현재 실행 가능한 masil 설정이라는 뜻은 아니다.
 
 ## 기본값과 초기화
 
@@ -27,7 +27,7 @@ rmux의 기본 키 설정은 기준 tmux의 기본 키 설정과 같아야 한�
 
 `tmux.c`는 `VISUAL`이 설정되어 있으면 이를 선택하고, 아니면 `EDITOR`를 확인한다. 선택한 값의 basename에 `vi`가 들어 있으면 `mode-keys`와 `status-keys`를 vi로 초기화하고, 아니면 emacs로 초기화한다. 명시적인 사용자 설정은 tmux와 같은 순서로 적용한다. 따라서 기본 copy mode를 항상 vi 또는 항상 emacs로 고정하지 않는다.
 
-tmux의 mouse 옵션과 pane 안 프로그램 자체의 mouse 입력은 구분한다. 에이전트 통합을 켰다는 이유로 `mouse`, `focus-events`, `escape-time`의 기준 기본값을 바꾸지 않는다. 2026-09-28 실제 build 검증에서 기존 문서가 macro 없는 fallback을 기본 build로 잘못 설명한 점을 정정했다. rmux와 같은 source의 stock build 모두 mouse on이다.
+tmux의 mouse 옵션과 pane 안 프로그램 자체의 mouse 입력은 구분한다. 에이전트 통합을 켰다는 이유로 `mouse`, `focus-events`, `escape-time`의 기준 기본값을 바꾸지 않는다. 2026-09-28 실제 build 검증에서 기존 문서가 macro 없는 fallback을 기본 build로 잘못 설명한 점을 정정했다. masil과 같은 source의 stock build 모두 mouse on이다.
 
 ## 주요 prefix 키
 
@@ -108,18 +108,18 @@ tmux의 mouse 옵션과 pane 안 프로그램 자체의 mouse 입력은 구분�
 
 ## 에이전트 기능과 충돌 방지
 
-- 기본 tmux 바인딩을 대체하거나 추가 해석하지 않는다. `-f` 없이 시작할 때 적용하는 [rmux UI 레이어](mouse-ui.md)도 기본 바인딩이 없는 키(`MouseDown1Control0`~`6`, pane 제목의 `MouseUp1Control3`·`MouseDrag1Control3`, prefix 뒤 세션 저장 `C-s`·불러오기 `C-r`)에만 바인딩하며 설명은 `rmux-ui:`로 시작한다.
+- 기본 tmux 바인딩을 대체하거나 추가 해석하지 않는다. `-f` 없이 시작할 때 적용하는 [masil UI 레이어](mouse-ui.md)도 기본 바인딩이 없는 키(`MouseDown1Control0`~`6`, pane 제목의 `MouseUp1Control3`·`MouseDrag1Control3`, prefix 뒤 세션 저장 `C-s`·불러오기 `C-r`)에만 바인딩하며 설명은 `masil-ui:`로 시작한다.
 - 에이전트 전용 global hotkey는 초기 기본값에 넣지 않는다. 공통 기능은 CLI와 `Prefix :`의 명령으로 접근할 수 있게 한다.
 - 사용자가 명시적으로 bind한 전용 key table과 키는 지원한다. 추천 설정은 기본 설정과 구분한다.
 - 원래 agent composer, 승인 화면, 검색, 계획 모드, 모델 선택 등에 필요한 입력을 보존한다.
 - 공통 agent overlay를 열었을 때 입력 소유자와 닫는 동작을 분명히 한다. overlay를 닫으면 기존 pane과 mode로 돌아간다.
-- tmux 업그레이드 때 새 기본 키와 rmux 추천 키의 충돌을 검사한다. rmux의 편의 키를 유지하기 위해 tmux 기본값을 변경하지 않는다.
+- tmux 업그레이드 때 새 기본 키와 masil 추천 키의 충돌을 검사한다. masil의 편의 키를 유지하기 위해 tmux 기본값을 변경하지 않는다.
 
 ## 검증 계약
 
-한중일 IME와 비영어 배열을 기본 입력 검증에 포함한다. 원래 pane, rmux의 popup/command prompt, 검색·이름 편집에서 확정 텍스트 직후 Enter, 긴 paste, UTF-8 chunk 경계, AltGr와 Ctrl 조합을 따로 확인한다. Windows host terminal→SSH→Unix server와 중첩 tmux 경로도 해당 지원 환경에서 검사한다.
+한중일 IME와 비영어 배열을 기본 입력 검증에 포함한다. 원래 pane, masil의 popup/command prompt, 검색·이름 편집에서 확정 텍스트 직후 Enter, 긴 paste, UTF-8 chunk 경계, AltGr와 Ctrl 조합을 따로 확인한다. Windows host terminal→SSH→Unix server와 중첩 tmux 경로도 해당 지원 환경에서 검사한다.
 
-rmux는 terminal이 전달하는 확정 텍스트와 key protocol을 보존한다. 관찰할 수 없는 IME preedit 상태를 추정해 Enter를 앞당기거나 마지막 글자를 제거하지 않는다. provider별·입력창별 대조를 남겨 host 입력 문제와 rmux 처리 문제를 구분한다.
+masil은 terminal이 전달하는 확정 텍스트와 key protocol을 보존한다. 관찰할 수 없는 IME preedit 상태를 추정해 Enter를 앞당기거나 마지막 글자를 제거하지 않는다. provider별·입력창별 대조를 남겨 host 입력 문제와 masil 처리 문제를 구분한다.
 
 출력·animation·reflow 중 selection 유지와 실제 복사 결과는 [신뢰성 계약 R-06, R-07](reliability.md)을 따른다. agent 상태의 `unknown`은 직접 사용자 키를 가로채는 근거가 아니다. 자동화의 합성 입력 제한과 수동 키 전달을 구분한다.
 

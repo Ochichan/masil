@@ -112,7 +112,7 @@ pub(crate) fn tr(language: Language, key: Text) -> &'static str {
     use super::model::Language::{English as En, Korean as Ko};
     use Text::*;
     match (language, key) {
-        (En, Product) => "rmux",
+        (En, Product) => "masil",
         (En, Desk) => "Agent desk",
         (En, ManagedDesk) => "Agent management",
         (En, Sidebar) => "Agent side panel",
@@ -217,7 +217,7 @@ pub(crate) fn tr(language: Language, key: Text) -> &'static str {
         (En, NotVerified) => "Not verified",
         (En, LastKnown) => "Last known",
 
-        (Ko, Product) => "rmux",
+        (Ko, Product) => "masil",
         (Ko, Desk) => "에이전트 데스크",
         (Ko, ManagedDesk) => "에이전트 관리",
         (Ko, Sidebar) => "에이전트 사이드 패널",
@@ -611,10 +611,10 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
             Note("Mark seen acknowledges only the displayed daemon epoch and request revision."),
             Note("Mark seen is not provider approval and never answers a request."),
             Note("Go to pane requires fresh matching core and PTY evidence."),
-            Note("Idle means idle; rmux does not claim that work is complete."),
+            Note("Idle means idle; masil does not claim that work is complete."),
             Note("Copy ID writes to the tmux buffer, not the system clipboard."),
             Note("The side panel is shared by clients viewing this tmux window."),
-            Note("rmux does not replace tmux defaults, including the Ctrl-b prefix."),
+            Note("masil does not replace tmux defaults, including the Ctrl-b prefix."),
             Note(
                 "While mouse capture is active, terminal text selection may require your terminal's override modifier.",
             ),
@@ -651,10 +651,10 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
             Note("확인 처리는 화면에 표시된 데몬 세대와 요청 리비전에만 적용됩니다."),
             Note("확인 처리는 제공자 승인이 아니며 요청에 답하지 않습니다."),
             Note("창 이동에는 일치하는 최신 코어 및 PTY 근거가 필요합니다."),
-            Note("대기 중은 완료를 뜻하지 않습니다. rmux는 완료를 주장하지 않습니다."),
+            Note("대기 중은 완료를 뜻하지 않습니다. masil은 완료를 주장하지 않습니다."),
             Note("ID 복사는 시스템 클립보드가 아닌 tmux 버퍼에 기록합니다."),
             Note("사이드 패널은 이 tmux 창을 보는 클라이언트들이 공유합니다."),
-            Note("rmux는 Ctrl-b 접두사를 포함한 tmux 기본값을 바꾸지 않습니다."),
+            Note("masil은 Ctrl-b 접두사를 포함한 tmux 기본값을 바꾸지 않습니다."),
             Note("마우스 캡처 중 터미널 텍스트 선택에는 터미널별 우회 키가 필요할 수 있습니다."),
         ],
     }

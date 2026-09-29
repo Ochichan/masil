@@ -1411,7 +1411,7 @@ options_push_changes(const char *name)
 		status_timer_start_all();
 	if (strcmp(name, "status") == 0 ||
 	    strcmp(name, "status-position") == 0 ||
-	    strcmp(name, "@rmux-status-width") == 0 ||
+	    strcmp(name, "@masil-status-width") == 0 ||
 	    strcmp(name, "pane-border-indicators") == 0 ||
 	    strcmp(name, "pane-border-lines") == 0 ||
 	    strcmp(name, "pane-border-status") == 0 ||

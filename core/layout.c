@@ -161,7 +161,7 @@ layout_search_by_border(struct layout_cell *lc, u_int x, u_int y)
 	struct layout_cell	*lcchild, *last = NULL;
 
 	TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-		/* rmux: floating groups are searched from their own root. */
+		/* masil: floating groups are searched from their own root. */
 		if (lcchild->type != LAYOUT_WINDOWPANE &&
 		    (lcchild->flags & LAYOUT_CELL_FLOATING))
 			continue;
@@ -247,7 +247,7 @@ layout_cell_is_tiled(struct layout_cell *lc)
 }
 
 /*
- * rmux: the floating cell a cell belongs to, or NULL if it is tiled. A
+ * masil: the floating cell a cell belongs to, or NULL if it is tiled. A
  * floating cell may be a node (a floating group); its descendants are not
  * flagged and are tiled inside it.
  */
@@ -261,7 +261,7 @@ layout_float_root(struct layout_cell *lc)
 	return (NULL);
 }
 
-/* rmux: whether a cell is a floating group of panes. */
+/* masil: whether a cell is a floating group of panes. */
 int
 layout_cell_is_group(struct layout_cell *lc)
 {
@@ -270,7 +270,7 @@ layout_cell_is_group(struct layout_cell *lc)
 }
 
 /*
- * rmux: whether a child cell takes part in its parent's tiling. Floating
+ * masil: whether a child cell takes part in its parent's tiling. Floating
  * cells, including floating groups, never do.
  */
 int
@@ -367,7 +367,7 @@ layout_fix_offsets1(struct layout_cell *lc)
 	}
 }
 
-/* rmux: fix cell offsets inside each floating group, from its position. */
+/* masil: fix cell offsets inside each floating group, from its position. */
 static void
 layout_fix_group_offsets(struct layout_cell *lc)
 {
@@ -784,7 +784,7 @@ out:
 	if (lc != NULL && TAILQ_NEXT(lc, entry) == NULL) {
 		TAILQ_REMOVE(&lcparent->cells, lc, entry);
 
-		/* rmux: the last cell of a floating group floats alone. */
+		/* masil: the last cell of a floating group floats alone. */
 		if (lcparent->flags & LAYOUT_CELL_FLOATING) {
 			lc->flags |= LAYOUT_CELL_FLOATING;
 			memcpy(&lc->g, &lcparent->g, sizeof lc->g);
@@ -825,7 +825,7 @@ layout_free(struct window *w, int only_nodes)
 }
 
 /*
- * rmux: grow or shrink a floating group, no further than its panes' minimum
+ * masil: grow or shrink a floating group, no further than its panes' minimum
  * size. Along the group's split, the pane at the moving edge (the first
  * with from_start, else the last) takes the change, then its neighbours;
  * across it, every pane follows. Returns the change made.
@@ -878,7 +878,7 @@ layout_resize_group(struct window *w, struct layout_cell *lc,
 }
 
 /*
- * rmux: set a floating cell's geometry. A floating group rescales its panes
+ * masil: set a floating cell's geometry. A floating group rescales its panes
  * and keeps the edge opposite a dragged left or top edge in place.
  */
 void
@@ -903,7 +903,7 @@ layout_set_floating_geometry(struct window *w, struct layout_cell *lc, int sx,
 	layout_fix_offsets(w);
 }
 
-/* rmux: the first pane cell in a subtree. */
+/* masil: the first pane cell in a subtree. */
 static struct layout_cell *
 layout_first_leaf(struct layout_cell *lc)
 {
@@ -1141,7 +1141,7 @@ layout_resize_floating_pane(struct window_pane *wp, enum layout_type type,
 	return (0);
 }
 
-/* rmux: whether a group member has a split of this type inside its group. */
+/* masil: whether a group member has a split of this type inside its group. */
 int
 layout_group_has_split(struct layout_cell *lc, enum layout_type type)
 {
@@ -1154,7 +1154,7 @@ layout_group_has_split(struct layout_cell *lc, enum layout_type type)
 }
 
 /*
- * rmux: resize a floating group relative to its size, like a floating pane.
+ * masil: resize a floating group relative to its size, like a floating pane.
  * With opposite, the group grows or shrinks at its left or top edge.
  */
 int
@@ -1184,7 +1184,7 @@ layout_resize_floating_group(struct window *w, struct layout_cell *lc,
 	return (0);
 }
 
-/* rmux: resize a floating group to a size including its border. */
+/* masil: resize a floating group to a size including its border. */
 int
 layout_resize_floating_group_to(struct window *w, struct layout_cell *lc,
     enum layout_type type, u_int size, char **cause)
@@ -1394,7 +1394,7 @@ layout_set_size_check(struct window *w, struct layout_cell *lc,
 		return (size >= PANE_MINIMUM);
 	available = size;
 
-	/* Count number of children. rmux: floating groups keep their size. */
+	/* Count number of children. masil: floating groups keep their size. */
 	count = 0;
 	TAILQ_FOREACH(lcchild, &lc->cells, entry) {
 		if (!layout_cell_is_group(lcchild))
@@ -1742,7 +1742,7 @@ layout_floating_pane(struct window *w, struct window_pane *wp,
 		lc = w->layout_root;
 	else
 		lc = wp->layout_cell;
-	/* rmux: a new floating pane goes beside a group, never inside it. */
+	/* masil: a new floating pane goes beside a group, never inside it. */
 	if (layout_float_root(lc) != NULL)
 		lc = layout_float_root(lc);
 	lcparent = lc->parent;
@@ -1764,7 +1764,7 @@ layout_floating_pane(struct window *w, struct window_pane *wp,
 }
 
 /*
- * rmux: whether a pane of a floating group has room to be tiled. It is tiled
+ * masil: whether a pane of a floating group has room to be tiled. It is tiled
  * beside its group, so the group's tiled neighbour must be able to split.
  */
 int
@@ -1786,7 +1786,7 @@ layout_group_member_can_tile(struct layout_cell *lc)
 }
 
 /*
- * rmux: take a pane out of its floating group and float it alone beside the
+ * masil: take a pane out of its floating group and float it alone beside the
  * group, keeping its position and size. The group gives the space to the
  * remaining panes, and a group of one becomes a lone floating pane.
  */
@@ -1912,7 +1912,7 @@ layout_spread_out(struct window_pane *wp)
 			layout_fix_panes(w, NULL);
 			break;
 		}
-		/* rmux: a floating group spreads only inside itself. */
+		/* masil: a floating group spreads only inside itself. */
 		if (parent->flags & LAYOUT_CELL_FLOATING)
 			break;
 	} while ((parent = parent->parent) != NULL);
@@ -1978,7 +1978,7 @@ layout_get_tiled_cell(struct cmdq_item *item, struct args *args,
 }
 
 /*
- * rmux: get a cell tiled inside a floating group, making the group from a lone
+ * masil: get a cell tiled inside a floating group, making the group from a lone
  * floating pane first. The group then moves, resizes and raises as one.
  */
 struct layout_cell *

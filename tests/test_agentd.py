@@ -15,9 +15,9 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from test_compatibility import RMUX, Server, wait_for
+from test_compatibility import MASIL, Server, wait_for
 
-AGENT = RMUX.with_name("rmux-agent")
+AGENT = MASIL.with_name("masil-agent")
 
 
 class Provider:
@@ -162,9 +162,9 @@ def manager_query(path: Path, kind, **fields):
 
 class AgentdHarness(unittest.TestCase):
     def setUp(self):
-        self.core = Server(RMUX, command=["/bin/cat"])
+        self.core = Server(MASIL, command=["/bin/cat"])
         self.bridge = self.core.path / "observe.sock"
-        self.core.env["RMUX_BRIDGE_SOCKET"] = str(self.bridge)
+        self.core.env["MASIL_BRIDGE_SOCKET"] = str(self.bridge)
         self.core.__enter__()
         self.addCleanup(self.core.__exit__)
         self.panes = ["%0", self.core.text("new-window", "-d", "-P", "-F", "#{pane_id}", "/bin/cat").strip()]

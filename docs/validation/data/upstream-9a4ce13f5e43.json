@@ -1,13 +1,13 @@
 [
   {
-    "binary": "rmux",
+    "binary": "masil",
     "script": "format-variables.sh",
     "status": "passed",
     "returncode": 0,
     "process_group": 69706,
     "normalizations": [],
     "seconds": 5.6135690830415115,
-    "log": ".build/regress-9a4ce13f5e43/logs/rmux/format-variables.sh.log"
+    "log": ".build/regress-9a4ce13f5e43/logs/masil/format-variables.sh.log"
   },
   {
     "binary": "tmux-baseline",

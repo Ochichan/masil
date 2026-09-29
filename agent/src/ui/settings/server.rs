@@ -1,4 +1,4 @@
-//! Talks to the running rmux server and applies saved choices.
+//! Talks to the running masil server and applies saved choices.
 
 use super::catalog::{SETTINGS, Scope, Setting, UI_KEY};
 use super::store::{self, LAYER};
@@ -26,29 +26,29 @@ pub(crate) enum Outcome {
     Hidden(&'static str),
     /// Applied now; saving failed, so it lasts until the server stops.
     SessionOnly(String),
-    /// Saved; the rmux UI layer is off, so nothing changed on screen.
+    /// Saved; the masil UI layer is off, so nothing changed on screen.
     SavedWhileOff,
     Failed(String),
 }
 
 impl Server {
-    /// Uses --socket when given, else the server of the surrounding rmux.
+    /// Uses --socket when given, else the server of the surrounding masil.
     pub(crate) fn locate(socket: Option<&str>) -> Result<Self, String> {
         let socket = match socket {
             Some(path) => PathBuf::from(path),
             None => {
                 let value = std::env::var("TMUX")
-                    .map_err(|_| "run this inside rmux or pass --socket PATH")?;
+                    .map_err(|_| "run this inside masil or pass --socket PATH")?;
                 PathBuf::from(value.split(',').next().unwrap_or_default())
             }
         };
         if !socket.is_absolute() {
-            return Err("the rmux socket path must be absolute".into());
+            return Err("the masil socket path must be absolute".into());
         }
         let binary = crate::native_ui::native_executable()
             .ok()
             .filter(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from("rmux"));
+            .unwrap_or_else(|| PathBuf::from("masil"));
         let pane = std::env::var("TMUX_PANE")
             .ok()
             .filter(|pane| pane.starts_with('%'));
@@ -59,7 +59,7 @@ impl Server {
         })
     }
 
-    /// Runs one rmux command and returns its standard output.
+    /// Runs one masil command and returns its standard output.
     pub(crate) fn run(&self, args: &[&str]) -> Result<String, String> {
         // -u keeps UTF-8 output, which some list formats rely on, without a
         // UTF-8 locale.
@@ -72,9 +72,9 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("cannot run rmux: {error}"))?;
-        let mut stdout = child.stdout.take().ok_or("rmux output unavailable")?;
-        let mut stderr = child.stderr.take().ok_or("rmux output unavailable")?;
+            .map_err(|error| format!("cannot run masil: {error}"))?;
+        let mut stdout = child.stdout.take().ok_or("masil output unavailable")?;
+        let mut stderr = child.stderr.take().ok_or("masil output unavailable")?;
         let out = std::thread::spawn(move || {
             let mut text = String::new();
             let _ = (&mut stdout).take(OUTPUT_LIMIT).read_to_string(&mut text);
@@ -93,7 +93,7 @@ impl Server {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("rmux did not answer: {}", args.join(" ")));
+                return Err(format!("masil did not answer: {}", args.join(" ")));
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -102,7 +102,7 @@ impl Server {
         if status.success() {
             Ok(out)
         } else {
-            let message = err.lines().next().unwrap_or("rmux command failed").trim();
+            let message = err.lines().next().unwrap_or("masil command failed").trim();
             Err(message.to_owned())
         }
     }
@@ -140,7 +140,7 @@ impl Server {
     pub(crate) fn source(&self, text: &str) -> Result<(), String> {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
-            "rmux-settings-{}-{}.conf",
+            "masil-settings-{}-{}.conf",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -161,13 +161,13 @@ impl Server {
         result
     }
 
-    /// Unbinds the layer's buttons and keys, found by their `rmux-ui:` notes.
+    /// Unbinds the layer's buttons and keys, found by their `masil-ui:` notes.
     fn unbind_layer_keys(&self) -> Result<(), String> {
         for table in ["root", "prefix"] {
             let listing = self.run(&["list-keys", "-N", "-T", table])?;
             for line in listing.lines() {
                 let words = line.split_whitespace().collect::<Vec<_>>();
-                if let Some(index) = words.iter().position(|word| *word == "rmux-ui:")
+                if let Some(index) = words.iter().position(|word| *word == "masil-ui:")
                     && index > 0
                 {
                     self.run(&["unbind-key", "-T", table, words[index - 1]])?;
@@ -209,7 +209,7 @@ impl Server {
     fn tmux_defaults(&self, options: &[String]) -> Result<Vec<String>, String> {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let socket = std::env::temp_dir().join(format!(
-            "rmux-defaults-{}-{}",
+            "masil-defaults-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -279,8 +279,8 @@ pub(crate) fn apply(
             let candidates = store::layer_lines(&text);
             // Under the tmux theme the layer leaves styles at tmux's
             // defaults, so an option still at its default belongs to it.
-            let leaving_tmux = setting.key == "@rmux-theme"
-                && server.global("@rmux-theme", Scope::Session).as_deref() == Some("tmux")
+            let leaving_tmux = setting.key == "@masil-theme"
+                && server.global("@masil-theme", Scope::Session).as_deref() == Some("tmux")
                 && value != "tmux";
             let defaults = if leaving_tmux {
                 let options = candidates
@@ -324,7 +324,7 @@ pub(crate) fn apply(
         }
     }
     // The tmux theme leaves styles at their tmux defaults.
-    let unset = setting.key == "@rmux-theme" && value == "tmux";
+    let unset = setting.key == "@masil-theme" && value == "tmux";
     for line in &lines {
         let result = if unset {
             server.run(&["set-option", "-gu", &line.option]).map(drop)
@@ -342,7 +342,7 @@ pub(crate) fn apply(
     let effective = server.global(option, scope);
     if effective.as_deref() != Some(value) {
         return Outcome::Failed(format!(
-            "rmux reports {option} = {}",
+            "masil reports {option} = {}",
             effective.as_deref().unwrap_or("(unset)")
         ));
     }

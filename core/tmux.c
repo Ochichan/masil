@@ -267,7 +267,7 @@ make_label(const char *label, char **cause)
 	}
 
 	/* Keep default and -L sockets separate from installed tmux servers. */
-	xasprintf(&base, "%s/rmux-%ld", path, (long)uid);
+	xasprintf(&base, "%s/masil-%ld", path, (long)uid);
 	free(path);
 	if (mkdir(base, S_IRWXU) != 0 && errno != EEXIST) {
 		xasprintf(cause, "couldn't create directory %s (%s)", base,
@@ -485,7 +485,7 @@ main(int argc, char **argv)
 		case 'f':
 			if (!fflag) {
 				fflag = 1;
-				rmux_ui_enabled = 0;
+				masil_ui_enabled = 0;
 				for (i = 0; i < cfg_nfiles; i++)
 					free(cfg_files[i]);
 				cfg_nfiles = 0;

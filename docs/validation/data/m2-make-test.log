@@ -1,9 +1,9 @@
 python3 scripts/build.py
 core-build: .build/logs/core-build.log
-tmux next-3.9 /Users/ochi/Documents/Projects/rmux/bin/rmux
+tmux next-3.9 /Users/ochi/Documents/Projects/masil/bin/masil
 python3 scripts/build.py --baseline
 baseline-build: .build/logs/baseline-build.log
-tmux next-3.9 /Users/ochi/Documents/Projects/rmux/bin/tmux-baseline
+tmux next-3.9 /Users/ochi/Documents/Projects/masil/bin/tmux-baseline
 python3 scripts/build.py --agent
 agent-build: .build/logs/agent-build.log
 python3 -m venv .build/bench-venv
@@ -53,7 +53,7 @@ Ran 6 tests in 0.055s
 OK
 cargo test --locked --manifest-path agent/Cargo.toml
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
-     Running unittests src/main.rs (agent/target/debug/deps/rmux_agent-040cfd6c1965c65f)
+     Running unittests src/main.rs (agent/target/debug/deps/masil_agent-040cfd6c1965c65f)
 
 running 2 tests
 test tests::rejects_nested_duplicate_fields ... ok

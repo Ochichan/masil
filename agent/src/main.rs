@@ -345,7 +345,7 @@ fn stream_value(stream: &mut UnixStream) -> Result<Option<Value>, String> {
         Ok(value) => Ok(Some(value)),
         Err(StreamError::Malformed(error)) => Err(error),
         Err(StreamError::Lost(error)) => {
-            eprintln!("rmux-agent: observation lost: {error}");
+            eprintln!("masil-agent: observation lost: {error}");
             Ok(None)
         }
     }
@@ -526,7 +526,7 @@ fn watch(
                 if matches!(write_ndjson(&mut output, &value)?, Output::Closed) {
                     return Ok(0);
                 }
-                eprintln!("rmux-agent: observation lost: resync required");
+                eprintln!("masil-agent: observation lost: resync required");
                 return Ok(3);
             }
             _ => return Err("unexpected watch stream frame".into()),
@@ -672,12 +672,12 @@ fn execute() -> Result<i32, String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args == ["--help"] {
         println!(
-            "rmux-agent 0.1.0 — native agents and terminal desk\n\nNative management:\n  rmux-agent agent --help\n  rmux-agent agent [--socket RMUX_SOCKET] list|ui|sidebar\n\nCore socket:\n  rmux-agent --socket PATH hello|inventory|snapshot %N|stats\n  rmux-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nManager socket:\n  rmux-agent --socket PATH serve --core CORE_SOCKET --config FILE\n  rmux-agent --socket PATH status|agents|inspect ID|stop\n  rmux-agent --socket PATH attention [--all]\n  rmux-agent --socket PATH ack ID --epoch E --revision R\n  rmux-agent --socket PATH watch-agents [--count N]\n  rmux-agent --socket PATH ui [--core-native CORE_SOCKET] [--client CLIENT] [--lang en|ko] [--theme dark|light|terminal]\n  rmux-agent --socket PATH sidebar --core-native CORE_SOCKET [--client CLIENT] [--target %N] [--lang en|ko]\n\nrmux server:\n  rmux-agent settings [--socket RMUX_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get]\n  rmux-agent session [--socket RMUX_SOCKET] [--client CLIENT] save|list|restore [NAME]|menu|autosave\n\nThe sidebar changes the shared window layout. Expand uses native pane zoom. No default tmux bindings are changed.\nAcknowledgements are shared only for this daemon lifetime and never approve provider requests.\n\nExplicit core bridge required: RMUX_BRIDGE_SOCKET=/private/path/observe.sock rmux ...\nProvider associations are unverified TUI bindings. Observer connections do not submit prompts or approve requests. Native prompt delivery is not provider acceptance. No daemon autostart."
+            "masil-agent 0.1.0 — native agents and terminal desk\n\nNative management:\n  masil-agent agent --help\n  masil-agent agent [--socket MASIL_SOCKET] list|ui|sidebar\n\nCore socket:\n  masil-agent --socket PATH hello|inventory|snapshot %N|stats\n  masil-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nManager socket:\n  masil-agent --socket PATH serve --core CORE_SOCKET --config FILE\n  masil-agent --socket PATH status|agents|inspect ID|stop\n  masil-agent --socket PATH attention [--all]\n  masil-agent --socket PATH ack ID --epoch E --revision R\n  masil-agent --socket PATH watch-agents [--count N]\n  masil-agent --socket PATH ui [--core-native CORE_SOCKET] [--client CLIENT] [--lang en|ko] [--theme dark|light|terminal]\n  masil-agent --socket PATH sidebar --core-native CORE_SOCKET [--client CLIENT] [--target %N] [--lang en|ko]\n\nmasil server:\n  masil-agent settings [--socket MASIL_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get]\n  masil-agent session [--socket MASIL_SOCKET] [--client CLIENT] save|list|restore [NAME]|menu|autosave\n\nThe sidebar changes the shared window layout. Expand uses native pane zoom. No default tmux bindings are changed.\nAcknowledgements are shared only for this daemon lifetime and never approve provider requests.\n\nExplicit core bridge required: MASIL_BRIDGE_SOCKET=/private/path/observe.sock masil ...\nProvider associations are unverified TUI bindings. Observer connections do not submit prompts or approve requests. Native prompt delivery is not provider acceptance. No daemon autostart."
         );
         return Ok(0);
     }
     if args == ["--version"] {
-        println!("rmux-agent 0.1.0");
+        println!("masil-agent 0.1.0");
         return Ok(0);
     }
     if args == ["--ui-design"] {
@@ -776,7 +776,7 @@ fn main() {
     match execute() {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("rmux-agent: {error}");
+            eprintln!("masil-agent: {error}");
             std::process::exit(2);
         }
     }

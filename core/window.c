@@ -33,7 +33,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
-#include "rmux-bridge.h"
+#include "masil-bridge.h"
 
 /*
  * Each window is attached to a number of panes, each of which is a pty. This
@@ -717,7 +717,7 @@ window_pane_update_focus(struct window_pane *wp)
 
 
 /*
- * rmux: move a floating pane to the front of the z-index. The rest of its
+ * masil: move a floating pane to the front of the z-index. The rest of its
  * floating group follows directly behind it.
  */
 void
@@ -739,7 +739,7 @@ window_raise_floating(struct window *w, struct window_pane *wp)
 	}
 }
 
-/* rmux: the first pane of a floating group in the z-index, or the pane. */
+/* masil: the first pane of a floating group in the z-index, or the pane. */
 struct window_pane *
 window_zindex_head(struct window *w, struct window_pane *wp)
 {
@@ -756,7 +756,7 @@ window_zindex_head(struct window *w, struct window_pane *wp)
 }
 
 /*
- * rmux: take all but the first pane of each floating group out of the
+ * masil: take all but the first pane of each floating group out of the
  * z-index, so z-index operations treat a group as one pane. The panes are
  * returned in z-index order for window_zindex_expand.
  */
@@ -780,7 +780,7 @@ window_zindex_collapse(struct window *w, u_int *n)
 	return (saved);
 }
 
-/* rmux: put collapsed group panes back behind the rest of their group. */
+/* masil: put collapsed group panes back behind the rest of their group. */
 void
 window_zindex_expand(struct window *w, struct window_pane **saved, u_int n)
 {
@@ -803,7 +803,7 @@ window_zindex_expand(struct window *w, struct window_pane **saved, u_int n)
 	free(saved);
 }
 
-/* rmux: keep the members of each floating group next to each other. */
+/* masil: keep the members of each floating group next to each other. */
 void
 window_zindex_fix_groups(struct window *w)
 {
@@ -1035,7 +1035,7 @@ window_find_string(struct window *w, const char *s)
 }
 
 /*
- * rmux: whether a pane floats over a zoomed pane. Only a lone floating pane
+ * masil: whether a pane floats over a zoomed pane. Only a lone floating pane
  * does; the panes of a floating group are hidden by a zoom.
  */
 static int
@@ -1557,7 +1557,7 @@ window_pane_create(struct window *w, u_int sx, u_int sy, u_int hlimit)
 
 	if (gethostname(host, sizeof host) == 0)
 		screen_set_title(&wp->base, host, 0);
-	rmux_bridge_pane_created(wp);
+	masil_bridge_pane_created(wp);
 
 	return (wp);
 }
@@ -1649,7 +1649,7 @@ window_pane_destroy(struct window_pane *wp)
 {
 	window_pane_wait_finish(wp);
 	spawn_editor_finish(wp);
-	rmux_bridge_pane_destroyed(wp);
+	masil_bridge_pane_destroyed(wp);
 
 	RB_REMOVE(window_pane_tree, &all_window_panes, wp);
 	wp->flags |= PANE_DESTROYED;
@@ -1747,7 +1747,7 @@ window_pane_error_callback(__unused struct bufferevent *bufev,
 	log_debug("%%%u error", wp->id);
 	if (~wp->flags & PANE_EXITED) {
 		wp->flags |= PANE_EXITED;
-		rmux_bridge_pane_state_changed(wp);
+		masil_bridge_pane_state_changed(wp);
 	}
 
 	if (window_pane_destroy_ready(wp))
@@ -1807,7 +1807,7 @@ window_pane_resize(struct window_pane *wp, u_int sx, u_int sy)
 
 	log_debug("%s: %%%u resize %ux%u", __func__, wp->id, sx, sy);
 	screen_resize(&wp->base, sx, sy, wp->base.saved_grid == NULL);
-	rmux_bridge_geometry_changed(wp);
+	masil_bridge_geometry_changed(wp);
 
 	wme = TAILQ_FIRST(&wp->modes);
 	if (wme != NULL && wme->mode->resize != NULL)

@@ -111,7 +111,7 @@ cmd_split_window_exec(struct cmd *self, struct cmdq_item *item)
 		flags |= SPAWN_SPLIT;
 
 		/*
-		 * rmux: -G splits a floating pane inside a floating group. A
+		 * masil: -G splits a floating pane inside a floating group. A
 		 * group member always splits inside its group.
 		 */
 		if (is_floating && (args_has(args, 'G') ||

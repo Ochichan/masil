@@ -5,11 +5,11 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// The layer rmux loads at startup; the core embeds the same file.
-pub(crate) const LAYER: &str = include_str!("../../../../core/rmux-ui-layer.conf");
+/// The layer masil loads at startup; the core embeds the same file.
+pub(crate) const LAYER: &str = include_str!("../../../../core/masil-ui-layer.conf");
 
 const HEADER: &str =
-    "# rmux settings, version 1. Written by `rmux-agent settings`; other lines are kept.";
+    "# masil settings, version 1. Written by `masil-agent settings`; other lines are kept.";
 const MAX_BYTES: u64 = 64 * 1024;
 
 /// The same rule as the core: an absolute XDG_CONFIG_HOME, else ~/.config.
@@ -23,7 +23,7 @@ pub(crate) fn settings_path() -> Option<PathBuf> {
                 .filter(|path| path.is_absolute())
                 .map(|home| home.join(".config"))
         })?;
-    Some(base.join("rmux/settings.conf"))
+    Some(base.join("masil/settings.conf"))
 }
 
 /// User configuration files the core reads after the layer, when present,
@@ -119,7 +119,7 @@ pub(crate) fn layer_lines(section: &str) -> Vec<LayerLine> {
     lines
 }
 
-/// Lines of settings.conf. Managed lines are `set -g @rmux-KEY VALUE`.
+/// Lines of settings.conf. Managed lines are `set -g @masil-KEY VALUE`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Saved {
     lines: Vec<String>,
@@ -140,7 +140,7 @@ impl Saved {
         let mut words = line.split_whitespace();
         match (words.next(), words.next(), words.next(), words.next()) {
             (Some("set"), Some("-g"), Some(key), Some(value))
-                if key.starts_with("@rmux-") && words.next().is_none() =>
+                if key.starts_with("@masil-") && words.next().is_none() =>
             {
                 Some((key, value))
             }
@@ -254,11 +254,11 @@ pub(crate) fn save(path: &Path, saved: &Saved) -> Result<(), String> {
     result
 }
 
-/// Text of one `## rmux:section NAME` block of the layer.
+/// Text of one `## masil:section NAME` block of the layer.
 pub(crate) fn section(name: &str) -> Option<String> {
-    let start = format!("## rmux:section {name}\n");
+    let start = format!("## masil:section {name}\n");
     let begin = LAYER.find(&start)? + start.len();
-    let end = LAYER[begin..].find("## rmux:end")? + begin;
+    let end = LAYER[begin..].find("## masil:end")? + begin;
     Some(LAYER[begin..end].to_owned())
 }
 
@@ -267,11 +267,11 @@ pub(crate) fn section(name: &str) -> Option<String> {
 pub(crate) fn section_names() -> Vec<&'static str> {
     LAYER
         .lines()
-        .filter_map(|line| line.strip_prefix("## rmux:section "))
+        .filter_map(|line| line.strip_prefix("## masil:section "))
         .collect()
 }
 
-/// The layer's own `@rmux-*` options that are not saved choices: colours,
+/// The layer's own `@masil-*` options that are not saved choices: colours,
 /// menu behaviour and the remembered sidebar width.
 pub(crate) fn layer_user_options() -> Vec<String> {
     let mut names = Vec::new();
@@ -282,9 +282,9 @@ pub(crate) fn layer_user_options() -> Vec<String> {
         }
         let _ = words.next();
         if let Some(name) = words.next()
-            && (name.starts_with("@rmux-c-")
-                || name == "@rmux-menu-stay-open"
-                || name == "@rmux-sidebar-width")
+            && (name.starts_with("@masil-c-")
+                || name == "@masil-menu-stay-open"
+                || name == "@masil-sidebar-width")
             && !names.iter().any(|known| known == name)
         {
             names.push(name.to_owned());
@@ -322,15 +322,15 @@ mod tests {
     #[test]
     fn set_replaces_in_place_and_keeps_other_lines() {
         let mut saved = Saved::parse(&format!(
-            "{HEADER}\n# mine\nset -g @rmux-theme light\nbind x kill-pane\nset -g @rmux-theme dark\n"
+            "{HEADER}\n# mine\nset -g @masil-theme light\nbind x kill-pane\nset -g @masil-theme dark\n"
         ));
-        assert_eq!(saved.get("@rmux-theme"), Some("dark"));
-        saved.set("@rmux-theme", "terminal");
-        saved.set("@rmux-lang", "ko");
+        assert_eq!(saved.get("@masil-theme"), Some("dark"));
+        saved.set("@masil-theme", "terminal");
+        saved.set("@masil-lang", "ko");
         assert_eq!(
             saved.render(),
             format!(
-                "{HEADER}\n# mine\nset -g @rmux-theme terminal\nbind x kill-pane\nset -g @rmux-lang ko\n"
+                "{HEADER}\n# mine\nset -g @masil-theme terminal\nbind x kill-pane\nset -g @masil-lang ko\n"
             )
         );
         saved.remove_all_managed();
@@ -397,12 +397,10 @@ mod tests {
             .iter()
             .find(|line| line.option == "status-style")
             .unwrap();
-        assert_eq!(status.value, "bg=#{@rmux-c-panel},fg=#{@rmux-c-muted}");
+        assert_eq!(status.value, "bg=#{@masil-c-panel},fg=#{@masil-c-muted}");
         let base = layer_lines(&section("base").unwrap());
-        assert!(
-            base.iter().any(|line| line.option == "status-position"
-                && line.value.contains("@rmux-status-position"))
-        );
+        assert!(base.iter().any(|line| line.option == "status-position"
+            && line.value.contains("@masil-status-position")));
     }
 
     #[test]
@@ -421,18 +419,18 @@ mod tests {
 
     #[test]
     fn save_refuses_symlinks_and_writes_privately() {
-        let directory = std::env::temp_dir().join(format!("rmux-settings-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("masil-settings-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("settings.conf");
         let mut saved = Saved::default();
-        saved.set("@rmux-theme", "light");
+        saved.set("@masil-theme", "light");
         save(&path, &saved).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(load(&path).unwrap().get("@rmux-theme"), Some("light"));
+        assert_eq!(load(&path).unwrap().get("@masil-theme"), Some("light"));
         let link = directory.join("link.conf");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(load(&link).is_err());

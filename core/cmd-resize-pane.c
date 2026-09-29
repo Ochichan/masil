@@ -98,7 +98,7 @@ cmd_resize_pane_exec(struct cmd *self, struct cmdq_item *item)
 	lc = wp->layout_cell; /* may have been replaced by unzoom */
 
 	/*
-	 * rmux: a pane in a floating group resizes against its neighbours in
+	 * masil: a pane in a floating group resizes against its neighbours in
 	 * the group; along an axis the group does not split, the whole group
 	 * resizes like a floating pane.
 	 */
@@ -233,7 +233,7 @@ cmd_resize_pane_exec(struct cmd *self, struct cmdq_item *item)
 	return (CMD_RETURN_NORMAL);
 }
 
-/* rmux: whether a drag starts on the outer border of a floating group. */
+/* masil: whether a drag starts on the outer border of a floating group. */
 static int
 cmd_resize_pane_on_outer_border(struct layout_cell *lc, struct mouse_event *m)
 {
@@ -276,7 +276,7 @@ cmd_resize_pane_mouse_update(__unused struct cmd *self, struct cmdq_item *item)
 	window_set_active_pane(w, wp, 1);
 
 	/*
-	 * rmux: where the drag starts decides it once. The outer border of a
+	 * masil: where the drag starts decides it once. The outer border of a
 	 * floating group moves or resizes the group; a separator inside it
 	 * resizes its panes.
 	 */
@@ -344,7 +344,7 @@ cmd_resize_pane_mouse_resize_move_floating(struct client *c,
 	else if (m->statusat > 0 && ly >= m->statusat)
 		ly = m->statusat - 1;
 
-	/* rmux: a floating group moves and resizes as a whole. */
+	/* masil: a floating group moves and resizes as a whole. */
 	root = layout_float_root(lc);
 	if (root != NULL && root->type != LAYOUT_WINDOWPANE) {
 		lc = root;
@@ -512,7 +512,7 @@ cmd_resize_pane_mouse_resize_tiled(struct client *c, struct mouse_event *m)
 	    wl->window->layout_root);
 }
 
-/* rmux: drag a separator inside a floating group. */
+/* masil: drag a separator inside a floating group. */
 static void
 cmd_resize_pane_mouse_resize_group(struct client *c, struct mouse_event *m)
 {

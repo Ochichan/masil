@@ -52,7 +52,7 @@ def environment():
         env['ACLOCAL_PATH'] = str(macros) + (os.pathsep + env['ACLOCAL_PATH']
                                            if env.get('ACLOCAL_PATH') else '')
     env.setdefault('CC', 'clang' if shutil.which('clang') else 'cc')
-    # Identical optimization settings for rmux and the upstream comparison.
+    # Identical optimization settings for masil and the upstream comparison.
     # Upstream's macOS debug build already exempts these compatibility headers.
     # Apply the same exceptions to both optimized builds; all other diagnostics fail.
     env['CFLAGS'] = '-O2 -Werror -Wno-macro-redefined -Wno-pointer-sign -Wno-deprecated-declarations'
@@ -101,7 +101,7 @@ def baseline_source():
         return source
     archive = BUILD / 'tmux-baseline.tar'
     if not archive.exists():
-        clone = Path(os.environ.get('RMUX_TMUX_SOURCE',
+        clone = Path(os.environ.get('MASIL_TMUX_SOURCE',
                                     str(Path.home() / 'Documents/git_clones/tmux')))
         actual = subprocess.check_output(['git', '-C', str(clone), 'rev-parse', SHA], text=True).strip()
         if actual != SHA:
@@ -133,7 +133,7 @@ def build(source, name, env, jobs):
              f'--prefix={ROOT / "bin-prefix"}'], output, probe_env, name+'-configure')
         stamp.write_text(config_key)
     run(['make', f'-j{jobs}', 'CFLAGS=' + env['CFLAGS']], output, env, name+'-build')
-    destination = ROOT / 'bin' / ('tmux-baseline' if name == 'baseline' else 'rmux')
+    destination = ROOT / 'bin' / ('tmux-baseline' if name == 'baseline' else 'masil')
     destination.parent.mkdir(exist_ok=True)
     staged = destination.with_suffix('.new')
     shutil.copy2(output / 'tmux', staged)
@@ -168,9 +168,9 @@ def main():
         # accidentally link a Conda/sysdeps libiconv with an unresolved @rpath.
         env.pop('LIBRARY_PATH', None)
         run(['cargo', 'build', '--locked', '--release', '--manifest-path', str(ROOT/'agent/Cargo.toml')], ROOT, env, 'agent-build')
-        run([str(ROOT/'agent/target/release/rmux-agent'), '--version'], ROOT, env, 'agent-smoke')
+        run([str(ROOT/'agent/target/release/masil-agent'), '--version'], ROOT, env, 'agent-smoke')
         (ROOT/'bin').mkdir(exist_ok=True)
-        shutil.copy2(ROOT/'agent/target/release/rmux-agent', ROOT/'bin/rmux-agent')
+        shutil.copy2(ROOT/'agent/target/release/masil-agent', ROOT/'bin/masil-agent')
         return
     bootstrap(env)
     source = baseline_source() if args.baseline else ROOT / 'core'

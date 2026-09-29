@@ -6,10 +6,10 @@
 
 ```text
 core/                         pinned tmux source, 기존 파일 구조 유지
-  rmux-bridge.c/h              socket, framing, handshake, quota, event 순서
-  rmux-observe.c/h             watch registry, generation, bounded grid snapshot
-  rmux-actions.c/h             guarded action, dedup, strict managed spawn 문맥
-  rmux-ui.c/h                  cached format, client menu, redraw evidence
+  masil-bridge.c/h              socket, framing, handshake, quota, event 순서
+  masil-observe.c/h             watch registry, generation, bounded grid snapshot
+  masil-actions.c/h             guarded action, dedup, strict managed spawn 문맥
+  masil-ui.c/h                  cached format, client menu, redraw evidence
   compat/yyjson/               고정 C codec과 원본 고지
 agent/                        Cargo workspace
   crates/agent/                CLI + serve 진입점, coordinator 구성
@@ -48,7 +48,7 @@ release build의 panic/abort·LTO·strip·allocator 설정은 C와 Rust 각각 �
 | 단계 | 구현할 결과 | 필수 확인 | 다음 단계 조건 |
 | --- | --- | --- | --- |
 | M0 기준 실행 | pinned tmux 재현 build, 기준 목록 확인, workload runner | build feature/OS 기록, 기본 key/command dump, stock baseline | 실행 결과를 재현할 수 있음 |
-| M1 최소 fork | executable/socket 격리, bridge off, 별도 rmux-agent skeleton | K-01~09, C 기본 smoke, B-01~03 | 기본 경로 회귀 없음 |
+| M1 최소 fork | executable/socket 격리, bridge off, 별도 masil-agent skeleton | K-01~09, C 기본 smoke, B-01~03 | 기본 경로 회귀 없음 |
 | M2 관찰 통신 | UDS/framing, generation, watch/inventory/snapshot/gap | malformed frame, memory quota, lifecycle/resize/copy-mode, I-01~04 | slow agentd가 PTY를 막지 않음 |
 | M3 Agent 관찰 | provider 하나의 native identity/event, fallback, projection/menu | G-01~03, V-04/06/18, B-04~09/12~13 | unknown·parent/child·shared view 계약 성립 |
 | M4 Durable 제어 | store, operation receipts, submit capability, wait/ack | V-01~05, commit 전후 kill, namespace 만료, approval 경합 | 중복 입력·거짓 성공·잘못된 승인 없음 |
@@ -71,7 +71,7 @@ M1이 모든 tmux 기능을 새로 구현하는 단계는 아니다. upstream �
 | `format.c`·status/menu | opt-in cached callback·대상 redraw | 기본 format/default key 불변, update fanout |
 | `tty.c` output write/discard | 제한된 화면 전달 evidence | slow tty·discard·reset·resize에서 거짓 표시 성공 없음 |
 
-모든 upstream 수정에는 어떤 rmux 불변식 때문에 필요한지와 대응 검증을 남긴다. command registry, default bindings, native option lookup에 새 agent 명령/옵션을 끼워 넣지 않는다. bridge 내부 동작은 agentd 전용 Interface로 한정한다.
+모든 upstream 수정에는 어떤 masil 불변식 때문에 필요한지와 대응 검증을 남긴다. command registry, default bindings, native option lookup에 새 agent 명령/옵션을 끼워 넣지 않는다. bridge 내부 동작은 agentd 전용 Interface로 한정한다.
 
 ## 5. 중요한 fault fixture
 
@@ -94,21 +94,21 @@ test는 public Module Interface를 통해 실제 결과를 확인한다. 내부 
 
 ## 6. 실행 이름·config·배포
 
-`rmux`와 `rmux-agent`를 별도 실행 파일로 제공한다. 선택적 `tmux` 호환 진입점은 rmux가 관리하는 전용 directory에서 opt-in으로 활성화한다. system binary를 대체하지 않는다. 절대 경로로 stock tmux를 실행하는 script는 명시적인 설정 변경이 필요함을 표시한다.
+`masil`과 `masil-agent`를 별도 실행 파일로 제공한다. 선택적 `tmux` 호환 진입점은 masil이 관리하는 전용 directory에서 opt-in으로 활성화한다. system binary를 대체하지 않는다. 절대 경로로 stock tmux를 실행하는 script는 명시적인 설정 변경이 필요함을 표시한다.
 
-rmux 환경의 호환 진입점은 rmux server namespace로 연결한다. native `TMUX`/`TMUX_PANE` 관계, config 검색 경로, plugin이 다시 호출하는 executable, server version mismatch를 실제로 검사한다. 기본 `.tmux.conf` 의미를 바꾸지 않고 agent 설정은 별도로 둔다.
+masil 환경의 호환 진입점은 masil server namespace로 연결한다. native `TMUX`/`TMUX_PANE` 관계, config 검색 경로, plugin이 다시 호출하는 executable, server version mismatch를 실제로 검사한다. 기본 `.tmux.conf` 의미를 바꾸지 않고 agent 설정은 별도로 둔다.
 
-stock tmux client와 rmux server의 내부 imsg binary 혼용은 초기 지원 대상으로 선언하지 않는다. 공개 CLI/control mode 호환과 별개다. 우연히 연결된 한 version의 결과를 장기 binary 호환으로 홍보하지 않는다.
+stock tmux client와 masil server의 내부 imsg binary 혼용은 초기 지원 대상으로 선언하지 않는다. 공개 CLI/control mode 호환과 별개다. 우연히 연결된 한 version의 결과를 장기 binary 호환으로 홍보하지 않는다.
 
 core-only build도 유지한다. Rust runtime 지원이 검증되지 않은 tmux 플랫폼에서는 native 기능을 계속 build할 수 있어야 한다. packaging이 optional agentd를 native core의 필수 시작 dependency로 만들지 않는다.
 
 ## 7. Upstream 유지 전략
 
-초기 core 기준은 `94796f6b1182507efac8a272fc309a79e22e58a5`다. upstream source는 원래 파일 구조를 유지하고 rmux patch를 목적별로 분리한다. code formatting이나 이름 변경으로 upstream diff를 불필요하게 키우지 않는다.
+초기 core 기준은 `94796f6b1182507efac8a272fc309a79e22e58a5`다. upstream source는 원래 파일 구조를 유지하고 masil patch를 목적별로 분리한다. code formatting이나 이름 변경으로 upstream diff를 불필요하게 키우지 않는다.
 
 upstream 갱신은 command/options/key/mode/format/control 목록 차이, terminal/PTY lifecycle 지점, 지원 platform 차이를 먼저 확인한다. [기준 추출 자료](../reference/README.md)를 재생성하고 의미 변경을 검토한다. baseline 숫자를 맞추려고 새 upstream 기능을 제외하지 않는다.
 
-upstream bug fix와 rmux 정책 변경을 구분한다. 기본 공개 동작을 바꾸는 fix는 회귀 fixture와 문서화된 판단이 필요하다. 현재 개발판 baseline의 새 기능을 stable tmux에 없다는 이유로 빼지 않는다.
+upstream bug fix와 masil 정책 변경을 구분한다. 기본 공개 동작을 바꾸는 fix는 회귀 fixture와 문서화된 판단이 필요하다. 현재 개발판 baseline의 새 기능을 stable tmux에 없다는 이유로 빼지 않는다.
 
 agentd upgrade와 core upgrade는 protocol capability로 조정한다. 불일치 시 agent 추가 기능을 거절해도 native core는 작동한다. DB schema 변경은 version·backup·failure recovery를 갖추며 downgrade가 안전하지 않으면 분명히 거절한다.
 

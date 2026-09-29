@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 rmux contributors
+ * Copyright (c) 2026 masil contributors
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,20 +14,20 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#ifndef RMUX_BRIDGE_H
-#define RMUX_BRIDGE_H
+#ifndef MASIL_BRIDGE_H
+#define MASIL_BRIDGE_H
 
 struct window_pane;
 
-void	rmux_bridge_start(void);
-void	rmux_bridge_stop(void);
-const char *rmux_bridge_get_boot_id(void);
+void	masil_bridge_start(void);
+void	masil_bridge_stop(void);
+const char *masil_bridge_get_boot_id(void);
 
-void	rmux_bridge_pane_created(struct window_pane *);
-void	rmux_bridge_pane_destroyed(struct window_pane *);
-void	rmux_bridge_pane_state_changed(struct window_pane *);
-void	rmux_bridge_pty_changed(struct window_pane *);
-void	rmux_bridge_output_changed(struct window_pane *);
-void	rmux_bridge_geometry_changed(struct window_pane *);
+void	masil_bridge_pane_created(struct window_pane *);
+void	masil_bridge_pane_destroyed(struct window_pane *);
+void	masil_bridge_pane_state_changed(struct window_pane *);
+void	masil_bridge_pty_changed(struct window_pane *);
+void	masil_bridge_output_changed(struct window_pane *);
+void	masil_bridge_geometry_changed(struct window_pane *);
 
-#endif /* RMUX_BRIDGE_H */
+#endif /* MASIL_BRIDGE_H */

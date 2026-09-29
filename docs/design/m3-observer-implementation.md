@@ -4,7 +4,7 @@
 
 ## 제공 범위
 
-- `rmux-agent --socket MANAGER serve --core CORE --config FILE`: foreground agentd. 단일 Tokio current-thread runtime. 별도 DB·daemon autostart·provider process 시작 없음.
+- `masil-agent --socket MANAGER serve --core CORE --config FILE`: foreground agentd. 단일 Tokio current-thread runtime. 별도 DB·daemon autostart·provider process 시작 없음.
 - 같은 manager socket의 `status`, `agents`, `inspect ID`, `stop`. status 조회만으로 process·인증·provider를 시작하지 않는다. stop은 agentd만 종료하고 core/provider는 그대로 둔다.
 - config는 최대 8개 OpenCode endpoint/project source와 합계 64개 명시적 session 관찰 대상. 같은 source는 하나의 HTTP client/SSE 연결을 공유한다. 각 관찰 대상은 로컬 표시 ID, pane ID, native session ID를 가진다.
 - HTTP는 사용자가 지정한 numeric loopback의 http endpoint만 지원한다. proxy·redirect·TLS·원격·자동 discovery는 이번 범위에 없다. source별 선택적 password_env와 username으로 기존 OpenCode Basic auth에 접속한다. 인증 비밀번호를 응답·로그·디스크에 남기지 않으며 transcript를 보관하지 않는다.

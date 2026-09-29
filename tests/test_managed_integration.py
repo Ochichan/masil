@@ -9,17 +9,17 @@ import subprocess
 import tempfile
 import unittest
 
-from test_compatibility import RMUX, ROOT, Server, wait_for
+from test_compatibility import MASIL, ROOT, Server, wait_for
 
 
-AGENT = Path(os.environ.get("RMUX_AGENT", ROOT / "bin/rmux-agent"))
+AGENT = Path(os.environ.get("MASIL_AGENT", ROOT / "bin/masil-agent"))
 MAX_CALLBACK_BYTES = 256 * 1024
 
 
 class ManagedIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.fixture = Path(tempfile.mkdtemp(prefix="rmux-integration-provider-"))
+        cls.fixture = Path(tempfile.mkdtemp(prefix="masil-integration-provider-"))
         fixture = cls.fixture / "provider"
         subprocess.run(
             [
@@ -42,7 +42,7 @@ class ManagedIntegration(unittest.TestCase):
         shutil.rmtree(cls.fixture)
 
     def setUp(self):
-        self.server = Server(RMUX)
+        self.server = Server(MASIL)
         self.server.__enter__()
         self.addCleanup(self.server.__exit__)
         self.env = self.server.env | {
@@ -73,8 +73,8 @@ class ManagedIntegration(unittest.TestCase):
     def hook(self, receipt, provider, payload, sequence, *, action=None, run=None, check=True):
         env = self.env | {
             "TMUX_PANE": receipt["pane_id"],
-            "RMUX_AGENT_RUN": run or receipt["run"],
-            "RMUX_AGENT_SEQUENCE": str(sequence),
+            "MASIL_AGENT_RUN": run or receipt["run"],
+            "MASIL_AGENT_SEQUENCE": str(sequence),
         }
         input_text = payload if isinstance(payload, str) else json.dumps(payload)
         args = ["integration", "hook", provider]
@@ -126,18 +126,18 @@ class ManagedIntegration(unittest.TestCase):
             driver.write_text(
                 """import { pathToFileURL } from 'node:url';
 const plugin = await import(pathToFileURL(process.argv[2]).href);
-const hooks = await plugin.RmuxAgentStatePlugin();
+const hooks = await plugin.MasilAgentStatePlugin();
 const mode = process.argv[3];
 if (mode === 'unconfigured' || mode === 'oversize') {
   delete process.env.TMUX_PANE;
-  delete process.env.RMUX_AGENT_RUN;
-  delete process.env.RMUX_AGENT_SOCKET;
+  delete process.env.MASIL_AGENT_RUN;
+  delete process.env.MASIL_AGENT_SOCKET;
 }
 await hooks['chat.message']({sessionID:'s1'});
 if (mode === 'oversize') {
   process.env.TMUX_PANE = '%999';
-  process.env.RMUX_AGENT_RUN = 'test-run';
-  process.env.RMUX_AGENT_SOCKET = process.argv[4];
+  process.env.MASIL_AGENT_RUN = 'test-run';
+  process.env.MASIL_AGENT_SOCKET = process.argv[4];
 }
 const padding = mode === 'oversize' ? 'x'.repeat(4 * 1024 * 1024) : '';
 await hooks.event({event:{type:'session.updated', properties:{sessionID:'s1', padding}}});
@@ -148,11 +148,11 @@ console.log('provider-survived');
 
             adapter_env = self.env | {
                 "TMUX_PANE": "%999",
-                "RMUX_AGENT_RUN": "test-run",
-                "RMUX_AGENT_SOCKET": str(self.server.socket),
+                "MASIL_AGENT_RUN": "test-run",
+                "MASIL_AGENT_SOCKET": str(self.server.socket),
             }
 
-            vanished = self.server.path / "vanished-rmux-agent"
+            vanished = self.server.path / "vanished-masil-agent"
             vanished.write_text("#!/bin/sh\nexit 0\n")
             vanished.chmod(0o700)
             missing_plugin = self.server.path / "opencode-missing.mjs"
@@ -181,14 +181,14 @@ console.log('provider-survived');
             self.assertIn("provider-survived", epipe.stdout)
 
             marker = self.server.path / "spawned"
-            recorder = self.server.path / "record-rmux-agent"
-            recorder.write_text('#!/bin/sh\nprintf "spawned\\n" >> "$RMUX_SPAWN_MARKER"\n')
+            recorder = self.server.path / "record-masil-agent"
+            recorder.write_text('#!/bin/sh\nprintf "spawned\\n" >> "$MASIL_SPAWN_MARKER"\n')
             recorder.chmod(0o700)
             guarded_plugin = self.server.path / "opencode-guarded.mjs"
             guarded_plugin.write_text(
                 plugin_text.replace(str(AGENT.resolve()), str(recorder))
             )
-            guard_env = self.env | {"RMUX_SPAWN_MARKER": str(marker)}
+            guard_env = self.env | {"MASIL_SPAWN_MARKER": str(marker)}
             for mode in ("unconfigured", "oversize"):
                 with self.subTest(adapter_guard=mode):
                     guarded = subprocess.run(
@@ -284,7 +284,7 @@ console.log('provider-survived');
             "opencode",
             {
                 "hook_event_name": "chat.message",
-                "rmux_scope": "frontend",
+                "masil_scope": "frontend",
                 "sessionID": "open-session",
             },
             1,

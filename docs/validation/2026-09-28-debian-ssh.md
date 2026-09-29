@@ -18,7 +18,7 @@
 
 [환경·소스·실행 파일 해시](data/debian-ssh/environment.json), [코어 빌드](data/debian-ssh/core-build.json), [stock 빌드](data/debian-ssh/baseline-build.json)를 보존했다.
 
-원격 작업 폴더는 `/home/ochi/.cache/rmux-validation.K2fYQL1P`다. 저장소 archive, 고정 upstream archive와 해시를 확인한 GNU 빌드 도구 archive를 복사했다. 필요한 Debian 개발 패키지는 `apt-get download`로 받고 `dpkg-deb -x`로 작업 폴더의 `.build/debian/sysroot`에 풀었다. 시스템 패키지·SSH 설정·기존 tmux 설치는 바꾸지 않았다.
+원격 작업 폴더는 `/home/ochi/.cache/masil-validation.K2fYQL1P`다. 저장소 archive, 고정 upstream archive와 해시를 확인한 GNU 빌드 도구 archive를 복사했다. 필요한 Debian 개발 패키지는 `apt-get download`로 받고 `dpkg-deb -x`로 작업 폴더의 `.build/debian/sysroot`에 풀었다. 시스템 패키지·SSH 설정·기존 tmux 설치는 바꾸지 않았다.
 
 개인 prefix의 aclocal이 시스템 `pkg.m4`를 찾도록 `ACLOCAL_PATH=/usr/share/aclocal`을 지정했다. pkg-config에는 private sysroot와 그 안의 `.pc` 경로를 지정했다. 실행 시에는 기기에 이미 설치된 공유 라이브러리를 사용한다. 설정은 원격 `.build/debian/env.sh`에 남아 있다.
 
@@ -45,7 +45,7 @@
 
 ## 실제 SSH에서 확인한 조작
 
-`tests/ssh_ui_smoke.py`는 로컬 PTY → 실제 SSH → 원격 PTY → UI 경로로 입력을 보낸다. native 모드에는 rmux 클라이언트와 sidebar pane 경로도 포함된다. 테스트가 끝나면 backend 결과를 받아 화면에 나타난 성공과 비교한다.
+`tests/ssh_ui_smoke.py`는 로컬 PTY → 실제 SSH → 원격 PTY → UI 경로로 입력을 보낸다. native 모드에는 masil 클라이언트와 sidebar pane 경로도 포함된다. 테스트가 끝나면 backend 결과를 받아 화면에 나타난 성공과 비교한다.
 
 - 관리 화면과 사이드패널에서 SGR 마우스로 Mark seen을 클릭하고 agentd의 공유 확인 상태가 바뀌었는지 검사했다. provider 요청은 모두 GET이었다.
 - 한글·중문 bracketed paste, 검색 지우기, 한국어 전환을 확인했다. 24×8 최소 크기 안내와 80×24 복귀를 검사했다.
@@ -92,7 +92,7 @@ Linux fixture locale을 이 기기에 없는 `en_US.UTF-8` 대신 `C.UTF-8`로 �
 
 ```sh
 ssh debian-ts
-cd /home/ochi/.cache/rmux-validation.K2fYQL1P
+cd /home/ochi/.cache/masil-validation.K2fYQL1P
 . .build/debian/env.sh
 
 python3 scripts/build.py --agent
@@ -101,19 +101,19 @@ cargo test --locked --release --manifest-path agent/Cargo.toml
 cargo clippy --locked --manifest-path agent/Cargo.toml --all-targets -- -D warnings
 ```
 
-실제 SSH 조작 검사는 **로컬 rmux 저장소에서** 실행한다. 빌드나 파일 복사는 수행하지 않으며, 지정한 원격 checkout의 private fixture 서버만 만든 뒤 종료한다. 알려진 host key를 요구한다.
+실제 SSH 조작 검사는 **로컬 masil 저장소에서** 실행한다. 빌드나 파일 복사는 수행하지 않으며, 지정한 원격 checkout의 private fixture 서버만 만든 뒤 종료한다. 알려진 host key를 요구한다.
 
 ```sh
 .build/bench-venv/bin/python tests/ssh_ui_smoke.py \
   --host debian-ts \
-  --remote-root /home/ochi/.cache/rmux-validation.K2fYQL1P \
+  --remote-root /home/ochi/.cache/masil-validation.K2fYQL1P \
   --output .build/debian-validation/ssh
 ```
 
 일반 코어를 직접 사용하려면 다음 명령으로 별도 session을 열 수 있다.
 
 ```sh
-ssh -t debian-ts '/home/ochi/.cache/rmux-validation.K2fYQL1P/bin/rmux -L try-rmux new-session -A -s work'
+ssh -t debian-ts '/home/ochi/.cache/masil-validation.K2fYQL1P/bin/masil -L try-masil new-session -A -s work'
 ```
 
 ## 아직 검증하지 않은 범위

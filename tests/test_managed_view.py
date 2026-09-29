@@ -39,7 +39,7 @@ class ManagedView(_ManagedAgents):
         self.assertEqual(saved['view']['workspaces'], [workspace])
         self.assertEqual(saved['view']['sort'], 'name')
 
-        encoded = self.server.text('show-options', '-gqv', '@rmux-agent-view').strip()
+        encoded = self.server.text('show-options', '-gqv', '@masil-agent-view').strip()
         self.assertTrue(encoded)
         self.assertEqual(json.loads(bytes.fromhex(encoded)), saved['view'])
         self.assertEqual(self.cli('view', 'get')['view'], saved['view'])
@@ -56,7 +56,7 @@ class ManagedView(_ManagedAgents):
 
         cleared = self.cli('view', 'clear')
         self.assertEqual(cleared['stage'], 'view_cleared')
-        self.assertEqual(self.server.text('show-options', '-gqv', '@rmux-agent-view'), '')
+        self.assertEqual(self.server.text('show-options', '-gqv', '@masil-agent-view'), '')
         self.assertEqual(
             {agent['name'] for agent in self.cli('list')['agents']},
             {'alpha', 'beta'},
@@ -107,7 +107,7 @@ class ManagedView(_ManagedAgents):
             'sort': 'priority',
             'unexpected': True,
         }
-        self.server.run('set-option', '-g', '@rmux-agent-view',
+        self.server.run('set-option', '-g', '@masil-agent-view',
                         json.dumps(malformed, separators=(',', ':')).encode().hex())
         rejected = self.cli('list', check=False)
         self.assertNotEqual(rejected.returncode, 0)

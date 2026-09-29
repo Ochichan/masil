@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
-#include "rmux-bridge.h"
+#include "masil-bridge.h"
 
 static void	server_destroy_session_group(struct session *);
 static void	server_fire_pane_exit(const char *, struct window_pane *);
@@ -416,7 +416,7 @@ server_destroy_pane(struct window_pane *wp, int notify)
 			screen_write_stop(&ctx);
 		}
 		wp->base.mode &= ~MODE_CURSOR;
-		rmux_bridge_output_changed(wp);
+		masil_bridge_output_changed(wp);
 
 		wp->flags |= PANE_REDRAW;
 		return;

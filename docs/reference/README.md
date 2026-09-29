@@ -21,7 +21,7 @@
 
 - [tmux-baseline.json](tmux-baseline.json): 명령·alias·옵션·hook·정적 format 변수·copy command·control notification·기본 키의 기계 판독 목록과 출처.
 - [tmux-default-bindings.conf](tmux-default-bindings.conf): `defaults[]`의 308개 문자열을 C escape 해석과 메뉴 매크로 확장 후 보존한 비교용 명령 목록.
-- [tmux-NOTICE.txt](tmux-NOTICE.txt): 복사·가공한 기본 바인딩과 참조 데이터의 원본 고지. rmux 자체의 라이선스를 결정하는 파일은 아니다.
+- [tmux-NOTICE.txt](tmux-NOTICE.txt): 복사·가공한 기본 바인딩과 참조 데이터의 원본 고지. masil 자체의 라이선스를 결정하는 파일은 아니다.
 
 | 추출 항목 | 수 | 정확한 범위 |
 | --- | ---: | --- |
@@ -74,4 +74,4 @@ refresh 시 같은 범위로 다시 추출하고 원본 소스의 구문 변경�
 - OpenCode [TUI의 내부/외부 server 선택](https://github.com/anomalyco/opencode/blob/b471c2b4495747353af768fbf2e0790c9d820ce2/packages/opencode/src/cli/cmd/tui.ts#L210), [기존 backend attach](https://github.com/anomalyco/opencode/blob/b471c2b4495747353af768fbf2e0790c9d820ce2/packages/opencode/src/cli/cmd/attach.ts#L114), [V2 입력 admission](https://github.com/anomalyco/opencode/blob/b471c2b4495747353af768fbf2e0790c9d820ce2/packages/core/src/session/input.ts#L245).
 - T3 Code [ProviderAdapter](https://github.com/pingdotgg/t3code/blob/94f92a7a386a26c98892b24fabdd0ea9fa804ce3/apps/server/src/provider/Services/ProviderAdapter.ts#L45), [명령 transaction](https://github.com/pingdotgg/t3code/blob/94f92a7a386a26c98892b24fabdd0ea9fa804ce3/apps/server/src/orchestration/Layers/OrchestrationEngine.ts#L245), [provider 제약](https://github.com/pingdotgg/t3code/blob/94f92a7a386a26c98892b24fabdd0ea9fa804ce3/docs/internals/providers.md).
 
-소스에서 확인한 메커니즘과 rmux의 제품 결정은 구분한다. 특정 프로젝트가 하는 모든 일을 rmux의 필수 기능으로 자동 채택하지 않는다. tmux 전체 기능과 기본 키 지원은 사용자가 명시한 별도의 필수 요구다.
+소스에서 확인한 메커니즘과 masil의 제품 결정은 구분한다. 특정 프로젝트가 하는 모든 일을 masil의 필수 기능으로 자동 채택하지 않는다. tmux 전체 기능과 기본 키 지원은 사용자가 명시한 별도의 필수 요구다.

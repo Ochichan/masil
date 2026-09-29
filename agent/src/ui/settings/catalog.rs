@@ -1,5 +1,5 @@
-//! Settings shown by `rmux-agent settings`. Each entry saves one `@rmux-*`
-//! choice that the built-in UI layer (core/rmux-ui-layer.conf) reads.
+//! Settings shown by `masil-agent settings`. Each entry saves one `@masil-*`
+//! choice that the built-in UI layer (core/masil-ui-layer.conf) reads.
 
 use crate::ui::model::Language;
 
@@ -26,8 +26,8 @@ impl Group {
             (Self::Input, Language::Korean) => "마우스와 입력",
             (Self::Look, Language::English) => "Appearance",
             (Self::Look, Language::Korean) => "모양",
-            (Self::Layer, Language::English) => "rmux UI",
-            (Self::Layer, Language::Korean) => "rmux UI",
+            (Self::Layer, Language::English) => "masil UI",
+            (Self::Layer, Language::Korean) => "masil UI",
         }
     }
 }
@@ -63,7 +63,7 @@ pub(crate) enum Kind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Setting {
-    /// The saved `@rmux-*` option.
+    /// The saved `@masil-*` option.
     pub key: &'static str,
     pub default: &'static str,
     pub kind: Kind,
@@ -109,11 +109,11 @@ const fn choice(value: &'static str, en: &'static str, ko: &'static str) -> Choi
 
 const ON_OFF: &[Choice] = &[choice("on", "On", "켜기"), choice("off", "Off", "끄기")];
 
-pub(crate) const UI_KEY: &str = "@rmux-ui";
+pub(crate) const UI_KEY: &str = "@masil-ui";
 
 pub(crate) const SETTINGS: &[Setting] = &[
     Setting {
-        key: "@rmux-status-position",
+        key: "@masil-status-position",
         default: "bottom",
         kind: Kind::Choices(&[
             choice("top", "Top", "위"),
@@ -130,7 +130,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "왼쪽과 오른쪽은 모든 창 옆에 상태줄을 사이드바로 그립니다.",
     },
     Setting {
-        key: "@rmux-status",
+        key: "@masil-status",
         default: "on",
         kind: Kind::Choices(ON_OFF),
         group: Group::Bar,
@@ -142,7 +142,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "끄면 상태줄과 버튼이 사라집니다. 오른쪽 클릭 메뉴는 계속 쓸 수 있습니다.",
     },
     Setting {
-        key: "@rmux-status-width",
+        key: "@masil-status-width",
         default: "24",
         kind: Kind::Number {
             min: 12,
@@ -151,14 +151,14 @@ pub(crate) const SETTINGS: &[Setting] = &[
         },
         group: Group::Bar,
         sections: &[],
-        readback: Some(("@rmux-status-width", Scope::Session)),
+        readback: Some(("@masil-status-width", Scope::Session)),
         en: "Sidebar width",
         ko: "사이드바 너비",
         help_en: "Columns used by a left or right bar.",
         help_ko: "왼쪽·오른쪽 상태줄이 차지하는 열 수입니다.",
     },
     Setting {
-        key: "@rmux-clock",
+        key: "@masil-clock",
         default: "on",
         kind: Kind::Choices(ON_OFF),
         group: Group::Bar,
@@ -170,7 +170,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "설정 버튼 옆에 시각을 표시합니다.",
     },
     Setting {
-        key: "@rmux-pane-titles",
+        key: "@masil-pane-titles",
         default: "top",
         kind: Kind::Choices(&[
             choice("off", "Off", "끄기"),
@@ -186,7 +186,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "제목을 누르면 이름을 바꿉니다. float, zoom, x 버튼도 제목줄에 있습니다.",
     },
     Setting {
-        key: "@rmux-scrollbars",
+        key: "@masil-scrollbars",
         default: "modal",
         kind: Kind::Choices(&[
             choice("off", "Off", "끄기"),
@@ -202,7 +202,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "스크롤바를 끌어 pane 기록을 이동합니다.",
     },
     Setting {
-        key: "@rmux-border-lines",
+        key: "@masil-border-lines",
         default: "single",
         kind: Kind::Choices(&[
             choice("single", "Single", "한 줄"),
@@ -219,7 +219,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "pane 사이 경계선 모양입니다.",
     },
     Setting {
-        key: "@rmux-mouse",
+        key: "@masil-mouse",
         default: "on",
         kind: Kind::Choices(ON_OFF),
         group: Group::Input,
@@ -227,11 +227,11 @@ pub(crate) const SETTINGS: &[Setting] = &[
         readback: Some(("mouse", Scope::Session)),
         en: "Mouse",
         ko: "마우스",
-        help_en: "Off gives clicks to the terminal; rmux buttons and menus stop responding.",
-        help_ko: "끄면 클릭이 터미널로 갑니다. rmux 버튼과 메뉴는 반응하지 않습니다.",
+        help_en: "Off gives clicks to the terminal; masil buttons and menus stop responding.",
+        help_ko: "끄면 클릭이 터미널로 갑니다. masil 버튼과 메뉴는 반응하지 않습니다.",
     },
     Setting {
-        key: "@rmux-base-index",
+        key: "@masil-base-index",
         default: "0",
         kind: Kind::Choices(&[choice("0", "0", "0"), choice("1", "1", "1")]),
         group: Group::Input,
@@ -243,7 +243,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "새 창과 pane의 첫 번호입니다.",
     },
     Setting {
-        key: "@rmux-renumber",
+        key: "@masil-renumber",
         default: "off",
         kind: Kind::Choices(ON_OFF),
         group: Group::Input,
@@ -255,7 +255,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "창을 닫으면 빈 번호를 채웁니다.",
     },
     Setting {
-        key: "@rmux-history",
+        key: "@masil-history",
         default: "10000",
         kind: Kind::Choices(&[
             choice("2000", "2,000", "2,000"),
@@ -271,7 +271,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "변경 후 만든 pane부터 적용됩니다.",
     },
     Setting {
-        key: "@rmux-theme",
+        key: "@masil-theme",
         default: "dark",
         kind: Kind::Choices(&[
             choice("dark", "Dark", "어둡게"),
@@ -288,7 +288,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_ko: "상태줄, 경계선, 메뉴의 색입니다.",
     },
     Setting {
-        key: "@rmux-lang",
+        key: "@masil-lang",
         default: "en",
         kind: Kind::Choices(&[
             choice("en", "English", "English"),
@@ -299,8 +299,8 @@ pub(crate) const SETTINGS: &[Setting] = &[
         readback: None,
         en: "Language",
         ko: "언어",
-        help_en: "Language of rmux buttons, menus and this screen.",
-        help_ko: "rmux 버튼, 메뉴, 이 화면의 언어입니다.",
+        help_en: "Language of masil buttons, menus and this screen.",
+        help_ko: "masil 버튼, 메뉴, 이 화면의 언어입니다.",
     },
 ];
 

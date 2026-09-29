@@ -82,7 +82,7 @@ status_timer_start_all(void)
 		status_timer_start(c);
 }
 
-/* rmux: read the status column width user option, or the default. */
+/* masil: read the status column width user option, or the default. */
 static u_int
 status_column_width_option(struct options *oo)
 {
@@ -90,10 +90,10 @@ status_column_width_option(struct options *oo)
 	const char		*value, *errstr;
 	long long		 width;
 
-	o = options_get(oo, "@rmux-status-width");
+	o = options_get(oo, "@masil-status-width");
 	if (o == NULL)
 		return (STATUS_COLUMN_DEFAULT_WIDTH);
-	value = options_get_string(oo, "@rmux-status-width");
+	value = options_get_string(oo, "@masil-status-width");
 	width = strtonum(value, STATUS_COLUMN_MIN_WIDTH,
 	    STATUS_COLUMN_MAX_WIDTH, &errstr);
 	if (errstr != NULL)
@@ -101,7 +101,7 @@ status_column_width_option(struct options *oo)
 	return (width);
 }
 
-/* rmux: get the global status column width for sizing new sessions. */
+/* masil: get the global status column width for sizing new sessions. */
 u_int
 status_column_default_width(void)
 {
@@ -161,7 +161,7 @@ status_line_size(struct client *c)
 }
 
 /*
- * rmux: get the width of a left or right status column. 0 means there is no
+ * masil: get the width of a left or right status column. 0 means there is no
  * column, including when the terminal is too narrow to keep a usable window.
  */
 u_int
@@ -178,7 +178,7 @@ status_column_size(struct client *c)
 	return (s->statuswidth);
 }
 
-/* rmux: get the first tty column of the status column, -1 if none. */
+/* masil: get the first tty column of the status column, -1 if none. */
 int
 status_column_at(struct client *c)
 {
@@ -191,7 +191,7 @@ status_column_at(struct client *c)
 	return (c->tty.sx - width);
 }
 
-/* rmux: get the tty x offset of the window area. */
+/* masil: get the tty x offset of the window area. */
 u_int
 status_column_left(struct client *c)
 {
@@ -227,7 +227,7 @@ status_get_range(struct client *c, u_int x, u_int y)
 	return (style_ranges_get_range(&sl->entries[y].ranges, x));
 }
 
-/* rmux: get the range at a column-local position in the status column. */
+/* masil: get the range at a column-local position in the status column. */
 struct style_range *
 status_get_column_range(struct client *c, u_int x, u_int y)
 {
@@ -239,7 +239,7 @@ status_get_column_range(struct client *c, u_int x, u_int y)
 }
 
 /*
- * rmux: resize the per-row entries of the status column. The range lists are
+ * masil: resize the per-row entries of the status column. The range lists are
  * TAILQs whose heads must not move, so the array is rebuilt, not reallocated.
  */
 static void
@@ -329,7 +329,7 @@ status_free(struct client *c)
 }
 
 /*
- * rmux: formats for rows of a left or right status column. They mirror the
+ * masil: formats for rows of a left or right status column. They mirror the
  * pieces of the default status-format so user styles and formats apply.
  */
 #define STATUS_COLUMN_LEFT_FORMAT \
@@ -352,7 +352,7 @@ status_free(struct client *c)
 	"}" \
 	"#[pop-default]"
 
-/* rmux: draw one row of the status column. Returns 1 if it changed. */
+/* masil: draw one row of the status column. Returns 1 if it changed. */
 static int
 status_column_row(struct screen_write_ctx *ctx, struct style_line_entry *sle,
     const struct grid_cell *gc, u_int row, u_int width, struct format_tree *ft,
@@ -394,7 +394,7 @@ status_column_row(struct screen_write_ctx *ctx, struct style_line_entry *sle,
 	return (1);
 }
 
-/* rmux: draw a left or right status column. Returns 1 if it changed. */
+/* masil: draw a left or right status column. Returns 1 if it changed. */
 static int
 status_redraw_column(struct client *c, struct format_tree *ft,
     const struct grid_cell *gc, u_int width, int force)
@@ -550,7 +550,7 @@ status_redraw(struct client *c)
 		memcpy(&sl->style, &gc, sizeof sl->style);
 	}
 
-	/* rmux: a left or right status column replaces the status lines. */
+	/* masil: a left or right status column replaces the status lines. */
 	if (cols != 0) {
 		changed = status_redraw_column(c, ft, &gc, cols, force);
 		format_free(ft);
@@ -945,7 +945,7 @@ status_prompt_screen_line(struct client *c)
 	struct tty	*tty = &c->tty;
 	u_int		 n;
 
-	/* rmux: with a status column the prompt overlays the last row. */
+	/* masil: with a status column the prompt overlays the last row. */
 	if (status_column_size(c) != 0)
 		return (tty->sy - 1);
 	if (options_get_number(c->session->options, "status-position") == 0)

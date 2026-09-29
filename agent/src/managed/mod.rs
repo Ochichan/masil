@@ -19,9 +19,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const META: &str = "@rmux-managed-agent";
-const TRACKED: &str = "@rmux-managed-observation";
-const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:rmux_core_boot_id}\t#{q:rmux_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@rmux-managed-agent}\t#{q:@rmux-managed-observation}\t#{q:rmux_foreground_pgid}\t#{q:pane_output_generation}\t#{q:rmux_osc_progress}";
+const META: &str = "@masil-managed-agent";
+const TRACKED: &str = "@masil-managed-observation";
+const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,7 +146,7 @@ impl Manager {
 
     pub async fn boot(&self) -> Result<String, String> {
         let boot = self
-            .command(&["display-message", "-p", "#{rmux_core_boot_id}"])
+            .command(&["display-message", "-p", "#{masil_core_boot_id}"])
             .await?
             .trim()
             .to_owned();
@@ -205,7 +205,8 @@ impl Manager {
                 || fields[6].parse::<u64>().is_err()
             {
                 return Err(
-                    "native core identity unavailable; rebuild and restart this rmux server".into(),
+                    "native core identity unavailable; rebuild and restart this masil server"
+                        .into(),
                 );
             }
             let metadata = decode::<Metadata>(encoded).filter(|m| {
@@ -423,11 +424,11 @@ impl Manager {
                 &agent.pane_id,
                 &identity_guard(agent),
                 &[command],
-                "rmux-agent-stale",
+                "masil-agent-stale",
             )
             .await?;
         let text = String::from_utf8(output.stdout).map_err(|_| "native output is not UTF-8")?;
-        if text.trim() == "rmux-agent-stale" {
+        if text.trim() == "masil-agent-stale" {
             return Err("agent run changed before reading".into());
         }
         Ok(text)
@@ -437,9 +438,9 @@ impl Manager {
         let guard = identity_guard(agent);
         let out = self
             .native
-            .guarded_script(&agent.pane_id, &guard, &commands, "rmux-agent-stale")
+            .guarded_script(&agent.pane_id, &guard, &commands, "masil-agent-stale")
             .await?;
-        if String::from_utf8_lossy(&out.stdout).contains("rmux-agent-stale") {
+        if String::from_utf8_lossy(&out.stdout).contains("masil-agent-stale") {
             return Err("agent run changed before the action".into());
         }
         Ok(())
@@ -478,9 +479,9 @@ impl Manager {
         let guard = and(&guards);
         let out = self
             .native
-            .guarded_group(&agent.pane_id, &guard, &commands, "rmux-agent-stale")
+            .guarded_group(&agent.pane_id, &guard, &commands, "masil-agent-stale")
             .await?;
-        if String::from_utf8_lossy(&out.stdout).contains("rmux-agent-stale") {
+        if String::from_utf8_lossy(&out.stdout).contains("masil-agent-stale") {
             return Err("agent foreground or run changed before input delivery".into());
         }
         Ok(())
@@ -571,18 +572,18 @@ impl Manager {
             "-d".into(),
             "-P".into(),
             "-F".into(),
-            "#{pane_id}\t#{rmux_core_boot_id}\t#{rmux_pty_generation}\t#{pane_pid}".into(),
+            "#{pane_id}\t#{masil_core_boot_id}\t#{masil_pty_generation}\t#{pane_pid}".into(),
             "-c".into(),
             cwd.as_os_str().into(),
         ]);
         for (key, value) in [
-            ("RMUX_AGENT_RUN", run.clone()),
+            ("MASIL_AGENT_RUN", run.clone()),
             (
-                "RMUX_AGENT_SOCKET",
+                "MASIL_AGENT_SOCKET",
                 self.native.socket.to_string_lossy().into_owned(),
             ),
             (
-                "RMUX_AGENT_BIN",
+                "MASIL_AGENT_BIN",
                 std::env::current_exe()
                     .map_err(|e| e.to_string())?
                     .to_string_lossy()
@@ -696,14 +697,14 @@ impl Manager {
         // Buffer preparation cannot type into a shell or answer an approval prompt.
         self.native
             .tmux(
-                ["load-buffer", "-b", "rmux-agent-draft", "-"]
+                ["load-buffer", "-b", "masil-agent-draft", "-"]
                     .iter()
                     .map(OsString::from),
                 Some(text.as_bytes().to_vec()),
             )
             .await?;
         Ok(
-            json!({"stage":"draft_prepared","buffer":"rmux-agent-draft","pane_id":agent.pane_id,"run":agent.run,"submitted":false}),
+            json!({"stage":"draft_prepared","buffer":"masil-agent-draft","pane_id":agent.pane_id,"run":agent.run,"submitted":false}),
         )
     }
 
@@ -862,12 +863,12 @@ fn and(guards: &[String]) -> String {
 
 fn identity_guard(agent: &Agent) -> String {
     and(&[
-        format!("#{{==:#{{rmux_core_boot_id}},{}}}", agent.boot),
-        format!("#{{==:#{{rmux_pty_generation}},{}}}", agent.generation),
+        format!("#{{==:#{{masil_core_boot_id}},{}}}", agent.boot),
+        format!("#{{==:#{{masil_pty_generation}},{}}}", agent.generation),
         format!("#{{==:#{{{META}}},{}}}", agent.encoded),
         format!("#{{==:#{{{TRACKED}}},{}}}", agent.tracked_encoded),
         format!(
-            "#{{==:#{{rmux_foreground_pgid}},{}}}",
+            "#{{==:#{{masil_foreground_pgid}},{}}}",
             if agent.foreground_group > 0 {
                 agent.foreground_group.to_string()
             } else {

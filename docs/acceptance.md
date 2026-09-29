@@ -6,18 +6,18 @@
 
 요구사항 상태는 `미구현`, `구현/미검증`, `검증 통과`, `차이 있음`, `환경에서 실행 불가`로 구분한다. 마지막 상태는 통과가 아니다. 모든 범위를 확인할 수 없을 때 `tmux 전체 호환`으로 표시하지 않는다.
 
-각 결과에는 요구 ID, 기준 tmux SHA·build 설정, rmux revision, OS·terminal·locale·환경, 재현 입력, 관찰 출력, 차이, 증거를 남긴다. 기준 목록의 개수는 기능 완료율이 아니다.
+각 결과에는 요구 ID, 기준 tmux SHA·build 설정, masil revision, OS·terminal·locale·환경, 재현 입력, 관찰 출력, 차이, 증거를 남긴다. 기준 목록의 개수는 기능 완료율이 아니다.
 
-기준 tmux와 rmux를 같은 조건에서 비교한다. 제품명·실행 파일명 및 실행마다 다른 PID·timestamp·socket 경로는 명시한 규칙으로 정규화할 수 있지만, 이를 핑계로 출력 field·ID 관계·순서·오류를 버리지 않는다.
+기준 tmux와 masil을 같은 조건에서 비교한다. 제품명·실행 파일명 및 실행마다 다른 PID·timestamp·socket 경로는 명시한 규칙으로 정규화할 수 있지만, 이를 핑계로 출력 field·ID 관계·순서·오류를 버리지 않는다.
 
-[사용자 제공 Herdr 조사](research/herdr-feedback-2026-09-28.md)의 이슈 상태와 rmux의 검증 결과는 별개다. 보고서에 있는 `closed`, 수정 배포 또는 `pending-release`는 통과 증거가 아니다. 모형 화면으로 재현한 조건과 실제 provider 통합에서 관찰한 조건도 따로 기록한다.
+[사용자 제공 Herdr 조사](research/herdr-feedback-2026-09-28.md)의 이슈 상태와 masil의 검증 결과는 별개다. 보고서에 있는 `closed`, 수정 배포 또는 `pending-release`는 통과 증거가 아니다. 모형 화면으로 재현한 조건과 실제 provider 통합에서 관찰한 조건도 따로 기록한다.
 
 ## 기준 환경
 
 - 무설정 비교는 격리된 socket과 임시 HOME/config 디렉터리에서 시작한다. 사용 중인 server와 실제 agent 계정·대화를 테스트 대상으로 삼지 않는다.
 - locale, TERM, terminal 크기, terminfo, build feature, shell, `VISUAL`/`EDITOR`, key encoding을 기록한다.
 - 원래 TUI 시나리오는 가짜 로그만으로 대체하지 않는다. deterministic terminal fixture와 실제 CLI 통합 검증을 함께 사용한다.
-- tmux upstream `regress/`를 테스트 설계의 근거로 삼는다. rmux에 적용 가능한 경우 executable 진입점을 바꿔 실행하고, 원본 기대값을 rmux 결과에 맞춰 바꾸지 않는다.
+- tmux upstream `regress/`를 테스트 설계의 근거로 삼는다. masil에 적용 가능한 경우 executable 진입점을 바꿔 실행하고, 원본 기대값을 masil 결과에 맞춰 바꾸지 않는다.
 - byte stream, terminal cell/attribute·cursor·mode, 명령 결과, format, event, 실제 프로세스 상태를 요구별로 나누어 검사한다.
 
 환경 기록에는 client/server/provider/integration 각각의 버전·release channel, terminal 버전과 key-reporting 설정, 입력 언어·IME·배열, 중첩 tmux/byobu, SSH·WSL, shell·direnv·Nix 초기화, native session ID의 대응을 포함한다. OS 이름만 같은 재현을 같은 조건으로 취급하지 않는다.
@@ -144,6 +144,6 @@ API 지연과 long-running operation의 진행 조회·취소 지연도 측정�
 6. 사람과 스크립트가 쓰는 기본 tmux 경로가 agent 기능 때문에 바뀌지 않는다.
 7. 제공하는 기능에 해당하는 R-01~R-12와 K-10/K-11·V 시나리오를 통과한다. 다기기 확인 상태, 부분 복구, 미확인 결과를 포함하고 아직 관찰할 수 없는 provider 기능은 그 한계를 표시한다.
 
-외부 조사 사례를 문서에 연결한 상태와 rmux 동작을 검증한 상태를 별도로 유지한다. 원문 확인·fixture 재현·실제 환경 검증·수정 배포·재검증 기록을 서로 대신하지 않는다.
+외부 조사 사례를 문서에 연결한 상태와 masil 동작을 검증한 상태를 별도로 유지한다. 원문 확인·fixture 재현·실제 환경 검증·수정 배포·재검증 기록을 서로 대신하지 않는다.
 
 부분 구현의 release는 가능하지만 단계와 검증 범위를 명확히 표시한다. 부분 release를 최종 목표 달성으로 바꾸어 적지 않는다.

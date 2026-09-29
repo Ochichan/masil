@@ -1,10 +1,10 @@
 # 구현된 코어 관찰 IPC
 
-2026-09-28 구현 계약. [최종 protocol 설계](design/protocol.md)의 읽기 전용 부분만 제공한다. 구현은 [rmux-bridge.c](../core/rmux-bridge.c), CLI는 [agent/src/main.rs](../agent/src/main.rs), 통합 검증은 [test_bridge.py](../tests/test_bridge.py)에 있다.
+2026-09-28 구현 계약. [최종 protocol 설계](design/protocol.md)의 읽기 전용 부분만 제공한다. 구현은 [masil-bridge.c](../core/masil-bridge.c), CLI는 [agent/src/main.rs](../agent/src/main.rs), 통합 검증은 [test_bridge.py](../tests/test_bridge.py)에 있다.
 
 ## 연결과 capability
 
-서버 시작 시 `RMUX_BRIDGE_SOCKET`을 설정하면 별도 Unix stream socket을 만든다. 0700 등 소유자만 접근할 수 있는 부모 directory와 같은 UID peer가 필요하다. socket 권한은 0600이며 기존 경로를 덮어쓰지 않는다. listener와 accepted FD는 child에 상속하지 않는다. 종료할 때 생성 당시 device/inode와 같은 socket만 지운다.
+서버 시작 시 `MASIL_BRIDGE_SOCKET`을 설정하면 별도 Unix stream socket을 만든다. 0700 등 소유자만 접근할 수 있는 부모 directory와 같은 UID peer가 필요하다. socket 권한은 0600이며 기존 경로를 덮어쓰지 않는다. listener와 accepted FD는 child에 상속하지 않는다. 종료할 때 생성 당시 device/inode와 같은 socket만 지운다.
 
 frame은 4-byte big-endian payload 길이와 UTF-8 JSON object로 구성한다. 요청에는 `v: 1`, `kind`, 문자열 `request_id`가 있어야 한다. 첫 요청은 `hello`다. 중복 key, 허용하지 않은 최상위 field, 잘못된 UTF-8/JSON, 크기·깊이 초과를 거절한다. CLI는 응답 frame 크기, 중복 key, 깊이, protocol version, request ID를 확인한다.
 
@@ -88,8 +88,8 @@ event는 재조회가 필요한 이유를 알린다. screen text나 provider 상
 느린 관찰자의 cursor가 journal 밖으로 밀리면 `gap`과 `resync_required`를 전송하고 연결을 닫는다. gap에는 `after_seq`, `first_available_seq`, `last_seq`가 있다. `after_seq`는 다른 scope까지 스캔한 서버 cursor여서 마지막 수신 event보다 클 수 있다. 보낼 공간이 없거나 TX가 5초간 막히면 연결 종료로 loss를 알린다. gap/EOF 이후 기존 projection을 fresh로 유지하면 안 된다.
 
 ```sh
-./bin/rmux-agent --socket /private/path/observe.sock watch %0 %2
-./bin/rmux-agent --socket /private/path/observe.sock watch --count 5 %0
+./bin/masil-agent --socket /private/path/observe.sock watch %0 %2
+./bin/masil-agent --socket /private/path/observe.sock watch --count 5 %0
 ```
 
 CLI는 ACK와 event를 NDJSON으로 즉시 flush한다. `--count`는 event 수이며 0은 baseline만 출력한다. 바뀌지 않는 pane은 계속 기다린다. 첫 frame byte를 받은 뒤에는 3초 완료 deadline을 적용한다. boot/epoch/scope/sequence/schema를 검증하고 gap 또는 예상치 않은 EOF는 exit 3, 잘못된 protocol은 exit 2, 서버의 등록 거절은 exit 5다. stdout pipe가 닫히면 정상 종료한다. 자동 재접속으로 loss를 숨기지 않는다.

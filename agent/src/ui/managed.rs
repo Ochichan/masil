@@ -246,8 +246,8 @@ impl Dialog {
             title: word(language, "Rename managed agent", "관리 에이전트 이름 변경"),
             note: word(
                 language,
-                "Updates rmux metadata for this pane.",
-                "이 창의 rmux 메타데이터를 변경합니다.",
+                "Updates masil metadata for this pane.",
+                "이 창의 masil 메타데이터를 변경합니다.",
             ),
             submit: word(language, "Rename", "이름 변경"),
             fields: vec![Field {
@@ -1186,7 +1186,7 @@ fn submit_dialog(
             let epoch = current_epoch.to_owned();
             let target = TargetIdentity::for_agent(&agent);
             tasks.spawn(async move {
-                let result = fleet.draft(&agent, &text).await.map(|_| ActionResult::Receipt(message(language, "Draft prepared in tmux buffer rmux-agent-draft; it was not pasted or submitted".into(), "tmux 버퍼 rmux-agent-draft에 초안을 준비했습니다. 붙여넣거나 전송하지 않았습니다".into())));
+                let result = fleet.draft(&agent, &text).await.map(|_| ActionResult::Receipt(message(language, "Draft prepared in tmux buffer masil-agent-draft; it was not pasted or submitted".into(), "tmux 버퍼 masil-agent-draft에 초안을 준비했습니다. 붙여넣거나 전송하지 않았습니다".into())));
                 action_message(epoch, Some(target), result)
             });
         }

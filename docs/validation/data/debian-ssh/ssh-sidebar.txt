@@ -29,4 +29,4 @@ Agents                      Online│
  Enter Details    z Expand        │
 Marked agent-0 as seen            │
 Shared window layout              │
-[main] 0:rmux-agent* 1:cat                                                                      "debian" 13:34 28-Sep-26
+[main] 0:masil-agent* 1:cat                                                                     "debian" 13:34 28-Sep-26

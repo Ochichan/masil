@@ -5,32 +5,32 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const HELP: &str = "Native agents (no observer configuration needed):
-  rmux-agent agent [--socket RMUX_SOCKET] [--client CLIENT] providers
-  rmux-agent agent endpoints list|add|remove|enable|disable ...
-  rmux-agent agent --endpoint ID COMMAND ...
-  rmux-agent agent [--socket RMUX_SOCKET] list --all
-  rmux-agent agent [--socket RMUX_SOCKET] list|get TARGET|explain TARGET
-  rmux-agent agent [--socket RMUX_SOCKET] read TARGET [--history]
-  rmux-agent agent [--socket RMUX_SOCKET] start NAME PROVIDER --cwd DIR [--split %N] [--session ID] [-- ARGS...]
-  rmux-agent agent [--socket RMUX_SOCKET] attach TARGET NAME
-  rmux-agent agent [--socket RMUX_SOCKET] rename TARGET NAME
-  rmux-agent agent [--socket RMUX_SOCKET] focus TARGET
-  rmux-agent agent [--socket RMUX_SOCKET] send-keys TARGET KEY...
-  rmux-agent agent [--socket RMUX_SOCKET] draft TARGET TEXT
-  rmux-agent agent [--socket RMUX_SOCKET] prompt TARGET TEXT [--run RUN --operation N]
-  rmux-agent agent [--socket RMUX_SOCKET] prompt-receipt TARGET [--run RUN] [--operation N]
-  rmux-agent agent [--socket RMUX_SOCKET] interrupt|close TARGET
-  rmux-agent agent [--socket RMUX_SOCKET] wait TARGET --state idle|working|blocked|exited [--timeout SECONDS] [--after-change]
-  rmux-agent agent [--socket RMUX_SOCKET] resume TARGET --name NAME [--split %N]
-  rmux-agent agent [--socket RMUX_SOCKET] ack TARGET --run RUN --revision REVISION
-  rmux-agent agent [--socket RMUX_SOCKET] save FILE
-  rmux-agent agent [--socket RMUX_SOCKET] restore FILE [--allow-fresh]
-  rmux-agent agent [--socket RMUX_SOCKET] view get|clear|set [--provider ID] [--state STATE] [--workspace NAME] [--sort priority|name|provider|workspace]
-  rmux-agent agent [--socket RMUX_SOCKET] integration status [PROVIDER]
-  rmux-agent agent [--socket RMUX_SOCKET] integration export PROVIDER [--directory ABSOLUTE_PATH]
-  rmux-agent agent [--socket RMUX_SOCKET] reload
-  rmux-agent agent [--socket RMUX_SOCKET] report --pane %N --run RUN --sequence N --state STATE [--session ID]
-  rmux-agent agent [--socket RMUX_SOCKET] ui|sidebar [--lang en|ko] [--theme dark|light|terminal]
+  masil-agent agent [--socket MASIL_SOCKET] [--client CLIENT] providers
+  masil-agent agent endpoints list|add|remove|enable|disable ...
+  masil-agent agent --endpoint ID COMMAND ...
+  masil-agent agent [--socket MASIL_SOCKET] list --all
+  masil-agent agent [--socket MASIL_SOCKET] list|get TARGET|explain TARGET
+  masil-agent agent [--socket MASIL_SOCKET] read TARGET [--history]
+  masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER --cwd DIR [--split %N] [--session ID] [-- ARGS...]
+  masil-agent agent [--socket MASIL_SOCKET] attach TARGET NAME
+  masil-agent agent [--socket MASIL_SOCKET] rename TARGET NAME
+  masil-agent agent [--socket MASIL_SOCKET] focus TARGET
+  masil-agent agent [--socket MASIL_SOCKET] send-keys TARGET KEY...
+  masil-agent agent [--socket MASIL_SOCKET] draft TARGET TEXT
+  masil-agent agent [--socket MASIL_SOCKET] prompt TARGET TEXT [--run RUN --operation N]
+  masil-agent agent [--socket MASIL_SOCKET] prompt-receipt TARGET [--run RUN] [--operation N]
+  masil-agent agent [--socket MASIL_SOCKET] interrupt|close TARGET
+  masil-agent agent [--socket MASIL_SOCKET] wait TARGET --state idle|working|blocked|exited [--timeout SECONDS] [--after-change]
+  masil-agent agent [--socket MASIL_SOCKET] resume TARGET --name NAME [--split %N]
+  masil-agent agent [--socket MASIL_SOCKET] ack TARGET --run RUN --revision REVISION
+  masil-agent agent [--socket MASIL_SOCKET] save FILE
+  masil-agent agent [--socket MASIL_SOCKET] restore FILE [--allow-fresh]
+  masil-agent agent [--socket MASIL_SOCKET] view get|clear|set [--provider ID] [--state STATE] [--workspace NAME] [--sort priority|name|provider|workspace]
+  masil-agent agent [--socket MASIL_SOCKET] integration status [PROVIDER]
+  masil-agent agent [--socket MASIL_SOCKET] integration export PROVIDER [--directory ABSOLUTE_PATH]
+  masil-agent agent [--socket MASIL_SOCKET] reload
+  masil-agent agent [--socket MASIL_SOCKET] report --pane %N --run RUN --sequence N --state STATE [--session ID]
+  masil-agent agent [--socket MASIL_SOCKET] ui|sidebar [--lang en|ko] [--theme dark|light|terminal]
 
 Socket defaults to the current TMUX server. Start creates a new window or split.
 Draft prepares a tmux buffer. Prompt checks idle/foreground identity, pastes, then sends Enter.
@@ -95,8 +95,8 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
                 .ok()
                 .and_then(|v| v.rsplitn(3, ',').last().map(str::to_owned))
         })
-        .or_else(|| std::env::var("RMUX_AGENT_SOCKET").ok())
-        .ok_or("specify --socket PATH or run this command inside rmux")?;
+        .or_else(|| std::env::var("MASIL_AGENT_SOCKET").ok())
+        .ok_or("specify --socket PATH or run this command inside masil")?;
     if command == "ui" || command == "sidebar" {
         let socket = PathBuf::from(&socket)
             .canonicalize()
@@ -135,7 +135,7 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
     let pane = std::env::var("TMUX_PANE").map_err(|_| "managed launcher needs TMUX_PANE")?;
     crate::pane_id(&pane)?;
     let run =
-        std::env::var("RMUX_AGENT_RUN").map_err(|_| "managed launcher needs a run identity")?;
+        std::env::var("MASIL_AGENT_RUN").map_err(|_| "managed launcher needs a run identity")?;
     let native = crate::native_ui::Context {
         socket: socket.into(),
         client: None,
@@ -448,7 +448,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         _ => {
             return Err(format!(
-                "invalid agent command or arguments; see rmux-agent agent --help\n{HELP}"
+                "invalid agent command or arguments; see masil-agent agent --help\n{HELP}"
             ));
         }
     }

@@ -8,15 +8,15 @@ import tempfile
 import time
 import unittest
 
-from test_compatibility import RMUX, ROOT, Server, wait_for
+from test_compatibility import MASIL, ROOT, Server, wait_for
 
-AGENT = ROOT / 'bin/rmux-agent'
+AGENT = ROOT / 'bin/masil-agent'
 
 
 class ManagedAgents(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.fixture = Path(tempfile.mkdtemp(prefix='rmux-provider-'))
+        cls.fixture = Path(tempfile.mkdtemp(prefix='masil-provider-'))
         subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(ROOT / 'tests/faults/agent.c'),
                         '-o', str(cls.fixture / 'codex')], check=True, capture_output=True)
 
@@ -26,12 +26,12 @@ class ManagedAgents(unittest.TestCase):
         shutil.rmtree(cls.fixture)
 
     def setUp(self):
-        self.server = Server(RMUX)
+        self.server = Server(MASIL)
         self.server.__enter__()
         self.addCleanup(self.server.__exit__)
         self.env = self.server.env | {'PATH': f'{self.fixture}:/usr/bin:/bin',
                                      'XDG_CONFIG_HOME': str(self.server.path / 'config')}
-        directory = Path(self.env['XDG_CONFIG_HOME']) / 'rmux/agent-detection'
+        directory = Path(self.env['XDG_CONFIG_HOME']) / 'masil/agent-detection'
         directory.mkdir(parents=True)
         (directory / 'codex.toml').write_text('''id = "codex"
 version = "1.0.0"
@@ -94,7 +94,7 @@ contains = ["STATE:idle"]
         self.assertEqual(self.cli('get', 'renamed')['pane_id'], receipt['pane_id'])
         result = self.cli('draft', 'renamed', 'hello\n한국어')
         self.assertFalse(result['submitted'])
-        self.assertEqual(self.server.text('show-buffer', '-b', 'rmux-agent-draft'), 'hello\n한국어')
+        self.assertEqual(self.server.text('show-buffer', '-b', 'masil-agent-draft'), 'hello\n한국어')
         self.assertEqual(self.cli('get', 'renamed')['state'], 'idle')
 
     def test_delivery_wait_and_shared_seen_do_not_approve(self):
@@ -241,7 +241,7 @@ contains = ["STATE:idle"]
         launch = self.start()
         ledger = {'run': launch['run'], 'sequence': 1, 'entries': [
             {'operation': 1, 'digest': hashlib.sha256(b'working').hexdigest(), 'stage': 'pending'}]}
-        self.server.run('set-option', '-p', '-t', launch['pane_id'], '@rmux-agent-prompt-receipts',
+        self.server.run('set-option', '-p', '-t', launch['pane_id'], '@masil-agent-prompt-receipts',
                         json.dumps(ledger).encode().hex())
         self.assertEqual(self.cli('prompt', 'builder', 'working', '--operation', '1', '--run', launch['run'])['stage'], 'pending')
         self.assertNotEqual(self.cli('prompt', 'builder', 'working', check=False).returncode, 0)
@@ -294,7 +294,7 @@ contains = ["STATE:idle"]
     def test_prompt_paste_failure_never_sends_enter_or_marks_delivered(self):
         import shlex
         self.start()
-        native = shlex.join([str(RMUX), '-S', str(self.server.socket)])
+        native = shlex.join([str(MASIL), '-S', str(self.server.socket)])
         remove_buffer = f'{native} delete-buffer -b "$({native} list-buffers | head -1 | cut -d: -f1)"'
         self.server.run('set-hook', '-g', 'after-load-buffer', 'run-shell ' + shlex.quote(remove_buffer))
         result = self.cli('prompt', 'builder', 'working', check=False)

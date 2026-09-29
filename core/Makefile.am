@@ -1,18 +1,18 @@
 # Obvious program stuff.
 bin_PROGRAMS = tmux
-CLEANFILES = tmux.1.mdoc tmux.1.man cmd-parse.c rmux-ui-layer.h
+CLEANFILES = tmux.1.mdoc tmux.1.man cmd-parse.c masil-ui-layer.h
 
-# rmux: the built-in UI layer, embedded as a C string.
-BUILT_SOURCES = rmux-ui-layer.h
-rmux-ui-layer.h: $(srcdir)/rmux-ui-layer.conf
+# masil: the built-in UI layer, embedded as a C string.
+BUILT_SOURCES = masil-ui-layer.h
+masil-ui-layer.h: $(srcdir)/masil-ui-layer.conf
 	$(AM_V_GEN)sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' \
-	    -e 's/$$/\\n"/' $(srcdir)/rmux-ui-layer.conf >$@.tmp && mv $@.tmp $@
+	    -e 's/$$/\\n"/' $(srcdir)/masil-ui-layer.conf >$@.tmp && mv $@.tmp $@
 
 # Distribution tarball options.
 EXTRA_DIST = \
 	CHANGES README COPYING example_tmux.conf \
 	osdep-*.c mdoc2man.awk tmux.1 compat/yyjson/LICENSE \
-	rmux-ui-layer.conf
+	masil-ui-layer.conf
 dist_EXTRA_tmux_SOURCES = compat/*.[ch]
 
 # Preprocessor flags.
@@ -204,9 +204,9 @@ dist_tmux_SOURCES = \
 	prompt-history.c \
 	prompt.c \
 	regsub.c \
-	rmux-bridge.c \
-	rmux-bridge.h \
-	rmux-ui.c \
+	masil-bridge.c \
+	masil-bridge.h \
+	masil-ui.c \
 	resize.c \
 	screen-redraw.c \
 	screen-write.c \

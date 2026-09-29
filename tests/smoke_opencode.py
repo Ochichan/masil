@@ -12,7 +12,7 @@ import time
 from urllib.request import Request, build_opener, ProxyHandler
 
 from test_agentd import AGENT, manager_query
-from test_compatibility import RMUX, Server, wait_for
+from test_compatibility import MASIL, Server, wait_for
 
 
 def main():
@@ -22,9 +22,9 @@ def main():
     args = parser.parse_args()
     if not args.opencode:
         parser.error("installed opencode is required")
-    core = Server(RMUX, command=["/bin/cat"])
+    core = Server(MASIL, command=["/bin/cat"])
     bridge = core.path / "observe.sock"
-    core.env["RMUX_BRIDGE_SOCKET"] = str(bridge)
+    core.env["MASIL_BRIDGE_SOCKET"] = str(bridge)
     with core:
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
@@ -73,13 +73,13 @@ def main():
             config = core.path / "sources.json"
             config.write_text(json.dumps({"sources": [{
                 "id": "installed", "endpoint": endpoint, "directory": str(core.path.resolve()),
-                "password_env": "RMUX_TEST_OPENCODE_PASSWORD",
+                "password_env": "MASIL_TEST_OPENCODE_PASSWORD",
                 "sessions": [{"id": "missing", "pane_id": "%0", "session_id": "ses_missing"}]
             }]}))
             manager = core.path / "manager.sock"
             daemon = subprocess.Popen([str(AGENT), "--socket", str(manager), "serve",
                                        "--core", str(bridge), "--config", str(config)],
-                                      env=core.env | {"RMUX_TEST_OPENCODE_PASSWORD": password},
+                                      env=core.env | {"MASIL_TEST_OPENCODE_PASSWORD": password},
                                       stdout=log, stderr=log)
             wait_for(manager.exists, 5)
             row = None

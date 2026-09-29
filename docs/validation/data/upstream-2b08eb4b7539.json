@@ -1,15 +1,15 @@
 [
   {
-    "binary": "rmux",
+    "binary": "masil",
     "script": "socket-path.sh",
     "status": "passed",
     "returncode": 0,
     "process_group": 69709,
     "normalizations": [
-      "socket namespace tmux-UID -> rmux-UID"
+      "socket namespace tmux-UID -> masil-UID"
     ],
     "seconds": 1.1968341669999063,
-    "log": ".build/regress-2b08eb4b7539/logs/rmux/socket-path.sh.log"
+    "log": ".build/regress-2b08eb4b7539/logs/masil/socket-path.sh.log"
   },
   {
     "binary": "tmux-baseline",

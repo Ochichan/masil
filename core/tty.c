@@ -1167,7 +1167,7 @@ tty_clamp_line(struct tty *tty, const struct tty_ctx *ctx, u_int px, u_int py,
 		return (0);
 	*ry = ctx->yoff + py - ctx->woy;
 
-	/* rmux: shift is the width of a left status column, if any. */
+	/* masil: shift is the width of a left status column, if any. */
 	if (xoff >= (int)ctx->wox && xoff + nx <= ctx->wox + ctx->wsx) {
 		/* All visible. */
 		*i = 0;
@@ -1264,7 +1264,7 @@ tty_clamp_area(struct tty *tty, const struct tty_ctx *ctx, u_int px, u_int py,
 	if (!tty_is_visible(tty, ctx, px, py, nx, ny))
 		return (0);
 
-	/* rmux: shift is the width of a left status column, if any. */
+	/* masil: shift is the width of a left status column, if any. */
 	if (xoff >= ctx->wox && xoff + nx <= ctx->wox + ctx->wsx) {
 		/* All visible. */
 		*i = 0;
@@ -2228,7 +2228,7 @@ tty_margin_pane(struct tty *tty, const struct tty_ctx *ctx)
 {
 	int	l, r, shift = ctx->xoff - ctx->rxoff;
 
-	/* rmux: shift is the width of a left status column, if any. */
+	/* masil: shift is the width of a left status column, if any. */
 	l = ctx->xoff - ctx->wox;
 	r = ctx->xoff + ctx->sx - 1 - ctx->wox;
 

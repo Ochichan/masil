@@ -5,7 +5,7 @@ primary_target: "agent/src/ui/mod.rs"
 related_targets: ["agent/src/ui/view.rs","agent/src/ui/input.rs"]
 ---
 
-# rmux agent desk: UI and interaction contract
+# masil agent desk: UI and interaction contract
 
 Status: implementation contract. User choices: persistent side panel plus an on-demand management screen, actual TUI implementation before visual review, English default with Korean switching. Reference: yututui's rendered hit regions, modal input ownership, responsive layouts and mouse parity. Existing tmux commands, prefix and default key tables remain authoritative.
 
@@ -30,8 +30,8 @@ The side panel uses the same model with compact rows and a short selected-item a
 
 ## Entry points and ownership
 
-- `rmux-agent --socket MANAGER ui` opens the management screen in the current terminal's alternate screen.
-- Explicit `sidebar` opens a native side pane in a specified/current rmux window. It preserves the original active pane and refuses to squeeze a terminal below the documented minimum. A same-manager panel in that window is reused rather than duplicated.
+- `masil-agent --socket MANAGER ui` opens the management screen in the current terminal's alternate screen.
+- Explicit `sidebar` opens a native side pane in a specified/current masil window. It preserves the original active pane and refuses to squeeze a terminal below the documented minimum. A same-manager panel in that window is reused rather than duplicated.
 - Expand toggles tmux's native pane zoom on the owned sidebar. Restore returns to the original split layout. The expanded pane renders the full inspector. No permanent default binding is added.
 - A sidebar is a shared native pane. All clients viewing the same tmux window see its layout. Opening/closing it is an explicit workspace action, and the UI labels that fact.
 - Close/Escape restores the UI's terminal. An owned sidebar process exits and its pane is removed. Creation sets remain-on-exit off only on that newly owned pane, even when the user enables it globally.

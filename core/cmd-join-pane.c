@@ -80,7 +80,7 @@ cmd_join_pane_place(struct cmdq_item *item, struct winlink *wl,
 	if (window_pane_get_pane_lines(wp) == PANE_LINES_NONE)
 		border = 0;
 
-	/* rmux: a floating group moves in the z-index as one pane. */
+	/* masil: a floating group moves in the z-index as one pane. */
 	wp = window_zindex_head(w, wp);
 	saved = window_zindex_collapse(w, &nsaved);
 
@@ -368,7 +368,7 @@ cmd_join_pane_zindex(struct cmdq_item *item, struct winlink *wl,
 		cmdq_error(item, "z-index %s", errstr);
 		return (CMD_RETURN_ERROR);
 	}
-	/* rmux: a floating group takes one z-index slot. */
+	/* masil: a floating group takes one z-index slot. */
 	wp = window_zindex_head(w, wp);
 	saved = window_zindex_collapse(w, &nsaved);
 	TAILQ_REMOVE(&w->z_index, wp, zentry);
@@ -412,7 +412,7 @@ cmd_join_pane_tile(struct cmdq_item *item, struct args *args, struct window *w,
 		return (CMD_RETURN_ERROR);
 	}
 
-	/* rmux: a group member leaves its group before it is tiled. */
+	/* masil: a group member leaves its group before it is tiled. */
 	if (layout_float_root(lc) != lc) {
 		if (!layout_group_member_can_tile(lc)) {
 			cmdq_error(item, "no space for a new pane");
@@ -519,7 +519,7 @@ cmd_join_pane_exec(struct cmd *self, struct cmdq_item *item)
 	if (args_has(args, 'f'))
 		flags |= SPAWN_FULLSIZE;
 
-	/* rmux: joining a floating group member adds the pane to the group. */
+	/* masil: joining a floating group member adds the pane to the group. */
 	if (window_pane_is_floating(dst_wp) &&
 	    layout_float_root(dst_wp->layout_cell) != dst_wp->layout_cell) {
 		lc = layout_get_group_cell(item, args, dst_w, dst_wp, flags,
