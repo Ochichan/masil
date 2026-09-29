@@ -12,6 +12,7 @@ mod input;
 pub(crate) mod model;
 mod network;
 mod preferences;
+pub(crate) mod settings;
 mod terminal;
 mod view;
 

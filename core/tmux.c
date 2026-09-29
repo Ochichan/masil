@@ -485,6 +485,7 @@ main(int argc, char **argv)
 		case 'f':
 			if (!fflag) {
 				fflag = 1;
+				rmux_ui_enabled = 0;
 				for (i = 0; i < cfg_nfiles; i++)
 					free(cfg_files[i]);
 				cfg_nfiles = 0;

@@ -107,7 +107,7 @@ menu_add_item(struct menu *menu, const struct menu_item *item,
 		menu->count--;
 		return;
 	}
-	max_width = c->tty.sx - 4;
+	max_width = c->tty.sx - status_column_size(c) - 4;
 
 	slen = strlen(s);
 	if (*s != '-' && item->key != KEYC_UNKNOWN && item->key != KEYC_NONE) {

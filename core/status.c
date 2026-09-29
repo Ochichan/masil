@@ -82,16 +82,53 @@ status_timer_start_all(void)
 		status_timer_start(c);
 }
 
+/* rmux: read the status column width user option, or the default. */
+static u_int
+status_column_width_option(struct options *oo)
+{
+	struct options_entry	*o;
+	const char		*value, *errstr;
+	long long		 width;
+
+	o = options_get(oo, "@rmux-status-width");
+	if (o == NULL)
+		return (STATUS_COLUMN_DEFAULT_WIDTH);
+	value = options_get_string(oo, "@rmux-status-width");
+	width = strtonum(value, STATUS_COLUMN_MIN_WIDTH,
+	    STATUS_COLUMN_MAX_WIDTH, &errstr);
+	if (errstr != NULL)
+		return (STATUS_COLUMN_DEFAULT_WIDTH);
+	return (width);
+}
+
+/* rmux: get the global status column width for sizing new sessions. */
+u_int
+status_column_default_width(void)
+{
+	return (status_column_width_option(global_s_options));
+}
+
 /* Update status cache. */
 void
 status_update_cache(struct session *s)
 {
+	u_int	position;
+
 	s->statuslines = options_get_number(s->options, "status");
+	position = options_get_number(s->options, "status-position");
+	s->statuscolumn = STATUS_COLUMN_NONE;
+	s->statuswidth = status_column_width_option(s->options);
 	if (s->statuslines == 0)
 		s->statusat = -1;
-	else if (options_get_number(s->options, "status-position") == 0)
+	else if (position == STATUS_POSITION_TOP)
 		s->statusat = 0;
-	else
+	else if (position == STATUS_POSITION_LEFT) {
+		s->statusat = -1;
+		s->statuscolumn = STATUS_COLUMN_LEFT;
+	} else if (position == STATUS_POSITION_RIGHT) {
+		s->statusat = -1;
+		s->statuscolumn = STATUS_COLUMN_RIGHT;
+	} else
 		s->statusat = 1;
 }
 
@@ -118,7 +155,49 @@ status_line_size(struct client *c)
 		return (0);
 	if (s == NULL)
 		return (options_get_number(global_s_options, "status"));
+	if (s->statuscolumn != STATUS_COLUMN_NONE)
+		return (0);
 	return (s->statuslines);
+}
+
+/*
+ * rmux: get the width of a left or right status column. 0 means there is no
+ * column, including when the terminal is too narrow to keep a usable window.
+ */
+u_int
+status_column_size(struct client *c)
+{
+	struct session	*s = c->session;
+
+	if (s == NULL || c->flags & (CLIENT_STATUSOFF|CLIENT_CONTROL))
+		return (0);
+	if (s->statuscolumn == STATUS_COLUMN_NONE || s->statuslines == 0)
+		return (0);
+	if (c->tty.sx < s->statuswidth + STATUS_COLUMN_MIN_WINDOW)
+		return (0);
+	return (s->statuswidth);
+}
+
+/* rmux: get the first tty column of the status column, -1 if none. */
+int
+status_column_at(struct client *c)
+{
+	u_int	width = status_column_size(c);
+
+	if (width == 0)
+		return (-1);
+	if (c->session->statuscolumn == STATUS_COLUMN_LEFT)
+		return (0);
+	return (c->tty.sx - width);
+}
+
+/* rmux: get the tty x offset of the window area. */
+u_int
+status_column_left(struct client *c)
+{
+	if (status_column_at(c) != 0)
+		return (0);
+	return (status_column_size(c));
 }
 
 /* Get the prompt line number for client's session. 1 means at the bottom. */
@@ -146,6 +225,43 @@ status_get_range(struct client *c, u_int x, u_int y)
 	if (y >= nitems(sl->entries))
 		return (NULL);
 	return (style_ranges_get_range(&sl->entries[y].ranges, x));
+}
+
+/* rmux: get the range at a column-local position in the status column. */
+struct style_range *
+status_get_column_range(struct client *c, u_int x, u_int y)
+{
+	struct status_line	*sl = &c->status;
+
+	if (y >= sl->ncolumn)
+		return (NULL);
+	return (style_ranges_get_range(&sl->column[y].ranges, x));
+}
+
+/*
+ * rmux: resize the per-row entries of the status column. The range lists are
+ * TAILQs whose heads must not move, so the array is rebuilt, not reallocated.
+ */
+static void
+status_column_resize(struct status_line *sl, u_int rows)
+{
+	u_int	i;
+
+	if (rows == sl->ncolumn)
+		return;
+	for (i = 0; i < sl->ncolumn; i++) {
+		style_ranges_free(&sl->column[i].ranges);
+		free((void *)sl->column[i].expanded);
+	}
+	free(sl->column);
+	sl->column = NULL;
+	sl->ncolumn = 0;
+	if (rows == 0)
+		return;
+	sl->column = xcalloc(rows, sizeof *sl->column);
+	for (i = 0; i < rows; i++)
+		style_ranges_init(&sl->column[i].ranges);
+	sl->ncolumn = rows;
 }
 
 /* Save old status line. */
@@ -200,6 +316,8 @@ status_free(struct client *c)
 		free((void *)sl->entries[i].expanded);
 	}
 
+	status_column_resize(sl, 0);
+
 	if (event_initialized(&sl->timer))
 		evtimer_del(&sl->timer);
 
@@ -208,6 +326,180 @@ status_free(struct client *c)
 		free(sl->active);
 	}
 	screen_free(&sl->screen);
+}
+
+/*
+ * rmux: formats for rows of a left or right status column. They mirror the
+ * pieces of the default status-format so user styles and formats apply.
+ */
+#define STATUS_COLUMN_LEFT_FORMAT \
+	"#[align=left range=left #{E:status-left-style}]" \
+	"#[push-default]" \
+	"#{T;=/#{status-left-length}:status-left}" \
+	"#[pop-default]" \
+	"#[norange default]"
+#define STATUS_COLUMN_RIGHT_FORMAT \
+	"#[align=left range=right #{E:status-right-style}]" \
+	"#[push-default]" \
+	"#{T;=/#{status-right-length}:status-right}" \
+	"#[pop-default]" \
+	"#[norange default]"
+#define STATUS_COLUMN_WINDOW_FORMAT \
+	"#[push-default]" \
+	"#{?window_active," \
+		"#{T:window-status-current-format}," \
+		"#{T:window-status-format}" \
+	"}" \
+	"#[pop-default]"
+
+/* rmux: draw one row of the status column. Returns 1 if it changed. */
+static int
+status_column_row(struct screen_write_ctx *ctx, struct style_line_entry *sle,
+    const struct grid_cell *gc, u_int row, u_int width, struct format_tree *ft,
+    const char *fmt, const char *key, struct winlink *wl, int force)
+{
+	struct style_range	*sr;
+	char			*expanded, *cached;
+	u_int			 n;
+
+	expanded = format_expand_time(ft, fmt);
+	xasprintf(&cached, "%s:%s", key, expanded);
+	if (!force && sle->expanded != NULL &&
+	    strcmp(cached, sle->expanded) == 0) {
+		free(cached);
+		free(expanded);
+		return (0);
+	}
+
+	screen_write_cursormove(ctx, 0, row, 0);
+	for (n = 0; n < width; n++)
+		screen_write_putc(ctx, gc, ' ');
+	screen_write_cursormove(ctx, 0, row, 0);
+	style_ranges_free(&sle->ranges);
+	format_draw(ctx, gc, width, expanded, &sle->ranges, 0);
+
+	/* The whole window row selects the window, after any inner ranges. */
+	if (wl != NULL) {
+		sr = xcalloc(1, sizeof *sr);
+		sr->type = STYLE_RANGE_WINDOW;
+		sr->argument = wl->idx;
+		sr->start = 0;
+		sr->end = width;
+		TAILQ_INSERT_TAIL(&sle->ranges, sr, entry);
+	}
+
+	free(expanded);
+	free(sle->expanded);
+	sle->expanded = cached;
+	return (1);
+}
+
+/* rmux: draw a left or right status column. Returns 1 if it changed. */
+static int
+status_redraw_column(struct client *c, struct format_tree *ft,
+    const struct grid_cell *gc, u_int width, int force)
+{
+	struct status_line	*sl = &c->status;
+	struct session		*s = c->session;
+	struct screen_write_ctx	 ctx;
+	struct winlink		*wl;
+	struct format_tree	*wft;
+	struct grid_cell	 rgc;
+	struct options		*oo;
+	u_int			 height = c->tty.sy, row, first, last, count;
+	u_int			 i, current = 0, nwindows = 0;
+	int			 changed = 0, flags;
+	char			 key[96];
+
+	if (screen_size_x(&sl->screen) != width ||
+	    screen_size_y(&sl->screen) != height) {
+		screen_resize(&sl->screen, width, height, 0);
+		force = 1;
+	}
+	status_column_resize(sl, height);
+
+	/*
+	 * Rows: status-left at the top, then a gap, one row per window, a gap,
+	 * and status-right at the bottom. Short columns keep the windows.
+	 */
+	if (height >= 5) {
+		first = 2;
+		last = height - 2;
+	} else {
+		first = 0;
+		last = height;
+	}
+	count = last - first;
+
+	RB_FOREACH(wl, winlinks, &s->windows) {
+		if (wl == s->curw)
+			current = nwindows;
+		nwindows++;
+	}
+
+	screen_write_start(&ctx, &sl->screen);
+	for (row = 0; row < height; row++) {
+		if (row >= first && row < last)
+			continue;
+		if (height >= 5 && row == 0) {
+			changed |= status_column_row(&ctx, &sl->column[row], gc,
+			    row, width, ft, STATUS_COLUMN_LEFT_FORMAT, "left",
+			    NULL, force);
+		} else if (height >= 5 && row == height - 1) {
+			changed |= status_column_row(&ctx, &sl->column[row], gc,
+			    row, width, ft, STATUS_COLUMN_RIGHT_FORMAT, "right",
+			    NULL, force);
+		} else {
+			changed |= status_column_row(&ctx, &sl->column[row], gc,
+			    row, width, ft, "", "gap", NULL, force);
+		}
+	}
+
+	/* Keep the current window visible when windows exceed the rows. */
+	i = 0;
+	if (nwindows > count && current >= count)
+		i = current - count + 1;
+	flags = FORMAT_STATUS;
+	if (c->flags & CLIENT_STATUSFORCE)
+		flags |= FORMAT_FORCE;
+	row = first;
+	RB_FOREACH(wl, winlinks, &s->windows) {
+		if (i != 0) {
+			i--;
+			continue;
+		}
+		if (row >= last)
+			break;
+		wft = format_create(c, NULL, FORMAT_WINDOW|wl->window->id,
+		    flags);
+		format_defaults(wft, c, s, wl, NULL);
+		memcpy(&rgc, gc, sizeof rgc);
+		oo = wl->window->options;
+		style_add(&rgc, oo, "window-status-style", wft);
+		if (wl == s->curw)
+			style_add(&rgc, oo, "window-status-current-style", wft);
+		if (wl == TAILQ_FIRST(&s->lastw))
+			style_add(&rgc, oo, "window-status-last-style", wft);
+		if (wl->flags & WINLINK_BELL)
+			style_add(&rgc, oo, "window-status-bell-style", wft);
+		else if (wl->flags & (WINLINK_ACTIVITY|WINLINK_SILENCE)) {
+			style_add(&rgc, oo, "window-status-activity-style",
+			    wft);
+		}
+		xsnprintf(key, sizeof key, "%d:%d:%d:%d:%d:%d", wl->idx,
+		    wl == s->curw, rgc.fg, rgc.bg, rgc.us, rgc.attr);
+		changed |= status_column_row(&ctx, &sl->column[row], &rgc, row,
+		    width, wft, STATUS_COLUMN_WINDOW_FORMAT, key, wl, force);
+		format_free(wft);
+		row++;
+	}
+	for (; row < last; row++) {
+		changed |= status_column_row(&ctx, &sl->column[row], gc, row,
+		    width, ft, "", "gap", NULL, force);
+	}
+	screen_write_stop(&ctx);
+
+	return (force || changed);
 }
 
 /* Draw status line for client. */
@@ -219,7 +511,7 @@ status_redraw(struct client *c)
 	struct session			*s = c->session;
 	struct screen_write_ctx		 ctx;
 	struct grid_cell		 gc;
-	u_int				 lines, i, n, width = c->tty.sx;
+	u_int				 lines, i, n, width = c->tty.sx, cols;
 	int				 flags, force = 0, changed = 0, fg, bg;
 	struct options_entry		*o;
 	union options_value		*ov;
@@ -234,7 +526,8 @@ status_redraw(struct client *c)
 
 	/* No status line? */
 	lines = status_line_size(c);
-	if (c->tty.sy == 0 || lines == 0)
+	cols = status_column_size(c);
+	if (c->tty.sy == 0 || (lines == 0 && cols == 0))
 		return (1);
 
 	/* Create format tree. */
@@ -256,6 +549,15 @@ status_redraw(struct client *c)
 		force = 1;
 		memcpy(&sl->style, &gc, sizeof sl->style);
 	}
+
+	/* rmux: a left or right status column replaces the status lines. */
+	if (cols != 0) {
+		changed = status_redraw_column(c, ft, &gc, cols, force);
+		format_free(ft);
+		log_debug("%s exit: column, changed=%d", __func__, changed);
+		return (changed);
+	}
+	status_column_resize(sl, 0);
 
 	/* Resize the target screen. */
 	if (screen_size_x(&sl->screen) != width ||
@@ -508,7 +810,8 @@ status_message_redraw(struct client *c)
 	format_free(ft);
 
 	screen_write_start(&ctx, sl->active);
-	screen_write_fast_copy(&ctx, &sl->screen, 0, 0, c->tty.sx, lines);
+	if (status_column_size(c) == 0)
+		screen_write_fast_copy(&ctx, &sl->screen, 0, 0, c->tty.sx, lines);
 	screen_write_cursormove(&ctx, ax, messageline, 0);
 	format_draw(&ctx, &gc, aw, expanded, NULL, 0);
 	screen_write_stop(&ctx);
@@ -642,6 +945,9 @@ status_prompt_screen_line(struct client *c)
 	struct tty	*tty = &c->tty;
 	u_int		 n;
 
+	/* rmux: with a status column the prompt overlays the last row. */
+	if (status_column_size(c) != 0)
+		return (tty->sy - 1);
 	if (options_get_number(c->session->options, "status-position") == 0)
 		return (status_prompt_line_at(c));
 	n = status_line_size(c) - status_prompt_line_at(c);
@@ -676,7 +982,8 @@ status_prompt_redraw(struct client *c)
 	status_message_area(c, &ax, &aw);
 
 	screen_write_start(&ctx, sl->active);
-	screen_write_fast_copy(&ctx, &sl->screen, 0, 0, c->tty.sx, lines);
+	if (status_column_size(c) == 0)
+		screen_write_fast_copy(&ctx, &sl->screen, 0, 0, c->tty.sx, lines);
 
 	pdd.ctx = &ctx;
 	pdd.area_x = ax;

@@ -5608,9 +5608,28 @@ see the
 .Sx STYLES
 section.
 .It Xo Ic status\-position
-.Op Ic top | bottom
+.Op Ic top | bottom | left | right
 .Xc
 Set the position of the status line.
+With
+.Ic left
+or
+.Ic right
+(an rmux extension) the status line is drawn as a column beside the window:
+.Ic status\-left
+on the first row, one row per window using
+.Ic window\-status\-format
+and
+.Ic window\-status\-current\-format ,
+and
+.Ic status\-right
+on the last row.
+Clicking a window row selects that window.
+The column width is the user option
+.Ic @rmux\-status\-width
+(default 24, from 8 to 80).
+The column is not drawn when the terminal is not at least 10 columns wider than it.
+Messages and the command prompt are shown over the last row.
 .It Ic status\-right Ar string
 Display
 .Ar string

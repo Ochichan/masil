@@ -235,6 +235,7 @@ struct redraw_draw_ctx {
 	struct window_pane	*marked;
 
 	u_int			 status_lines;
+	u_int			 xoff; /* rmux: left status column width */
 	enum pane_lines		 pane_lines;
 	struct grid_cell	 default_gc;
 
@@ -279,7 +280,7 @@ redraw_get_window_offset(struct client *c, u_int *ox, u_int *oy, u_int *sx,
 
 	tty_window_offset(&c->tty, ox, oy, sx, sy);
 
-	tty_sx = c->tty.sx;
+	tty_sx = c->tty.sx - status_column_size(c);
 	tty_sy = c->tty.sy - status_line_size(c);
 	if (*sx < tty_sx)
 		*sx = tty_sx;
@@ -1121,7 +1122,7 @@ redraw_draw_pane_span(struct redraw_draw_ctx *dctx,
 
 	px = span->data.p.px + (x - span->x);
 	py = span->data.p.py;
-	tty_draw_line(tty, s, px, py, n, x, y, &style_ctx);
+	tty_draw_line(tty, s, px, py, n, x + dctx->xoff, y, &style_ctx);
 }
 
 /* Get default border style for spans without a pane. */
@@ -1252,7 +1253,7 @@ redraw_draw_border_span(struct redraw_draw_ctx *dctx,
 
 	if (cell_type == CELL_UD && (dctx->flags & REDRAW_ISOLATES))
 		isolates = 1;
-	tty_cursor(tty, x, y);
+	tty_cursor(tty, x + dctx->xoff, y);
 	if (isolates)
 		tty_puts(tty, REDRAW_END_ISOLATE);
 	for (i = 0; i < n; i++)
@@ -1277,7 +1278,7 @@ redraw_draw_status_span(struct redraw_draw_ctx *dctx,
 	if (px < sx) {
 		if (n > sx - px)
 			n = sx - px;
-		tty_draw_line(tty, s, px, 0, n, x, y, NULL);
+		tty_draw_line(tty, s, px, 0, n, x + dctx->xoff, y, NULL);
 	}
 }
 
@@ -1337,7 +1338,7 @@ redraw_draw_scrollbar_span(struct redraw_draw_ctx *dctx,
 	sb_pad = sb_style->pad;
 	off = x - span->x;
 
-	tty_cursor(tty, x, y);
+	tty_cursor(tty, x + dctx->xoff, y);
 	for (i = 0; i < n; i++) {
 		if (span->data.sb.flags & REDRAW_SCROLLBAR_LEFT) {
 			if (off + i >= sb_w && off + i < sb_w + sb_pad) {
@@ -1370,7 +1371,7 @@ redraw_draw_menu_span(struct redraw_draw_ctx *dctx,
 	u_int			 px;
 
 	px = span->data.m.px + (x - span->x);
-	tty_draw_line(tty, s, px, span->data.m.py, n, x, y, NULL);
+	tty_draw_line(tty, s, px, span->data.m.py, n, x + dctx->xoff, y, NULL);
 }
 
 /* Draw a span. */
@@ -1598,6 +1599,7 @@ redraw_set_draw_context(struct redraw_draw_ctx *dctx,
 	if (options_get_number(oo, "status-position") == 0)
 		dctx->flags |= REDRAW_STATUS_TOP;
 	dctx->status_lines = lines;
+	dctx->xoff = status_column_left(c);
 
 	if ((c->flags & CLIENT_UTF8) && tty_term_has(tty->term, TTYC_BIDI))
 		dctx->flags |= REDRAW_ISOLATES;
@@ -1655,7 +1657,7 @@ redraw_draw_pane_prompt(struct redraw_draw_ctx *dctx, struct window_pane *wp)
 	prompt_draw(wp->prompt, &pdd);
 	screen_write_stop(&ctx);
 
-	tty_draw_line(tty, &screen, offset, 0, width, px, cy, NULL);
+	tty_draw_line(tty, &screen, offset, 0, width, px + dctx->xoff, cy, NULL);
 	screen_free(&screen);
 }
 
@@ -1670,9 +1672,9 @@ redraw_draw(struct client *c, struct window_pane *wp, int flags)
 	struct screen		*sl;
 	struct redraw_scene	*scene;
 	struct window_pane	*loop;
-	u_int			 width, i, y, lines;
+	u_int			 width, i, y, lines, cols;
 	struct redraw_span	*first;
-	int			 redraw;
+	int			 redraw, cx, overlay;
 
 	if (c->flags & CLIENT_SUSPENDED)
 		return;
@@ -1770,7 +1772,32 @@ redraw_draw(struct client *c, struct window_pane *wp, int flags)
 	if (w->menu != NULL && (flags & REDRAW_MENU))
 		redraw_draw_menu_lines(&dctx);
 
-	if (flags & REDRAW_STATUS) {
+	if ((flags & REDRAW_STATUS) && (cols = status_column_size(c)) != 0) {
+		/*
+		 * rmux: draw the status column. A message or prompt overlays
+		 * the last row across the whole width, as with no status line.
+		 */
+		cx = status_column_at(c);
+		overlay = (c->message_string != NULL || c->prompt != NULL);
+		lines = c->tty.sy - overlay;
+		/* The column screen is only resized by status_redraw. */
+		sl = &c->status.screen;
+		if (lines > screen_size_y(sl))
+			lines = screen_size_y(sl);
+		if (cols > screen_size_x(sl))
+			cols = screen_size_x(sl);
+		for (i = 0; i < lines; i++)
+			tty_draw_line(tty, sl, 0, i, cols, cx, i, NULL);
+		sl = c->status.active;
+		if (overlay && sl != &c->status.screen &&
+		    screen_size_y(sl) != 0) {
+			width = screen_size_x(sl);
+			if (width > tty->sx)
+				width = tty->sx;
+			tty_draw_line(tty, sl, 0, 0, width, 0, c->tty.sy - 1,
+			    NULL);
+		}
+	} else if (flags & REDRAW_STATUS) {
 		lines = dctx.status_lines;
 		if (c->message_string != NULL || c->prompt != NULL)
 			lines = (lines == 0 ? 1 : lines);

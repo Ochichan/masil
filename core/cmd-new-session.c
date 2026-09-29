@@ -81,6 +81,7 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 	char			*wname = NULL, *sname = NULL, *prefix = NULL;
 	int			 detached, already_attached, is_control = 0;
 	u_int			 sx, sy, dsx, dsy, count = args_count(args);
+	u_int			 position, width;
 	struct spawn_context	 sc = { 0 };
 	enum cmd_retval		 retval;
 	struct cmd_find_state    fs;
@@ -250,8 +251,18 @@ cmd_new_session_exec(struct cmd *self, struct cmdq_item *item)
 	if (!detached && !is_control) {
 		sx = c->tty.sx;
 		sy = c->tty.sy;
-		if (sy > 0 && options_get_number(global_s_options, "status"))
-			sy--;
+		if (options_get_number(global_s_options, "status")) {
+			/* rmux: a left or right status column takes width. */
+			position = options_get_number(global_s_options,
+			    "status-position");
+			width = status_column_default_width();
+			if (position == STATUS_POSITION_LEFT ||
+			    position == STATUS_POSITION_RIGHT) {
+				if (sx >= width + STATUS_COLUMN_MIN_WINDOW)
+					sx -= width;
+			} else if (sy > 0)
+				sy--;
+		}
 	} else {
 		tmp = options_get_string(global_s_options, "default-size");
 		if (sscanf(tmp, "%ux%u", &sx, &sy) != 2) {

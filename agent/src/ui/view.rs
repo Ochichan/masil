@@ -15,22 +15,22 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy)]
-struct Palette {
-    canvas: Color,
-    panel: Color,
-    raised: Color,
-    text: Color,
-    muted: Color,
-    accent: Color,
-    accent_text: Color,
-    warning: Color,
-    danger: Color,
-    success: Color,
-    track: Color,
+pub(super) struct Palette {
+    pub(super) canvas: Color,
+    pub(super) panel: Color,
+    pub(super) raised: Color,
+    pub(super) text: Color,
+    pub(super) muted: Color,
+    pub(super) accent: Color,
+    pub(super) accent_text: Color,
+    pub(super) warning: Color,
+    pub(super) danger: Color,
+    pub(super) success: Color,
+    pub(super) track: Color,
 }
 
 impl Palette {
-    fn for_theme(theme: Theme) -> Self {
+    pub(super) fn for_theme(theme: Theme) -> Self {
         match theme {
             Theme::Dark => Self {
                 canvas: Color::Rgb(12, 16, 22),
@@ -74,7 +74,7 @@ impl Palette {
         }
     }
 
-    fn tone(self, tone: Tone) -> Color {
+    pub(super) fn tone(self, tone: Tone) -> Color {
         match tone {
             Tone::Normal => self.text,
             Tone::Muted => self.muted,
@@ -87,7 +87,7 @@ impl Palette {
 
 /// Semantic text roles. Color only reinforces a label that is already visible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Tone {
+pub(super) enum Tone {
     Normal,
     Muted,
     Good,
@@ -1885,7 +1885,7 @@ fn header_target(focus_index: usize) -> HitTarget {
 }
 
 /// Clips styled spans to `width` terminal cells.
-fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+pub(super) fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
     let mut used = 0;
     let mut output = Vec::new();
     for span in spans {
@@ -1900,7 +1900,7 @@ fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
 }
 
 /// Clips to `width` cells and pads with spaces to exactly that width.
-fn pad(text: &str, width: usize) -> String {
+pub(super) fn pad(text: &str, width: usize) -> String {
     let mut output = clip(text, width);
     let used = cell_width(&output);
     output.push_str(&" ".repeat(width.saturating_sub(used)));
@@ -1908,7 +1908,7 @@ fn pad(text: &str, width: usize) -> String {
 }
 
 /// Word-wraps by rendered cell width; words wider than a line break by grapheme.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return Vec::new();
     }
@@ -1952,7 +1952,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn inset_x(rect: Rect, amount: u16) -> Rect {
+pub(super) fn inset_x(rect: Rect, amount: u16) -> Rect {
     Rect::new(
         rect.x.saturating_add(amount),
         rect.y,
@@ -2072,7 +2072,7 @@ fn search_window(text: &str, cursor: usize, width: usize) -> (String, usize, usi
     (shown, cursor_x, start)
 }
 
-fn clip(text: &str, width: usize) -> String {
+pub(super) fn clip(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
@@ -2106,11 +2106,11 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
-fn cell_width(text: &str) -> usize {
+pub(super) fn cell_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-fn inset(rect: Rect, amount: u16) -> Rect {
+pub(super) fn inset(rect: Rect, amount: u16) -> Rect {
     Rect::new(
         rect.x.saturating_add(amount),
         rect.y.saturating_add(amount),

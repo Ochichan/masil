@@ -1642,6 +1642,8 @@ struct session {
 
 	int		 statusat;
 	u_int		 statuslines;
+	int		 statuscolumn; /* rmux: STATUS_COLUMN_* */
+	u_int		 statuswidth;
 
 	struct options	*options;
 
@@ -1701,6 +1703,16 @@ struct mouse_event {
 
 	int		statusat;
 	u_int		statuslines;
+
+	/*
+	 * rmux: set when the event landed in a left or right status column;
+	 * colx is the column-local x. x is then the nearest window-area x.
+	 */
+	int		incolumn;
+	u_int		colx;
+	int		colshifted;
+	u_int		rawx;
+	u_int		rawlx;
 
 	u_int		x;
 	u_int		y;
@@ -1840,6 +1852,7 @@ struct tty {
 	u_int		 mouse_last_y;
 	u_int		 mouse_last_b;
 	int		 mouse_drag_flag;
+	int		 mouse_column_drag; /* rmux */
 	u_int		 mouse_drag_x;
 	u_int		 mouse_drag_y;
 	int		 mouse_scrolling_flag;
@@ -2091,7 +2104,24 @@ struct status_line {
 
 	struct grid_cell	 style;
 	struct style_line_entry entries[STATUS_LINES_LIMIT];
+
+	/* rmux: one entry per row of a left or right status column. */
+	struct style_line_entry	*column;
+	u_int			 ncolumn;
 };
+
+/* rmux: status-position values beyond tmux's top and bottom. */
+#define STATUS_POSITION_TOP 0
+#define STATUS_POSITION_BOTTOM 1
+#define STATUS_POSITION_LEFT 2
+#define STATUS_POSITION_RIGHT 3
+#define STATUS_COLUMN_NONE 0
+#define STATUS_COLUMN_LEFT 1
+#define STATUS_COLUMN_RIGHT 2
+#define STATUS_COLUMN_DEFAULT_WIDTH 24
+#define STATUS_COLUMN_MIN_WIDTH 8
+#define STATUS_COLUMN_MAX_WIDTH 80
+#define STATUS_COLUMN_MIN_WINDOW 10
 
 /* File in client. */
 typedef void (*client_file_cb) (struct client *, const char *, int, int,
@@ -2614,6 +2644,10 @@ extern struct client *cfg_client;
 extern char **cfg_files;
 extern u_int cfg_nfiles;
 extern int cfg_quiet;
+
+/* rmux-ui.c */
+extern int rmux_ui_enabled;
+void	 rmux_ui_load(struct client *, int);
 void	start_cfg(void);
 int	load_cfg(const char *, struct client *, struct cmdq_item *,
             struct cmd_find_state *, int, struct cmdq_item **);
@@ -3364,7 +3398,12 @@ void	 status_update_cache(struct session *);
 u_int	 status_prompt_line_at(struct client *);
 int	 status_at_line(struct client *);
 u_int	 status_line_size(struct client *);
+u_int	 status_column_size(struct client *);
+u_int	 status_column_default_width(void);
+int	 status_column_at(struct client *);
+u_int	 status_column_left(struct client *);
 struct style_range *status_get_range(struct client *, u_int, u_int);
+struct style_range *status_get_column_range(struct client *, u_int, u_int);
 void	 status_init(struct client *);
 void	 status_free(struct client *);
 int	 status_redraw(struct client *);

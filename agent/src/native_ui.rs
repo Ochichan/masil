@@ -923,7 +923,7 @@ where
     Ok(bytes)
 }
 
-fn native_executable() -> Result<PathBuf, String> {
+pub(crate) fn native_executable() -> Result<PathBuf, String> {
     let current =
         std::env::current_exe().map_err(|error| format!("locating native executable: {error}"))?;
     let directory = current

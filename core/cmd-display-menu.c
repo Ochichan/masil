@@ -91,6 +91,25 @@ cmd_display_menu_args_parse(struct args *args, u_int idx, __unused char **cause)
 	return (type);
 }
 
+/*
+ * rmux: the UI layer keeps mouse menus open after the opening click, like -O,
+ * without replacing tmux's default menu bindings.
+ */
+static int
+cmd_display_menu_stays_open(struct client *tc)
+{
+	struct options_entry	*o;
+	const char		*value;
+
+	if (tc->session == NULL)
+		return (0);
+	o = options_get(tc->session->options, "@rmux-menu-stay-open");
+	if (o == NULL)
+		return (0);
+	value = options_get_string(tc->session->options, "@rmux-menu-stay-open");
+	return (strcmp(value, "on") == 0 || strcmp(value, "1") == 0);
+}
+
 static int
 cmd_display_menu_get_menu_pos(struct client *tc, struct cmdq_item *item,
     struct args *args, u_int *px, u_int *py, u_int w, u_int h)
@@ -136,7 +155,35 @@ cmd_display_menu_get_menu_pos(struct client *tc, struct cmdq_item *item,
 
 	lines = status_line_size(tc);
 	position = options_get_number(s->options, "status-position");
-	if (status_at_line(tc) != -1 && lines != 0) {
+	if (status_column_size(tc) != 0) {
+		/*
+		 * rmux: in a left or right status column, open beside the
+		 * window's row, against the column edge.
+		 */
+		for (line = 0; line < tc->status.ncolumn; line++) {
+			ranges = &tc->status.column[line].ranges;
+			TAILQ_FOREACH(sr, ranges, entry) {
+				if (sr->type != STYLE_RANGE_WINDOW)
+					continue;
+				if (sr->argument == (u_int)wl->idx)
+					break;
+			}
+			if (sr != NULL)
+				break;
+		}
+		if (sr != NULL) {
+			if (status_column_at(tc) == 0) {
+				format_add(ft, "popup_window_status_line_x",
+				    "%u", ox);
+			} else {
+				format_add(ft, "popup_window_status_line_x",
+				    "%u", ox + (sx > w ? sx - w : 0));
+			}
+			format_add(ft, "popup_window_status_line_y", "%u",
+			    oy + line + h);
+		}
+		format_add(ft, "popup_status_line_y", "%u", h);
+	} else if (status_at_line(tc) != -1 && lines != 0) {
 		for (line = 0; line < lines; line++) {
 			ranges = &tc->status.entries[line].ranges;
 			TAILQ_FOREACH(sr, ranges, entry) {
@@ -350,7 +397,7 @@ cmd_display_menu_exec(struct cmd *self, struct cmdq_item *item)
 	if (!cmd_display_menu_get_menu_pos(tc, item, args, &px, &py, sx, sy))
 		goto out;
 
-	if (args_has(args, 'O'))
+	if (args_has(args, 'O') || cmd_display_menu_stays_open(tc))
 		flags |= MENU_STAYOPEN;
 	if (!event->m.valid && !args_has(args, 'M'))
 		flags |= MENU_NOMOUSE;

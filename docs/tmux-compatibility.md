@@ -16,6 +16,7 @@ tmux에서 가능한 기능을 rmux에서도 모두 제공한다. 호환 대상�
 4. 사람이 조작하는 화면은 키 안내, 선택, focus, mode, pane geometry, terminal cell 내용을 포함해 비교한다. rmux 고유의 탐색 UI는 허용하되, 같은 pane 영역에서의 터미널 동작과 사용자 지정 status/format의 의미를 유지한다. 기능 존재 여부만 확인하지 않는다.
 5. 원래 tmux가 OS나 terminal capability에 따라 제한하는 기능은 같은 조건에서 비교한다. 환경 의존성은 기능 삭제의 근거가 아니다.
 6. 더 안전하거나 편리해 보인다는 이유로 기본 의미를 조용히 바꾸지 않는다. rmux 확장은 명시한 추가 동작으로 제공한다.
+7. `-f` 없이 시작하면 [rmux UI 레이어](mouse-ui.md)를 사용자 설정보다 먼저 적용한다. 레이어는 옵션 값과 기본 바인딩이 없는 `MouseDown1Control0`~`6`만 바꾸며, 옵션 표·키 표의 기본값은 그대로다. 같은 조건의 stock tmux와 비교할 때는 `-f`로 시작한다. `status-position`의 `left`, `right`는 rmux 확장 값이다.
 
 [신뢰성 계약](reliability.md)의 단계별 응답은 rmux 추가 기능에 적용한다. 예를 들어 호환 `send-keys`의 성공은 기존 tmux 의미를 유지하며, 이를 agent의 prompt 수락으로 확대하지 않는다. 추가 관찰 경로로 provider 수락을 확인할 수 있어도 기존 exit status나 control-mode 출력에 임의의 field를 삽입하지 않는다.
 

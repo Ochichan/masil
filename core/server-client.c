@@ -735,6 +735,20 @@ server_client_check_mouse_in_pane(struct window_pane *wp, int px, int py,
 	return (KEYC_MOUSE_LOCATION_NOWHERE);
 }
 
+/*
+ * rmux: move a tty x to the window area beside a status column of width cols
+ * starting at colat. Positions in or beyond the column clamp to its edge.
+ */
+static u_int
+server_client_column_to_window(u_int x, u_int cols, int colat)
+{
+	if (colat == 0)
+		return (x >= cols ? x - cols : 0);
+	if (x >= (u_int)colat)
+		return (colat - 1);
+	return (x);
+}
+
 /* Check for mouse keys. */
 static key_code
 server_client_check_mouse(struct client *c, struct key_event *event)
@@ -745,14 +759,24 @@ server_client_check_mouse(struct client *c, struct key_event *event)
 	struct winlink			*fwl;
 	struct window_pane		*wp, *fwp, *lwp = NULL;
 	u_int				 x, y, sx, sy, px, py, n, sl_mpos = 0;
-	u_int				 b, bn;
-	int				 ignore = 0;
+	u_int				 b, bn, cols;
+	int				 ignore = 0, colat;
 	int				 modal_drag = 0;
 	key_code			 key;
 	struct timeval			 tv;
 	struct style_range		*sr;
 	enum key_code_type		 type = KEYC_TYPE_NOTYPE;
 	enum key_code_mouse_location	 loc = KEYC_MOUSE_LOCATION_NOWHERE;
+
+	/*
+	 * rmux: a replayed click was already moved beside a status column;
+	 * start again from the terminal position.
+	 */
+	if (m->colshifted) {
+		m->x = m->rawx;
+		m->lx = m->rawlx;
+		m->colshifted = 0;
+	}
 
 	log_debug("%s mouse %02x at %u,%u (last %u,%u) (%d)", c->name, m->b,
 	    m->x, m->y, m->lx, m->ly, c->tty.mouse_drag_flag);
@@ -840,13 +864,56 @@ have_event:
 	m->wp = -1;
 	m->ignore = ignore;
 
+	/*
+	 * rmux: with a left or right status column, an event in the column
+	 * uses the column rows. Every other position moves to window-area
+	 * coordinates here so later consumers of m->x and m->lx are unchanged.
+	 * A drag already in progress stays in the window area.
+	 */
+	m->incolumn = 0;
+	m->colx = 0;
+	cols = status_column_size(c);
+	colat = status_column_at(c);
+	if (cols != 0) {
+		/* A drag stays where it began: in the column or the window. */
+		if (c->tty.mouse_drag_flag != 0)
+			m->incolumn = c->tty.mouse_column_drag;
+		else {
+			m->incolumn = (x >= (u_int)colat &&
+			    x < colat + cols &&
+			    y < c->tty.sy);
+			if (type == KEYC_TYPE_MOUSEDRAG)
+				c->tty.mouse_column_drag = m->incolumn;
+		}
+		if (m->incolumn) {
+			if (x < (u_int)colat)
+				m->colx = 0;
+			else if (x >= colat + cols)
+				m->colx = cols - 1;
+			else
+				m->colx = x - colat;
+			if (y >= c->tty.sy)
+				y = c->tty.sy - 1;
+		}
+		m->rawx = m->x;
+		m->rawlx = m->lx;
+		m->colshifted = 1;
+		x = server_client_column_to_window(x, cols, colat);
+		m->x = server_client_column_to_window(m->x, cols, colat);
+		m->lx = server_client_column_to_window(m->lx, cols, colat);
+	}
+
 	/* Is this on the status line? */
 	m->statusat = status_at_line(c);
 	m->statuslines = status_line_size(c);
-	if (m->statusat != -1 &&
+	if (m->incolumn ||
+	    (m->statusat != -1 &&
 	    y >= (u_int)m->statusat &&
-	    y < m->statusat + m->statuslines) {
-		sr = status_get_range(c, x, y - m->statusat);
+	    y < m->statusat + m->statuslines)) {
+		if (m->incolumn)
+			sr = status_get_column_range(c, m->colx, y);
+		else
+			sr = status_get_range(c, x, y - m->statusat);
 		if (sr == NULL) {
 			loc = KEYC_MOUSE_LOCATION_STATUS_DEFAULT;
 		} else {
@@ -947,6 +1014,7 @@ have_event:
 				c->tty.mouse_drag_update = NULL;
 				c->tty.mouse_drag_release = NULL;
 				c->tty.mouse_drag_flag = 0;
+				c->tty.mouse_column_drag = 0;
 				c->tty.mouse_scrolling_flag = 0;
 				c->tty.mouse_slider_mpos = -1;
 				c->tty.mouse_last_pane = -1;
@@ -1050,6 +1118,7 @@ have_event:
 		 */
 		type = KEYC_TYPE_MOUSEDRAGEND;
 		c->tty.mouse_drag_flag = 0;
+		c->tty.mouse_column_drag = 0;
 		c->tty.mouse_slider_mpos = -1;
 		c->tty.mouse_last_pane = -1;
 	}
@@ -1589,18 +1658,33 @@ server_client_handle_menu_key(struct client *c, struct key_event *event)
 	struct window		*w = c->session->curw->window;
 	struct key_event	 new_event;
 	struct mouse_event	*m;
-	u_int			 ox, oy, sx, sy;
+	u_int			 ox, oy, sx, sy, cols;
+	int			 colat;
 
 	if (w->menu == NULL)
 		return (0);
 
 	memcpy(&new_event, event, sizeof new_event);
-	if (KEYC_IS_MOUSE(event->key)) {
+	if (new_event.m.colshifted) {
+		new_event.m.x = new_event.m.rawx;
+		new_event.m.lx = new_event.m.rawlx;
+		new_event.m.colshifted = 0;
+	}
+	cols = status_column_size(c);
+	colat = status_column_at(c);
+	if (KEYC_IS_MOUSE(event->key) && cols != 0 &&
+	    new_event.m.x >= (u_int)colat && new_event.m.x < colat + cols) {
+		/* rmux: the status column is outside any menu. */
+		m = &new_event.m;
+		m->x = m->y = UINT_MAX;
+	} else if (KEYC_IS_MOUSE(event->key)) {
 		m = &new_event.m;
 		m->statusat = status_at_line(c);
 		m->statuslines = status_line_size(c);
 
 		tty_window_offset(&c->tty, &ox, &oy, &sx, &sy);
+		if (colat == 0)
+			m->x -= cols;
 		m->x += ox;
 		if (m->statusat == 0) {
 			if (m->y < m->statuslines)
@@ -1626,6 +1710,8 @@ server_client_handle_key0(struct client *c, struct key_event *event,
 	struct session		*s = c->session;
 	struct cmdq_item	*item;
 	struct window_pane	*wp;
+	struct mouse_event	 pm;
+	u_int			 cols;
 
 	/* Check the client is good to accept input. */
 	if (s == NULL || (c->flags & CLIENT_UNATTACHEDFLAGS))
@@ -1676,7 +1762,14 @@ server_client_handle_key0(struct client *c, struct key_event *event,
 		if (server_client_handle_menu_key(c, event))
 			return (0);
 		if (c->prompt != NULL) {
-			switch (status_prompt_key(c, event->key, &event->m)) {
+			/* rmux: the prompt row spans the terminal width. */
+			memcpy(&pm, &event->m, sizeof pm);
+			if (pm.colshifted) {
+				pm.x = pm.rawx;
+				pm.lx = pm.rawlx;
+				pm.colshifted = 0;
+			}
+			switch (status_prompt_key(c, event->key, &pm)) {
 			case PROMPT_KEY_HANDLED:
 			case PROMPT_KEY_CLOSE:
 				return (0);
@@ -1697,8 +1790,23 @@ server_client_handle_key0(struct client *c, struct key_event *event,
 		if (wp != NULL &&
 		    window_pane_has_prompt(wp) &&
 		    window_pane_is_visible(wp)) {
+			/* rmux: pane prompts use window-area coordinates. */
+			memcpy(&pm, &event->m, sizeof pm);
+			if (pm.colshifted) {
+				pm.x = pm.rawx;
+				pm.lx = pm.rawlx;
+				pm.colshifted = 0;
+			}
+			if (KEYC_IS_MOUSE(event->key) &&
+			    status_column_at(c) == 0) {
+				cols = status_column_size(c);
+				pm.x = server_client_column_to_window(pm.x, cols,
+				    0);
+				pm.lx = server_client_column_to_window(pm.lx,
+				    cols, 0);
+			}
 			switch (window_pane_prompt_key(wp, c, event->key,
-			    &event->m)) {
+			    &pm)) {
 			case PROMPT_KEY_HANDLED:
 			case PROMPT_KEY_CLOSE:
 			case PROMPT_KEY_MOVE:
@@ -2012,6 +2120,7 @@ server_client_prompt_cursor(struct client *c, struct window_pane *wp, int *mode,
 	if (window_position_is_visible(r, *cx)) {
 		if (status_at_line(c) == 0)
 			*cy += status_line_size(c);
+		*cx += status_column_left(c);
 		*mode |= MODE_CURSOR;
 	}
 	return (1);
@@ -2080,6 +2189,7 @@ server_client_reset_state(struct client *c)
 				cy -= oy;
 				if (status_at_line(c) == 0)
 					cy += status_line_size(c);
+				cx += status_column_left(c);
 			}
 			prompt = 1;
 		} else {
@@ -2119,6 +2229,7 @@ server_client_reset_state(struct client *c)
 
 				if (status_at_line(c) == 0)
 					cy += status_line_size(c);
+				cx += status_column_left(c);
 			}
 
 			if (!cursor)

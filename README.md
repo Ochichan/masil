@@ -6,6 +6,8 @@ rmux는 tmux의 기능과 기본 키 조작을 갖추고, 각 코딩 에이전�
 
 `attention`은 승인·질문 대기 목록을, `ack`는 daemon 수명 동안 클라이언트들이 공유하는 확인 표시를 제공한다. `watch-agents`로 전체 목록의 최신 상태를 계속 받을 수 있다. 확인 명령은 provider 요청을 승인하지 않는다.
 
+`-f` 없이 시작하면 처음부터 마우스로 창·pane·세션을 만들고 조작하는 rmux UI 레이어가 적용된다. 상태줄의 `+`로 새 창, pane 제목으로 이름 변경, `Settings`로 설정 화면을 연다. 상태줄은 위·아래·왼쪽·오른쪽 사이드바로 옮길 수 있다. [마우스 UI와 설정 화면](docs/mouse-ui.md)을 참고한다. tmux 기본값과 같은 조건이 필요하면 `rmux -f FILE`로 시작한다.
+
 `rmux-agent ui`는 검색·필터·상세 보기·확인 표시·pane 이동을 제공하는 터미널 관리 화면이다. `sidebar`는 34열 사이드패널을 열고 tmux 줌으로 확대한다. 마우스 선택·메뉴·휠·스크롤바·구분선 드래그, 영어·한국어, 어두운·밝은·터미널 테마를 지원한다. [관리 화면 사용법](docs/agent-desk.md)을 참고한다.
 
 ```sh
@@ -42,6 +44,8 @@ macOS 초기 비교에서 50-pane idle 서버 RSS는 rmux 4.44 MiB, stock tmux 4
 | 문서 | 다루는 내용 |
 | --- | --- |
 | [현재 구현과 실행](docs/implementation-status.md) | 빌드·사용법, 실제 기능과 남은 작업 |
+| [마우스 UI와 설정 화면](docs/mouse-ui.md) | 기본 UI 레이어, 버튼·메뉴, 상태줄 위치와 사이드바, 설정 화면, 적용 순서 |
+| [마우스 UI 설계](docs/design/mouse-ui-layer.md) | Herdr 대조, 레이어 적재, 세로 상태줄의 코어 변경과 검증 |
 | [에이전트 관리 화면](docs/agent-desk.md) | 사이드패널·확대 화면, 마우스·키보드, 영어·한국어 |
 | [UI 상호작용 설계](docs/ui/agent-desk.md) | 화면 구성, 입력 소유권, 상태·복구·반응형 계약 |
 | [Debian·SSH 검증](docs/validation/2026-09-28-debian-ssh.md) | 원격 Linux 빌드, 실제 SSH 마우스·한국어·사이드패널, 수정과 재현 방법 |

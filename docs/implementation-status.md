@@ -33,6 +33,9 @@ make test            # 호환·IPC·실패 주입·측정 도구·Rust 검사
 | 기본 command/key/option | 같은 build의 stock dump와 비교 통과. 92개 등록 명령 유지 |
 | prefix | `C-b`, 추가 기본 binding 없음 |
 | mouse | 이 commit의 빌드 기본값인 `on` 유지 |
+| rmux UI 레이어 | `-f` 없이 시작하면 사용자 설정보다 먼저 적용. `+`·설정·rmux 메뉴 버튼, pane 제목줄, 메뉴 유지, 테마. 기본 binding이 없는 `MouseDown1Control0`~`6`만 사용. [마우스 UI](mouse-ui.md) |
+| `status-position` | `top`, `bottom`에 rmux 확장 `left`, `right`(세로 상태줄) 추가. 폭은 `@rmux-status-width` |
+| 설정 화면 | `rmux-agent settings`. 선택은 `~/.config/rmux/settings.conf`의 `@rmux-*` 옵션 |
 | default / `-L` socket | `rmux-UID` directory. stock의 `tmux-UID`와 분리 |
 | `-S` | 사용자가 지정한 경로를 사용 |
 | native protocol | 8-bit version 136. stock과 양방향 접속 거절 |

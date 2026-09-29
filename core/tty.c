@@ -397,6 +397,7 @@ tty_start_tty(struct tty *tty)
 		tty_force_cursor_colour(tty, -1);
 
 	tty->mouse_drag_flag = 0;
+	tty->mouse_column_drag = 0;
 	tty->mouse_drag_update = NULL;
 	tty->mouse_drag_release = NULL;
 }
@@ -952,7 +953,8 @@ tty_window_bigger(struct tty *tty)
 	struct client	*c = tty->client;
 	struct window	*w = c->session->curw->window;
 
-	return (tty->sx < w->sx || tty->sy - status_line_size(c) < w->sy);
+	return (tty->sx - status_column_size(c) < w->sx ||
+	    tty->sy - status_line_size(c) < w->sy);
 }
 
 /* What offset should this window be drawn at? */
@@ -974,11 +976,12 @@ tty_window_offset1(struct tty *tty, u_int *ox, u_int *oy, u_int *sx, u_int *sy)
 	struct client		*c = tty->client;
 	struct window		*w = c->session->curw->window;
 	struct window_pane	*wp = w->active;
-	u_int			 cx, cy, lines;
+	u_int			 cx, cy, lines, tsx;
 
 	lines = status_line_size(c);
+	tsx = tty->sx - status_column_size(c);
 
-	if (tty->sx >= w->sx && tty->sy - lines >= w->sy) {
+	if (tsx >= w->sx && tty->sy - lines >= w->sy) {
 		*ox = 0;
 		*oy = 0;
 		*sx = w->sx;
@@ -988,7 +991,7 @@ tty_window_offset1(struct tty *tty, u_int *ox, u_int *oy, u_int *sx, u_int *sy)
 		return (0);
 	}
 
-	*sx = tty->sx;
+	*sx = tsx;
 	*sy = tty->sy - lines;
 
 	if (c->pan_window == w) {
@@ -1147,6 +1150,7 @@ tty_clamp_line(struct tty *tty, const struct tty_ctx *ctx, u_int px, u_int py,
     u_int nx, u_int *i, u_int *x, u_int *rx, u_int *ry)
 {
 	int	xoff = ctx->rxoff + px;
+	u_int	shift = ctx->xoff - ctx->rxoff;
 
 	/*
 	 * px = x position in pane
@@ -1163,6 +1167,7 @@ tty_clamp_line(struct tty *tty, const struct tty_ctx *ctx, u_int px, u_int py,
 		return (0);
 	*ry = ctx->yoff + py - ctx->woy;
 
+	/* rmux: shift is the width of a left status column, if any. */
 	if (xoff >= (int)ctx->wox && xoff + nx <= ctx->wox + ctx->wsx) {
 		/* All visible. */
 		*i = 0;
@@ -1171,18 +1176,19 @@ tty_clamp_line(struct tty *tty, const struct tty_ctx *ctx, u_int px, u_int py,
 	} else if (xoff < (int)ctx->wox && xoff + nx > ctx->wox + ctx->wsx) {
 		/* Both left and right not visible. */
 		*i = ctx->wox;
-		*x = 0;
+		*x = shift;
 		*rx = ctx->wsx;
 	} else if (xoff < (int)ctx->wox) {
 		/* Left not visible. */
-		*i = ctx->wox - (ctx->xoff + px);
-		*x = 0;
+		*i = ctx->wox - (ctx->rxoff + px);
+		*x = shift;
 		*rx = nx - *i;
 	} else {
 		/* Right not visible. */
 		*i = 0;
-		*x = (ctx->xoff + px) - ctx->wox;
+		*x = (ctx->rxoff + px) - ctx->wox;
 		*rx = ctx->wsx - *x;
+		*x += shift;
 	}
 	if (*rx > nx)
 		fatalx("%s: x too big, %u > %u", __func__, *rx, nx);
@@ -1253,10 +1259,12 @@ tty_clamp_area(struct tty *tty, const struct tty_ctx *ctx, u_int px, u_int py,
     u_int *ry)
 {
 	u_int	xoff = ctx->rxoff + px, yoff = ctx->ryoff + py;
+	u_int	shift = ctx->xoff - ctx->rxoff;
 
 	if (!tty_is_visible(tty, ctx, px, py, nx, ny))
 		return (0);
 
+	/* rmux: shift is the width of a left status column, if any. */
 	if (xoff >= ctx->wox && xoff + nx <= ctx->wox + ctx->wsx) {
 		/* All visible. */
 		*i = 0;
@@ -1265,18 +1273,19 @@ tty_clamp_area(struct tty *tty, const struct tty_ctx *ctx, u_int px, u_int py,
 	} else if (xoff < ctx->wox && xoff + nx > ctx->wox + ctx->wsx) {
 		/* Both left and right not visible. */
 		*i = ctx->wox;
-		*x = 0;
+		*x = shift;
 		*rx = ctx->wsx;
 	} else if (xoff < ctx->wox) {
 		/* Left not visible. */
-		*i = ctx->wox - (ctx->xoff + px);
-		*x = 0;
+		*i = ctx->wox - (ctx->rxoff + px);
+		*x = shift;
 		*rx = nx - *i;
 	} else {
 		/* Right not visible. */
 		*i = 0;
-		*x = (ctx->xoff + px) - ctx->wox;
+		*x = (ctx->rxoff + px) - ctx->wox;
 		*rx = ctx->wsx - *x;
+		*x += shift;
 	}
 	if (*rx > nx)
 		fatalx("%s: x too big, %u > %u", __func__, *rx, nx);
@@ -1473,6 +1482,7 @@ tty_set_client_cb(struct tty_ctx *ttyctx, struct client *c)
 	else
 		ttyctx->flags &= ~TTY_CTX_WINDOW_BIGGER;
 
+	ttyctx->xoff = ttyctx->rxoff + status_column_left(c);
 	ttyctx->yoff = ttyctx->ryoff = wp->yoff;
 	if (status_at_line(c) == 0)
 		ttyctx->yoff += status_line_size(c);
@@ -1971,8 +1981,8 @@ tty_cmd_cells(struct tty *tty, const struct tty_ctx *ctx)
 		return;
 
 	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) &&
-	    (ctx->xoff + ctx->ocx < ctx->wox ||
-	    ctx->xoff + ctx->ocx + n > ctx->wox + ctx->wsx)) {
+	    (ctx->rxoff + ctx->ocx < ctx->wox ||
+	    ctx->rxoff + ctx->ocx + n > ctx->wox + ctx->wsx)) {
 		if ((~ctx->flags & TTY_CTX_WRAPPED) ||
 		    !tty_full_width(tty, ctx) ||
 		    (tty->term->flags & TERM_NOAM) ||
@@ -2216,19 +2226,20 @@ tty_margin_off(struct tty *tty)
 static void
 tty_margin_pane(struct tty *tty, const struct tty_ctx *ctx)
 {
-	int	l, r;
+	int	l, r, shift = ctx->xoff - ctx->rxoff;
 
+	/* rmux: shift is the width of a left status column, if any. */
 	l = ctx->xoff - ctx->wox;
 	r = ctx->xoff + ctx->sx - 1 - ctx->wox;
 
-	if (l < 0)
-		l = 0;
-	if (l > (int)ctx->wsx)
-		l = ctx->wsx;
-	if (r < 0)
-		r = 0;
-	if (r > (int)ctx->wsx)
-		r = ctx->wsx;
+	if (l < shift)
+		l = shift;
+	if (l > (int)ctx->wsx + shift)
+		l = ctx->wsx + shift;
+	if (r < shift)
+		r = shift;
+	if (r > (int)ctx->wsx + shift)
+		r = ctx->wsx + shift;
 
 	tty_margin(tty, l, r);
 }

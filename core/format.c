@@ -1390,7 +1390,10 @@ format_cb_mouse_status_line(struct format_tree *ft)
 	if (ft->c == NULL || (~ft->c->tty.flags & TTY_STARTED))
 		return (NULL);
 
-	if (ft->m.statusat == 0 && ft->m.y < ft->m.statuslines) {
+	if (ft->m.incolumn) {
+		/* rmux: the row of a left or right status column. */
+		y = ft->m.y;
+	} else if (ft->m.statusat == 0 && ft->m.y < ft->m.statuslines) {
 		y = ft->m.y;
 	} else if (ft->m.statusat > 0 && ft->m.y >= (u_int)ft->m.statusat) {
 		y = ft->m.y - ft->m.statusat;
@@ -1413,16 +1416,19 @@ format_cb_mouse_status_range(struct format_tree *ft)
 	if (ft->c == NULL || (~ft->c->tty.flags & TTY_STARTED))
 		return (NULL);
 
-	if (ft->m.statusat == 0 && ft->m.y < ft->m.statuslines) {
+	if (ft->m.incolumn) {
+		/* rmux: a left or right status column. */
+		sr = status_get_column_range(ft->c, ft->m.colx, ft->m.y);
+	} else if (ft->m.statusat == 0 && ft->m.y < ft->m.statuslines) {
 		x = ft->m.x;
 		y = ft->m.y;
+		sr = status_get_range(ft->c, x, y);
 	} else if (ft->m.statusat > 0 && ft->m.y >= (u_int)ft->m.statusat) {
 		x = ft->m.x;
 		y = ft->m.y - ft->m.statusat;
+		sr = status_get_range(ft->c, x, y);
 	} else
 		return (NULL);
-
-	sr = status_get_range(ft->c, x, y);
 	if (sr == NULL)
 		return (NULL);
 	switch (sr->type) {
@@ -2089,6 +2095,8 @@ format_cb_mouse_x(struct format_tree *ft)
 	if (wp != NULL && cmd_mouse_at(wp, &ft->m, &x, &y, 0) == 0)
 		return (format_printf("%u", x));
 	if (ft->c != NULL && (ft->c->tty.flags & TTY_STARTED)) {
+		if (ft->m.incolumn)
+			return (format_printf("%u", ft->m.colx));
 		if (ft->m.statusat == 0 && ft->m.y < ft->m.statuslines)
 			return (format_printf("%u", ft->m.x));
 		if (ft->m.statusat > 0 && ft->m.y >= (u_int)ft->m.statusat)
@@ -2110,6 +2118,8 @@ format_cb_mouse_y(struct format_tree *ft)
 	if (wp != NULL && cmd_mouse_at(wp, &ft->m, &x, &y, 0) == 0)
 		return (format_printf("%u", y));
 	if (ft->c != NULL && (ft->c->tty.flags & TTY_STARTED)) {
+		if (ft->m.incolumn)
+			return (format_printf("%u", ft->m.y));
 		if (ft->m.statusat == 0 && ft->m.y < ft->m.statuslines)
 			return (format_printf("%u", ft->m.y));
 		if (ft->m.statusat > 0 && ft->m.y >= (u_int)ft->m.statusat)
