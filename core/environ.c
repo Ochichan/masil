@@ -252,9 +252,10 @@ environ_log(struct environ *env, const char *fmt, ...)
 struct environ *
 environ_for_session(struct session *s, int no_TERM)
 {
-	struct environ	*env;
-	const char	*value;
-	int		 idx;
+	struct environ		*env;
+	struct environ_entry	*envent;
+	const char		*value;
+	int			 idx;
 
 	env = environ_create();
 	environ_copy(global_environ, env);
@@ -269,6 +270,14 @@ environ_for_session(struct session *s, int no_TERM)
 		/* Keep the outer terminal's colour hint in masil mode. */
 		if (!masil_ui_enabled)
 			environ_set(env, "COLORTERM", 0, "truecolor");
+		/* Claude otherwise clamps RGB to 256 colours when TMUX is set. */
+		if (masil_ui_enabled &&
+		    (envent = environ_find(env, "COLORTERM")) != NULL &&
+		    envent->value != NULL &&
+		    (strcasecmp(envent->value, "truecolor") == 0 ||
+		    strcasecmp(envent->value, "24bit") == 0) &&
+		    environ_find(env, "CLAUDE_CODE_TMUX_TRUECOLOR") == NULL)
+			environ_set(env, "CLAUDE_CODE_TMUX_TRUECOLOR", 0, "1");
 	}
 
 #ifdef HAVE_SYSTEMD
