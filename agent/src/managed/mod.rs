@@ -17,13 +17,14 @@ use std::ffi::OsString;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const META: &str = "@masil-managed-agent";
 const TRACKED: &str = "@masil-managed-observation";
 const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}";
 const CAPTURE_BATCH_SIZE: usize = 12;
 const MAX_PS_TTY_ARGUMENT: usize = 4096;
+const TRACKED_REJECTED: &str = "masil-agent-stale";
 
 struct CaptureRequest {
     pane: String,
@@ -32,15 +33,15 @@ struct CaptureRequest {
 }
 
 enum PreparedEvidence {
-    Cached(Value),
+    Cached(Arc<Value>),
     Screen(String),
 }
 
 fn store_cached_evidence(
-    cache: &mut HashMap<String, (String, Value)>,
+    cache: &mut HashMap<String, (String, Arc<Value>)>,
     pane: String,
     key: String,
-    evidence: Value,
+    evidence: Arc<Value>,
 ) {
     if cache.contains_key(&pane) || cache.len() < 64 {
         cache.insert(pane, (key, evidence));
@@ -101,7 +102,7 @@ pub(crate) struct Agent {
     pub process: String,
     pub state: String,
     pub session_id: Option<String>,
-    pub evidence: Value,
+    pub evidence: Arc<Value>,
     pub seen: bool,
     pub revision: String,
     pub returned_idle: bool,
@@ -136,7 +137,7 @@ pub(crate) struct Agent {
 pub(crate) struct Manager {
     pub native: native_ui::Context,
     engine: Engine,
-    cache: Mutex<HashMap<String, (String, Value)>>,
+    cache: Mutex<HashMap<String, (String, Arc<Value>)>>,
 }
 
 impl Manager {
@@ -273,11 +274,10 @@ impl Manager {
                     .map(|provider| (fields[0].as_str(), capture_identity(fields, provider.id)))
             })
             .collect();
-        if requests.iter().any(|request| {
-            current_by_pane
-                .get(request.pane.as_str())
-                .map_or(true, |identity| identity != &request.identity)
-        }) {
+        if requests
+            .iter()
+            .any(|request| current_by_pane.get(request.pane.as_str()) != Some(&request.identity))
+        {
             return Err("native pane identity changed during observation".into());
         }
         Ok(prepared)
@@ -329,6 +329,8 @@ impl Manager {
             .capture_cache_misses(&inventory, &identified, target)
             .await?;
         let mut agents = Vec::new();
+        let mut tracked_groups = Vec::new();
+        let mut tracked_updates = Vec::new();
         let mut seen_panes = HashSet::new();
         for fields in inventory {
             // A linked window can occur in more than one session.
@@ -365,12 +367,12 @@ impl Manager {
                 {
                     PreparedEvidence::Cached(evidence) => evidence,
                     PreparedEvidence::Screen(screen) => {
-                        let evidence = self.engine.explain_with_progress(
+                        let evidence = Arc::new(self.engine.explain_with_progress(
                             provider.id,
                             &screen,
                             &fields[9],
                             &fields[15],
-                        );
+                        ));
                         let mut cache = self
                             .cache
                             .lock()
@@ -380,7 +382,9 @@ impl Manager {
                     }
                 }
             } else {
-                json!({"state":"unknown", "source":"process", "reason": if dead {"process_exited"} else {"foreground_not_verified"}})
+                Arc::new(
+                    json!({"state":"unknown", "source":"process", "reason": if dead {"process_exited"} else {"foreground_not_verified"}}),
+                )
             };
             let mut state = evidence["state"].as_str().unwrap_or("unknown").to_owned();
             let metadata = metadata.filter(|m| {
@@ -393,7 +397,7 @@ impl Manager {
                 // A visible blocker is stronger than a hook claiming idle/working.
                 if evidence["visible_blocker"] != true || report.state == "blocked" {
                     state = report.state.clone();
-                    evidence = json!({"state":state,"source":"run_report","sequence":report.sequence,"observed_at_ms":report.at,"screen":evidence});
+                    evidence = run_report_evidence(evidence, report);
                 }
             }
             if dead {
@@ -442,7 +446,7 @@ impl Manager {
                 .unwrap_or_else(|| {
                     format!("{}-{}", provider.id, fields[0].trim_start_matches('%'))
                 });
-            let mut agent = Agent {
+            let agent = Agent {
                 id: name.clone(),
                 name,
                 provider: provider.id.into(),
@@ -485,13 +489,59 @@ impl Manager {
             };
             if changed {
                 let encoded = encode(&agent.tracked)?;
-                self.guarded(&agent, vec![Self::option(&agent, TRACKED, encoded.clone())])
-                    .await?;
-                agent.tracked_encoded = encoded;
+                tracked_groups.push((
+                    agent.pane_id.clone(),
+                    identity_guard(&agent),
+                    vec![Self::option(&agent, TRACKED, encoded.clone())],
+                    TRACKED_REJECTED.into(),
+                ));
+                tracked_updates.push((agents.len(), encoded));
             }
             agents.push(agent);
         }
+        self.write_tracked_updates(&mut agents, &tracked_groups, &tracked_updates)
+            .await?;
         Ok(agents)
+    }
+
+    async fn write_tracked_updates(
+        &self,
+        agents: &mut [Agent],
+        groups: &[native_ui::GuardedGroup],
+        updates: &[(usize, String)],
+    ) -> Result<(), String> {
+        if groups.len() != updates.len() {
+            return Err("invalid tracked update batch".into());
+        }
+        let sizes = groups
+            .iter()
+            .map(native_ui::guarded_group_script_bytes)
+            .collect::<Vec<_>>();
+        if sizes.iter().any(|size| *size > native_ui::MAX_SCRIPT) {
+            return Err("native tracked update exceeds script limit".into());
+        }
+
+        let mut start = 0;
+        while start < groups.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < groups.len() && bytes + sizes[end] <= native_ui::MAX_SCRIPT {
+                bytes += sizes[end];
+                end += 1;
+            }
+            let output = self.native.guarded_groups(&groups[start..end]).await?;
+            if String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == TRACKED_REJECTED)
+            {
+                return Err("agent run changed before the action".into());
+            }
+            for (agent, encoded) in &updates[start..end] {
+                agents[*agent].tracked_encoded = encoded.clone();
+            }
+            start = end;
+        }
+        Ok(())
     }
 
     pub async fn get(&self, target: &str) -> Result<Agent, String> {
@@ -953,6 +1003,16 @@ impl Agent {
     }
 }
 
+fn run_report_evidence(evidence: Arc<Value>, report: &Report) -> Arc<Value> {
+    Arc::new(json!({
+        "state": report.state,
+        "source": "run_report",
+        "sequence": report.sequence,
+        "observed_at_ms": report.at,
+        "screen": evidence,
+    }))
+}
+
 fn valid_name(name: &str) -> bool {
     name.len() <= 32
         && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
@@ -1359,18 +1419,120 @@ mod tests {
             .map(|index| {
                 (
                     format!("%{index}"),
-                    (format!("old-{index}"), json!({"pane":index})),
+                    (format!("old-{index}"), Arc::new(json!({"pane":index}))),
                 )
             })
             .collect::<HashMap<_, _>>();
         let snapshot = cache.clone();
-        store_cached_evidence(&mut cache, "%0".into(), "new".into(), json!({"pane":0}));
-        store_cached_evidence(&mut cache, "%64".into(), "new".into(), json!({"pane":64}));
+        store_cached_evidence(
+            &mut cache,
+            "%0".into(),
+            "new".into(),
+            Arc::new(json!({"pane":0})),
+        );
+        store_cached_evidence(
+            &mut cache,
+            "%64".into(),
+            "new".into(),
+            Arc::new(json!({"pane":64})),
+        );
 
         assert_eq!(cache.len(), 64);
         assert_eq!(cache["%0"].0, "new");
         assert!(!cache.contains_key("%64"));
         assert_eq!(snapshot["%0"].0, "old-0");
         assert_eq!(snapshot["%63"], cache["%63"]);
+    }
+
+    #[test]
+    fn agent_evidence_json_roundtrip_preserves_full_public_shape() {
+        let evidence = json!({
+            "state": "blocked",
+            "source": "screen",
+            "explanations": [
+                {"rule": "question", "matched": true, "detail": "Proceed?"},
+                {"rule": "approval", "matched": false, "detail": null}
+            ],
+            "visible_blocker": true
+        });
+        let agent = Agent {
+            id: "codex-1".into(),
+            name: "codex-1".into(),
+            provider: "codex".into(),
+            pane_id: "%1".into(),
+            window_id: "@1".into(),
+            workspace: "main".into(),
+            cwd: "/tmp/project".into(),
+            boot: "00000000-0000-0000-0000-000000000000".into(),
+            generation: "1".into(),
+            run: "run-1".into(),
+            process: "running".into(),
+            state: "blocked".into(),
+            session_id: Some("session-1".into()),
+            evidence: Arc::new(evidence.clone()),
+            seen: false,
+            revision: "3".into(),
+            returned_idle: false,
+            endpoint_id: String::new(),
+            endpoint_label: String::new(),
+            endpoint_key: String::new(),
+            stale: false,
+            metadata: None,
+            encoded: String::new(),
+            foreground_command: String::new(),
+            tracked: Tracked::default(),
+            tracked_encoded: String::new(),
+            foreground_group: 0,
+            output_generation: 0,
+            title: String::new(),
+            progress: String::new(),
+        };
+
+        let serialized = serde_json::to_value(&agent).unwrap();
+        assert_eq!(serialized["evidence"], evidence);
+        assert!(serialized.get("metadata").is_none());
+
+        let decoded: Agent = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(*decoded.evidence, evidence);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), serialized);
+    }
+
+    #[test]
+    fn cached_evidence_survives_report_overlay_and_screen_refresh() {
+        let original = Arc::new(json!({
+            "state": "blocked",
+            "source": "screen",
+            "explanations": [{"rule": "question", "detail": "Proceed?"}],
+            "visible_blocker": true
+        }));
+        let mut cache = HashMap::new();
+        store_cached_evidence(&mut cache, "%1".into(), "screen-1".into(), original.clone());
+
+        let report = Report {
+            sequence: 7,
+            state: "blocked".into(),
+            at: 1234,
+        };
+        let reported = run_report_evidence(cache["%1"].1.clone(), &report);
+        store_cached_evidence(
+            &mut cache,
+            "%1".into(),
+            "screen-2".into(),
+            Arc::new(json!({
+                "state": "working",
+                "source": "screen",
+                "explanations": [{"rule": "activity", "detail": "Generating"}]
+            })),
+        );
+
+        assert_eq!(reported["source"], "run_report");
+        assert_eq!(reported["screen"], *original);
+        assert_eq!(
+            original["explanations"],
+            json!([{"rule": "question", "detail": "Proceed?"}])
+        );
+        assert_eq!(cache["%1"].0, "screen-2");
+        assert_eq!(cache["%1"].1["state"], "working");
+        assert_eq!(cache["%1"].1["explanations"][0]["detail"], "Generating");
     }
 }

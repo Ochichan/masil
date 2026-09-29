@@ -170,7 +170,10 @@ def main():
         run(['cargo', 'build', '--locked', '--release', '--manifest-path', str(ROOT/'agent/Cargo.toml')], ROOT, env, 'agent-build')
         run([str(ROOT/'agent/target/release/masil-agent'), '--version'], ROOT, env, 'agent-smoke')
         (ROOT/'bin').mkdir(exist_ok=True)
-        shutil.copy2(ROOT/'agent/target/release/masil-agent', ROOT/'bin/masil-agent')
+        destination = ROOT/'bin/masil-agent'
+        staged = destination.with_suffix('.new')
+        shutil.copy2(ROOT/'agent/target/release/masil-agent', staged)
+        staged.replace(destination)
         return
     bootstrap(env)
     source = baseline_source() if args.baseline else ROOT / 'core'

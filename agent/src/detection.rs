@@ -15,6 +15,7 @@ use crate::providers;
 const ENGINE_VERSION: u32 = 3;
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 const MAX_SCREEN_BYTES: usize = 1024 * 1024;
+const MAX_REGION_CACHE_BYTES: usize = MAX_SCREEN_BYTES;
 const MAX_TITLE_BYTES: usize = 8192;
 const MAX_RULES_PER_MANIFEST: usize = 128;
 const MAX_GATE_DEPTH: usize = 8;
@@ -138,9 +139,16 @@ impl Engine {
         };
         let mut matched: Option<(&ManifestRule, &str)> = None;
         let mut explanations = Vec::with_capacity(loaded.manifest.rules.len());
+        let mut regions = HashMap::new();
+        let mut region_cache_bytes = 0;
         for (rule, compiled) in loaded.manifest.rules.iter().zip(&loaded.compiled_rules) {
-            let region_text = region(input, &rule.region);
+            let region_text = regions
+                .entry(rule.region.trim())
+                .or_insert_with(|| RegionText::new(region(input, &rule.region)));
+            let previous_lower_bytes = region_text.lower.get().map_or(0, String::len);
             let rule_matched = compiled_gate_matches(&compiled.gate, region_text);
+            region_cache_bytes +=
+                region_text.lower.get().map_or(0, String::len) - previous_lower_bytes;
             explanations.push(json!({
                 "id": rule.id,
                 "priority": rule.priority,
@@ -154,8 +162,8 @@ impl Engine {
                     "all_count": rule.all.len(),
                     "any_count": rule.any.len(),
                     "not_count": rule.not_gate.len(),
-                    "region_bytes": region_text.len(),
-                    "region_preview": bounded_preview(region_text),
+                    "region_bytes": region_text.text.len(),
+                    "region_preview": region_text.preview,
                 },
             }));
             if rule_matched
@@ -163,7 +171,13 @@ impl Engine {
                     .as_ref()
                     .is_none_or(|(previous, _)| rule.priority > previous.priority)
             {
-                matched = Some((rule, region_text));
+                matched = Some((rule, region_text.text));
+            }
+            // Custom manifests can request many overlapping large regions.
+            // Retain at most this budget between rules, plus the active region.
+            if region_cache_bytes > MAX_REGION_CACHE_BYTES {
+                regions.clear();
+                region_cache_bytes = 0;
             }
         }
 
@@ -685,31 +699,44 @@ fn gate_has_any_matcher(gate: &ManifestGate) -> bool {
     gate_has_positive_matcher(gate) || !gate.not_gate.is_empty()
 }
 
-fn compiled_gate_matches(gate: &CompiledGate, text: &str) -> bool {
-    let lower = text.to_lowercase();
-    compiled_gate_matches_lowered(gate, text, &lower)
+struct RegionText<'a> {
+    text: &'a str,
+    lower: OnceLock<String>,
+    preview: String,
 }
 
-fn compiled_gate_matches_lowered(gate: &CompiledGate, text: &str, lower: &str) -> bool {
-    gate.contains.iter().all(|needle| lower.contains(needle))
-        && gate.regex.iter().all(|regex| regex.is_match(text))
+impl<'a> RegionText<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            lower: OnceLock::new(),
+            preview: bounded_preview(text),
+        }
+    }
+}
+
+fn compiled_gate_matches(gate: &CompiledGate, region: &RegionText<'_>) -> bool {
+    (gate.contains.is_empty() || {
+        let lower = region.lower.get_or_init(|| region.text.to_lowercase());
+        gate.contains.iter().all(|needle| lower.contains(needle))
+    }) && gate.regex.iter().all(|regex| regex.is_match(region.text))
         && gate
             .line_regex
             .iter()
-            .all(|regex| text.lines().any(|line| regex.is_match(line)))
+            .all(|regex| region.text.lines().any(|line| regex.is_match(line)))
         && gate
             .all
             .iter()
-            .all(|nested| compiled_gate_matches_lowered(nested, text, lower))
+            .all(|nested| compiled_gate_matches(nested, region))
         && (gate.any.is_empty()
             || gate
                 .any
                 .iter()
-                .any(|nested| compiled_gate_matches_lowered(nested, text, lower)))
+                .any(|nested| compiled_gate_matches(nested, region)))
         && !gate
             .not_gate
             .iter()
-            .any(|nested| compiled_gate_matches_lowered(nested, text, lower))
+            .any(|nested| compiled_gate_matches(nested, region))
 }
 
 #[derive(Clone, Copy)]
@@ -982,8 +1009,9 @@ fn line_start_offset(content: &str, lines: &[&str], index: usize) -> usize {
 }
 
 fn bounded_preview(text: &str) -> String {
-    let mut preview: String = text.chars().take(240).collect();
-    if text.chars().count() > 240 {
+    let mut chars = text.chars();
+    let mut preview: String = chars.by_ref().take(240).collect();
+    if chars.next().is_some() {
         preview.push_str("...");
     }
     preview
@@ -1269,6 +1297,66 @@ not = [{ contains = ["cancelled"] }]
         let unknown = engine.explain("codex", "nothing useful", "");
         assert_eq!(unknown["state"], "unknown");
         assert_eq!(unknown["fallback_reason"], "no_matching_rule");
+    }
+
+    #[test]
+    fn shared_regions_preserve_unicode_gates_and_refresh_between_screens() {
+        let engine = synthetic(
+            r#"
+id = "codex"
+[[rules]]
+id = "ready"
+state = "idle"
+priority = 10
+contains = ["äready"]
+[[rules]]
+id = "confirm"
+state = "blocked"
+priority = 20
+all = [{ contains = ["ÄREADY"] }]
+any = [{ line_regex = ['^confirm$'] }]
+not = [{ contains = ["cancel"] }]
+[[rules]]
+id = "case_sensitive"
+state = "working"
+priority = 5
+regex = ['^ÄREADY']
+[[rules]]
+id = "title"
+state = "working"
+priority = 30
+region = "osc_title"
+contains = ["äready"]
+"#,
+        );
+        let first = engine.explain("codex", "ÄREADY\nconfirm\n", "unrelated");
+        assert_eq!(first["matched_rule"]["id"], "confirm");
+        let matched: Vec<_> = first["explanations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rule| rule["matched"].as_bool().unwrap())
+            .collect();
+        assert_eq!(matched, [true, true, true, false]);
+        assert_eq!(
+            first["explanations"][1]["evidence"]["region_preview"],
+            "ÄREADY\nconfirm\n"
+        );
+        let second = engine.explain("codex", "äready\nconfirm\ncancel", "unrelated");
+        assert_eq!(second["matched_rule"]["id"], "ready");
+        assert_eq!(second["explanations"][2]["matched"], false);
+        let third = engine.explain("codex", "nothing", "ÄREADY");
+        assert_eq!(third["matched_rule"]["id"], "title");
+        assert_eq!(third["explanations"][0]["matched"], false);
+    }
+
+    #[test]
+    fn previews_truncate_at_unicode_character_boundaries() {
+        for count in [0, 239, 240, 241, 10_000] {
+            let input = "한".repeat(count);
+            let expected = "한".repeat(count.min(240)) + if count > 240 { "..." } else { "" };
+            assert_eq!(bounded_preview(&input), expected);
+        }
     }
 
     #[test]

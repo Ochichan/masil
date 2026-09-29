@@ -15,7 +15,7 @@ use tokio::time::timeout;
 
 const COMMAND_DEADLINE: Duration = Duration::from_secs(3);
 const MAX_OUTPUT: usize = 64 * 1024;
-const MAX_SCRIPT: usize = 64 * 1024;
+pub(crate) const MAX_SCRIPT: usize = 64 * 1024;
 const MAX_COPY: usize = 64 * 1024;
 const SIDEBAR_WIDTH: &str = "34";
 const MIN_WINDOW_WIDTH: u32 = 100;
@@ -29,6 +29,8 @@ const OPT_BOOT: &str = "@masil-sidebar-core-boot";
 const OPT_MANAGER: &str = "@masil-sidebar-manager";
 const OPT_GENERATION: &str = "@masil-sidebar-pty-generation";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) type GuardedGroup = (String, String, Vec<Vec<String>>, String);
 
 const CLIENT_FORMAT: &str =
     "#{client_name}\t#{client_readonly}\t#{client_control_mode}\t#{pane_id}\t#{window_id}";
@@ -827,7 +829,7 @@ impl Context {
 
     pub(crate) async fn guarded_groups(
         &self,
-        groups: &[(String, String, Vec<Vec<String>>, String)],
+        groups: &[GuardedGroup],
     ) -> Result<ProcessOutput, String> {
         let mut script = String::new();
         for (target, guard, commands, rejected) in groups {
@@ -1047,6 +1049,12 @@ fn private_parent(socket: &Path) -> Result<PathBuf, String> {
         return Err("native socket parent must be a private owner directory".into());
     }
     Ok(directory.to_owned())
+}
+
+pub(crate) fn guarded_group_script_bytes(group: &GuardedGroup) -> usize {
+    let mut script = String::new();
+    write_group(&mut script, &group.0, &group.1, &group.2, &group.3);
+    script.len()
 }
 
 fn write_if(
@@ -1477,6 +1485,31 @@ mod tests {
         assert!(script.contains("'/tmp/a b/masil-agent'"));
         assert!(script.contains("'label'\\''; display-message hacked'"));
         assert_eq!(script.matches("display-message").count(), 2);
+    }
+
+    #[test]
+    fn guarded_group_size_uses_encoded_bytes_at_script_boundary() {
+        let group = (
+            "%1".into(),
+            core_guard(BOOT, "2"),
+            vec![vec![
+                "set-option".into(),
+                "-p".into(),
+                "-t".into(),
+                "%1".into(),
+                "@test".into(),
+                "x".repeat(MAX_SCRIPT / 2),
+            ]],
+            REJECTED.into(),
+        );
+        let single = guarded_group_script_bytes(&group);
+        let mut encoded = String::new();
+        write_group(&mut encoded, &group.0, &group.1, &group.2, &group.3);
+        write_group(&mut encoded, &group.0, &group.1, &group.2, &group.3);
+
+        assert_eq!(single * 2, encoded.len());
+        assert!(single <= MAX_SCRIPT);
+        assert!(encoded.len() > MAX_SCRIPT);
     }
 
     #[test]
