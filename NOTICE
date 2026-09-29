@@ -1,0 +1,17 @@
+masil is licensed under the MIT License (see LICENSE). It includes code from
+the projects below, which keep their own licenses.
+
+core/
+    Derived from tmux, commit 94796f6b1182507efac8a272fc309a79e22e58a5.
+    ISC License. See core/COPYING and the copyright notice in each file.
+    core/UPSTREAM.json records the hashes of the imported files.
+
+core/compat/yyjson/
+    yyjson 0.13.0. MIT License. See core/compat/yyjson/LICENSE.
+
+agent/src/manifests/
+    Agent screen detection manifests from Herdr, commit
+    0d5d6f1f317e238c8297076bc6ab5c3a0cd56283.
+    Apache License 2.0. See agent/src/manifests/LICENSE.
+
+Rust dependencies are pinned in agent/Cargo.lock and keep their own licenses.

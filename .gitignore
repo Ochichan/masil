@@ -11,3 +11,7 @@ core/config.h.in
 core/config.h.in~
 core/Makefile.in
 core/etc/
+# Notes, docs and review records stay local.
+*.md
+/docs/
+/.impeccable/
