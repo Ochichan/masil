@@ -1672,8 +1672,8 @@ rmux_bridge_private_parent(const char *path)
 const char *
 rmux_bridge_get_boot_id(void)
 {
-	if (!rmux_bridge_enabled)
-		return ("");
+	if (*rmux_bridge_boot_id == '\0')
+		rmux_bridge_new_boot_id();
 	return (rmux_bridge_boot_id);
 }
 
@@ -1686,6 +1686,7 @@ rmux_bridge_start(void)
 	mode_t			 old_mask;
 	int			 saved_errno;
 
+	(void)rmux_bridge_get_boot_id();
 	if (path == NULL || *path == '\0' || rmux_bridge_enabled)
 		return;
 	if (rmux_bridge_private_parent(path) != 0 ||
@@ -1722,7 +1723,6 @@ rmux_bridge_start(void)
 	rmux_bridge_socket_dev = sb.st_dev;
 	rmux_bridge_socket_ino = sb.st_ino;
 	setblocking(rmux_bridge_fd, 0);
-	rmux_bridge_new_boot_id();
 	rmux_bridge_snapshot_updated = rmux_bridge_now_usec();
 	rmux_bridge_snapshot_credit = RMUX_BRIDGE_SNAPSHOT_RATE *
 	    RMUX_BRIDGE_CREDIT_SCALE;
@@ -1793,11 +1793,11 @@ void
 rmux_bridge_pane_created(struct window_pane *wp)
 {
 	wp->rmux_watch_slot = 0;
+	wp->rmux_pty_generation = 0;
+	wp->rmux_screen_generation = rmux_bridge_enabled ? 1 : 0;
+	wp->rmux_generation_exhausted = 0;
 	if (!rmux_bridge_enabled)
 		return;
-	wp->rmux_pty_generation = 0;
-	wp->rmux_screen_generation = 1;
-	wp->rmux_generation_exhausted = 0;
 	if (rmux_bridge_bump(&rmux_bridge_revision) != 0)
 		rmux_bridge_revision_exhausted = wp->rmux_generation_exhausted = 1;
 }
@@ -1844,10 +1844,11 @@ rmux_bridge_pty_changed(struct window_pane *wp)
 	struct rmux_bridge_watch_slot *slot;
 	int exhausted = 0;
 
+	if (rmux_bridge_bump(&wp->rmux_pty_generation) != 0)
+		exhausted = wp->rmux_generation_exhausted = 1;
 	if (!rmux_bridge_enabled)
 		return;
-	if (rmux_bridge_bump(&wp->rmux_pty_generation) != 0 ||
-	    rmux_bridge_bump(&wp->rmux_screen_generation) != 0)
+	if (!exhausted && rmux_bridge_bump(&wp->rmux_screen_generation) != 0)
 		exhausted = wp->rmux_generation_exhausted = 1;
 	if (exhausted)
 		rmux_bridge_watch_fail_closed();

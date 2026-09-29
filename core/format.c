@@ -2347,11 +2347,43 @@ format_cb_pane_output_generation(struct format_tree *ft)
 	return (NULL);
 }
 
+/* Callback for rmux_bracketed_paste. */
+static void *
+format_cb_rmux_bracketed_paste(struct format_tree *ft)
+{
+	if (ft->wp == NULL)
+		return (NULL);
+	return (format_printf("%d", !!(ft->wp->screen->mode & MODE_BRACKETPASTE)));
+}
+
 /* Callback for rmux_core_boot_id. */
 static void *
 format_cb_rmux_core_boot_id(__unused struct format_tree *ft)
 {
 	return (xstrdup(rmux_bridge_get_boot_id()));
+}
+
+/* Callback for rmux_foreground_pgid. */
+static void *
+format_cb_rmux_foreground_pgid(struct format_tree *ft)
+{
+	pid_t	 pgid;
+
+	if (ft->wp == NULL || ft->wp->fd == -1)
+		return (xstrdup(""));
+	pgid = tcgetpgrp(ft->wp->fd);
+	if (pgid <= 0)
+		return (xstrdup(""));
+	return (format_printf("%ld", (long)pgid));
+}
+
+/* Callback for rmux_osc_progress. */
+static void *
+format_cb_rmux_osc_progress(struct format_tree *ft)
+{
+	if (ft->wp == NULL)
+		return (NULL);
+	return (xstrdup(ft->wp->base.rmux_osc_progress));
 }
 
 /* Callback for rmux_pty_generation. */
@@ -2747,7 +2779,7 @@ format_cb_pane_unzoomed_height(struct format_tree *ft)
 	if (lc == NULL)
 		return (NULL);
 	sy = lc->g.sy;
-	floating = (lc->flags & LAYOUT_CELL_FLOATING);
+	floating = (layout_float_root(lc) != NULL);
 
 	root = w->saved_layout_root;
 	if (root == NULL)
@@ -4028,8 +4060,17 @@ static const struct format_table_entry format_table[] = {
 	{ "pid", FORMAT_TABLE_STRING,
 	  format_cb_pid
 	},
+	{ "rmux_bracketed_paste", FORMAT_TABLE_STRING,
+	  format_cb_rmux_bracketed_paste
+	},
 	{ "rmux_core_boot_id", FORMAT_TABLE_STRING,
 	  format_cb_rmux_core_boot_id
+	},
+	{ "rmux_foreground_pgid", FORMAT_TABLE_STRING,
+	  format_cb_rmux_foreground_pgid
+	},
+	{ "rmux_osc_progress", FORMAT_TABLE_STRING,
+	  format_cb_rmux_osc_progress
 	},
 	{ "rmux_pty_generation", FORMAT_TABLE_STRING,
 	  format_cb_rmux_pty_generation

@@ -86,9 +86,17 @@ impl App {
             KeyCode::Char('t') => self.change_theme(),
             KeyCode::Char('a') => self.one_effect(Action::MarkSeen),
             KeyCode::Char('g') => self.one_effect(Action::GoToPane),
-            KeyCode::Char('c') => self.one_effect(Action::CopyId),
+            KeyCode::Char('c') if !self.managed => self.one_effect(Action::CopyId),
             KeyCode::Char('z') => self.one_effect(Action::Expand),
+            KeyCode::Char('r') if self.managed => self.one_effect(Action::RenameAgent),
             KeyCode::Char('r') => self.one_effect(Action::Retry),
+            KeyCode::Char('n') if self.managed => self.one_effect(Action::NewAgent),
+            KeyCode::Char('s') if self.managed => self.one_effect(Action::ResumeAgent),
+            KeyCode::Char('d') if self.managed => self.one_effect(Action::PrepareDraft),
+            KeyCode::Char('p') if self.managed => self.one_effect(Action::SendPrompt),
+            KeyCode::Char('x') if self.managed => self.one_effect(Action::InterruptAgent),
+            KeyCode::Char('v') if self.managed => self.one_effect(Action::ReadScreen),
+            KeyCode::Char('X') if self.managed => self.one_effect(Action::CloseAgent),
             KeyCode::Esc => {
                 if self.details_open {
                     self.details_open = false;
@@ -268,6 +276,38 @@ impl App {
                     KeyCode::Char('g') => {
                         self.overlay = None;
                         self.one_effect(Action::GoToPane)
+                    }
+                    KeyCode::Char('n') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::NewAgent)
+                    }
+                    KeyCode::Char('r') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::RenameAgent)
+                    }
+                    KeyCode::Char('s') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::ResumeAgent)
+                    }
+                    KeyCode::Char('d') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::PrepareDraft)
+                    }
+                    KeyCode::Char('p') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::SendPrompt)
+                    }
+                    KeyCode::Char('x') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::InterruptAgent)
+                    }
+                    KeyCode::Char('v') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::ReadScreen)
+                    }
+                    KeyCode::Char('X') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::CloseAgent)
                     }
                     _ => Vec::new(),
                 }
@@ -562,8 +602,23 @@ impl App {
     fn wheel(&mut self, column: u16, row: u16, amount: isize) {
         let target = self.hit_at(column, row).map(|hit| hit.target.clone());
         if let Some(overlay) = self.overlay {
-            if overlay == Overlay::Help {
-                self.scroll_help(amount);
+            match overlay {
+                Overlay::Help => self.scroll_help(amount),
+                // The wheel reaches menu items a short screen cannot show.
+                Overlay::Context
+                    if matches!(
+                        target,
+                        Some(HitTarget::ContextItem(_) | HitTarget::OverlaySurface)
+                    ) =>
+                {
+                    let last = self.context_actions().len().saturating_sub(1);
+                    self.context_selection = self
+                        .context_selection
+                        .saturating_add_signed(amount.signum())
+                        .min(last);
+                    self.dirty = true;
+                }
+                Overlay::Context => {}
             }
             return;
         }
@@ -880,7 +935,11 @@ impl App {
     }
 
     pub(crate) fn visible_actions(&self) -> Vec<Action> {
-        let mut actions = vec![Action::MarkSeen, Action::GoToPane, Action::Details];
+        let mut actions = if self.managed {
+            vec![Action::NewAgent, Action::GoToPane, Action::Details]
+        } else {
+            vec![Action::MarkSeen, Action::GoToPane, Action::Details]
+        };
         if self.compact && self.native_available {
             actions.push(Action::Expand);
         }
@@ -891,6 +950,21 @@ impl App {
     }
 
     pub(crate) fn context_actions(&self) -> Vec<Action> {
+        if self.managed {
+            return vec![
+                Action::NewAgent,
+                Action::GoToPane,
+                Action::Details,
+                Action::MarkSeen,
+                Action::RenameAgent,
+                Action::ResumeAgent,
+                Action::PrepareDraft,
+                Action::SendPrompt,
+                Action::InterruptAgent,
+                Action::ReadScreen,
+                Action::CloseAgent,
+            ];
+        }
         vec![
             Action::MarkSeen,
             Action::GoToPane,

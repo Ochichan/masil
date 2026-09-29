@@ -74,6 +74,7 @@ struct layout_parse_cell_ctx {
 	int			 last;
 	int			 index;
 	int			 zindex;
+	struct layout_cell	*group;	/* rmux: floating group, if any */
 };
 
 /* Layout parse context. */
@@ -86,6 +87,9 @@ struct layout_parse_ctx {
 	int				  size;		/* number used */
 	int				  capacity;	/* number allocated */
 	struct layout_parse_cell_ctx	 *cctxs;
+
+	struct layout_cell		 *group;	/* rmux: group parsed */
+	int				  group_zindex;
 };
 
 static struct layout_cell	*layout_find_bottomright(struct layout_cell *);
@@ -203,6 +207,8 @@ layout_parse_init_ctx(struct layout_parse_ctx *pctx, char **cause)
 	pctx->size = 0;
 	pctx->capacity = 64;
 	pctx->cctxs = xcalloc(pctx->capacity, sizeof *pctx->cctxs);
+	pctx->group = NULL;
+	pctx->group_zindex = INT_MAX;
 }
 
 /* Free a parse context. */
@@ -236,6 +242,7 @@ layout_parse_add_cctx(struct layout_parse_ctx *pctx, struct layout_cell *lc,
 	cctx->last = last;
 	cctx->index = index;
 	cctx->zindex = zindex;
+	cctx->group = NULL;
 }
 
 /* Remove a cell context from the parse context. Does not preserve ordering. */
@@ -307,33 +314,48 @@ bad:
 	return (xstrdup("0000,"));
 }
 
-/* Get a floating pane cell's z-index in the layout being dumped. */
+/*
+ * Get a floating cell's z-index in the layout being dumped. rmux: a floating
+ * group has one z-index; its members are not counted separately.
+ */
 static u_int
 layout_cell_zindex(struct layout_cell *lc)
 {
-	struct window_pane	*wp = lc->wp, *wq;
-	struct window		*w = wp->window;
-	struct layout_cell	*other;
-	int			 saved = (lc == wp->saved_layout_cell);
+	struct layout_cell	*leaf = lc, *other, *root, *counted = NULL;
+	struct layout_cell	*zoomed = NULL;
+	struct window_pane	*wp, *wq;
+	struct window		*w;
+	int			 saved;
 	u_int			 i = 0;
+
+	while (leaf->type != LAYOUT_WINDOWPANE)
+		leaf = TAILQ_FIRST(&leaf->cells);
+	wp = leaf->wp;
+	w = wp->window;
+	saved = (leaf == wp->saved_layout_cell);
 
 	if (saved &&
 	    w->active != NULL &&
-	    (w->active->flags & PANE_ZOOMED) &&
-	    (w->active->saved_layout_cell->flags & LAYOUT_CELL_FLOATING)) {
-		if (wp == w->active)
-			return (0);
-		i++;
+	    (w->active->flags & PANE_ZOOMED)) {
+		zoomed = layout_float_root(w->active->saved_layout_cell);
+		if (zoomed != NULL) {
+			if (zoomed == lc)
+				return (0);
+			i++;
+		}
 	}
 	TAILQ_FOREACH(wq, &w->z_index, zentry) {
-		if (wq == wp)
-			break;
 		if (saved)
 			other = wq->saved_layout_cell;
 		else
 			other = wq->layout_cell;
-		if (other != NULL && (other->flags & LAYOUT_CELL_FLOATING))
-			i++;
+		root = layout_float_root(other);
+		if (root == lc)
+			break;
+		if (root == NULL || root == counted || root == zoomed)
+			continue;
+		counted = root;
+		i++;
 	}
 	return (i);
 }
@@ -364,6 +386,11 @@ layout_append_v2(struct layout_cell *lc, struct layout_string *ls)
 	layout_string_write(ls, "{\"t\":\"%c\",\"w\":%u,\"h\":%u,\"x\":%d"
 	    ",\"y\":%d", c, lc->g.sx, lc->g.sy, lc->g.xoff, lc->g.yoff);
 	if (type != LAYOUT_WINDOWPANE) {
+		/* rmux: a floating group carries the z-index of its panes. */
+		if (lc->flags & LAYOUT_CELL_FLOATING) {
+			z = layout_cell_zindex(lc);
+			layout_string_write(ls, ",\"z\":%u", z);
+		}
 		layout_string_write(ls, ",\"c\":[");
 		n = 0;
 		TAILQ_FOREACH(lcchild, &lc->cells, entry) {
@@ -448,8 +475,7 @@ layout_custom_copy_layout(struct layout_cell *lc)
 	struct layout_cell	*lcchild, *lcnewchild, *lconly;
 	struct layout_cell	*lcnew;
 
-	if (lc->type == LAYOUT_WINDOWPANE &&
-	    (lc->flags & LAYOUT_CELL_FLOATING))
+	if (lc->flags & LAYOUT_CELL_FLOATING)
 		return (NULL);
 
 	lcnew = layout_create_cell(NULL);
@@ -541,8 +567,7 @@ layout_append(struct layout_cell *lcroot, struct layout_string *ls, int flags)
 	int			 result;
 
 	if (flags & LAYOUT_CUSTOM_OLD_FORMAT) {
-		if (!layout_cell_is_tiled(lcroot) &&
-		    !layout_cell_has_tiled_child(lcroot))
+		if (!layout_cell_in_tiling(lcroot))
 			return (-1);
 		lccompat = layout_custom_create_compat(lcroot);
 		result = layout_append_v1(lccompat, ls);
@@ -565,9 +590,13 @@ layout_check(struct layout_cell *lc)
 		break;
 	case LAYOUT_LEFTRIGHT:
 		TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-			if (!layout_cell_is_tiled(lcchild) &&
-			    !layout_cell_has_tiled_child(lcchild))
+			if (!layout_cell_in_tiling(lcchild)) {
+				/* rmux: a floating group is checked alone. */
+				if (lcchild->type != LAYOUT_WINDOWPANE &&
+				    !layout_check(lcchild))
+					return (0);
 				continue;
+			}
 			if (lcchild->g.sy != lc->g.sy)
 				return (0);
 			if (!layout_check(lcchild))
@@ -579,9 +608,12 @@ layout_check(struct layout_cell *lc)
 		break;
 	case LAYOUT_TOPBOTTOM:
 		TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-			if (!layout_cell_is_tiled(lcchild) &&
-			    !layout_cell_has_tiled_child(lcchild))
+			if (!layout_cell_in_tiling(lcchild)) {
+				if (lcchild->type != LAYOUT_WINDOWPANE &&
+				    !layout_check(lcchild))
+					return (0);
 				continue;
+			}
 			if (lcchild->g.sx != lc->g.sx)
 				return (0);
 			if (!layout_check(lcchild))
@@ -656,8 +688,7 @@ layout_parse(struct window *w, const char *input, char **cause)
 		break;
 	case LAYOUT_LEFTRIGHT:
 		TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-			if (layout_cell_is_tiled(lcchild) ||
-			    layout_cell_has_tiled_child(lcchild)) {
+			if (layout_cell_in_tiling(lcchild)) {
 				sy = lcchild->g.sy + 1;
 				sx += lcchild->g.sx + 1;
 			}
@@ -665,8 +696,7 @@ layout_parse(struct window *w, const char *input, char **cause)
 		break;
 	case LAYOUT_TOPBOTTOM:
 		TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-			if (layout_cell_is_tiled(lcchild) ||
-			    layout_cell_has_tiled_child(lcchild)) {
+			if (layout_cell_in_tiling(lcchild)) {
 				sx = lcchild->g.sx + 1;
 				sy += lcchild->g.sy + 1;
 			}
@@ -686,16 +716,16 @@ layout_parse(struct window *w, const char *input, char **cause)
 	}
 
 	/* Resize window to the layout size. */
-	if (layout_cell_is_tiled(lc) ||
-	    layout_cell_has_tiled_child(lc))
+	if (layout_cell_in_tiling(lc))
 		window_resize(w, lc->g.sx, lc->g.sy, -1, -1);
 
 	/* Preserve floating panes for version 1. */
 	if (pctx.version == 1) {
 		TAILQ_FOREACH(wp, &w->panes, entry) {
-			if (!window_pane_is_floating(wp))
+			/* rmux: keep a floating group whole. */
+			lcchild = layout_float_root(wp->layout_cell);
+			if (lcchild == NULL || lcchild->parent == NULL)
 				continue;
-			lcchild = wp->layout_cell;
 			TAILQ_REMOVE(&lcchild->parent->cells, lcchild, entry);
 			lcchild->parent = NULL;
 		}
@@ -796,8 +826,9 @@ layout_assign_fallback(struct window *w, struct layout_cell *lcroot)
 
 	wp = TAILQ_FIRST(&w->panes);
 	while (wp != NULL) {
-		if (window_pane_is_floating(wp)) {
-			lc = wp->layout_cell;
+		/* rmux: a floating group is linked once, as a whole. */
+		lc = layout_float_root(wp->layout_cell);
+		if (lc != NULL && lc->parent == NULL) {
 			lc->parent = lcroot;
 			TAILQ_INSERT_TAIL(&lcroot->cells, lc, entry);
 		}
@@ -1049,6 +1080,11 @@ layout_parse_json_layout(struct json_node *node, struct layout_cell *lcparent,
 		}
 
 		if (json_find(node, "z") != NULL) {
+			if (pctx->group != NULL) {
+				*cause = xstrdup("floating pane inside a "
+				    "floating group");
+				goto fail;
+			}
 			if (json_find_number(node, "z", &num, cause) != 0)
 				goto fail;
 			if (num < 0 || num > INT_MAX - 1) {
@@ -1058,10 +1094,13 @@ layout_parse_json_layout(struct json_node *node, struct layout_cell *lcparent,
 			}
 			zindex = num;
 			lc->flags |= LAYOUT_CELL_FLOATING;
-		} else
+		} else if (pctx->group != NULL)
+			zindex = pctx->group_zindex;
+		else
 			zindex = INT_MAX;
 
 		layout_parse_add_cctx(pctx, lc, active, last, index, zindex);
+		pctx->cctxs[pctx->size - 1].group = pctx->group;
 	} else {
 		if (json_find_array(node, "c", &array, cause) != 0)
 			goto fail;
@@ -1069,6 +1108,25 @@ layout_parse_json_layout(struct json_node *node, struct layout_cell *lcparent,
 		    json_array_next(member) == NULL) {
 			*cause = xstrdup("nodes must have more than one child");
 			goto fail;
+		}
+
+		/* rmux: a node with a z-index is a floating group. */
+		if (json_find(node, "z") != NULL) {
+			if (pctx->group != NULL) {
+				*cause = xstrdup("floating group inside a "
+				    "floating group");
+				goto fail;
+			}
+			if (json_find_number(node, "z", &num, cause) != 0)
+				goto fail;
+			if (num < 0 || num > INT_MAX - 1) {
+				xasprintf(cause, "invalid floating zindex %lld",
+				    (long long)num);
+				goto fail;
+			}
+			lc->flags |= LAYOUT_CELL_FLOATING;
+			pctx->group = lc;
+			pctx->group_zindex = num;
 		}
 		while (member != NULL) {
 			lcchild = layout_parse_json_layout(member, lc,
@@ -1078,6 +1136,8 @@ layout_parse_json_layout(struct json_node *node, struct layout_cell *lcparent,
 			TAILQ_INSERT_TAIL(&lc->cells, lcchild, entry);
 			member = json_array_next(member);
 		}
+		if (pctx->group == lc)
+			pctx->group = NULL;
 	}
 
 	return (lc);
@@ -1170,6 +1230,7 @@ layout_parse_apply_ctx(struct window *w, struct layout_parse_ctx *pctx)
 		if (window_pane_is_floating(wp))
 			TAILQ_INSERT_HEAD(&w->z_index, wp, zentry);
 	}
+	window_zindex_fix_groups(w);
 
 	/* Set the active pane. */
 	for (i = 0; i < pctx->size; i++) {
@@ -1225,7 +1286,9 @@ layout_parse_ctx_check_indexes(struct layout_parse_ctx *pctx)
 	while (n < pctx->size && pctx->cctxs[n].zindex == INT_MAX)
 		n++;
 	for (i = n + 1; i < pctx->size; i++) {
-		if (pctx->cctxs[i].zindex == pctx->cctxs[i - 1].zindex) {
+		if (pctx->cctxs[i].zindex == pctx->cctxs[i - 1].zindex &&
+		    (pctx->cctxs[i].group == NULL ||
+		    pctx->cctxs[i].group != pctx->cctxs[i - 1].group)) {
 			*pctx->cause = xstrdup("duplicate pane z-index");
 			return (0);
 		}

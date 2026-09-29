@@ -45,7 +45,7 @@ const struct cmd_entry cmd_swap_pane_entry = {
 static struct window_pane *
 cmd_swap_pane_next_tiled_pane(struct window_pane *wp)
 {
-	while (wp != NULL && !layout_cell_is_tiled(wp->layout_cell))
+	while (wp != NULL && window_pane_is_floating(wp))
 		wp = TAILQ_NEXT(wp, entry);
 	return (wp);
 }
@@ -53,7 +53,7 @@ cmd_swap_pane_next_tiled_pane(struct window_pane *wp)
 static struct window_pane *
 cmd_swap_pane_prev_tiled_pane(struct window_pane *wp)
 {
-	while (wp != NULL && !layout_cell_is_tiled(wp->layout_cell))
+	while (wp != NULL && window_pane_is_floating(wp))
 		wp = TAILQ_PREV(wp, window_panes, entry);
 	return (wp);
 }

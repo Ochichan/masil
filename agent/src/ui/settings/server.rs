@@ -61,7 +61,10 @@ impl Server {
 
     /// Runs one rmux command and returns its standard output.
     pub(crate) fn run(&self, args: &[&str]) -> Result<String, String> {
+        // -u keeps UTF-8 output, which some list formats rely on, without a
+        // UTF-8 locale.
         let mut child = Command::new(&self.binary)
+            .arg("-u")
             .arg("-S")
             .arg(&self.socket)
             .args(args)
@@ -158,15 +161,17 @@ impl Server {
         result
     }
 
-    /// Unbinds the layer's buttons, found by their `rmux-ui:` notes.
+    /// Unbinds the layer's buttons and keys, found by their `rmux-ui:` notes.
     fn unbind_layer_keys(&self) -> Result<(), String> {
-        let listing = self.run(&["list-keys", "-N", "-T", "root"])?;
-        for line in listing.lines() {
-            let words = line.split_whitespace().collect::<Vec<_>>();
-            if let Some(index) = words.iter().position(|word| *word == "rmux-ui:")
-                && index > 0
-            {
-                self.run(&["unbind-key", "-n", words[index - 1]])?;
+        for table in ["root", "prefix"] {
+            let listing = self.run(&["list-keys", "-N", "-T", table])?;
+            for line in listing.lines() {
+                let words = line.split_whitespace().collect::<Vec<_>>();
+                if let Some(index) = words.iter().position(|word| *word == "rmux-ui:")
+                    && index > 0
+                {
+                    self.run(&["unbind-key", "-T", table, words[index - 1]])?;
+                }
             }
         }
         Ok(())

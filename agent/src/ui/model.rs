@@ -101,6 +101,14 @@ pub enum Effect {
         epoch: String,
     },
     Retry,
+    NewAgent,
+    RenameAgent,
+    ResumeAgent,
+    PrepareDraft,
+    SendPrompt,
+    InterruptAgent,
+    ReadScreen,
+    CloseAgent,
     Quit,
     Preferences {
         language: Language,
@@ -147,6 +155,14 @@ pub(crate) enum Action {
     CopyId,
     Expand,
     Retry,
+    NewAgent,
+    RenameAgent,
+    ResumeAgent,
+    PrepareDraft,
+    SendPrompt,
+    InterruptAgent,
+    ReadScreen,
+    CloseAgent,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +211,7 @@ pub(crate) struct Observation {
     pub attention_kind: String,
     pub permission_count: u64,
     pub question_count: u64,
+    pub pending_count: u64,
     pub attention_revision: String,
     pub acknowledged: bool,
     pub pending: bool,
@@ -240,6 +257,10 @@ impl Observation {
                 .get("question_count")
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
+            pending_count: native
+                .get("pending_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
             attention_revision: attention
                 .get("revision")
                 .and_then(Value::as_str)
@@ -278,7 +299,9 @@ impl Observation {
     }
 
     pub(crate) fn attention_total(&self) -> u64 {
-        self.permission_count.saturating_add(self.question_count)
+        self.permission_count
+            .saturating_add(self.question_count)
+            .saturating_add(self.pending_count)
     }
 }
 
@@ -318,6 +341,7 @@ pub struct App {
     pub language: Language,
     pub theme: Theme,
     pub(crate) compact: bool,
+    pub(crate) managed: bool,
     pub(crate) connected: bool,
     pub(crate) connection_message: Option<String>,
     pub(crate) native_available: bool,
@@ -355,7 +379,10 @@ pub struct App {
     pub(crate) drag: Option<Drag>,
     pub(crate) last_click: Option<ClickRecord>,
     pub(crate) ack_in_flight: Option<(String, String)>,
+    pub(crate) prompt_in_flight: bool,
     pub(crate) toast: Option<String>,
+    /// Server status line on the last footer row, and whether one is offline.
+    pub(crate) endpoint_line: Option<(String, bool)>,
     pub(crate) last_area: Rect,
 }
 
@@ -366,6 +393,7 @@ impl App {
             language,
             theme,
             compact,
+            managed: false,
             connected: false,
             connection_message: None,
             native_available: false,
@@ -403,9 +431,15 @@ impl App {
             drag: None,
             last_click: None,
             ack_in_flight: None,
+            prompt_in_flight: false,
             toast: None,
+            endpoint_line: None,
             last_area: Rect::default(),
         }
+    }
+
+    pub(crate) fn set_managed(&mut self) {
+        self.managed = true;
     }
 
     pub fn apply_snapshot(&mut self, snapshot: Value) {
@@ -428,12 +462,14 @@ impl App {
             .flatten()
             .filter_map(Observation::parse)
             .collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
-            right
-                .pending
-                .cmp(&left.pending)
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        if !self.managed {
+            rows.sort_by(|left, right| {
+                right
+                    .pending
+                    .cmp(&left.pending)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
         self.epoch = next_epoch;
         self.revision = snapshot
             .get("revision")
@@ -462,6 +498,7 @@ impl App {
             self.cancel_interactions();
             self.overlay = None;
             self.ack_in_flight = None;
+            self.prompt_in_flight = false;
             self.details.clear();
             self.toast = None;
         } else if let Some(pressed) = &self.pressed
@@ -510,6 +547,12 @@ impl App {
 
     pub fn finish_action(&mut self) {
         self.ack_in_flight = None;
+        self.prompt_in_flight = false;
+        self.dirty = true;
+    }
+
+    pub(crate) fn start_prompt(&mut self) {
+        self.prompt_in_flight = true;
         self.dirty = true;
     }
 
@@ -559,6 +602,7 @@ impl App {
                 self.connected
                     && row.pending
                     && row.attention_available
+                    && (!self.managed || row.core_freshness == "fresh")
                     && !row.attention_revision.is_empty()
                     && self.ack_in_flight.is_none()
                     && !self.epoch.is_empty()
@@ -582,6 +626,40 @@ impl App {
             }
             Action::Expand => self.compact && self.native_available,
             Action::Retry => !self.connected,
+            Action::NewAgent => self.managed && self.connected,
+            Action::RenameAgent | Action::ReadScreen | Action::CloseAgent => {
+                self.managed
+                    && self.connected
+                    && self
+                        .selected()
+                        .is_some_and(|row| row.core_freshness == "fresh")
+            }
+            Action::ResumeAgent => {
+                self.managed
+                    && self.connected
+                    && self.selected().is_some_and(|row| {
+                        row.core_freshness == "fresh"
+                            && !row.session_id.is_empty()
+                            && row.session_id != "unverified"
+                    })
+            }
+            Action::PrepareDraft | Action::InterruptAgent => {
+                self.managed
+                    && self.connected
+                    && self.selected().is_some_and(|row| {
+                        row.core_process == "running" && row.core_freshness == "fresh"
+                    })
+            }
+            Action::SendPrompt => {
+                self.managed
+                    && self.connected
+                    && !self.prompt_in_flight
+                    && self.selected().is_some_and(|row| {
+                        row.core_process == "running"
+                            && row.core_freshness == "fresh"
+                            && row.activity == "idle"
+                    })
+            }
         }
     }
 
@@ -622,6 +700,14 @@ impl App {
             },
             Action::Expand => Effect::Expand,
             Action::Retry => Effect::Retry,
+            Action::NewAgent => Effect::NewAgent,
+            Action::RenameAgent => Effect::RenameAgent,
+            Action::ResumeAgent => Effect::ResumeAgent,
+            Action::PrepareDraft => Effect::PrepareDraft,
+            Action::SendPrompt => Effect::SendPrompt,
+            Action::InterruptAgent => Effect::InterruptAgent,
+            Action::ReadScreen => Effect::ReadScreen,
+            Action::CloseAgent => Effect::CloseAgent,
         };
         self.toast = None;
         self.dirty = true;
@@ -664,5 +750,39 @@ impl App {
         } else if selected >= self.list_scroll + self.list_page.max(1) {
             self.list_scroll = selected + 1 - self.list_page.max(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row(id: &str, pending: bool) -> Value {
+        json!({
+            "id":id,"source_id":"codex","session_id":"unverified","pane_id":"%1",
+            "native":{"exists":true,"activity":"idle","attention":if pending {"needs_input"} else {"none"},
+                "permission_count":0,"question_count":0,"pending_count":u8::from(pending),"freshness":"fresh","observed_at_ms":0},
+            "core":{"process":"running","pty_generation":"1","freshness":"fresh"},
+            "binding":"explicit_unverified","frontend_verified":false,
+            "attention":{"revision":id,"acknowledged":false,"pending":pending,"available":pending}
+        })
+    }
+
+    #[test]
+    fn managed_snapshot_preserves_saved_view_order() {
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        app.set_managed();
+        app.apply_snapshot(json!({
+            "epoch":"boot","revision":"1",
+            "observations":[row("alpha-idle", false), row("zulu-blocked", true)]
+        }));
+        assert_eq!(
+            app.rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha-idle", "zulu-blocked"]
+        );
     }
 }

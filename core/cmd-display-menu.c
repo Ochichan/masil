@@ -112,13 +112,13 @@ cmd_display_menu_stays_open(struct client *tc)
 
 static int
 cmd_display_menu_get_menu_pos(struct client *tc, struct cmdq_item *item,
-    struct args *args, u_int *px, u_int *py, u_int w, u_int h)
+    struct args *args, struct window *window, u_int *px, u_int *py, u_int w,
+    u_int h)
 {
 	struct cmd_find_state	*target = cmdq_get_target(item);
 	struct key_event	*event = cmdq_get_event(item);
 	struct session		*s = tc->session;
 	struct winlink		*wl = target->wl;
-	struct window		*window = target->w;
 	struct window_pane	*wp = target->wp;
 	struct style_ranges	*ranges = NULL;
 	struct style_range	*sr = NULL;
@@ -394,7 +394,8 @@ cmd_display_menu_exec(struct cmd *self, struct cmdq_item *item)
 	} else
 		lines = options_get_number(o, "menu-border-lines");
 	menu_get_size(menu, lines, &sx, &sy);
-	if (!cmd_display_menu_get_menu_pos(tc, item, args, &px, &py, sx, sy))
+	if (!cmd_display_menu_get_menu_pos(tc, item, args,
+	    tc->session->curw->window, &px, &py, sx, sy))
 		goto out;
 
 	if (args_has(args, 'O') || cmd_display_menu_stays_open(tc))
@@ -503,7 +504,7 @@ cmd_display_popup_exec(struct cmd *self, struct cmdq_item *item)
 	if ((lines == PANE_LINES_NONE && (sx < 1 || sy < 1)) ||
 	    (lines != PANE_LINES_NONE && (sx < 3 || sy < 3)))
 		goto out;
-	if (!cmd_display_menu_get_menu_pos(tc, item, args, &px, &py, sx, sy))
+	if (!cmd_display_menu_get_menu_pos(tc, item, args, w, &px, &py, sx, sy))
 		goto out;
 
 	lg.sx = sx;

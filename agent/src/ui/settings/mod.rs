@@ -8,7 +8,9 @@ pub(crate) mod store;
 
 use super::model::{Language, Theme};
 use super::terminal::Session;
-use super::view::{Palette, Tone, cell_width, clip, clip_line, inset, inset_x, pad, wrap};
+use super::view::{
+    Palette, Tone, cell_width, clip, clip_line, ellipsize, inset, inset_x, pad, wrap, wrap_rows,
+};
 use catalog::{Group, Kind, SETTINGS, Scope, Setting, UI_KEY};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -485,8 +487,10 @@ impl App {
                 "설정을 표시하기에 터미널이 작습니다. q로 닫습니다.",
             );
             frame.render_widget(
-                Paragraph::new(wrap(message, area.width as usize).join("\n"))
-                    .style(Style::default().fg(palette.warning)),
+                Paragraph::new(
+                    wrap_rows(message, area.width as usize, area.height as usize).join("\n"),
+                )
+                .style(Style::default().fg(palette.warning)),
                 area,
             );
             self.push_hit(area, area, Hit::Close);
@@ -532,11 +536,17 @@ impl App {
         // Footer: receipt, then keyboard hints.
         let footer = Rect::new(area.x, area.bottom() - 2, area.width, 2);
         let line = inset_x(footer, 1);
-        if let Some((tone, message)) = &self.receipt {
+        // A long receipt takes the hint row too.
+        let receipt = self
+            .receipt
+            .as_ref()
+            .map(|(tone, message)| (*tone, wrap_rows(message, line.width as usize, 2)))
+            .unwrap_or((Tone::Muted, Vec::new()));
+        for (index, message) in receipt.1.iter().enumerate() {
             frame.render_widget(
-                Paragraph::new(clip(message, line.width as usize))
-                    .style(Style::default().fg(palette.tone(*tone))),
-                Rect::new(line.x, line.y, line.width, 1),
+                Paragraph::new(message.as_str())
+                    .style(Style::default().fg(palette.tone(receipt.0))),
+                Rect::new(line.x, line.y + index as u16, line.width, 1),
             );
         }
         let full = text(
@@ -553,11 +563,13 @@ impl App {
                 "Tab  ↑↓  ←→  Enter  q 닫기",
             )
         };
-        frame.render_widget(
-            Paragraph::new(clip(hint, line.width as usize))
-                .style(Style::default().fg(palette.muted)),
-            Rect::new(line.x, line.y + 1, line.width, 1),
-        );
+        if receipt.1.len() < 2 {
+            frame.render_widget(
+                Paragraph::new(ellipsize(hint, line.width as usize))
+                    .style(Style::default().fg(palette.muted)),
+                Rect::new(line.x, line.y + 1, line.width, 1),
+            );
+        }
 
         // Body.
         let body = Rect::new(
@@ -735,7 +747,8 @@ impl App {
         }
         let heights = blocks
             .iter()
-            .map(|lines| 2 + lines.len() as u16 + 1)
+            .zip(&rows)
+            .map(|(lines, row)| 1 + self.control_lines(*row, inner.width) + lines.len() as u16 + 1)
             .collect::<Vec<_>>();
         let total: u16 = heights.iter().sum();
         let top: u16 = heights[..self.row].iter().sum();
@@ -791,12 +804,10 @@ impl App {
                     Hit::Row(index),
                 );
             }
-            let controls_y = y + 1;
-            if controls_y >= inner.y as i32 && controls_y < inner.bottom() as i32 {
-                self.draw_controls(frame, *row, index, inner, controls_y as u16, palette);
-            }
+            self.draw_controls(frame, *row, index, inner, y + 1, palette);
+            let help_y = y + 1 + self.control_lines(*row, inner.width) as i32;
             for (offset, (tone, line)) in blocks[index].iter().enumerate() {
-                let line_y = y + 2 + offset as i32;
+                let line_y = help_y + offset as i32;
                 if line_y >= inner.y as i32 && line_y < inner.bottom() as i32 {
                     frame.render_widget(
                         Paragraph::new(pad(line, inner.width as usize))
@@ -809,97 +820,147 @@ impl App {
         }
     }
 
+    /// The chips of a row's choices; a number row has its own controls.
+    fn row_chips(&self, row: Row, index: usize) -> Vec<(&'static str, Hit, bool)> {
+        let language = self.language;
+        match row {
+            Row::Setting(setting) => {
+                let Kind::Choices(choices) = setting.kind else {
+                    return Vec::new();
+                };
+                let current = self
+                    .values
+                    .get(setting.key)
+                    .map_or(setting.default, String::as_str);
+                choices
+                    .iter()
+                    .map(|choice| {
+                        (
+                            choice.label(language),
+                            Hit::Value(index, choice.value.to_owned()),
+                            choice.value == current,
+                        )
+                    })
+                    .collect()
+            }
+            Row::Layer => [("on", "On", "켜기"), ("off", "Off", "끄기")]
+                .into_iter()
+                .map(|(value, en, ko)| {
+                    (
+                        text(language, en, ko),
+                        Hit::Value(index, value.to_owned()),
+                        (value == "on") == self.layer_on,
+                    )
+                })
+                .collect(),
+            Row::Reset => vec![(
+                text(language, "Reset all rmux settings", "모든 rmux 설정 초기화"),
+                Hit::Row(index),
+                false,
+            )],
+        }
+    }
+
+    /// Lines a row's controls take once its chips wrap to `width`.
+    fn control_lines(&self, row: Row, width: u16) -> u16 {
+        let chips = self.row_chips(row, 0);
+        if chips.is_empty() {
+            return 1;
+        }
+        flow(&chip_widths(&chips), width).1
+    }
+
     fn draw_controls(
         &mut self,
         frame: &mut Frame,
         row: Row,
         index: usize,
         inner: Rect,
-        y: u16,
+        y: i32,
         palette: Palette,
     ) {
-        let language = self.language;
-        let mut x = inner.x;
-        match row {
-            Row::Setting(setting) => {
-                let current = self
-                    .values
-                    .get(setting.key)
-                    .cloned()
-                    .unwrap_or_else(|| setting.default.to_owned());
-                match setting.kind {
-                    Kind::Choices(choices) => {
-                        for choice in choices {
-                            let width = self.chip(
-                                frame,
-                                x,
-                                y,
-                                choice.label(language),
-                                Hit::Value(index, choice.value.to_owned()),
-                                choice.value == current,
-                                inner,
-                                palette,
-                            );
-                            x = x.saturating_add(width + 1);
-                        }
-                    }
-                    Kind::Number { .. } => {
-                        let width = self.chip(
-                            frame,
-                            x,
-                            y,
-                            "-",
-                            Hit::Step(index, -1),
-                            false,
-                            inner,
-                            palette,
-                        );
-                        x = x.saturating_add(width + 1);
-                        let value = format!("{current:>3}");
-                        if x < inner.right() {
-                            frame.render_widget(
-                                Paragraph::new(clip(&value, (inner.right() - x) as usize)).style(
-                                    Style::default()
-                                        .fg(palette.text)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                                Rect::new(x, y, cell_width(&value) as u16, 1),
-                            );
-                        }
-                        x = x.saturating_add(cell_width(&value) as u16 + 1);
-                        self.chip(frame, x, y, "+", Hit::Step(index, 1), false, inner, palette);
-                    }
-                }
+        let visible = |y: i32| y >= inner.y as i32 && y < inner.bottom() as i32;
+        if let Row::Setting(setting) = row
+            && let Kind::Number { .. } = setting.kind
+        {
+            if !visible(y) {
+                return;
             }
-            Row::Layer => {
-                for (value, en, ko) in [("on", "On", "켜기"), ("off", "Off", "끄기")] {
-                    let width = self.chip(
-                        frame,
-                        x,
-                        y,
-                        text(language, en, ko),
-                        Hit::Value(index, value.to_owned()),
-                        (value == "on") == self.layer_on,
-                        inner,
-                        palette,
-                    );
-                    x = x.saturating_add(width + 1);
-                }
+            let y = y as u16;
+            let current = self
+                .values
+                .get(setting.key)
+                .cloned()
+                .unwrap_or_else(|| setting.default.to_owned());
+            let mut x = inner.x;
+            let width = self.chip(
+                frame,
+                x,
+                y,
+                "-",
+                Hit::Step(index, -1),
+                false,
+                inner,
+                palette,
+            );
+            x = x.saturating_add(width + 1);
+            let value = format!("{current:>3}");
+            if x < inner.right() {
+                frame.render_widget(
+                    Paragraph::new(clip(&value, (inner.right() - x) as usize)).style(
+                        Style::default()
+                            .fg(palette.text)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Rect::new(x, y, cell_width(&value) as u16, 1),
+                );
             }
-            Row::Reset => {
+            x = x.saturating_add(cell_width(&value) as u16 + 1);
+            self.chip(frame, x, y, "+", Hit::Step(index, 1), false, inner, palette);
+            return;
+        }
+        // Chips that do not fit move to the next line.
+        let chips = self.row_chips(row, index);
+        let (places, _) = flow(&chip_widths(&chips), inner.width);
+        for ((label, hit, selected), (x, line)) in chips.into_iter().zip(places) {
+            let chip_y = y + line as i32;
+            if visible(chip_y) {
                 self.chip(
                     frame,
-                    x,
-                    y,
-                    text(language, "Reset all rmux settings", "모든 rmux 설정 초기화"),
-                    Hit::Row(index),
-                    false,
+                    inner.x + x,
+                    chip_y as u16,
+                    label,
+                    hit,
+                    selected,
                     inner,
                     palette,
                 );
             }
         }
     }
+}
+
+fn chip_widths(chips: &[(&str, Hit, bool)]) -> Vec<u16> {
+    chips
+        .iter()
+        .map(|(label, _, _)| cell_width(label) as u16 + 2)
+        .collect()
+}
+
+/// Places items of `widths` left to right with one-cell gaps, wrapping
+/// within `width`. Returns each item's column and line, and the line count.
+fn flow(widths: &[u16], width: u16) -> (Vec<(u16, u16)>, u16) {
+    let mut places = Vec::new();
+    let (mut x, mut line) = (0u16, 0u16);
+    for &item in widths {
+        if x > 0 && x.saturating_add(item) > width {
+            x = 0;
+            line += 1;
+        }
+        places.push((x, line));
+        x = x.saturating_add(item + 1);
+    }
+    (places, line + 1)
 }
 
 fn usage() -> String {

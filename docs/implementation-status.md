@@ -2,7 +2,7 @@
 
 2026-09-28. tmux의 고정 소스 전체를 실행 가능한 rmux 코어로 도입했다. PTY, VT parser, grid/history, renderer, 키 테이블, command queue, control mode를 유지하고 제품 socket 격리와 읽기 전용 관찰 IPC를 추가했다. 원본 C 소스와 고지는 [core](../core/README), 가져온 파일별 해시는 [UPSTREAM.json](../core/UPSTREAM.json)에 있다.
 
-전체 rmux 제품의 완료 상태는 아니다. OpenCode native session의 읽기 전용 상태 관찰과 명시적으로 시작하는 agentd를 추가했다. verified TUI binding, durable prompt 전송, 승인, SQLite, 대화 복구, 원격 관리, worktree job은 아직 구현하지 않았다. 원래 에이전트 TUI를 pane에서 실행하는 일은 일반 terminal child로 지원한다.
+전체 rmux 제품의 완료 상태는 아니다. OpenCode native session의 읽기 전용 관찰과 agentd에 더해, 2026-09-29에 native Agent 관리 CLI·사이드패널을 추가했다. 24종 provider 식별, 원래 TUI 실행, 상태·확인·키 전달·draft 준비·검사 후 prompt 제출, native session 재개와 항목별 snapshot 복구를 제공한다. [Agent 관리의 구현 범위와 남은 차이](managed-agents.md)를 참고한다. verified native TUI binding, durable prompt 수락, provider 승인 응답, SQLite, worktree job은 미구현이다. 명시적으로 등록한 원격/로컬 endpoint의 Agent 통합 목록·조작·native 연결은 제공한다.
 
 ## 빌드와 실행
 
@@ -33,7 +33,7 @@ make test            # 호환·IPC·실패 주입·측정 도구·Rust 검사
 | 기본 command/key/option | 같은 build의 stock dump와 비교 통과. 92개 등록 명령 유지 |
 | prefix | `C-b`, 추가 기본 binding 없음 |
 | mouse | 이 commit의 빌드 기본값인 `on` 유지 |
-| rmux UI 레이어 | `-f` 없이 시작하면 사용자 설정보다 먼저 적용. `+`·설정·rmux 메뉴 버튼, pane 제목줄, 메뉴 유지, 테마. 기본 binding이 없는 `MouseDown1Control0`~`6`만 사용. [마우스 UI](mouse-ui.md) |
+| rmux UI 레이어 | `-f` 없이 시작하면 사용자 설정보다 먼저 적용. `+`·설정·rmux 메뉴 버튼, pane 제목줄, 메뉴 유지, 테마. floating 묶음, 제목줄 드래그, 세션 저장·불러오기(prefix `C-s`·`C-r`, 15분 자동 저장). 기본 binding이 없는 키만 사용. [마우스 UI](mouse-ui.md) |
 | `status-position` | `top`, `bottom`에 rmux 확장 `left`, `right`(세로 상태줄) 추가. 폭은 `@rmux-status-width` |
 | 설정 화면 | `rmux-agent settings`. 선택은 `~/.config/rmux/settings.conf`의 `@rmux-*` 옵션 |
 | default / `-L` socket | `rmux-UID` directory. stock의 `tmux-UID`와 분리 |

@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -94,6 +94,10 @@ pub(super) enum Tone {
     Warn,
     Bad,
 }
+
+/// Identity cells a one-line list row keeps before attention moves to a
+/// second line.
+const MIN_ID_COLUMN: usize = 12;
 
 /// A labelled control. The key hint is drawn in the accent role so keyboard
 /// routes stay visible next to every mouse target.
@@ -302,20 +306,40 @@ impl App {
             bottom.saturating_sub(inner.y),
         );
         if message.height > 0 {
+            let lines = wrap_rows(
+                tr(self.language, Text::TerminalTooSmall),
+                message.width as usize,
+                message.height as usize,
+            );
             frame.render_widget(
-                Paragraph::new(tr(self.language, Text::TerminalTooSmall))
-                    .style(
-                        Style::default()
-                            .fg(palette.warning)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .wrap(Wrap { trim: true }),
+                Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()).style(
+                    Style::default()
+                        .fg(palette.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 message,
             );
         }
     }
 
     fn connection_label(&self, short: bool, palette: Palette) -> (&'static str, Color) {
+        if self.managed && !short {
+            return (
+                tr(
+                    self.language,
+                    if self.connected {
+                        Text::NativeConnected
+                    } else {
+                        Text::NativeServerUnavailable
+                    },
+                ),
+                if self.connected {
+                    palette.success
+                } else {
+                    palette.warning
+                },
+            );
+        }
         let key = match (self.connected, self.rows.is_empty(), short) {
             (true, _, false) => Text::Connected,
             (true, _, true) => Text::ShortConnected,
@@ -449,26 +473,38 @@ impl App {
         let view = if self.compact && self.last_area.width < 100 {
             tr(self.language, Text::Sidebar)
         } else {
-            tr(self.language, Text::Desk)
+            tr(
+                self.language,
+                if self.managed {
+                    Text::ManagedDesk
+                } else {
+                    Text::Desk
+                },
+            )
         };
         let (connection, connection_color) = self.connection_label(false, palette);
-        let title = vec![
-            product,
-            Span::styled(format!("  {view}"), Style::default().fg(palette.text)),
-            Span::styled(
-                format!("  {connection}"),
-                Style::default().fg(connection_color),
-            ),
+        let (short, _) = self.connection_label(true, palette);
+        let view = Span::styled(format!("  {view}"), Style::default().fg(palette.text));
+        let status = |text: String| Span::styled(text, Style::default().fg(connection_color));
+        let titles = [
+            vec![
+                product.clone(),
+                view.clone(),
+                status(format!("  {connection}")),
+            ],
+            vec![product.clone(), view, status(format!("  {short}"))],
+            vec![product, status(format!("  {short}"))],
+            vec![status(short.to_owned())],
         ];
-        let title_width = title
-            .iter()
-            .map(|span| cell_width(&span.content))
-            .sum::<usize>() as u16;
-        let level = fit_level(
-            &levels,
-            1,
-            line.width.saturating_sub(title_width.saturating_add(2)),
-        );
+        // Title and control labels shorten in turns until both fit.
+        let (title, level) = [(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (2, 3), (3, 3)]
+            .into_iter()
+            .find(|&(title, level)| {
+                spans_width(&titles[title]) + 2 + row_width(&levels[level], 1) as usize
+                    <= line.width as usize
+            })
+            .unwrap_or((3, 3));
+        let title = titles[title].clone();
         let mut right = line.right();
         for (index, control) in levels[level].iter().enumerate() {
             let needed = control.width();
@@ -488,10 +524,17 @@ impl App {
             self.header_controls += 1;
             right = right.saturating_sub(1);
         }
-        let title_room = right.saturating_sub(line.x).saturating_sub(1);
+        let title_room = right.saturating_sub(line.x).saturating_sub(1) as usize;
+        let title = if spans_width(&title) > title_room {
+            let mut title = clip_line(title, title_room.saturating_sub(1)).spans;
+            title.push(Span::styled("…", Style::default().fg(connection_color)));
+            Line::from(title)
+        } else {
+            Line::from(title)
+        };
         frame.render_widget(
-            Paragraph::new(clip_line(title, title_room as usize)),
-            Rect::new(line.x, line.y, title_room, 1),
+            Paragraph::new(title),
+            Rect::new(line.x, line.y, title_room as u16, 1),
         );
     }
 
@@ -778,45 +821,11 @@ impl App {
             self.list_page = 1;
             return;
         }
-        let row_height = if two_line { 2 } else { 1 };
-        let previous_page = self.list_page;
-        self.list_page = (inner.height / row_height).max(1) as usize;
-        if self.list_page == previous_page {
-            self.clamp_selection_and_scroll();
-        } else {
-            self.reveal_selection();
-        }
         let rows = self
             .filtered_rows()
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        if rows.is_empty() {
-            let (message, hint) = self.empty_list_text();
-            let text = if hint.is_empty() {
-                message.to_owned()
-            } else {
-                format!("{message}\n{hint}")
-            };
-            frame.render_widget(
-                Paragraph::new(text)
-                    .style(Style::default().fg(palette.muted))
-                    .alignment(Alignment::Center)
-                    .wrap(Wrap { trim: true }),
-                inset_x(
-                    Rect::new(
-                        inner.x,
-                        inner.y + (inner.height / 3).min(inner.height.saturating_sub(1)),
-                        inner.width,
-                        inner.height - (inner.height / 3).min(inner.height.saturating_sub(1)),
-                    ),
-                    1,
-                ),
-            );
-            return;
-        }
-        let has_scroll = rows.len() > self.list_page;
-        let content_width = inner.width.saturating_sub(u16::from(has_scroll)) as usize;
         // Columns are sized from every filtered row, not just the visible
         // page, so they stay put while the list scrolls.
         let state_width = rows
@@ -840,14 +849,61 @@ impl App {
                 .max()
                 .unwrap_or(0)
         };
+        let (short_attention, long_attention) = (attention_width(false), attention_width(true));
+        // One line keeps the whole attention column and at least a short
+        // identity prefix; otherwise attention moves to a second line.
+        let one_line_scroll = rows.len() > inner.height as usize;
+        let two_line = two_line
+            || 2 + id_width.min(MIN_ID_COLUMN) + 2 + state_width + 2 + short_attention
+                > inner.width.saturating_sub(u16::from(one_line_scroll)) as usize;
+        let row_height = if two_line { 2 } else { 1 };
+        let previous_page = self.list_page;
+        self.list_page = (inner.height / row_height).max(1) as usize;
+        if self.list_page == previous_page {
+            self.clamp_selection_and_scroll();
+        } else {
+            self.reveal_selection();
+        }
+        if rows.is_empty() {
+            let (message, hint) = self.empty_list_text();
+            let width = inner.width.saturating_sub(2) as usize;
+            let height = inner.height as usize;
+            let mut lines = wrap_rows(message, width, height);
+            let hint = if hint.is_empty() {
+                Vec::new()
+            } else {
+                wrap(hint, width)
+            };
+            // The hint is dropped before the message is cut.
+            if lines.len() + hint.len() <= height {
+                lines.extend(hint);
+            }
+            let top = (height / 3).min(height - lines.len()) as u16;
+            frame.render_widget(
+                Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                    .style(Style::default().fg(palette.muted))
+                    .alignment(Alignment::Center),
+                inset_x(
+                    Rect::new(inner.x, inner.y + top, inner.width, inner.height - top),
+                    1,
+                ),
+            );
+            return;
+        }
+        let has_scroll = rows.len() > self.list_page;
+        let content_width = inner.width.saturating_sub(u16::from(has_scroll)) as usize;
         // Keep "pending" only while every row's attention fits beside the
         // identity; the kind, count and seen state always stay.
         let verbose = if two_line {
-            attention_width(true) + 2 <= content_width
+            long_attention + 2 <= content_width
         } else {
-            2 + id_width + 2 + state_width + 2 + attention_width(true) <= content_width
+            2 + id_width + 2 + state_width + 2 + long_attention <= content_width
         };
-        let attention_width = attention_width(verbose);
+        let attention_width = if verbose {
+            long_attention
+        } else {
+            short_attention
+        };
         for (visible, observation) in rows
             .iter()
             .skip(self.list_scroll)
@@ -910,7 +966,7 @@ impl App {
             if two_line {
                 // Identity left, state right; attention on its own line.
                 let room = content_width.saturating_sub(2 + 2 + cell_width(state) + 1);
-                let id = clip(&observation.id, room);
+                let id = ellipsize(&observation.id, room);
                 let pad = content_width.saturating_sub(2 + cell_width(&id) + cell_width(state) + 1);
                 let first = vec![
                     marker,
@@ -923,7 +979,13 @@ impl App {
                     Rect::new(rect.x, rect.y, rect.width, 1),
                 );
                 if height > 1 {
-                    let mut second = vec![Span::raw("  ")];
+                    // The indent goes before any attention text is cut.
+                    let indent = if spans_width(&attention) + 2 <= content_width {
+                        "  "
+                    } else {
+                        ""
+                    };
+                    let mut second = vec![Span::raw(indent)];
                     second.extend(attention);
                     frame.render_widget(
                         Paragraph::new(clip_line(second, content_width)),
@@ -933,10 +995,13 @@ impl App {
             } else {
                 // Marker, identity, activity and attention in aligned columns.
                 let room = content_width.saturating_sub(2 + 2 + state_width + 2);
-                let id_column = id_width.min((room / 2).max(room.saturating_sub(attention_width)));
+                let id_column = id_width.min(room.saturating_sub(attention_width));
                 let line = vec![
                     marker,
-                    Span::styled(pad(&observation.id, id_column), id_style),
+                    Span::styled(
+                        pad(&ellipsize(&observation.id, id_column), id_column),
+                        id_style,
+                    ),
                     Span::raw("  "),
                     Span::styled(pad(state, state_width), state_style),
                     Span::raw("  "),
@@ -970,12 +1035,29 @@ impl App {
     fn empty_list_text(&self) -> (&'static str, &'static str) {
         if self.rows.is_empty() {
             if self.connected {
-                (
-                    tr(self.language, Text::NoAgentsObserved),
-                    tr(self.language, Text::NoAgentsHint),
-                )
+                if self.managed {
+                    (
+                        tr(self.language, Text::NoManagedAgents),
+                        tr(self.language, Text::NoManagedAgentsHint),
+                    )
+                } else {
+                    (
+                        tr(self.language, Text::NoAgentsObserved),
+                        tr(self.language, Text::NoAgentsHint),
+                    )
+                }
             } else {
-                (tr(self.language, Text::Connecting), "")
+                (
+                    tr(
+                        self.language,
+                        if self.managed {
+                            Text::ConnectingNative
+                        } else {
+                            Text::Connecting
+                        },
+                    ),
+                    "",
+                )
             }
         } else if !self.search.is_empty() {
             (
@@ -1160,6 +1242,13 @@ impl App {
             row.question_count.to_string(),
             Tone::Normal,
         ));
+        if row.pending_count > 0 {
+            entries.push(Entry::Field(
+                tr(language, Text::NeedsInput),
+                row.pending_count.to_string(),
+                Tone::Warn,
+            ));
+        }
 
         entries.push(Entry::Gap);
         entries.push(Entry::Heading(tr(language, Text::NativeSection).to_owned()));
@@ -1453,21 +1542,7 @@ impl App {
             area,
         );
         let line = inset_x(area, gutter);
-        let status = self
-            .toast
-            .as_deref()
-            .or(self.connection_message.as_deref())
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                if self.compact && self.last_area.width < 60 {
-                    match self.language {
-                        Language::English => "j/k Move  Enter Details  ? Help".to_owned(),
-                        Language::Korean => "j/k 이동  Enter 상세  ? 도움말".to_owned(),
-                    }
-                } else {
-                    self.current_hint()
-                }
-            });
+        let width = line.width as usize;
         let color = if self.toast.is_some() {
             palette.accent
         } else if self.connected {
@@ -1475,50 +1550,87 @@ impl App {
         } else {
             palette.warning
         };
-        frame.render_widget(
-            Paragraph::new(clip(&status, line.width as usize)).style(Style::default().fg(color)),
-            Rect::new(line.x, line.y, line.width, 1),
-        );
-        if area.height > 1 && self.compact {
+        // A message may take every footer row except the server status
+        // line's; a hint shortens to one row.
+        let rows = area.height - u16::from(area.height > 1 && self.endpoint_line.is_some());
+        let lines = match self.toast.as_deref().or(self.connection_message.as_deref()) {
+            Some(message) => wrap_rows(message, width, rows as usize),
+            None => {
+                let hints = self.current_hint();
+                let first = usize::from(self.compact && self.last_area.width < 60);
+                let hint = hints[first..]
+                    .iter()
+                    .find(|hint| cell_width(hint) <= width)
+                    .unwrap_or(&hints[2]);
+                vec![ellipsize(hint, width)]
+            }
+        };
+        for (index, text) in lines.iter().enumerate() {
             frame.render_widget(
-                Paragraph::new(clip(
+                Paragraph::new(text.as_str()).style(Style::default().fg(color)),
+                Rect::new(line.x, line.y + index as u16, line.width, 1),
+            );
+        }
+        if area.height as usize <= lines.len() {
+            return;
+        }
+        let y = area.bottom() - 1;
+        if let Some((note, offline)) = &self.endpoint_line {
+            frame.render_widget(
+                Paragraph::new(ellipsize(note, area.width as usize)).style(
+                    Style::default().bg(palette.panel).fg(if *offline {
+                        palette.warning
+                    } else {
+                        palette.muted
+                    }),
+                ),
+                Rect::new(area.x, y, area.width, 1),
+            );
+        } else if self.compact {
+            frame.render_widget(
+                Paragraph::new(ellipsize(
                     tr(self.language, Text::SharedSidebarShort),
-                    line.width as usize,
+                    width,
                 ))
                 .style(Style::default().fg(palette.muted)),
-                Rect::new(line.x, line.y + 1, line.width, 1),
+                Rect::new(line.x, y, line.width, 1),
             );
         }
     }
 
-    fn current_hint(&self) -> String {
-        if let Some(target) = &self.hover {
-            return match target {
-                HitTarget::Action(Action::MarkSeen) if !self.action_enabled(Action::MarkSeen) => {
-                    tr(self.language, Text::AckUnavailable).to_owned()
-                }
-                HitTarget::Action(Action::GoToPane) if !self.action_enabled(Action::GoToPane) => {
-                    tr(self.language, Text::NavigationUnavailable).to_owned()
-                }
-                HitTarget::Divider => tr(self.language, Text::DividerHint).to_owned(),
-                HitTarget::Search | HitTarget::ClearSearch => {
-                    tr(self.language, Text::SearchHint).to_owned()
-                }
-                HitTarget::Row { .. } => tr(self.language, Text::ListHint).to_owned(),
-                _ => self.focus_hint().to_owned(),
-            };
+    /// The hint for the hovered target or focus: full, short, then minimal.
+    fn current_hint(&self) -> [&'static str; 3] {
+        let hint = |full, short| {
+            [
+                tr(self.language, full),
+                tr(self.language, short),
+                tr(self.language, Text::HelpHintShort),
+            ]
+        };
+        match &self.hover {
+            Some(HitTarget::Action(Action::MarkSeen)) if !self.action_enabled(Action::MarkSeen) => {
+                return hint(Text::AckUnavailable, Text::AckUnavailableShort);
+            }
+            Some(HitTarget::Action(Action::GoToPane)) if !self.action_enabled(Action::GoToPane) => {
+                return hint(
+                    Text::NavigationUnavailable,
+                    Text::NavigationUnavailableShort,
+                );
+            }
+            Some(HitTarget::Divider) => return hint(Text::DividerHint, Text::DividerHintShort),
+            Some(HitTarget::Search | HitTarget::ClearSearch) => {
+                return hint(Text::SearchHint, Text::SearchHintShort);
+            }
+            Some(HitTarget::Row { .. }) => return hint(Text::ListHint, Text::ListHintShort),
+            _ => {}
         }
-        self.focus_hint().to_owned()
-    }
-
-    fn focus_hint(&self) -> &'static str {
         match self.focus {
-            Focus::Filters => tr(self.language, Text::FilterHint),
-            Focus::Search => tr(self.language, Text::SearchHint),
-            Focus::List => tr(self.language, Text::ListHint),
-            Focus::Inspector => tr(self.language, Text::InspectorHint),
-            Focus::Actions => tr(self.language, Text::ActionHint),
-            Focus::Header => tr(self.language, Text::ClipboardHint),
+            Focus::Filters => hint(Text::FilterHint, Text::FilterHintShort),
+            Focus::Search => hint(Text::SearchHint, Text::SearchHintShort),
+            Focus::List => hint(Text::ListHint, Text::ListHintShort),
+            Focus::Inspector => hint(Text::InspectorHint, Text::InspectorHintShort),
+            Focus::Actions => hint(Text::ActionHint, Text::ActionHintShort),
+            Focus::Header => hint(Text::ClipboardHint, Text::ClipboardHintShort),
         }
     }
 
@@ -1531,7 +1643,7 @@ impl App {
     }
 
     fn help_text(&self, width: usize, palette: Palette) -> Vec<Line<'static>> {
-        let items = help_items(self.language);
+        let items = help_items(self.language, self.managed);
         let key_width = items
             .iter()
             .filter_map(|item| match item {
@@ -1549,19 +1661,25 @@ impl App {
         for item in items {
             match item {
                 HelpItem::Gap => lines.push(Line::default()),
-                HelpItem::Group(name) => lines.push(Line::styled(
-                    clip(name, width),
-                    Style::default()
-                        .fg(palette.muted)
-                        .add_modifier(Modifier::BOLD),
-                )),
+                HelpItem::Group(name) => lines.extend(wrap(name, width).into_iter().map(|line| {
+                    Line::styled(
+                        line,
+                        Style::default()
+                            .fg(palette.muted)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                })),
                 HelpItem::Note(text) => lines.extend(
                     wrap(text, width)
                         .into_iter()
                         .map(|line| Line::styled(line, Style::default().fg(palette.text))),
                 ),
                 HelpItem::Key(key, text) if stacked => {
-                    lines.push(Line::styled(clip(key, width), key_style));
+                    lines.extend(
+                        wrap(key, width)
+                            .into_iter()
+                            .map(|line| Line::styled(line, key_style)),
+                    );
                     lines.extend(wrap(text, width.saturating_sub(2)).into_iter().map(|line| {
                         Line::from(vec![
                             Span::raw("  "),
@@ -1603,9 +1721,22 @@ impl App {
         let height = (lines.len() as u16 + 2).clamp(7, max_height);
         let modal = centered(area, width, height);
         frame.render_widget(Clear, modal);
+        // The close control sits in the top border so every row holds help;
+        // the title and the control label shorten to share that border.
+        let full_close = Control::new("Esc", tr(self.language, Text::Close));
+        let border = modal.width.saturating_sub(4) as usize;
+        let (title, close) = [
+            (Text::HelpTitle, full_close.clone()),
+            (Text::Help, full_close),
+            (Text::Help, Control::new("Esc", "")),
+        ]
+        .into_iter()
+        .map(|(title, close)| (format!(" {} ", tr(self.language, title)), close))
+        .find(|(title, close)| cell_width(title) + 1 + close.width() as usize <= border)
+        .unwrap_or_else(|| (String::new(), Control::new("Esc", "")));
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" {} ", tr(self.language, Text::HelpTitle)))
+            .title(title)
             .title_style(
                 Style::default()
                     .fg(palette.accent)
@@ -1616,8 +1747,6 @@ impl App {
         let inner = inset(modal, 1);
         frame.render_widget(block, modal);
         self.push_hit(modal, HitTarget::OverlaySurface, 100);
-        // The close control sits in the top border so every row holds help.
-        let close = Control::new("Esc", tr(self.language, Text::Close));
         let close_width = close.width().min(modal.width.saturating_sub(2));
         let close_rect = Rect::new(
             modal.right().saturating_sub(close_width + 2),
@@ -1721,13 +1850,30 @@ impl App {
         self.push_hit(menu, HitTarget::OverlaySurface, 100);
         let inner = inset(menu, 1);
         self.context_selection = self.context_selection.min(actions.len().saturating_sub(1));
-        for (index, (action, control)) in actions
+        // A menu taller than the screen scrolls to keep the selection shown.
+        let first = (self.context_selection + 1).saturating_sub(inner.height as usize);
+        let hidden_below = actions.len() > first + inner.height as usize;
+        for (shown, y) in [
+            (first > 0, menu.y),
+            (hidden_below, menu.bottom().saturating_sub(1)),
+        ] {
+            if shown && menu.width > 3 {
+                frame.render_widget(
+                    Paragraph::new(if y == menu.y { "↑" } else { "↓" })
+                        .style(Style::default().fg(palette.accent).bg(palette.panel)),
+                    Rect::new(menu.right() - 2, y, 1, 1),
+                );
+            }
+        }
+        for (row, (index, (action, control))) in actions
             .into_iter()
             .zip(items)
             .enumerate()
+            .skip(first)
             .take(inner.height as usize)
+            .enumerate()
         {
-            let rect = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
+            let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
             self.draw_control(
                 frame,
                 rect,
@@ -1884,6 +2030,10 @@ fn header_target(focus_index: usize) -> HitTarget {
     }
 }
 
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|span| cell_width(&span.content)).sum()
+}
+
 /// Clips styled spans to `width` terminal cells.
 pub(super) fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
     let mut used = 0;
@@ -2011,6 +2161,14 @@ fn action_shortcut(action: Action) -> &'static str {
         Action::CopyId => "c",
         Action::Expand => "z",
         Action::Retry => "r",
+        Action::NewAgent => "n",
+        Action::RenameAgent => "r",
+        Action::ResumeAgent => "s",
+        Action::PrepareDraft => "d",
+        Action::SendPrompt => "p",
+        Action::InterruptAgent => "x",
+        Action::ReadScreen => "v",
+        Action::CloseAgent => "X",
     }
 }
 
@@ -2073,8 +2231,36 @@ fn search_window(text: &str, cursor: usize, width: usize) -> (String, usize, usi
 }
 
 pub(super) fn clip(text: &str, width: usize) -> String {
+    fit(text, width).0
+}
+
+/// Clips to `width` cells and marks a cut with an ellipsis.
+pub(super) fn ellipsize(text: &str, width: usize) -> String {
+    let (output, cut) = fit(text, width);
+    if !cut || width == 0 {
+        return output;
+    }
+    let (mut output, _) = fit(text, width - 1);
+    output.push('…');
+    output
+}
+
+/// Word-wraps into at most `rows` lines; a cut ends with an ellipsis.
+pub(super) fn wrap_rows(text: &str, width: usize, rows: usize) -> Vec<String> {
+    let mut lines = wrap(text, width);
+    if lines.len() > rows {
+        let rest = lines.split_off(rows).join(" ");
+        if let Some(last) = lines.pop() {
+            lines.push(ellipsize(&format!("{last} {rest}"), width));
+        }
+    }
+    lines
+}
+
+/// The longest prefix of `text` within `width` cells, and whether it was cut.
+fn fit(text: &str, width: usize) -> (String, bool) {
     if width == 0 {
-        return String::new();
+        return (String::new(), !text.is_empty());
     }
     let mut output = String::new();
     let mut used = 0;
@@ -2086,12 +2272,12 @@ pub(super) fn clip(text: &str, width: usize) -> String {
         };
         let next = UnicodeWidthStr::width(safe);
         if used + next > width {
-            break;
+            return (output, true);
         }
         output.push_str(safe);
         used += next;
     }
-    output
+    (output, false)
 }
 
 fn sanitize(text: &str) -> String {

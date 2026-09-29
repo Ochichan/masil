@@ -1110,6 +1110,7 @@ struct screen {
 
 	struct hyperlinks		*hyperlinks;
 	struct progress_bar		 progress_bar;
+	char				 rmux_osc_progress[32];
 };
 
 /* Screen write context. */
@@ -2563,6 +2564,7 @@ struct spawn_context {
 #define SPAWN_SPLIT 0x400
 #define SPAWN_MODAL 0x800
 #define SPAWN_FLOATOVERZOOM 0x1000
+#define SPAWN_GROUP 0x2000 /* rmux: split inside a floating group */
 };
 
 /* Paste buffer. */
@@ -3746,6 +3748,11 @@ void		 window_pane_wait_finish(struct window_pane *);
 struct window_pane *window_get_active_at(struct window *, u_int, u_int);
 struct window_pane *window_find_string(struct window *, const char *);
 int		 window_has_floating_panes(struct window *);
+void		 window_raise_floating(struct window *, struct window_pane *);
+void		 window_zindex_fix_groups(struct window *);
+struct window_pane *window_zindex_head(struct window *, struct window_pane *);
+struct window_pane **window_zindex_collapse(struct window *, u_int *);
+void		 window_zindex_expand(struct window *, struct window_pane **, u_int);
 int		 window_has_pane(struct window *, struct window_pane *);
 int		 window_pane_contains(struct window_pane *, u_int, u_int);
 int		 window_set_active_pane(struct window *, struct window_pane *,
@@ -3890,6 +3897,9 @@ void		 layout_make_leaf(struct layout_cell *, struct window_pane *);
 void		 layout_make_node(struct layout_cell *, enum layout_type);
 int		 layout_cell_is_tiled(struct layout_cell *);
 int		 layout_cell_has_tiled_child(struct layout_cell *);
+struct layout_cell *layout_float_root(struct layout_cell *);
+int		 layout_cell_in_tiling(struct layout_cell *);
+int		 layout_cell_is_group(struct layout_cell *);
 int		 layout_add_horizontal_border(struct layout_cell *,
 		     struct layout_cell *, int);
 void		 layout_fix_offsets(struct window *);
@@ -3926,6 +3936,19 @@ void		 layout_close_pane(struct window_pane *);
 int		 layout_spread_cell(struct window *, struct layout_cell *);
 void		 layout_spread_out(struct window_pane *);
 struct layout_cell *layout_get_tiled_cell(struct cmdq_item *, struct args *,
+		     struct window *, struct window_pane *, int, char **);
+void		 layout_float_detach(struct window *, struct window_pane *);
+int		 layout_group_member_can_tile(struct layout_cell *);
+int		 layout_resize_group(struct window *, struct layout_cell *,
+		     enum layout_type, int, int);
+void		 layout_set_floating_geometry(struct window *,
+		     struct layout_cell *, int, int, int, int);
+int		 layout_group_has_split(struct layout_cell *, enum layout_type);
+int		 layout_resize_floating_group(struct window *,
+		     struct layout_cell *, enum layout_type, int, int, char **);
+int		 layout_resize_floating_group_to(struct window *,
+		     struct layout_cell *, enum layout_type, u_int, char **);
+struct layout_cell *layout_get_group_cell(struct cmdq_item *, struct args *,
 		     struct window *, struct window_pane *, int, char **);
 struct layout_cell *layout_get_floating_cell(struct cmdq_item *, struct args *,
 		     enum pane_lines, struct window *, struct window_pane *,

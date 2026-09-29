@@ -97,9 +97,11 @@ class Compatibility(unittest.TestCase):
         with Server(BASELINE) as base, Server(RMUX) as rmux:
             queries = [('list-commands',), ('list-keys', '-a'),
                        ('show-options', '-g'), ('show-options', '-gw'), ('show-options', '-gs')]
+            # split-window -G (floating groups) is a documented rmux extension.
+            extension = ('[-bdefGhIklPvWZ]', '[-bdefhIklPvWZ]')
             for query in queries:
                 with self.subTest(query=query):
-                    self.assertEqual(base.text(*query), rmux.text(*query))
+                    self.assertEqual(base.text(*query), rmux.text(*query).replace(*extension))
             self.assertEqual(len(rmux.text('list-commands').splitlines()), 92)
             self.assertEqual(rmux.text('show-options', '-gv', 'prefix').strip(), 'C-b')
 

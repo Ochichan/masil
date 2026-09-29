@@ -123,13 +123,64 @@ layout_set_previous(struct window *w)
 	return (layout);
 }
 
+/* rmux: whether a pane is tiled, not floating alone or in a group. */
+static int
+layout_set_is_tiled(struct window_pane *wp)
+{
+	return (wp->layout_cell != NULL && !window_pane_is_floating(wp));
+}
+
+/*
+ * rmux: the cell a preset links for a pane. A floating group is linked once,
+ * as a whole, when its first pane is seen.
+ */
+static struct layout_cell *
+layout_set_pane_cell(struct window_pane *wp)
+{
+	struct layout_cell	*lc = wp->layout_cell;
+	struct layout_cell	*root = layout_float_root(lc);
+
+	if (root == NULL || root == lc)
+		return (lc);
+	if (root->parent != NULL)
+		return (NULL);
+	return (root);
+}
+
+/*
+ * rmux: take floating groups out of the tree so freeing its nodes keeps them;
+ * they are linked again with the other floating cells. Other pane cells lose
+ * their parent, which is about to be freed.
+ */
+static void
+layout_set_detach_groups(struct layout_cell *lc)
+{
+	struct layout_cell	*lcchild, *lcnext;
+
+	if (lc->type == LAYOUT_WINDOWPANE) {
+		lc->parent = NULL;
+		return;
+	}
+	lcchild = TAILQ_FIRST(&lc->cells);
+	while (lcchild != NULL) {
+		lcnext = TAILQ_NEXT(lcchild, entry);
+		if (lcchild->type != LAYOUT_WINDOWPANE &&
+		    (lcchild->flags & LAYOUT_CELL_FLOATING)) {
+			TAILQ_REMOVE(&lc->cells, lcchild, entry);
+			lcchild->parent = NULL;
+		} else
+			layout_set_detach_groups(lcchild);
+		lcchild = lcnext;
+	}
+}
+
 static struct window_pane *
 layout_set_first_tiled(struct window *w)
 {
 	struct window_pane	*wp;
 
 	TAILQ_FOREACH(wp, &w->panes, entry) {
-		if (wp->layout_cell && layout_cell_is_tiled(wp->layout_cell))
+		if (wp->layout_cell && layout_set_is_tiled(wp))
 			return (wp);
 	}
 	return (NULL);
@@ -142,8 +193,8 @@ layout_set_link_floating(struct window *w, struct layout_cell *lcroot)
 	struct layout_cell	*lc;
 
 	TAILQ_FOREACH(wp, &w->panes, entry) {
-		lc = wp->layout_cell;
-		if (!layout_cell_is_tiled(lc)) {
+		lc = layout_set_pane_cell(wp);
+		if (lc != NULL && !layout_cell_is_tiled(lc)) {
 			TAILQ_INSERT_TAIL(&lcroot->cells, lc, entry);
 			lc->parent = lcroot;
 		}
@@ -175,13 +226,16 @@ layout_set_even(struct window *w, enum layout_type type)
 		sx = w->sx;
 	}
 
+	layout_set_detach_groups(w->layout_root);
 	layout_free(w, 1);
 	lcroot = w->layout_root = layout_create_cell(NULL);
 	layout_set_size(lcroot, sx, sy, 0, 0);
 	layout_make_node(lcroot, type);
 
 	TAILQ_FOREACH(wp, &w->panes, entry) {
-		lcchild = wp->layout_cell;
+		lcchild = layout_set_pane_cell(wp);
+		if (lcchild == NULL)
+			continue;
 		TAILQ_INSERT_TAIL(&lcroot->cells, lcchild, entry);
 		lcchild->parent = lcroot;
 		if (layout_cell_is_tiled(lcchild)) {
@@ -265,6 +319,7 @@ layout_set_main_h(struct window *w)
 	if (sx < w->sx)
 		sx = w->sx;
 
+	layout_set_detach_groups(w->layout_root);
 	layout_free(w, 1);
 	lcroot = w->layout_root = layout_create_cell(NULL);
 	layout_set_size(lcroot, sx, mainh + otherh + 1, 0, 0);
@@ -278,7 +333,7 @@ layout_set_main_h(struct window *w)
 
 	if (n == 1) {
 		wp = TAILQ_NEXT(wpmain, entry);
-		while (wp != NULL && !layout_cell_is_tiled(wp->layout_cell))
+		while (wp != NULL && !layout_set_is_tiled(wp))
 			wp = TAILQ_NEXT(wp, entry);
 		TAILQ_INSERT_TAIL(&lcroot->cells, wp->layout_cell, entry);
 		wp->layout_cell->parent = lcroot;
@@ -293,7 +348,9 @@ layout_set_main_h(struct window *w)
 		TAILQ_FOREACH(wp, &w->panes, entry) {
 			if (wp == wpmain)
 				continue;
-			lcchild = wp->layout_cell;
+			lcchild = layout_set_pane_cell(wp);
+			if (lcchild == NULL)
+				continue;
 			TAILQ_INSERT_TAIL(&lcother->cells, lcchild, entry);
 			lcchild->parent = lcother;
 			if (layout_cell_is_tiled(lcchild))
@@ -364,6 +421,7 @@ layout_set_main_h_mirrored(struct window *w)
 	if (sx < w->sx)
 		sx = w->sx;
 
+	layout_set_detach_groups(w->layout_root);
 	layout_free(w, 1);
 	lcroot = w->layout_root = layout_create_cell(NULL);
 	layout_set_size(lcroot, sx, mainh + otherh + 1, 0, 0);
@@ -377,7 +435,7 @@ layout_set_main_h_mirrored(struct window *w)
 
 	if (n == 1) {
 		wp = TAILQ_NEXT(wpmain, entry);
-		while (wp != NULL && !layout_cell_is_tiled(wp->layout_cell))
+		while (wp != NULL && !layout_set_is_tiled(wp))
 			wp = TAILQ_NEXT(wp, entry);
 		TAILQ_INSERT_HEAD(&lcroot->cells, wp->layout_cell, entry);
 		wp->layout_cell->parent = lcroot;
@@ -392,7 +450,9 @@ layout_set_main_h_mirrored(struct window *w)
 		TAILQ_FOREACH(wp, &w->panes, entry) {
 			if (wp == wpmain)
 				continue;
-			lcchild = wp->layout_cell;
+			lcchild = layout_set_pane_cell(wp);
+			if (lcchild == NULL)
+				continue;
 			TAILQ_INSERT_TAIL(&lcother->cells, lcchild, entry);
 			lcchild->parent = lcother;
 			if (layout_cell_is_tiled(lcchild))
@@ -463,6 +523,7 @@ layout_set_main_v(struct window *w)
 	if (sy < w->sy)
 		sy = w->sy;
 
+	layout_set_detach_groups(w->layout_root);
 	layout_free(w, 1);
 	lcroot = w->layout_root = layout_create_cell(NULL);
 	layout_set_size(lcroot, mainw + otherw + 1, sy, 0, 0);
@@ -476,7 +537,7 @@ layout_set_main_v(struct window *w)
 
 	if (n == 1) {
 		wp = TAILQ_NEXT(wpmain, entry);
-		while (wp != NULL && !layout_cell_is_tiled(wp->layout_cell))
+		while (wp != NULL && !layout_set_is_tiled(wp))
 			wp = TAILQ_NEXT(wp, entry);
 		TAILQ_INSERT_TAIL(&lcroot->cells, wp->layout_cell, entry);
 		wp->layout_cell->parent = lcroot;
@@ -491,7 +552,9 @@ layout_set_main_v(struct window *w)
 		TAILQ_FOREACH(wp, &w->panes, entry) {
 			if (wp == wpmain)
 				continue;
-			lcchild = wp->layout_cell;
+			lcchild = layout_set_pane_cell(wp);
+			if (lcchild == NULL)
+				continue;
 			TAILQ_INSERT_TAIL(&lcother->cells, lcchild, entry);
 			lcchild->parent = lcother;
 			if (layout_cell_is_tiled(lcchild))
@@ -563,6 +626,7 @@ layout_set_main_v_mirrored(struct window *w)
 	if (sy < w->sy)
 		sy = w->sy;
 
+	layout_set_detach_groups(w->layout_root);
 	layout_free(w, 1);
 	lcroot = w->layout_root = layout_create_cell(NULL);
 	layout_set_size(lcroot, mainw + otherw + 1, sy, 0, 0);
@@ -576,7 +640,7 @@ layout_set_main_v_mirrored(struct window *w)
 
 	if (n == 1) {
 		wp = TAILQ_NEXT(wpmain, entry);
-		while (wp != NULL && !layout_cell_is_tiled(wp->layout_cell))
+		while (wp != NULL && !layout_set_is_tiled(wp))
 			wp = TAILQ_NEXT(wp, entry);
 		TAILQ_INSERT_HEAD(&lcroot->cells, wp->layout_cell, entry);
 		wp->layout_cell->parent = lcroot;
@@ -591,7 +655,9 @@ layout_set_main_v_mirrored(struct window *w)
 		TAILQ_FOREACH(wp, &w->panes, entry) {
 			if (wp == wpmain)
 				continue;
-			lcchild = wp->layout_cell;
+			lcchild = layout_set_pane_cell(wp);
+			if (lcchild == NULL)
+				continue;
 			TAILQ_INSERT_TAIL(&lcother->cells, lcchild, entry);
 			lcchild->parent = lcother;
 			if (layout_cell_is_tiled(lcchild))
@@ -654,6 +720,7 @@ layout_set_tiled(struct window *w)
 	if (sy < w->sy)
 		sy = w->sy;
 
+	layout_set_detach_groups(w->layout_root);
 	layout_free(w, 1);
 	lcroot = w->layout_root = layout_create_cell(NULL);
 	layout_set_size(lcroot, sx, sy, 0, 0);
@@ -662,7 +729,7 @@ layout_set_tiled(struct window *w)
 	/* Create a grid of the tiled cells. */
 	wp = TAILQ_FIRST(&w->panes);
 	for (j = 0; j < rows; j++) {
-		while (wp != NULL && !layout_cell_is_tiled(wp->layout_cell))
+		while (wp != NULL && !layout_set_is_tiled(wp))
 			wp = TAILQ_NEXT(wp, entry);
 		/* If this is the last cell, all done. */
 		if (wp == NULL)
@@ -695,7 +762,7 @@ layout_set_tiled(struct window *w)
 			/* Move to the next non-floating cell. */
 			wp = TAILQ_NEXT(wp, entry);
 			while (wp != NULL &&
-			    !layout_cell_is_tiled(wp->layout_cell))
+			    !layout_set_is_tiled(wp))
 				wp = TAILQ_NEXT(wp, entry);
 			if (wp == NULL)
 				break;

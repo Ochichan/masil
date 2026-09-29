@@ -59,8 +59,8 @@ const struct cmd_entry cmd_split_window_entry = {
 	.name = "split-window",
 	.alias = "splitw",
 
-	.args = { "bB:c:de:EfF:hIkl:m:p:PR:s:S:t:T:vWZ", 0, -1, NULL },
-	.usage = "[-bdefhIklPvWZ] [-B border-lines] [-c start-directory] "
+	.args = { "bB:c:de:EfF:GhIkl:m:p:PR:s:S:t:T:vWZ", 0, -1, NULL },
+	.usage = "[-bdefGhIklPvWZ] [-B border-lines] [-c start-directory] "
 		 "[-e environment] [-F format] [-l size] [-m message] "
 		 "[-p percentage] [-s style] [-S active-border-style] "
 		 "[-R inactive-border-style] [-T title] "
@@ -88,7 +88,7 @@ cmd_split_window_exec(struct cmd *self, struct cmdq_item *item)
 	struct event_payload	*ep;
 	struct cmd_find_state	 fs;
 	struct key_event	*event = cmdq_get_event(item);
-	int			 input, empty, is_floating, flags = 0;
+	int			 input, empty, is_floating, group = 0, flags = 0;
 	int			 restore_zoom = 0;
 	const char		*template, *style, *value;
 	char			*cause = NULL, *cp, *title;
@@ -109,6 +109,16 @@ cmd_split_window_exec(struct cmd *self, struct cmdq_item *item)
 			window_unzoom(w, 1);
 		is_floating = window_pane_is_floating(wp);
 		flags |= SPAWN_SPLIT;
+
+		/*
+		 * rmux: -G splits a floating pane inside a floating group. A
+		 * group member always splits inside its group.
+		 */
+		if (is_floating && (args_has(args, 'G') ||
+		    layout_float_root(wp->layout_cell) != wp->layout_cell)) {
+			group = 1;
+			is_floating = 0;
+		}
 	}
 
 	if (args_has(args, 'O')) {
@@ -129,6 +139,8 @@ cmd_split_window_exec(struct cmd *self, struct cmdq_item *item)
 
 	if (is_floating)
 		flags |= SPAWN_FLOATING;
+	if (group)
+		flags |= SPAWN_GROUP;
 	if (args_has(args, 'h'))
 		flags |= SPAWN_HORIZONTAL;
 	if (args_has(args, 'b'))
@@ -175,7 +187,9 @@ cmd_split_window_exec(struct cmd *self, struct cmdq_item *item)
 	if (flags & SPAWN_FLOATING) {
 		lc = layout_get_floating_cell(item, args, lines, w, wp, flags,
 		    &cause);
-	} else
+	} else if (flags & SPAWN_GROUP)
+		lc = layout_get_group_cell(item, args, w, wp, flags, &cause);
+	else
 		lc = layout_get_tiled_cell(item, args, w, wp, flags, &cause);
 	if (cause != NULL) {
 		cmdq_error(item, "%s", cause);

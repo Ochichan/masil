@@ -715,6 +715,120 @@ window_pane_update_focus(struct window_pane *wp)
 	}
 }
 
+
+/*
+ * rmux: move a floating pane to the front of the z-index. The rest of its
+ * floating group follows directly behind it.
+ */
+void
+window_raise_floating(struct window *w, struct window_pane *wp)
+{
+	struct layout_cell	*root = layout_float_root(wp->layout_cell);
+	struct window_pane	*loop, *next, *last = wp;
+
+	TAILQ_REMOVE(&w->z_index, wp, zentry);
+	TAILQ_INSERT_HEAD(&w->z_index, wp, zentry);
+	if (root == NULL || root->type == LAYOUT_WINDOWPANE)
+		return;
+	TAILQ_FOREACH_SAFE(loop, &w->z_index, zentry, next) {
+		if (loop == wp || layout_float_root(loop->layout_cell) != root)
+			continue;
+		TAILQ_REMOVE(&w->z_index, loop, zentry);
+		TAILQ_INSERT_AFTER(&w->z_index, last, loop, zentry);
+		last = loop;
+	}
+}
+
+/* rmux: the first pane of a floating group in the z-index, or the pane. */
+struct window_pane *
+window_zindex_head(struct window *w, struct window_pane *wp)
+{
+	struct layout_cell	*root = layout_float_root(wp->layout_cell);
+	struct window_pane	*loop;
+
+	if (root == NULL || root->type == LAYOUT_WINDOWPANE)
+		return (wp);
+	TAILQ_FOREACH(loop, &w->z_index, zentry) {
+		if (layout_float_root(loop->layout_cell) == root)
+			return (loop);
+	}
+	return (wp);
+}
+
+/*
+ * rmux: take all but the first pane of each floating group out of the
+ * z-index, so z-index operations treat a group as one pane. The panes are
+ * returned in z-index order for window_zindex_expand.
+ */
+struct window_pane **
+window_zindex_collapse(struct window *w, u_int *n)
+{
+	struct window_pane	*wp, *next, **saved = NULL;
+	struct layout_cell	*root;
+
+	*n = 0;
+	TAILQ_FOREACH_SAFE(wp, &w->z_index, zentry, next) {
+		root = layout_float_root(wp->layout_cell);
+		if (root == NULL || root->type == LAYOUT_WINDOWPANE)
+			continue;
+		if (window_zindex_head(w, wp) == wp)
+			continue;
+		TAILQ_REMOVE(&w->z_index, wp, zentry);
+		saved = xreallocarray(saved, *n + 1, sizeof *saved);
+		saved[(*n)++] = wp;
+	}
+	return (saved);
+}
+
+/* rmux: put collapsed group panes back behind the rest of their group. */
+void
+window_zindex_expand(struct window *w, struct window_pane **saved, u_int n)
+{
+	struct window_pane	*wp, *last;
+	struct layout_cell	*root;
+	u_int			 i;
+
+	for (i = 0; i < n; i++) {
+		root = layout_float_root(saved[i]->layout_cell);
+		last = NULL;
+		TAILQ_FOREACH(wp, &w->z_index, zentry) {
+			if (layout_float_root(wp->layout_cell) == root)
+				last = wp;
+		}
+		if (last == NULL)
+			TAILQ_INSERT_TAIL(&w->z_index, saved[i], zentry);
+		else
+			TAILQ_INSERT_AFTER(&w->z_index, last, saved[i], zentry);
+	}
+	free(saved);
+}
+
+/* rmux: keep the members of each floating group next to each other. */
+void
+window_zindex_fix_groups(struct window *w)
+{
+	struct window_pane	*wp, *loop, *next, *last;
+	struct layout_cell	*root;
+
+	TAILQ_FOREACH(wp, &w->z_index, zentry) {
+		root = layout_float_root(wp->layout_cell);
+		if (root == NULL || root->type == LAYOUT_WINDOWPANE)
+			continue;
+		last = wp;
+		for (loop = TAILQ_NEXT(wp, zentry); loop != NULL; loop = next) {
+			next = TAILQ_NEXT(loop, zentry);
+			if (layout_float_root(loop->layout_cell) != root)
+				continue;
+			if (loop != TAILQ_NEXT(last, zentry)) {
+				TAILQ_REMOVE(&w->z_index, loop, zentry);
+				TAILQ_INSERT_AFTER(&w->z_index, last, loop,
+				    zentry);
+			}
+			last = loop;
+		}
+	}
+}
+
 int
 window_set_active_pane(struct window *w, struct window_pane *wp, int notify)
 {
@@ -795,10 +909,9 @@ window_redraw_active_switch(struct window *w, struct window_pane *wp)
 		if (wp == w->active)
 			break;
 
-		/* If the pane is floating, move to the front. */
+		/* If the pane is floating, move it and its group to the front. */
 		if (window_pane_is_floating(wp)) {
-			TAILQ_REMOVE(&w->z_index, wp, zentry);
-			TAILQ_INSERT_HEAD(&w->z_index, wp, zentry);
+			window_raise_floating(w, wp);
 			wp->flags |= PANE_REDRAW;
 			redraw_invalidate_scene(w);
 		}
@@ -921,6 +1034,20 @@ window_find_string(struct window *w, const char *s)
 	return (window_get_active_at(w, x, y));
 }
 
+/*
+ * rmux: whether a pane floats over a zoomed pane. Only a lone floating pane
+ * does; the panes of a floating group are hidden by a zoom.
+ */
+static int
+window_pane_floats_over_zoom(struct window_pane *wp)
+{
+	struct layout_cell	*lc = wp->layout_cell;
+
+	return ((wp->flags & PANE_FLOATOVERZOOM) && lc != NULL &&
+	    lc->type == LAYOUT_WINDOWPANE &&
+	    (lc->flags & LAYOUT_CELL_FLOATING));
+}
+
 int
 window_zoom(struct window_pane *wp)
 {
@@ -935,9 +1062,7 @@ window_zoom(struct window_pane *wp)
 		return (-1);
 
 	if (w->active != wp &&
-	    (w->active == NULL ||
-	    (~w->active->flags & PANE_FLOATOVERZOOM) ||
-	    !window_pane_is_floating(w->active)))
+	    (w->active == NULL || !window_pane_floats_over_zoom(w->active)))
 		window_set_active_pane(w, wp, 1);
 	wp->flags |= PANE_ZOOMED;
 
@@ -960,7 +1085,7 @@ window_zoom(struct window_pane *wp)
 		layout_assign_pane(lc, wp1, 0);
 	}
 	/* A floating zoom target is now tiled, so put it behind the floats. */
-	if (wp->saved_layout_cell->flags & LAYOUT_CELL_FLOATING) {
+	if (layout_float_root(wp->saved_layout_cell) != NULL) {
 		TAILQ_REMOVE(&w->z_index, wp, zentry);
 		TAILQ_INSERT_TAIL(&w->z_index, wp, zentry);
 	}
@@ -1020,6 +1145,7 @@ window_unzoom(struct window *w, int notify)
 			else
 				TAILQ_INSERT_BEFORE(wp, zoomed, zentry);
 		}
+		window_zindex_fix_groups(w);
 	}
 	layout_fix_panes(w, NULL);
 
@@ -1053,9 +1179,7 @@ window_active_pane_is_over_zoom(struct window *w)
 		return (0);
 	if (w->active == NULL)
 		return (0);
-	if (~w->active->flags & PANE_FLOATOVERZOOM)
-		return (0);
-	return (window_pane_is_floating(w->active));
+	return (window_pane_floats_over_zoom(w->active));
 }
 
 int
@@ -1087,8 +1211,7 @@ window_pop_zoom(struct window *w)
 		w->flags &= ~WINDOW_WASZOOMED;
 		w->was_zoomed = NULL;
 		if (w->active != NULL &&
-		    ((~w->active->flags & PANE_FLOATOVERZOOM) ||
-		    !window_pane_is_floating(w->active)))
+		    !window_pane_floats_over_zoom(w->active))
 			wp = w->active;
 		if (wp == NULL || !window_has_pane(w, wp))
 			wp = w->active;
@@ -1124,7 +1247,9 @@ window_add_pane(struct window *w, struct window_pane *other, u_int hlimit,
 		else
 			TAILQ_INSERT_AFTER(&w->panes, other, wp, entry);
 	}
-	if (~flags & SPAWN_FLOATING)
+	if (flags & SPAWN_GROUP)
+		TAILQ_INSERT_AFTER(&w->z_index, other, wp, zentry);
+	else if (~flags & SPAWN_FLOATING)
 		TAILQ_INSERT_TAIL(&w->z_index, wp, zentry);
 	else if (w->modal != NULL)
 		TAILQ_INSERT_AFTER(&w->z_index, w->modal, wp, zentry);
@@ -2911,14 +3036,11 @@ window_pane_get_pane_status(struct window_pane *wp)
 	return (status);
 }
 
+/* A pane is floating alone or as a member of a floating group. */
 int
 window_pane_is_floating(struct window_pane *wp)
 {
-	struct layout_cell	*lc = wp->layout_cell;
-
-	if (lc == NULL || (lc->flags & LAYOUT_CELL_FLOATING) == 0)
-		return (0);
-	return (1);
+	return (layout_float_root(wp->layout_cell) != NULL);
 }
 
 int
@@ -2928,7 +3050,5 @@ window_pane_is_floating_with_hidden(struct window_pane *wp)
 
 	if (lc == NULL)
 		lc = wp->saved_layout_cell;
-	if (lc == NULL || (lc->flags & LAYOUT_CELL_FLOATING) == 0)
-		return (0);
-	return (1);
+	return (layout_float_root(lc) != NULL);
 }

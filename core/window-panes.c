@@ -154,9 +154,7 @@ window_panes_pane_floating(struct window_pane *wp)
 
 	if (lc == NULL)
 		lc = wp->layout_cell;
-	if (lc == NULL || (~lc->flags & LAYOUT_CELL_FLOATING))
-		return (0);
-	return (1);
+	return (layout_float_root(lc) != NULL);
 }
 
 static int
@@ -336,10 +334,11 @@ window_panes_mark_borders_cell(u_char *map, struct layout_cell *lc, u_int osx,
 		return;
 
 	TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-		window_panes_mark_borders_cell(map, lcchild, osx, osy, dsx,
-		    dsy);
+		/* rmux: floating groups are drawn as floating panes. */
 		if (lcchild->flags & LAYOUT_CELL_FLOATING)
 			continue;
+		window_panes_mark_borders_cell(map, lcchild, osx, osy, dsx,
+		    dsy);
 		lcnext = window_panes_next_tiled_cell(lcchild);
 		if (lcnext == NULL)
 			continue;
@@ -407,7 +406,7 @@ window_panes_get_floating_borders(struct window_pane *wp, u_int osx, u_int osy,
 	lc = wp->saved_layout_cell;
 	if (lc == NULL)
 		lc = wp->layout_cell;
-	if (lc == NULL || (~lc->flags & LAYOUT_CELL_FLOATING))
+	if (layout_float_root(lc) == NULL)
 		return (0);
 
 	if (lc->g.xoff == 0)
@@ -514,10 +513,11 @@ window_panes_mark_border_joins_cell(u_char *map, struct layout_cell *lc,
 		return;
 
 	TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-		window_panes_mark_border_joins_cell(map, lcchild, osx, osy,
-		    dsx, dsy);
+		/* rmux: floating groups are drawn as floating panes. */
 		if (lcchild->flags & LAYOUT_CELL_FLOATING)
 			continue;
+		window_panes_mark_border_joins_cell(map, lcchild, osx, osy,
+		    dsx, dsy);
 		lcnext = window_panes_next_tiled_cell(lcchild);
 		if (lcnext == NULL)
 			continue;

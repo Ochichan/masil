@@ -137,6 +137,7 @@ screen_reinit(struct screen *s, int check)
 #endif
 
 	screen_set_progress_bar(s, PROGRESS_BAR_HIDDEN, 0);
+	s->rmux_osc_progress[0] = '\0';
 	screen_reset_hyperlinks(s);
 }
 

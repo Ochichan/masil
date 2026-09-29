@@ -9,6 +9,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 */
 mod i18n;
 mod input;
+mod managed;
 pub(crate) mod model;
 mod network;
 mod preferences;
@@ -28,6 +29,10 @@ use tokio::{
 // Keep the terminal build's direction reference auditable in the stripped
 // executable through an explicit CLI, without putting design metadata in UI.
 pub(crate) const DESIGN_CONTRACT: &str = "rmux agent desk, Operate; user-pinned sidebar plus native zoom; seed e2f9e8dc; docs/ui/agent-desk.md";
+
+pub(crate) fn run_managed(socket: &str, args: &[String], sidebar: bool) -> Result<i32, String> {
+    managed::run(socket, args, sidebar)
+}
 
 #[derive(Default)]
 struct Options {

@@ -343,7 +343,12 @@ mod tests {
     #[test]
     fn every_section_is_found_and_balanced() {
         let names = section_names();
-        assert_eq!(names, ["base", "panes", "colors", "styles", "bar", "keys"]);
+        assert_eq!(
+            names,
+            [
+                "base", "panes", "colors", "styles", "bar", "keys", "sessions"
+            ]
+        );
         for name in names {
             let text = section(name).unwrap();
             assert_eq!(

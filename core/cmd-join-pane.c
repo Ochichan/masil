@@ -69,15 +69,20 @@ cmd_join_pane_place(struct cmdq_item *item, struct winlink *wl,
     struct window_pane *wp, const char *position)
 {
 	struct window		*w = wl->window;
-	struct layout_cell	*lc = wp->layout_cell;
-	struct window_pane	*owp;
+	struct layout_cell	*lc = layout_float_root(wp->layout_cell);
+	struct window_pane	*owp, **saved;
 	int			 wx = w->sx, wy = w->sy;
 	int			 px = lc->g.sx, py = lc->g.sy;
 	int			 xoff = lc->g.xoff, yoff = lc->g.yoff;
 	int			 border = 1;
+	u_int			 nsaved;
 
 	if (window_pane_get_pane_lines(wp) == PANE_LINES_NONE)
 		border = 0;
+
+	/* rmux: a floating group moves in the z-index as one pane. */
+	wp = window_zindex_head(w, wp);
+	saved = window_zindex_collapse(w, &nsaved);
 
 	if (strcmp(position, "top-left") == 0) {
 		xoff = border;
@@ -185,13 +190,17 @@ cmd_join_pane_place(struct cmdq_item *item, struct winlink *wl,
 			TAILQ_INSERT_HEAD(&w->z_index, wp, zentry);
 		}
 	} else {
+		window_zindex_expand(w, saved, nsaved);
 		cmdq_error(item, "unknown position: %s", position);
 		return (CMD_RETURN_ERROR);
 	}
+	window_zindex_expand(w, saved, nsaved);
 
 	if (xoff != lc->g.xoff || yoff != lc->g.yoff) {
 		lc->g.xoff = xoff;
 		lc->g.yoff = yoff;
+		if (lc->type != LAYOUT_WINDOWPANE)
+			layout_fix_offsets(w);
 		layout_fix_panes(w, NULL);
 	}
 	redraw_invalidate_scene(w);
@@ -206,7 +215,7 @@ cmd_join_pane_move(struct cmdq_item *item, struct args *args,
     struct winlink *wl, struct window_pane *wp)
 {
 	struct window		*w = wl->window;
-	struct layout_cell	*lc = wp->layout_cell;
+	struct layout_cell	*lc = layout_float_root(wp->layout_cell);
 	const char		*errstr, *argval;
 	const char		 flags[] = { 'U', 'D', 'L', 'R' };
 	char			*cause = NULL, flag;
@@ -264,6 +273,8 @@ cmd_join_pane_move(struct cmdq_item *item, struct args *args,
 	if (xoff != lc->g.xoff || yoff != lc->g.yoff) {
 		lc->g.xoff = xoff;
 		lc->g.yoff = yoff;
+		if (lc->type != LAYOUT_WINDOWPANE)
+			layout_fix_offsets(w);
 		layout_fix_panes(w, NULL);
 		events_fire_window("window-layout-changed", w);
 		server_redraw_window(w);
@@ -315,7 +326,11 @@ cmd_join_pane_mouse_move(struct client *c, struct mouse_event *m)
 		return;
 	}
 	w = wl->window;
-	lc = wp->layout_cell;
+	lc = layout_float_root(wp->layout_cell);
+	if (lc == NULL) {
+		c->tty.mouse_drag_update = NULL;
+		return;
+	}
 
 	y = m->y + m->oy; x = m->x + m->ox;
 	if (m->statusat == 0 && y >= (int)m->statuslines)
@@ -331,6 +346,8 @@ cmd_join_pane_mouse_move(struct client *c, struct mouse_event *m)
 	if (x != lx || y != ly) {
 		lc->g.xoff += x - lx;
 		lc->g.yoff += y - ly;
+		if (lc->type != LAYOUT_WINDOWPANE)
+			layout_fix_offsets(w);
 		layout_fix_panes(w, NULL);
 		server_redraw_window(w);
 		server_redraw_window_borders(w);
@@ -342,15 +359,18 @@ cmd_join_pane_zindex(struct cmdq_item *item, struct winlink *wl,
     struct window_pane *wp, const char *s)
 {
 	struct window		*w = wl->window;
-	struct window_pane	*owp;
+	struct window_pane	*owp, **saved;
 	const char		*errstr;
-	u_int			 n, z;
+	u_int			 n, z, nsaved;
 
 	z = strtonum(s, 0, UINT_MAX, &errstr);
 	if (errstr != NULL) {
 		cmdq_error(item, "z-index %s", errstr);
 		return (CMD_RETURN_ERROR);
 	}
+	/* rmux: a floating group takes one z-index slot. */
+	wp = window_zindex_head(w, wp);
+	saved = window_zindex_collapse(w, &nsaved);
 	TAILQ_REMOVE(&w->z_index, wp, zentry);
 
 	n = 0;
@@ -368,6 +388,7 @@ cmd_join_pane_zindex(struct cmdq_item *item, struct winlink *wl,
 		TAILQ_INSERT_BEFORE(owp, wp, zentry);
 	else
 		TAILQ_INSERT_TAIL(&w->z_index, wp, zentry);
+	window_zindex_expand(w, saved, nsaved);
 
 	redraw_invalidate_scene(w);
 	events_fire_window("window-layout-changed", w);
@@ -389,6 +410,17 @@ cmd_join_pane_tile(struct cmdq_item *item, struct args *args, struct window *w,
 	if (w->flags & WINDOW_ZOOMED) {
 		cmdq_error(item, "can't tile a pane while window is zoomed");
 		return (CMD_RETURN_ERROR);
+	}
+
+	/* rmux: a group member leaves its group before it is tiled. */
+	if (layout_float_root(lc) != lc) {
+		if (!layout_group_member_can_tile(lc)) {
+			cmdq_error(item, "no space for a new pane");
+			return (CMD_RETURN_ERROR);
+		}
+		layout_float_detach(w, wp);
+		window_zindex_fix_groups(w);
+		lc = wp->layout_cell;
 	}
 
 	lc->fg.sx = lc->g.sx;
@@ -487,7 +519,14 @@ cmd_join_pane_exec(struct cmd *self, struct cmdq_item *item)
 	if (args_has(args, 'f'))
 		flags |= SPAWN_FULLSIZE;
 
-	lc = layout_get_tiled_cell(item, args, dst_w, dst_wp, flags, &cause);
+	/* rmux: joining a floating group member adds the pane to the group. */
+	if (window_pane_is_floating(dst_wp) &&
+	    layout_float_root(dst_wp->layout_cell) != dst_wp->layout_cell) {
+		lc = layout_get_group_cell(item, args, dst_w, dst_wp, flags,
+		    &cause);
+	} else
+		lc = layout_get_tiled_cell(item, args, dst_w, dst_wp, flags,
+		    &cause);
 	if (cause != NULL) {
 		cmdq_error(item, "size or position %s", cause);
 		free(cause);

@@ -37,6 +37,10 @@ struct menu_data {
 	enum box_lines		 border_lines;
 
 	struct cmd_find_state	 fs;
+	u_int			 target_session_id;
+	u_int			 target_window_id;
+	u_int			 target_pane_id;
+	int			 have_target;
 	key_code		 key;
 	struct mouse_event	 m;
 	struct screen		 s;
@@ -50,6 +54,17 @@ struct menu_data {
 	menu_choice_cb		 cb;
 	void			*data;
 };
+
+static int
+menu_target_valid(struct menu_data *md)
+{
+	if (!cmd_find_valid_state(&md->fs))
+		return (0);
+	return (!md->have_target ||
+	    (md->fs.s->id == md->target_session_id &&
+	    md->fs.w->id == md->target_window_id &&
+	    md->fs.wp->id == md->target_pane_id));
+}
 
 void
 menu_get_size(struct menu *menu, enum box_lines lines, u_int *sx, u_int *sy)
@@ -109,6 +124,7 @@ menu_add_item(struct menu *menu, const struct menu_item *item,
 	}
 	max_width = c->tty.sx - status_column_size(c) - 4;
 
+	/* rmux: measure cells, not bytes, so wide text is not cut early. */
 	slen = strlen(s);
 	if (*s != '-' && item->key != KEYC_UNKNOWN && item->key != KEYC_NONE) {
 		key = key_string_lookup_key(item->key, 0);
@@ -129,6 +145,7 @@ menu_add_item(struct menu *menu, const struct menu_item *item,
 		max_width--;
 		suffix = ">";
 	}
+	/* rmux: keep the start of the text; the ">" marks the cut end. */
 	trimmed = format_trim_right(s, max_width);
 	if (key != NULL) {
 		xasprintf(&name, "%s%s#[default] #[align=right](%s)",
@@ -197,7 +214,11 @@ menu_reapply_styles(struct menu_data *md)
 	struct format_tree	*ft;
 	struct style		 sytmp;
 
-	ft = format_create_defaults(NULL, NULL, md->fs.s, md->fs.wl, md->fs.wp);
+	if (menu_target_valid(md))
+		ft = format_create_defaults(NULL, NULL, md->fs.s, md->fs.wl,
+		    md->fs.wp);
+	else
+		ft = format_create_defaults(NULL, NULL, NULL, NULL, NULL);
 
 	/* Reapply menu style from options. */
 	memcpy(&md->style_gc, &grid_default_cell, sizeof md->style_gc);
@@ -542,6 +563,12 @@ chosen:
 		md->cb = NULL;
 		return (1);
 	}
+	/* A menu can be displayed on a different window from its target. */
+	if (md->have_target && !menu_target_valid(md)) {
+		status_message_set(c, -1, 1, 0, 0,
+		    "Menu target no longer exists");
+		return (1);
+	}
 
 	if (md->key != KEYC_NONE) {
 		memset(&saved_event, 0, sizeof saved_event);
@@ -604,10 +631,7 @@ menu_display(struct menu *menu, int flags, int starting_choice,
 	struct window		*w;
 	struct options		*o;
 
-	if (fs == NULL)
-		w = c->session->curw->window;
-	else
-		w = fs->w;
+	w = c->session->curw->window;
 	o = w->options;
 
 	if (lines == BOX_LINES_DEFAULT)
@@ -647,6 +671,12 @@ menu_display(struct menu *menu, int flags, int starting_choice,
 		cmd_find_copy_state(&md->fs, fs);
 	else if (cmd_find_from_window(&md->fs, w, 0) != 0)
 		cmd_find_clear_state(&md->fs, 0);
+	if (cmd_find_valid_state(&md->fs)) {
+		md->have_target = 1;
+		md->target_session_id = md->fs.s->id;
+		md->target_window_id = md->fs.w->id;
+		md->target_pane_id = md->fs.wp->id;
+	}
 	screen_init(&md->s, sx, sy, 0);
 	if (~md->flags & MENU_NOMOUSE)
 		md->s.mode |= (MODE_MOUSE_ALL|MODE_MOUSE_BUTTON);

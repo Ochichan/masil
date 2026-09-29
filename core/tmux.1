@@ -4085,7 +4085,7 @@ the command behaves like
 .Ic last\-window .
 .Tg splitw
 .It Xo Ic split\-window
-.Op Fl bdefhIkPvZ
+.Op Fl bdefGhIkPvZ
 .Op Fl B Ar border\-lines
 .Op Fl c Ar start\-directory
 .Op Fl e Ar environment
@@ -4163,6 +4163,26 @@ flags.
 If any of the new pane would not be visible on the screen,
 .Ar target\-pane
 and the new pane are resized to fit.
+.Pp
+With
+.Fl G ,
+a floating
+.Ar target\-pane
+is split inside a floating group instead: the panes of a floating group are
+tiled inside one floating rectangle, which moves, resizes and comes to the
+front as a whole.
+If
+.Ar target\-pane
+is already in a floating group, it is always split inside the group.
+Dragging the outer border of a group moves or resizes it; dragging a border
+between its panes resizes them.
+.Ic join\-pane
+with a target in a floating group adds the source pane to the group, and
+tiling a pane of a group takes it out of the group.
+.Fl G
+is ignored if
+.Ar target\-pane
+is tiled.
 .Pp
 .Fl k
 keeps the pane open after the optional

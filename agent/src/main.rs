@@ -2,9 +2,13 @@
 mod agent_stream;
 mod attention;
 mod daemon;
+mod detection;
+mod managed;
 mod native_ui;
 mod observation;
 mod opencode;
+mod providers;
+mod session;
 mod ui;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -668,7 +672,7 @@ fn execute() -> Result<i32, String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args == ["--help"] {
         println!(
-            "rmux-agent 0.1.0 — agent observation and terminal desk\n\nCore socket:\n  rmux-agent --socket PATH hello|inventory|snapshot %N|stats\n  rmux-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nManager socket:\n  rmux-agent --socket PATH serve --core CORE_SOCKET --config FILE\n  rmux-agent --socket PATH status|agents|inspect ID|stop\n  rmux-agent --socket PATH attention [--all]\n  rmux-agent --socket PATH ack ID --epoch E --revision R\n  rmux-agent --socket PATH watch-agents [--count N]\n  rmux-agent --socket PATH ui [--core-native CORE_SOCKET] [--client CLIENT] [--lang en|ko] [--theme dark|light|terminal]\n  rmux-agent --socket PATH sidebar --core-native CORE_SOCKET [--client CLIENT] [--target %N] [--lang en|ko]\n\nrmux server:\n  rmux-agent settings [--socket RMUX_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get]\n\nThe sidebar changes the shared window layout. Expand uses native pane zoom. No default tmux bindings are changed.\nAcknowledgements are shared only for this daemon lifetime and never approve provider requests.\n\nExplicit core bridge required: RMUX_BRIDGE_SOCKET=/private/path/observe.sock rmux ...\nProvider associations are unverified TUI bindings. No prompt submission, approval, completion claim, or daemon autostart."
+            "rmux-agent 0.1.0 — native agents and terminal desk\n\nNative management:\n  rmux-agent agent --help\n  rmux-agent agent [--socket RMUX_SOCKET] list|ui|sidebar\n\nCore socket:\n  rmux-agent --socket PATH hello|inventory|snapshot %N|stats\n  rmux-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nManager socket:\n  rmux-agent --socket PATH serve --core CORE_SOCKET --config FILE\n  rmux-agent --socket PATH status|agents|inspect ID|stop\n  rmux-agent --socket PATH attention [--all]\n  rmux-agent --socket PATH ack ID --epoch E --revision R\n  rmux-agent --socket PATH watch-agents [--count N]\n  rmux-agent --socket PATH ui [--core-native CORE_SOCKET] [--client CLIENT] [--lang en|ko] [--theme dark|light|terminal]\n  rmux-agent --socket PATH sidebar --core-native CORE_SOCKET [--client CLIENT] [--target %N] [--lang en|ko]\n\nrmux server:\n  rmux-agent settings [--socket RMUX_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get]\n  rmux-agent session [--socket RMUX_SOCKET] [--client CLIENT] save|list|restore [NAME]|menu|autosave\n\nThe sidebar changes the shared window layout. Expand uses native pane zoom. No default tmux bindings are changed.\nAcknowledgements are shared only for this daemon lifetime and never approve provider requests.\n\nExplicit core bridge required: RMUX_BRIDGE_SOCKET=/private/path/observe.sock rmux ...\nProvider associations are unverified TUI bindings. Observer connections do not submit prompts or approve requests. Native prompt delivery is not provider acceptance. No daemon autostart."
         );
         return Ok(0);
     }
@@ -682,6 +686,12 @@ fn execute() -> Result<i32, String> {
     }
     if args[0] == "settings" {
         return ui::settings::run(&args[1..]);
+    }
+    if args[0] == "session" {
+        return session::run(&args[1..]);
+    }
+    if args[0] == "agent" {
+        return managed::run(&args[1..]);
     }
     if args.len() < 3 || args[0] != "--socket" {
         return Err("expected --socket PATH command".into());

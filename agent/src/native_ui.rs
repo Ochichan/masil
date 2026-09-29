@@ -66,9 +66,9 @@ pub enum NavigationOutcome {
 }
 
 #[derive(Debug)]
-struct ProcessOutput {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct ProcessOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -123,9 +123,50 @@ impl Context {
         language: Option<&str>,
         theme: Option<&str>,
     ) -> Result<SidebarOutcome, String> {
+        let boot = manager_boot_id(executable, manager_socket).await?;
+        self.sidebar_inner(
+            manager_socket,
+            executable,
+            target,
+            language,
+            theme,
+            (boot, false),
+        )
+        .await
+    }
+
+    pub async fn managed_sidebar(
+        &self,
+        executable: &Path,
+        target: Option<&str>,
+        language: Option<&str>,
+        theme: Option<&str>,
+    ) -> Result<SidebarOutcome, String> {
+        let client = self.resolve_client().await?;
+        let target = self.target_info(target.unwrap_or(&client.pane_id)).await?;
+        self.sidebar_inner(
+            &self.socket,
+            executable,
+            Some(&target.pane_id),
+            language,
+            theme,
+            (target.boot, true),
+        )
+        .await
+    }
+
+    async fn sidebar_inner(
+        &self,
+        manager_socket: &Path,
+        executable: &Path,
+        target: Option<&str>,
+        language: Option<&str>,
+        theme: Option<&str>,
+        identity: (String, bool),
+    ) -> Result<SidebarOutcome, String> {
         validate_optional_label(language, "language")?;
         validate_optional_label(theme, "theme")?;
-        let expected_boot = manager_boot_id(executable, manager_socket).await?;
+        let (expected_boot, managed) = identity;
         let client = self.resolve_client().await?;
         let requested = target.unwrap_or(&client.pane_id);
         let initial = self.target_info(requested).await?;
@@ -192,15 +233,24 @@ impl Context {
             target.pane_id.clone(),
             "--".to_owned(),
             path_text(executable, "executable")?.to_owned(),
+        ];
+        if managed {
+            command.push("agent".into());
+        }
+        command.extend([
             "--socket".to_owned(),
             path_text(manager_socket, "manager socket")?.to_owned(),
             "ui".to_owned(),
             "--compact".to_owned(),
-            "--core-native".to_owned(),
-            path_text(&self.socket, "native socket")?.to_owned(),
             "--client".to_owned(),
             client.name.clone(),
-        ];
+        ]);
+        if !managed {
+            command.extend([
+                "--core-native".into(),
+                path_text(&self.socket, "native socket")?.into(),
+            ]);
+        }
         if let Some(language) = language {
             command.extend(["--lang".to_owned(), language.to_owned()]);
         }
@@ -234,7 +284,7 @@ impl Context {
                 format!("#{{==:{},#{{window_id}}}}", target.window_id),
             ),
         );
-        let marker_commands = vec![
+        let mut marker_commands = vec![
             vec![
                 "set-option".into(),
                 "-p".into(),
@@ -249,6 +299,12 @@ impl Context {
             set_marker(&pane_id, OPT_GENERATION, &generation),
             vec!["display-message".into(), "-p".into(), MARKED.into()],
         ];
+        if managed {
+            marker_commands.insert(
+                0,
+                set_marker(&pane_id, "@rmux-managed-sidebar", &manager_marker),
+            );
+        }
         let marked = self
             .guarded_script(&pane_id, &marker_guard, &marker_commands, REJECTED)
             .await
@@ -727,7 +783,7 @@ impl Context {
         }
     }
 
-    async fn guarded_script(
+    pub(crate) async fn guarded_script(
         &self,
         target: &str,
         guard: &str,
@@ -736,6 +792,36 @@ impl Context {
     ) -> Result<ProcessOutput, String> {
         let mut script = String::new();
         write_if(&mut script, target, guard, commands, rejected);
+        self.source_script(script).await
+    }
+
+    /// One tmux command group: a failed command suppresses all later commands.
+    pub(crate) async fn guarded_group(
+        &self,
+        target: &str,
+        guard: &str,
+        commands: &[Vec<String>],
+        rejected: &str,
+    ) -> Result<ProcessOutput, String> {
+        let mut script = String::new();
+        writeln!(
+            script,
+            "if-shell -F -t {} {} {{",
+            tmux_quote(target),
+            tmux_quote(guard)
+        )
+        .unwrap();
+        for command in commands {
+            write_command(&mut script, command);
+            script.pop(); // All commands must share one source-file line/group.
+            script.push_str("; ");
+        }
+        writeln!(
+            script,
+            "\n}} {{ display-message -p {}; }}",
+            tmux_quote(rejected)
+        )
+        .unwrap();
         self.source_script(script).await
     }
 
@@ -750,7 +836,11 @@ impl Context {
         .await
     }
 
-    async fn tmux<I>(&self, args: I, input: Option<Vec<u8>>) -> Result<ProcessOutput, String>
+    pub(crate) async fn tmux<I>(
+        &self,
+        args: I,
+        input: Option<Vec<u8>>,
+    ) -> Result<ProcessOutput, String>
     where
         I: IntoIterator<Item = OsString>,
     {
@@ -846,7 +936,7 @@ async fn manager_boot_id(executable: &Path, socket: &Path) -> Result<String, Str
     Ok(boot.to_owned())
 }
 
-async fn run_process<I>(
+pub(crate) async fn run_process<I>(
     program: &OsStr,
     args: I,
     input: Option<Vec<u8>>,
@@ -983,7 +1073,7 @@ fn write_command(script: &mut String, command: &[String]) {
     script.push('\n');
 }
 
-fn tmux_quote(value: &str) -> String {
+pub(crate) fn tmux_quote(value: &str) -> String {
     let mut quoted = String::from("'");
     for character in value.chars() {
         match character {

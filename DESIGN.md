@@ -110,7 +110,7 @@ Clipped or zero-size geometry never receives input. Help is centered and bounded
 
 ### Header and connection line
 
-The header keeps the view name and observer state visible. Wide layouts show full language, theme, help, and close labels. Narrow layouts retain keyboard hints and compact labels. Connected uses the success role; connecting and disconnected use the warning role with explicit text.
+The header keeps the view name and observer state visible. Wide layouts show full language, theme, help, and close labels. Narrow layouts retain keyboard hints and compact labels. The title shortens in turn with the controls: the long connection text first, then the view name, then the product name. The short connection state stays, ending in `…` only at the 28-column minimum. Connected uses the success role; connecting and disconnected use the warning role with explicit text.
 
 ### Filters
 
@@ -122,7 +122,7 @@ Search matches observation identity, source, session, and pane identity. The fie
 
 ### Agent list
 
-Rows sort pending attention first and then by stable observation identity. Selection follows that identity across live reordering. Wide rows place identity, activity, and attention in aligned columns sized from every filtered row, so columns stay put while scrolling. A selected row uses the raised fill, bold identity text, and a teal `›` marker; a hovered row shows a muted marker. Activity and attention carry separate colors: activity uses the working, pending, or unavailable role, and attention uses amber only for unseen pending requests. The word `pending` drops when the column cannot hold it; the kind, count, and seen state stay. Compact rows reserve one line for identity with right-aligned activity and one for the named attention type, count, and seen state. Approval and Question remain labeled rather than collapsing into an unlabeled number.
+Rows sort pending attention first and then by stable observation identity. Selection follows that identity across live reordering. Wide rows place identity, activity, and attention in aligned columns sized from every filtered row, so columns stay put while scrolling. A selected row uses the raised fill, bold identity text, and a teal `›` marker; a hovered row shows a muted marker. Activity and attention carry separate colors: activity uses the working, pending, or unavailable role, and attention uses amber only for unseen pending requests. The word `pending` drops when the column cannot hold it; the kind, count, and seen state stay. When a row cannot hold the whole attention column beside a 12-cell identity prefix, every row switches to the two-line layout. A cut identity ends in `…`. Compact rows reserve one line for identity with right-aligned activity and one for the named attention type, count, and seen state. Approval and Question remain labeled rather than collapsing into an unlabeled number.
 
 Unavailable rows use `State unavailable`. An offline row uses `Last known`. An empty list says why: connecting, no observed agents, no search match, or no pending requests. Freshness, configured but unverified bindings, invalidated associations, and exited or removed core state remain distinct. A disconnected observer leaves last-known evidence, never a completion claim.
 
@@ -140,11 +140,13 @@ Idle controls use the raised fill with the keyboard key in bold teal before the 
 
 ### Overlays, scrolling, and ownership
 
-Help and the row action menu own keyboard and mouse input while open. Help aligns keys in one column, wraps notes to its width, and places its Esc Close control in the top border. Menu items show their keyboard key at the right edge. A click outside closes the top overlay and consumes that click. List, inspector, and help scroll independently. Wheel input goes only to the region under the pointer.
+Help and the row action menu own keyboard and mouse input while open. Help aligns keys in one column, wraps notes and narrow key names to its width, and places its Esc Close control in the top border. A narrow border shortens the title to Help and then the control to Esc. Menu items show their keyboard key at the right edge. A menu taller than the screen scrolls to keep the selection visible, marks hidden items with `↑` and `↓` in its border, and moves the selection with the wheel. A click outside closes the top overlay and consumes that click. List, inspector, and help scroll independently. Wheel input goes only to the region under the pointer.
 
 A control activates only when press and release land on the same current target within two seconds. Row actions also retain the selected observation identity and revision across the gesture. A double-click uses the same row identity, button position, and a 500 millisecond window. Keyboard shortcuts call the same guarded actions as mouse controls.
 
 ### Feedback and restoration
+
+A focus hint falls back to a short key list and then to `? Help`. Receipts and connection messages wrap over both footer rows and end in `…` if they still do not fit. In a two-row footer, the managed desk keeps its server status line on the last row, and messages wrap only in the row above it.
 
 English is the default language and Korean is a full alternative. Receipts name only completed local or tmux actions, such as marking an identity seen, selecting the configured pane, expanding the sidebar, restoring the layout, or copying an ID to the named tmux buffer.
 
@@ -169,3 +171,17 @@ The terminal session owns alternate screen, raw input, cursor visibility, mouse 
 - **Don't** add an idle render loop, decorative animation, rounded web controls, or shadow depth.
 - **Don't** import yututui artwork, music content, or product styling. It was used only as a craft and mouse-interaction reference.
 - **Don't** treat review screenshots as shipping art. They are PTY-rendered test evidence with capture metadata.
+
+## Native Agent Management UI
+
+The shipped native management view reuses the desk's header, filters, Unicode search, identity-stable list, evidence inspector, action strip, context menu, themes, terminal restoration and responsive layouts. It switches the data source from agentd observations to the native `Manager` only for `rmux-agent agent ui` and its explicit sidebar.
+
+The view owns one asynchronous inventory query at a time and schedules it once per second only while open. A projection comparison prevents unchanged inventory from triggering a redraw. Native actions run in bounded background tasks so pane reads and process operations do not block keyboard or mouse input.
+
+Managed rows use **Needs input** for an untyped blocked state and **Returned idle** when a previously working run becomes idle. Both use shared acknowledgement revisions; neither asserts a question, approval, completion, or task success. Approval and Question stay at zero unless typed evidence exists. Start and resume receipts say that provider or native-session acceptance is unverified. Draft preparation names the `rmux-agent-draft` tmux buffer and explicitly says it was neither pasted nor submitted.
+
+The managed action menu contains New agent, Go to pane, Details, Rename, Resume session, Prepare draft, Interrupt, Read screen and Close pane. Start, rename and draft use cell-grid forms. Interrupt and close require confirmations. Every form and confirmation consumes background input and exposes matching keyboard and mouse controls above the desk's existing highest overlay layer.
+
+The optional 34-column management sidebar is created only by the explicit `agent sidebar` command. A per-pane marker binds it to the encoded native socket; repeated opening in the same window selects the live owned pane. Creation refuses an already zoomed window, and Expand rechecks the marker before toggling native pane zoom. The rmux menu opens the full management view in an ordinary native window and adds no default key binding.
+
+원격 Agent 목록은 같은 관리 화면에 endpoint::name으로 표시한다. 서버별 연결 상태를 지속 표시하고 stale 행의 조작을 비활성화한다. 원격 새 실행에는 서버와 원격 cwd를 명시하며, 원래 TUI는 별도 native 연결 창에서 연다.

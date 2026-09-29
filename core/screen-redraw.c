@@ -518,10 +518,33 @@ redraw_data_has_pane(struct redraw_span_data *data, struct window_pane *wp)
 	return (0);
 }
 
+/* rmux: whether a border cell belongs to a pane in the same floating group. */
+static int
+redraw_data_has_group(struct redraw_span_data *data, struct window_pane *wp)
+{
+	struct layout_cell	*root = layout_float_root(wp->layout_cell);
+	struct window_pane	*owners[4];
+	u_int			 i;
+
+	if (root == NULL || root->type == LAYOUT_WINDOWPANE)
+		return (0);
+	owners[0] = data->b.top_wp;
+	owners[1] = data->b.bottom_wp;
+	owners[2] = data->b.left_wp;
+	owners[3] = data->b.right_wp;
+	for (i = 0; i < nitems(owners); i++) {
+		if (owners[i] != NULL &&
+		    layout_float_root(owners[i]->layout_cell) == root)
+			return (1);
+	}
+	return (0);
+}
+
 /*
  * Mark one border cell. If a non-border cell is marked as a border, replace
  * it. If it is already a border and this is not a floating pane, merge the
- * border mask and pane ownership.
+ * border mask and pane ownership. rmux: panes of one floating group also
+ * merge the separators they share.
  */
 static void
 redraw_mark_border_cell(struct redraw_build_ctx *bctx, int wx, int wy,
@@ -552,7 +575,8 @@ redraw_mark_border_cell(struct redraw_build_ctx *bctx, int wx, int wy,
 			return;
 	} else {
 		if (bc->data.type != REDRAW_SPAN_BORDER ||
-		    !redraw_data_has_pane(&bc->data, wp))
+		    (!redraw_data_has_pane(&bc->data, wp) &&
+		    !redraw_data_has_group(&bc->data, wp)))
 			reset = 1;
 	}
 	if (reset) {

@@ -3033,6 +3033,14 @@ input_osc_9(struct input_ctx *ictx, const char *p)
 	const char		*pb = p;
 	enum progress_bar_state	 state;
 	int			 progress = 0;
+	size_t			 length = strlen(p);
+
+	/* Preserve bounded agent evidence independently of progress rendering. */
+	if (length >= 3 && length < sizeof ictx->ctx.s->rmux_osc_progress &&
+	    p[0] == '4' && p[1] == ';' && p[2] >= '0' && p[2] <= '4' &&
+	    strspn(p, "0123456789;-") == length)
+		strlcpy(ictx->ctx.s->rmux_osc_progress, p,
+		    sizeof ictx->ctx.s->rmux_osc_progress);
 
 	if (*pb++ != '4')
 		return;
