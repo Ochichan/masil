@@ -32,7 +32,9 @@ test: core baseline agent benchmark-env
 	.build/bench-venv/bin/python tests/test_ui.py
 	.build/bench-venv/bin/python tests/test_mouse_ui.py
 	.build/bench-venv/bin/python tests/test_agent_titles.py
+	.build/bench-venv/bin/python tests/test_terminal_colors.py
 	.build/bench-venv/bin/python tests/test_managed_ui.py
+	.build/bench-venv/bin/python tests/test_managed_stress.py
 	cargo test --locked --manifest-path agent/Cargo.toml
 
 benchmark-env:

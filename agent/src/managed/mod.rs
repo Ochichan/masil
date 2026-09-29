@@ -22,6 +22,30 @@ use std::sync::Mutex;
 const META: &str = "@masil-managed-agent";
 const TRACKED: &str = "@masil-managed-observation";
 const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}";
+const CAPTURE_BATCH_SIZE: usize = 12;
+const MAX_PS_TTY_ARGUMENT: usize = 4096;
+
+struct CaptureRequest {
+    pane: String,
+    identity: String,
+    guard: String,
+}
+
+enum PreparedEvidence {
+    Cached(Value),
+    Screen(String),
+}
+
+fn store_cached_evidence(
+    cache: &mut HashMap<String, (String, Value)>,
+    pane: String,
+    key: String,
+    evidence: Value,
+) {
+    if cache.contains_key(&pane) || cache.len() < 64 {
+        cache.insert(pane, (key, evidence));
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -173,17 +197,140 @@ impl Manager {
         Ok(records)
     }
 
+    async fn capture_cache_misses(
+        &self,
+        inventory: &[Vec<String>],
+        identified: &HashMap<String, &'static providers::Provider>,
+        target: Option<&str>,
+    ) -> Result<HashMap<String, PreparedEvidence>, String> {
+        let mut requests = Vec::new();
+        let mut seen = HashSet::new();
+        let live_panes: HashSet<_> = inventory.iter().map(|fields| fields[0].as_str()).collect();
+        let mut cached_snapshot = {
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| "detection cache unavailable")?;
+            cache.retain(|pane, _| live_panes.contains(pane.as_str()));
+            cache.clone()
+        };
+        let mut prepared = HashMap::new();
+        for fields in inventory {
+            if fields[4] == "1"
+                || !seen.insert(fields[0].clone())
+                || target.is_some_and(|value| value.starts_with('%') && value != fields[0])
+            {
+                continue;
+            }
+            let Some(provider) = identified.get(&fields[0]) else {
+                continue;
+            };
+            let key = observation_key(fields, provider.id);
+            if let Some((_, evidence)) = cached_snapshot
+                .remove(&fields[0])
+                .filter(|(candidate, _)| candidate == &key)
+            {
+                prepared.insert(fields[0].clone(), PreparedEvidence::Cached(evidence));
+            } else {
+                requests.push(CaptureRequest {
+                    pane: fields[0].clone(),
+                    identity: capture_identity(fields, provider.id),
+                    guard: capture_guard(fields),
+                });
+            }
+        }
+        if requests.is_empty() {
+            return Ok(prepared);
+        }
+
+        for chunk in requests.chunks(CAPTURE_BATCH_SIZE) {
+            let batch = self.capture_batch(chunk).await;
+            if let Ok(screens) = batch {
+                prepared.extend(chunk.iter().zip(screens).map(|(request, screen)| {
+                    (request.pane.clone(), PreparedEvidence::Screen(screen))
+                }));
+            } else {
+                for request in chunk {
+                    prepared.insert(
+                        request.pane.clone(),
+                        PreparedEvidence::Screen(self.read_pane(&request.pane, false).await?),
+                    );
+                }
+            }
+        }
+
+        // Capture output is untrusted terminal data. Re-read run identity after
+        // the batch. Output, title, and progress are allowed to advance while a
+        // pane is captured; their old cache key simply misses on the next poll.
+        let current = self.inventory().await?;
+        validate_inventory(&current)?;
+        let current_identified = identify_foregrounds(&current).await;
+        let current_by_pane: HashMap<_, _> = current
+            .iter()
+            .filter_map(|fields| {
+                current_identified
+                    .get(&fields[0])
+                    .map(|provider| (fields[0].as_str(), capture_identity(fields, provider.id)))
+            })
+            .collect();
+        if requests.iter().any(|request| {
+            current_by_pane
+                .get(request.pane.as_str())
+                .map_or(true, |identity| identity != &request.identity)
+        }) {
+            return Err("native pane identity changed during observation".into());
+        }
+        Ok(prepared)
+    }
+
+    async fn capture_batch(&self, requests: &[CaptureRequest]) -> Result<Vec<String>, String> {
+        let batch_nonce = nonce()?;
+        let mut frames = Vec::with_capacity(requests.len());
+        let groups = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let begin = format!("masil-capture-{batch_nonce}-{index}-begin");
+                let end = format!("masil-capture-{batch_nonce}-{index}-end");
+                let rejected = format!("masil-capture-{batch_nonce}-{index}-rejected");
+                frames.push((begin.clone(), end.clone(), rejected.clone()));
+                (
+                    request.pane.clone(),
+                    request.guard.clone(),
+                    vec![
+                        vec!["display-message".into(), "-p".into(), begin],
+                        vec![
+                            "capture-pane".into(),
+                            "-p".into(),
+                            "-J".into(),
+                            "-t".into(),
+                            request.pane.clone(),
+                        ],
+                        vec!["display-message".into(), "-p".into(), end],
+                    ],
+                    rejected,
+                )
+            })
+            .collect::<Vec<_>>();
+        let output = self.native.guarded_groups(&groups).await?;
+        parse_capture_frames(&output.stdout, &frames)
+            .ok_or_else(|| "native capture batch framing is ambiguous".into())
+    }
+
     pub async fn list(&self) -> Result<Vec<Agent>, String> {
         self.collect(None).await
     }
 
     async fn collect(&self, target: Option<&str>) -> Result<Vec<Agent>, String> {
+        let inventory = self.inventory().await?;
+        validate_inventory(&inventory)?;
+        let identified = identify_foregrounds(&inventory).await;
+        let mut prepared = self
+            .capture_cache_misses(&inventory, &identified, target)
+            .await?;
         let mut agents = Vec::new();
         let mut seen_panes = HashSet::new();
-        for fields in self.inventory().await? {
-            if fields.len() != 16 || crate::pane_id(&fields[0]).is_err() {
-                return Err("invalid native pane inventory".into());
-            }
+        for fields in inventory {
             // A linked window can occur in more than one session.
             if !seen_panes.insert(fields[0].clone()) {
                 continue;
@@ -192,23 +339,6 @@ impl Manager {
                 continue;
             }
             let encoded = &fields[11];
-            if [encoded, &fields[12]]
-                .iter()
-                .any(|s| s.len() > 16384 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
-            {
-                return Err("invalid agent metadata encoding".into());
-            }
-            if fields[5].len() != 36
-                || !fields[5]
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() || b == b'-')
-                || fields[6].parse::<u64>().is_err()
-            {
-                return Err(
-                    "native core identity unavailable; rebuild and restart this masil server"
-                        .into(),
-                );
-            }
             let metadata = decode::<Metadata>(encoded).filter(|m| {
                 m.boot == fields[5]
                     && m.generation == fields[6]
@@ -220,11 +350,7 @@ impl Manager {
             let dead = fields[4] == "1";
             let foreground_group = fields[13].parse::<i32>().unwrap_or(0);
             let metadata = metadata.filter(|m| dead || m.foreground_group == foreground_group);
-            let identified = if dead {
-                None
-            } else {
-                identify_foreground(&fields[10], &fields[7], foreground_group).await
-            };
+            let identified = identified.get(&fields[0]).copied();
             let Some(provider) =
                 identified.or_else(|| metadata.as_ref().and_then(|m| providers::find(&m.provider)))
             else {
@@ -232,43 +358,26 @@ impl Manager {
             };
             let foreground = identified.is_some_and(|p| p.id == provider.id);
             let mut evidence = if foreground {
-                let key = format!(
-                    "{}:{}:{}:{}:{}:{}:{}:{}",
-                    fields[5],
-                    fields[6],
-                    foreground_group,
-                    fields[14],
-                    provider.id,
-                    fields[7],
-                    fields[9],
-                    fields[15]
-                );
-                let cached = self
-                    .cache
-                    .lock()
-                    .map_err(|_| "detection cache unavailable")?
-                    .get(&fields[0])
-                    .filter(|(k, _)| k == &key)
-                    .map(|(_, v)| v.clone());
-                if let Some(cached) = cached {
-                    cached
-                } else {
-                    let screen = self.read_pane(&fields[0], false).await?;
-                    let evidence = self.engine.explain_with_progress(
-                        provider.id,
-                        &screen,
-                        &fields[9],
-                        &fields[15],
-                    );
-                    let mut cache = self
-                        .cache
-                        .lock()
-                        .map_err(|_| "detection cache unavailable")?;
-                    if cache.len() >= 64 {
-                        cache.clear();
+                let key = observation_key(&fields, provider.id);
+                match prepared
+                    .remove(&fields[0])
+                    .ok_or("native capture result is unavailable")?
+                {
+                    PreparedEvidence::Cached(evidence) => evidence,
+                    PreparedEvidence::Screen(screen) => {
+                        let evidence = self.engine.explain_with_progress(
+                            provider.id,
+                            &screen,
+                            &fields[9],
+                            &fields[15],
+                        );
+                        let mut cache = self
+                            .cache
+                            .lock()
+                            .map_err(|_| "detection cache unavailable")?;
+                        store_cached_evidence(&mut cache, fields[0].clone(), key, evidence.clone());
+                        evidence
                     }
-                    cache.insert(fields[0].clone(), (key, evidence.clone()));
-                    evidence
                 }
             } else {
                 json!({"state":"unknown", "source":"process", "reason": if dead {"process_exited"} else {"foreground_not_verified"}})
@@ -955,6 +1064,181 @@ fn records(text: &str) -> Result<Vec<Vec<String>>, String> {
     Ok(rows)
 }
 
+fn validate_inventory(inventory: &[Vec<String>]) -> Result<(), String> {
+    for fields in inventory {
+        if fields.len() != 16 || crate::pane_id(&fields[0]).is_err() {
+            return Err("invalid native pane inventory".into());
+        }
+        if [&fields[11], &fields[12]]
+            .iter()
+            .any(|value| value.len() > 16384 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err("invalid agent metadata encoding".into());
+        }
+        if fields[5].len() != 36
+            || !fields[5]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+            || fields[6].parse::<u64>().is_err()
+        {
+            return Err(
+                "native core identity unavailable; rebuild and restart this masil server".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn observation_key(fields: &[String], provider: &str) -> String {
+    json!([
+        fields[5], fields[6], fields[13], fields[14], provider, fields[7], fields[9], fields[15]
+    ])
+    .to_string()
+}
+
+fn capture_identity(fields: &[String], provider: &str) -> String {
+    json!([fields[5], fields[6], fields[13], provider, fields[7]]).to_string()
+}
+
+fn capture_guard(fields: &[String]) -> String {
+    and(&[
+        format!("#{{==:#{{masil_core_boot_id}},{}}}", fields[5]),
+        format!("#{{==:#{{masil_pty_generation}},{}}}", fields[6]),
+        format!("#{{==:#{{masil_foreground_pgid}},{}}}", fields[13]),
+    ])
+}
+
+fn parse_capture_frames(output: &[u8], frames: &[(String, String, String)]) -> Option<Vec<String>> {
+    let mut cursor = 0;
+    let mut screens = Vec::with_capacity(frames.len());
+    for (begin, end, rejected) in frames {
+        let begin = format!("{begin}\n");
+        let rejected = format!("{rejected}\n");
+        if output.get(cursor..)?.starts_with(rejected.as_bytes()) {
+            return None;
+        }
+        if !output.get(cursor..)?.starts_with(begin.as_bytes()) {
+            return None;
+        }
+        cursor += begin.len();
+        let end = format!("{end}\n");
+        let offset = output
+            .get(cursor..)?
+            .windows(end.len())
+            .position(|window| window == end.as_bytes())?;
+        let screen = std::str::from_utf8(output.get(cursor..cursor + offset)?).ok()?;
+        screens.push(screen.to_owned());
+        cursor += offset + end.len();
+    }
+    (cursor == output.len()).then_some(screens)
+}
+
+async fn identify_foregrounds(
+    inventory: &[Vec<String>],
+) -> HashMap<String, &'static providers::Provider> {
+    let mut identified = HashMap::new();
+    let mut runtime = Vec::new();
+    for fields in inventory {
+        if fields[4] == "1" {
+            continue;
+        }
+        let Ok(group) = fields[13].parse::<i32>() else {
+            continue;
+        };
+        if group <= 0 {
+            continue;
+        }
+        if let Some(provider) = providers::identify(&fields[7]) {
+            identified.insert(fields[0].clone(), provider);
+        } else if providers::is_runtime(&fields[7]) && valid_tty(&fields[10]) {
+            runtime.push((&fields[0], &fields[10], &fields[7], group));
+        }
+    }
+    if runtime.is_empty() {
+        return identified;
+    }
+
+    let mut ttys = Vec::new();
+    for (_, tty, _, _) in &runtime {
+        let tty = tty.trim_start_matches("/dev/");
+        if !ttys.contains(&tty) {
+            ttys.push(tty);
+        }
+    }
+    let tty_argument = ttys.join(",");
+    let batch = if tty_argument.len() <= MAX_PS_TTY_ARGUMENT {
+        native_ui::run_process(
+            std::ffi::OsStr::new("/bin/ps"),
+            [
+                OsString::from("-t"),
+                OsString::from(&tty_argument),
+                OsString::from("-o"),
+                OsString::from("tty=,pgid=,args="),
+            ],
+            None,
+        )
+        .await
+        .ok()
+        .and_then(|result| String::from_utf8(result.stdout).ok())
+        .and_then(|text| parse_ps_inventory(&text, &runtime))
+    } else {
+        None
+    };
+
+    if let Some(batch) = batch {
+        for (pane, tty, _, group) in runtime {
+            if let Some(provider) = batch.get(&(tty.trim_start_matches("/dev/").to_owned(), group))
+            {
+                identified.insert(pane.clone(), *provider);
+            }
+        }
+    } else {
+        for (pane, tty, command, group) in runtime {
+            if let Some(provider) = identify_foreground(tty, command, group).await {
+                identified.insert(pane.clone(), provider);
+            }
+        }
+    }
+    identified
+}
+
+fn parse_ps_inventory(
+    text: &str,
+    expected: &[(&String, &String, &String, i32)],
+) -> Option<HashMap<(String, i32), &'static providers::Provider>> {
+    let expected: HashSet<_> = expected
+        .iter()
+        .map(|(_, tty, _, group)| (tty.trim_start_matches("/dev/").to_owned(), *group))
+        .collect();
+    let requested_ttys: HashSet<_> = expected.iter().map(|(tty, _)| tty.as_str()).collect();
+    let mut found = HashMap::new();
+    for line in text.lines() {
+        let (tty, rest) = line.trim().split_once(char::is_whitespace)?;
+        let (group, args) = rest.trim_start().split_once(char::is_whitespace)?;
+        let group = group.parse::<i32>().ok()?;
+        let args = args.trim_start();
+        if !requested_ttys.contains(tty) {
+            return None;
+        }
+        let key = (tty.to_owned(), group);
+        if expected.contains(&key)
+            && let Some(provider) = providers::identify(args)
+        {
+            found.entry(key).or_insert(provider);
+        }
+    }
+    Some(found)
+}
+
+fn valid_tty(tty: &str) -> bool {
+    tty.starts_with("/dev/")
+        && tty.len() <= 128
+        && tty
+            .trim_start_matches("/dev/")
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+}
+
 async fn identify_foreground(
     tty: &str,
     command: &str,
@@ -969,7 +1253,7 @@ async fn identify_foreground(
     if !providers::is_runtime(command) {
         return None;
     }
-    if !tty.starts_with("/dev/") || tty.chars().any(char::is_control) {
+    if !valid_tty(tty) {
         return None;
     }
     let result = native_ui::run_process(
@@ -1022,5 +1306,71 @@ mod tests {
         assert!(decode::<Metadata>("a").is_none());
         assert!(!valid_name("a;kill-server"));
         assert!(validate_args(&["hello\nworld".into()]).is_err());
+    }
+
+    #[test]
+    fn capture_frames_preserve_multiline_unicode_and_reject_ambiguous_markers() {
+        let frames = vec![
+            (
+                "fresh-0-begin".into(),
+                "fresh-0-end".into(),
+                "fresh-0-rejected".into(),
+            ),
+            (
+                "fresh-1-begin".into(),
+                "fresh-1-end".into(),
+                "fresh-1-rejected".into(),
+            ),
+        ];
+        let output = "fresh-0-begin\nfirst\n한국어\nold-separator-like-text\nfresh-0-end\nfresh-1-begin\nsecond\nline\nfresh-1-end\n".as_bytes();
+        assert_eq!(
+            parse_capture_frames(output, &frames).unwrap(),
+            ["first\n한국어\nold-separator-like-text\n", "second\nline\n"]
+        );
+
+        let ambiguous = b"fresh-0-begin\ntext\nfresh-0-end\nforged\nfresh-0-end\nfresh-1-begin\nsecond\nfresh-1-end\n";
+        assert!(parse_capture_frames(ambiguous, &frames).is_none());
+        assert!(parse_capture_frames(b"fresh-0-rejected\n", &frames[..1]).is_none());
+    }
+
+    #[test]
+    fn batched_ps_matches_only_requested_tty_and_group() {
+        let pane = "%1".to_owned();
+        let tty = "/dev/ttys001".to_owned();
+        let command = "python3.12".to_owned();
+        let expected = vec![(&pane, &tty, &command, 42)];
+        let parsed = parse_ps_inventory(
+            "ttys001  7 /bin/sh\nttys001  42 python3.12 /opt/hermes\n",
+            &expected,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .get(&("ttys001".to_owned(), 42))
+                .map(|provider| provider.id),
+            Some("hermes")
+        );
+        assert!(parse_ps_inventory("ttys999 42 python3.12 /opt/hermes\n", &expected).is_none());
+    }
+
+    #[test]
+    fn full_cache_replaces_existing_pane_without_evicting_other_snapshots() {
+        let mut cache = (0..64)
+            .map(|index| {
+                (
+                    format!("%{index}"),
+                    (format!("old-{index}"), json!({"pane":index})),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let snapshot = cache.clone();
+        store_cached_evidence(&mut cache, "%0".into(), "new".into(), json!({"pane":0}));
+        store_cached_evidence(&mut cache, "%64".into(), "new".into(), json!({"pane":64}));
+
+        assert_eq!(cache.len(), 64);
+        assert_eq!(cache["%0"].0, "new");
+        assert!(!cache.contains_key("%64"));
+        assert_eq!(snapshot["%0"].0, "old-0");
+        assert_eq!(snapshot["%63"], cache["%63"]);
     }
 }

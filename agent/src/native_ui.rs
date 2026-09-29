@@ -825,6 +825,17 @@ impl Context {
         self.source_script(script).await
     }
 
+    pub(crate) async fn guarded_groups(
+        &self,
+        groups: &[(String, String, Vec<Vec<String>>, String)],
+    ) -> Result<ProcessOutput, String> {
+        let mut script = String::new();
+        for (target, guard, commands, rejected) in groups {
+            write_group(&mut script, target, guard, commands, rejected);
+        }
+        self.source_script(script).await
+    }
+
     async fn source_script(&self, script: String) -> Result<ProcessOutput, String> {
         if script.len() > MAX_SCRIPT {
             return Err("native tmux command exceeds script limit".into());
@@ -1058,6 +1069,33 @@ fn write_if(
     writeln!(
         script,
         "}} {{ display-message -p {}; }}",
+        tmux_quote(rejected)
+    )
+    .unwrap();
+}
+
+fn write_group(
+    script: &mut String,
+    target: &str,
+    guard: &str,
+    commands: &[Vec<String>],
+    rejected: &str,
+) {
+    writeln!(
+        script,
+        "if-shell -F -t {} {} {{",
+        tmux_quote(target),
+        tmux_quote(guard)
+    )
+    .unwrap();
+    for command in commands {
+        write_command(script, command);
+        script.pop();
+        script.push_str("; ");
+    }
+    writeln!(
+        script,
+        "\n}} {{ display-message -p {}; }}",
         tmux_quote(rejected)
     )
     .unwrap();

@@ -266,7 +266,9 @@ environ_for_session(struct session *s, int no_TERM)
 		environ_set(env, "TERM", 0, "%s", value);
 		environ_set(env, "TERM_PROGRAM", 0, "%s", "tmux");
 		environ_set(env, "TERM_PROGRAM_VERSION", 0, "%s", getversion());
-		environ_set(env, "COLORTERM", 0, "truecolor");
+		/* Keep the outer terminal's colour hint in masil mode. */
+		if (!masil_ui_enabled)
+			environ_set(env, "COLORTERM", 0, "truecolor");
 	}
 
 #ifdef HAVE_SYSTEMD

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::Deserialize;
@@ -51,18 +52,23 @@ const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
 /// Immutable detection engine. Call `load` again to pick up override changes.
 #[derive(Debug)]
 pub struct Engine {
-    manifests: HashMap<String, LoadedManifest>,
+    manifests: HashMap<&'static str, ManifestEntry>,
 }
 
 impl Engine {
-    /// Loads the 22 bundled manifests and any local masil overrides.
+    /// Registers the 22 bundled manifests and loads any local masil overrides.
     ///
     /// Overrides live in `$XDG_CONFIG_HOME/masil/agent-detection`, falling
     /// back to `~/.config/masil/agent-detection`. A present invalid override
-    /// fails the load rather than silently weakening detection.
+    /// fails the load rather than silently weakening detection. Bundled
+    /// manifests are compiled when first used by this engine.
     pub fn load() -> Result<Self, String> {
-        let mut engine = Self::load_bundled()?;
-        let Some(directory) = override_directory() else {
+        Self::load_with_override_directory(override_directory())
+    }
+
+    fn load_with_override_directory(directory: Option<PathBuf>) -> Result<Self, String> {
+        let mut engine = Self::load_bundled();
+        let Some(directory) = directory else {
             return Ok(engine);
         };
         for (id, _) in BUNDLED_MANIFESTS {
@@ -88,7 +94,7 @@ impl Engine {
                     loaded.manifest.id
                 ));
             }
-            engine.manifests.insert((*id).to_string(), loaded);
+            engine.manifests.insert(*id, ManifestEntry::Loaded(loaded));
         }
         Ok(engine)
     }
@@ -109,8 +115,12 @@ impl Engine {
         let Some(provider) = providers::find(provider) else {
             return unknown_explanation(provider, "unknown_provider", None, Vec::new());
         };
-        let Some(loaded) = self.manifests.get(provider.id) else {
+        let Some(manifest) = self.manifests.get(provider.id) else {
             return unknown_explanation(provider.id, "manifest_unavailable", None, Vec::new());
+        };
+        let loaded = match manifest.loaded() {
+            Ok(loaded) => loaded,
+            Err(error) => return unavailable_explanation(provider.id, error),
         };
         if screen.len() > MAX_SCREEN_BYTES || title.len() > MAX_TITLE_BYTES || progress.len() > 31 {
             return unknown_explanation(
@@ -191,21 +201,63 @@ impl Engine {
         })
     }
 
-    fn load_bundled() -> Result<Self, String> {
+    fn load_bundled() -> Self {
         let mut manifests = HashMap::with_capacity(BUNDLED_MANIFESTS.len());
         for (id, text) in BUNDLED_MANIFESTS {
-            let loaded = load_manifest(text, ManifestSource::Bundled)
-                .map_err(|error| format!("invalid bundled {id} manifest: {error}"))?;
-            if loaded.manifest.id != *id {
-                return Err(format!(
-                    "invalid bundled {id} manifest: id is {}",
-                    loaded.manifest.id
-                ));
-            }
-            manifests.insert((*id).to_string(), loaded);
+            manifests.insert(*id, ManifestEntry::bundled(id, text));
         }
-        Ok(Self { manifests })
+        Self { manifests }
     }
+}
+
+#[derive(Debug)]
+enum ManifestEntry {
+    Bundled {
+        id: &'static str,
+        text: &'static str,
+        loaded: OnceLock<Result<LoadedManifest, String>>,
+    },
+    Loaded(LoadedManifest),
+}
+
+impl ManifestEntry {
+    fn bundled(id: &'static str, text: &'static str) -> Self {
+        Self::Bundled {
+            id,
+            text,
+            loaded: OnceLock::new(),
+        }
+    }
+
+    fn loaded(&self) -> Result<&LoadedManifest, &str> {
+        match self {
+            Self::Bundled { id, text, loaded } => loaded
+                .get_or_init(|| load_bundled_manifest(id, text))
+                .as_ref()
+                .map_err(String::as_str),
+            Self::Loaded(loaded) => Ok(loaded),
+        }
+    }
+
+    #[cfg(test)]
+    fn bundled_is_loaded(&self) -> bool {
+        match self {
+            Self::Bundled { loaded, .. } => loaded.get().is_some(),
+            Self::Loaded(_) => false,
+        }
+    }
+}
+
+fn load_bundled_manifest(id: &str, text: &str) -> Result<LoadedManifest, String> {
+    let loaded = load_manifest(text, ManifestSource::Bundled)
+        .map_err(|error| format!("invalid bundled {id} manifest: {error}"))?;
+    if loaded.manifest.id != id {
+        return Err(format!(
+            "invalid bundled {id} manifest: id is {}",
+            loaded.manifest.id
+        ));
+    }
+    Ok(loaded)
 }
 
 #[derive(Debug)]
@@ -344,16 +396,7 @@ fn load_manifest(text: &str, source: ManifestSource) -> Result<LoadedManifest, S
         return Err(format!("manifest exceeds {MAX_MANIFEST_BYTES} bytes"));
     }
     let manifest: AgentManifest = toml::from_str(text).map_err(|error| error.to_string())?;
-    validate_manifest(&manifest)?;
-    let compiled_rules = manifest
-        .rules
-        .iter()
-        .map(|rule| {
-            compile_gate(&gate_from_rule(rule))
-                .map(|gate| CompiledRule { gate })
-                .map_err(|error| format!("rule {} could not be compiled: {error}", rule.id))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let compiled_rules = validate_manifest(&manifest)?;
     Ok(LoadedManifest {
         manifest,
         compiled_rules,
@@ -361,7 +404,7 @@ fn load_manifest(text: &str, source: ManifestSource) -> Result<LoadedManifest, S
     })
 }
 
-fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
+fn validate_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, String> {
     if manifest.id.trim().is_empty() {
         return Err("manifest id must not be empty".into());
     }
@@ -387,6 +430,7 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
         ));
     }
     let mut complexity = Complexity::default();
+    let mut compiled_rules = Vec::with_capacity(manifest.rules.len());
     for rule in &manifest.rules {
         if rule.id.trim().is_empty() {
             return Err("manifest rule id must not be empty".into());
@@ -417,10 +461,12 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
                 rule.id
             ));
         }
-        validate_gate(&gate_from_rule(rule), "rule", 0, &mut complexity)
+        let gate = gate_from_rule(rule);
+        let gate = validate_gate(&gate, "rule", 0, &mut complexity)
             .map_err(|error| format!("rule {} has invalid matcher gates: {error}", rule.id))?;
+        compiled_rules.push(CompiledRule { gate });
     }
-    Ok(())
+    Ok(compiled_rules)
 }
 
 fn validate_version(version: &str) -> Result<(), String> {
@@ -458,7 +504,7 @@ fn validate_gate(
     context: &str,
     depth: usize,
     complexity: &mut Complexity,
-) -> Result<(), String> {
+) -> Result<CompiledGate, String> {
     if depth > MAX_GATE_DEPTH {
         return Err(format!("{context} exceeds max gate depth {MAX_GATE_DEPTH}"));
     }
@@ -493,35 +539,62 @@ fn validate_gate(
             ));
         }
     }
-    for pattern in &gate.regex {
-        Regex::new(pattern)
-            .map_err(|error| format!("{context} contains invalid regex {pattern:?}: {error}"))?;
-    }
-    for pattern in &gate.line_regex {
-        Regex::new(pattern).map_err(|error| {
-            format!("{context} contains invalid line_regex {pattern:?}: {error}")
-        })?;
-    }
-    for nested in &gate.all {
-        validate_gate(nested, "all gate", depth + 1, complexity)?;
-    }
-    for nested in &gate.any {
-        validate_gate(nested, "any gate", depth + 1, complexity)?;
-    }
-    for nested in &gate.not_gate {
-        if !gate_has_any_matcher(nested) {
-            return Err(format!("{context} contains an empty not gate"));
-        }
-        validate_not_gate(nested, depth + 1, complexity)?;
-    }
-    Ok(())
+    let regex = gate
+        .regex
+        .iter()
+        .map(|pattern| {
+            Regex::new(pattern)
+                .map_err(|error| format!("{context} contains invalid regex {pattern:?}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let line_regex = gate
+        .line_regex
+        .iter()
+        .map(|pattern| {
+            Regex::new(pattern).map_err(|error| {
+                format!("{context} contains invalid line_regex {pattern:?}: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let all = gate
+        .all
+        .iter()
+        .map(|nested| validate_gate(nested, "all gate", depth + 1, complexity))
+        .collect::<Result<Vec<_>, _>>()?;
+    let any = gate
+        .any
+        .iter()
+        .map(|nested| validate_gate(nested, "any gate", depth + 1, complexity))
+        .collect::<Result<Vec<_>, _>>()?;
+    let not_gate = gate
+        .not_gate
+        .iter()
+        .map(|nested| {
+            if !gate_has_any_matcher(nested) {
+                return Err(format!("{context} contains an empty not gate"));
+            }
+            validate_not_gate(nested, depth + 1, complexity)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CompiledGate {
+        all,
+        any,
+        not_gate,
+        contains: gate
+            .contains
+            .iter()
+            .map(|value| value.to_lowercase())
+            .collect(),
+        regex,
+        line_regex,
+    })
 }
 
 fn validate_not_gate(
     gate: &ManifestGate,
     depth: usize,
     complexity: &mut Complexity,
-) -> Result<(), String> {
+) -> Result<CompiledGate, String> {
     if depth > MAX_GATE_DEPTH {
         return Err(format!("not gate exceeds max gate depth {MAX_GATE_DEPTH}"));
     }
@@ -556,23 +629,48 @@ fn validate_not_gate(
             ));
         }
     }
-    for pattern in &gate.regex {
-        Regex::new(pattern).map_err(|error| format!("invalid not regex {pattern:?}: {error}"))?;
-    }
-    for pattern in &gate.line_regex {
-        Regex::new(pattern)
-            .map_err(|error| format!("invalid not line_regex {pattern:?}: {error}"))?;
-    }
-    for nested in &gate.all {
-        validate_gate(nested, "not all gate", depth + 1, complexity)?;
-    }
-    for nested in &gate.any {
-        validate_gate(nested, "not any gate", depth + 1, complexity)?;
-    }
-    for nested in &gate.not_gate {
-        validate_not_gate(nested, depth + 1, complexity)?;
-    }
-    Ok(())
+    let regex = gate
+        .regex
+        .iter()
+        .map(|pattern| {
+            Regex::new(pattern).map_err(|error| format!("invalid not regex {pattern:?}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let line_regex = gate
+        .line_regex
+        .iter()
+        .map(|pattern| {
+            Regex::new(pattern)
+                .map_err(|error| format!("invalid not line_regex {pattern:?}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let all = gate
+        .all
+        .iter()
+        .map(|nested| validate_gate(nested, "not all gate", depth + 1, complexity))
+        .collect::<Result<Vec<_>, _>>()?;
+    let any = gate
+        .any
+        .iter()
+        .map(|nested| validate_gate(nested, "not any gate", depth + 1, complexity))
+        .collect::<Result<Vec<_>, _>>()?;
+    let not_gate = gate
+        .not_gate
+        .iter()
+        .map(|nested| validate_not_gate(nested, depth + 1, complexity))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CompiledGate {
+        all,
+        any,
+        not_gate,
+        contains: gate
+            .contains
+            .iter()
+            .map(|value| value.to_lowercase())
+            .collect(),
+        regex,
+        line_regex,
+    })
 }
 
 fn gate_has_positive_matcher(gate: &ManifestGate) -> bool {
@@ -585,41 +683,6 @@ fn gate_has_positive_matcher(gate: &ManifestGate) -> bool {
 
 fn gate_has_any_matcher(gate: &ManifestGate) -> bool {
     gate_has_positive_matcher(gate) || !gate.not_gate.is_empty()
-}
-
-fn compile_gate(gate: &ManifestGate) -> Result<CompiledGate, String> {
-    Ok(CompiledGate {
-        all: gate
-            .all
-            .iter()
-            .map(compile_gate)
-            .collect::<Result<Vec<_>, _>>()?,
-        any: gate
-            .any
-            .iter()
-            .map(compile_gate)
-            .collect::<Result<Vec<_>, _>>()?,
-        not_gate: gate
-            .not_gate
-            .iter()
-            .map(compile_gate)
-            .collect::<Result<Vec<_>, _>>()?,
-        contains: gate
-            .contains
-            .iter()
-            .map(|value| value.to_lowercase())
-            .collect(),
-        regex: gate
-            .regex
-            .iter()
-            .map(|pattern| Regex::new(pattern).map_err(|error| error.to_string()))
-            .collect::<Result<Vec<_>, _>>()?,
-        line_regex: gate
-            .line_regex
-            .iter()
-            .map(|pattern| Regex::new(pattern).map_err(|error| error.to_string()))
-            .collect::<Result<Vec<_>, _>>()?,
-    })
 }
 
 fn compiled_gate_matches(gate: &CompiledGate, text: &str) -> bool {
@@ -951,6 +1014,12 @@ fn unknown_explanation(
     })
 }
 
+fn unavailable_explanation(provider: &str, warning: &str) -> Value {
+    let mut explanation = unknown_explanation(provider, "manifest_unavailable", None, Vec::new());
+    explanation["warning"] = Value::String(warning.to_owned());
+    explanation
+}
+
 fn override_directory() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(path).join("masil").join("agent-detection"));
@@ -1006,18 +1075,166 @@ fn read_override(path: &std::path::Path) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            loop {
+                let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "masil-detection-test-{}-{sequence}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create test directory: {error}"),
+                }
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn synthetic(text: &str) -> Engine {
         let loaded = load_manifest(text, ManifestSource::Bundled).unwrap();
         Engine {
-            manifests: HashMap::from([("codex".to_string(), loaded)]),
+            manifests: HashMap::from([("codex", ManifestEntry::Loaded(loaded))]),
         }
     }
 
     #[test]
     fn bundled_manifests_are_valid_v3_schema() {
-        let engine = Engine::load_bundled().unwrap();
-        assert_eq!(engine.manifests.len(), 22);
+        for (id, text) in BUNDLED_MANIFESTS {
+            load_bundled_manifest(id, text).unwrap();
+        }
+    }
+
+    #[test]
+    fn bundled_manifests_compile_only_when_used() {
+        let engine = Engine::load_bundled();
+        assert_eq!(engine.manifests.len(), BUNDLED_MANIFESTS.len());
+        assert_eq!(
+            engine
+                .manifests
+                .values()
+                .filter(|manifest| manifest.bundled_is_loaded())
+                .count(),
+            0
+        );
+
+        engine.explain("codex", "", "");
+
+        assert!(engine.manifests["codex"].bundled_is_loaded());
+        assert_eq!(
+            engine
+                .manifests
+                .values()
+                .filter(|manifest| manifest.bundled_is_loaded())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_bundled_manifest_is_reported_as_unavailable() {
+        let engine = Engine {
+            manifests: HashMap::from([(
+                "codex",
+                ManifestEntry::bundled(
+                    "codex",
+                    r#"
+id = "codex"
+[[rules]]
+id = "invalid"
+state = "idle"
+regex = ["("]
+"#,
+                ),
+            )]),
+        };
+
+        let explanation = engine.explain("codex", "anything", "");
+
+        assert_eq!(explanation["state"], "unknown");
+        assert_eq!(explanation["fallback_reason"], "manifest_unavailable");
+        assert!(
+            explanation["warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("invalid bundled codex manifest"))
+        );
+    }
+
+    #[test]
+    fn overrides_are_eagerly_validated_and_new_engines_see_changes() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("qwen.toml");
+        std::fs::write(
+            &path,
+            r#"
+id = "qwen"
+[[rules]]
+id = "invalid"
+state = "idle"
+regex = ["("]
+"#,
+        )
+        .unwrap();
+
+        let error =
+            Engine::load_with_override_directory(Some(directory.path().to_owned())).unwrap_err();
+        assert!(error.contains("invalid override"), "{error}");
+        assert!(error.contains("invalid regex"), "{error}");
+
+        std::fs::write(
+            &path,
+            r#"
+id = "qwen"
+[[rules]]
+id = "first"
+state = "idle"
+contains = ["first version"]
+"#,
+        )
+        .unwrap();
+        let first =
+            Engine::load_with_override_directory(Some(directory.path().to_owned())).unwrap();
+        assert_eq!(first.explain("qwen", "first version", "")["state"], "idle");
+
+        std::fs::write(
+            &path,
+            r#"
+id = "qwen"
+[[rules]]
+id = "second"
+state = "working"
+contains = ["second version"]
+"#,
+        )
+        .unwrap();
+        let second =
+            Engine::load_with_override_directory(Some(directory.path().to_owned())).unwrap();
+
+        assert_eq!(
+            first.explain("qwen", "second version", "")["state"],
+            "unknown"
+        );
+        assert_eq!(
+            second.explain("qwen", "second version", "")["state"],
+            "working"
+        );
     }
 
     #[test]
@@ -1133,7 +1350,7 @@ contains = ["x"]
 
     #[test]
     fn unsupported_provider_and_oversized_input_are_unknown() {
-        let engine = Engine::load_bundled().unwrap();
+        let engine = Engine::load_bundled();
         assert_eq!(engine.explain("shell", "", "")["state"], "unknown");
         let oversized = "x".repeat(MAX_SCREEN_BYTES + 1);
         assert_eq!(
