@@ -1,6 +1,7 @@
-use super::{Manager, validate_args};
+use super::{Agent, Manager, validate_args};
 use crate::providers;
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::json;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -183,7 +184,7 @@ fn value(args: &[String], index: usize) -> Result<&str, String> {
         .ok_or_else(|| format!("missing value for {}", args[index]))
 }
 
-fn print(value: &Value) -> Result<(), String> {
+fn print<T: Serialize + ?Sized>(value: &T) -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(value).map_err(|e| e.to_string())?
@@ -224,7 +225,14 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "integration" => print(&super::integration::run(&manager, args).await?)?,
         "list" if args.is_empty() || args == ["--json"] => {
-            print(&json!({"agents":manager.list_view().await?}))?
+            #[derive(Serialize)]
+            struct AgentList {
+                agents: Vec<Agent>,
+            }
+
+            print(&AgentList {
+                agents: manager.list_view().await?,
+            })?
         }
         "get" | "explain" if args.len() == 1 => {
             let agent = manager.get(&args[0]).await?;

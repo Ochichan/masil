@@ -1,6 +1,7 @@
 //! Native agent management. Nothing runs until a management command or view is opened.
 mod cli;
 pub(crate) mod endpoints;
+mod evidence;
 pub(crate) mod fleet;
 mod integration;
 mod prompt;
@@ -10,6 +11,7 @@ mod view;
 
 use crate::{detection::Engine, native_ui, observation::now_ms, providers};
 pub(crate) use cli::run;
+use evidence::Evidence;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -33,15 +35,15 @@ struct CaptureRequest {
 }
 
 enum PreparedEvidence {
-    Cached(Arc<Value>),
+    Cached(Arc<Evidence>),
     Screen(String),
 }
 
 fn store_cached_evidence(
-    cache: &mut HashMap<String, (String, Arc<Value>)>,
+    cache: &mut HashMap<String, (String, Arc<Evidence>)>,
     pane: String,
     key: String,
-    evidence: Arc<Value>,
+    evidence: Arc<Evidence>,
 ) {
     if cache.contains_key(&pane) || cache.len() < 64 {
         cache.insert(pane, (key, evidence));
@@ -102,7 +104,7 @@ pub(crate) struct Agent {
     pub process: String,
     pub state: String,
     pub session_id: Option<String>,
-    pub evidence: Arc<Value>,
+    pub evidence: Arc<Evidence>,
     pub seen: bool,
     pub revision: String,
     pub returned_idle: bool,
@@ -137,7 +139,7 @@ pub(crate) struct Agent {
 pub(crate) struct Manager {
     pub native: native_ui::Context,
     engine: Engine,
-    cache: Mutex<HashMap<String, (String, Arc<Value>)>>,
+    cache: Mutex<HashMap<String, (String, Arc<Evidence>)>>,
 }
 
 impl Manager {
@@ -367,12 +369,13 @@ impl Manager {
                 {
                     PreparedEvidence::Cached(evidence) => evidence,
                     PreparedEvidence::Screen(screen) => {
-                        let evidence = Arc::new(self.engine.explain_with_progress(
-                            provider.id,
-                            &screen,
-                            &fields[9],
-                            &fields[15],
-                        ));
+                        let evidence =
+                            Arc::new(Evidence::from_value(self.engine.explain_with_progress(
+                                provider.id,
+                                &screen,
+                                &fields[9],
+                                &fields[15],
+                            )));
                         let mut cache = self
                             .cache
                             .lock()
@@ -382,11 +385,11 @@ impl Manager {
                     }
                 }
             } else {
-                Arc::new(
+                Arc::new(Evidence::from_value(
                     json!({"state":"unknown", "source":"process", "reason": if dead {"process_exited"} else {"foreground_not_verified"}}),
-                )
+                ))
             };
-            let mut state = evidence["state"].as_str().unwrap_or("unknown").to_owned();
+            let mut state = evidence.state().to_owned();
             let metadata = metadata.filter(|m| {
                 m.provider == provider.id && (dead || m.foreground_group == foreground_group)
             });
@@ -395,7 +398,7 @@ impl Manager {
                 && now_ms().saturating_sub(report.at) <= 30_000
             {
                 // A visible blocker is stronger than a hook claiming idle/working.
-                if evidence["visible_blocker"] != true || report.state == "blocked" {
+                if !evidence.visible_blocker() || report.state == "blocked" {
                     state = report.state.clone();
                     evidence = run_report_evidence(evidence, report);
                 }
@@ -410,7 +413,7 @@ impl Manager {
                 )
             });
             let previous = decode::<Tracked>(&fields[12]).unwrap_or_default();
-            if evidence["skip_state_update"] == true && previous.run == run {
+            if evidence.skip_state_update() && previous.run == run {
                 state = previous.state.clone();
             }
             let sequence = metadata
@@ -1003,14 +1006,13 @@ impl Agent {
     }
 }
 
-fn run_report_evidence(evidence: Arc<Value>, report: &Report) -> Arc<Value> {
-    Arc::new(json!({
-        "state": report.state,
-        "source": "run_report",
-        "sequence": report.sequence,
-        "observed_at_ms": report.at,
-        "screen": evidence,
-    }))
+fn run_report_evidence(evidence: Arc<Evidence>, report: &Report) -> Arc<Evidence> {
+    Arc::new(Evidence::report_overlay(
+        &evidence,
+        &report.state,
+        report.sequence,
+        report.at,
+    ))
 }
 
 fn valid_name(name: &str) -> bool {
@@ -1226,6 +1228,12 @@ async fn identify_foregrounds(
         }
     }
     let tty_argument = ttys.join(",");
+    let tty_names = ps_tty_names(&runtime);
+    let columns = if tty_names.is_some() {
+        "tdev=,pgid=,args="
+    } else {
+        "tty=,pgid=,args="
+    };
     let batch = if tty_argument.len() <= MAX_PS_TTY_ARGUMENT {
         native_ui::run_process(
             std::ffi::OsStr::new("/bin/ps"),
@@ -1233,14 +1241,14 @@ async fn identify_foregrounds(
                 OsString::from("-t"),
                 OsString::from(&tty_argument),
                 OsString::from("-o"),
-                OsString::from("tty=,pgid=,args="),
+                OsString::from(columns),
             ],
             None,
         )
         .await
         .ok()
         .and_then(|result| String::from_utf8(result.stdout).ok())
-        .and_then(|text| parse_ps_inventory(&text, &runtime))
+        .and_then(|text| parse_ps_inventory(&text, &runtime, tty_names.as_ref()))
     } else {
         None
     };
@@ -1262,9 +1270,42 @@ async fn identify_foregrounds(
     identified
 }
 
+// Darwin's symbolic tty formatting resolves each device name separately. Match
+// the numeric device instead, without weakening the tty + process-group check.
+#[cfg(target_os = "macos")]
+fn ps_tty_names(expected: &[(&String, &String, &String, i32)]) -> Option<HashMap<String, String>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let mut names = HashMap::new();
+    let mut seen = HashSet::new();
+    for (_, tty, _, _) in expected {
+        if !seen.insert(tty.as_str()) {
+            continue;
+        }
+        let metadata = std::fs::metadata(tty).ok()?;
+        if !metadata.file_type().is_char_device() {
+            return None;
+        }
+        let device = metadata.rdev() as libc::dev_t;
+        let key = format!("{}/{}", libc::major(device), libc::minor(device));
+        let name = tty.trim_start_matches("/dev/").to_owned();
+        if names.insert(key, name).is_some() {
+            // Ambiguous aliases use the original symbolic query.
+            return None;
+        }
+    }
+    Some(names)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ps_tty_names(_: &[(&String, &String, &String, i32)]) -> Option<HashMap<String, String>> {
+    None
+}
+
 fn parse_ps_inventory(
     text: &str,
     expected: &[(&String, &String, &String, i32)],
+    tty_names: Option<&HashMap<String, String>>,
 ) -> Option<HashMap<(String, i32), &'static providers::Provider>> {
     let expected: HashSet<_> = expected
         .iter()
@@ -1274,6 +1315,10 @@ fn parse_ps_inventory(
     let mut found = HashMap::new();
     for line in text.lines() {
         let (tty, rest) = line.trim().split_once(char::is_whitespace)?;
+        let tty = match tty_names {
+            Some(names) => names.get(tty)?.as_str(),
+            None => tty,
+        };
         let (group, args) = rest.trim_start().split_once(char::is_whitespace)?;
         let group = group.parse::<i32>().ok()?;
         let args = args.trim_start();
@@ -1402,6 +1447,7 @@ mod tests {
         let parsed = parse_ps_inventory(
             "ttys001  7 /bin/sh\nttys001  42 python3.12 /opt/hermes\n",
             &expected,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1410,7 +1456,42 @@ mod tests {
                 .map(|provider| provider.id),
             Some("hermes")
         );
-        assert!(parse_ps_inventory("ttys999 42 python3.12 /opt/hermes\n", &expected).is_none());
+        assert!(
+            parse_ps_inventory("ttys999 42 python3.12 /opt/hermes\n", &expected, None).is_none()
+        );
+    }
+
+    #[test]
+    fn numeric_ps_preserves_tty_and_foreground_group_matching() {
+        let pane = "%1".to_owned();
+        let tty = "/dev/ttys066".to_owned();
+        let command = "node".to_owned();
+        let expected = vec![(&pane, &tty, &command, 42)];
+        let names = HashMap::from([("16/66".to_owned(), "ttys066".to_owned())]);
+        let args = "node /opt/codex.js";
+        let parsed = parse_ps_inventory(
+            &format!("16/66 7 {args}\n16/66 42 {args}\n"),
+            &expected,
+            Some(&names),
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[&("ttys066".to_owned(), 42)].id, "codex");
+        for device in ["16/67", "17/66", "??", "-16/66", "16/-66", "16/66/0"] {
+            assert!(
+                parse_ps_inventory(&format!("{device} 42 {args}\n"), &expected, Some(&names))
+                    .is_none()
+            );
+        }
+        assert!(
+            parse_ps_inventory(&format!("16/66 7 {args}\n"), &expected, Some(&names))
+                .unwrap()
+                .is_empty()
+        );
+        let foreign = HashMap::from([("16/66".to_owned(), "ttys999".to_owned())]);
+        assert!(
+            parse_ps_inventory(&format!("16/66 42 {args}\n"), &expected, Some(&foreign)).is_none()
+        );
     }
 
     #[test]
@@ -1419,7 +1500,10 @@ mod tests {
             .map(|index| {
                 (
                     format!("%{index}"),
-                    (format!("old-{index}"), Arc::new(json!({"pane":index}))),
+                    (
+                        format!("old-{index}"),
+                        Arc::new(Evidence::from_value(json!({"pane":index}))),
+                    ),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -1428,20 +1512,21 @@ mod tests {
             &mut cache,
             "%0".into(),
             "new".into(),
-            Arc::new(json!({"pane":0})),
+            Arc::new(Evidence::from_value(json!({"pane":0}))),
         );
         store_cached_evidence(
             &mut cache,
             "%64".into(),
             "new".into(),
-            Arc::new(json!({"pane":64})),
+            Arc::new(Evidence::from_value(json!({"pane":64}))),
         );
 
         assert_eq!(cache.len(), 64);
         assert_eq!(cache["%0"].0, "new");
         assert!(!cache.contains_key("%64"));
         assert_eq!(snapshot["%0"].0, "old-0");
-        assert_eq!(snapshot["%63"], cache["%63"]);
+        assert_eq!(snapshot["%63"].0, cache["%63"].0);
+        assert!(Arc::ptr_eq(&snapshot["%63"].1, &cache["%63"].1));
     }
 
     #[test]
@@ -1469,7 +1554,7 @@ mod tests {
             process: "running".into(),
             state: "blocked".into(),
             session_id: Some("session-1".into()),
-            evidence: Arc::new(evidence.clone()),
+            evidence: Arc::new(Evidence::from_value(evidence.clone())),
             seen: false,
             revision: "3".into(),
             returned_idle: false,
@@ -1493,18 +1578,18 @@ mod tests {
         assert!(serialized.get("metadata").is_none());
 
         let decoded: Agent = serde_json::from_value(serialized.clone()).unwrap();
-        assert_eq!(*decoded.evidence, evidence);
+        assert_eq!(serde_json::to_value(&decoded.evidence).unwrap(), evidence);
         assert_eq!(serde_json::to_value(decoded).unwrap(), serialized);
     }
 
     #[test]
     fn cached_evidence_survives_report_overlay_and_screen_refresh() {
-        let original = Arc::new(json!({
+        let original = Arc::new(Evidence::from_value(json!({
             "state": "blocked",
             "source": "screen",
             "explanations": [{"rule": "question", "detail": "Proceed?"}],
             "visible_blocker": true
-        }));
+        })));
         let mut cache = HashMap::new();
         store_cached_evidence(&mut cache, "%1".into(), "screen-1".into(), original.clone());
 
@@ -1518,21 +1603,25 @@ mod tests {
             &mut cache,
             "%1".into(),
             "screen-2".into(),
-            Arc::new(json!({
+            Arc::new(Evidence::from_value(json!({
                 "state": "working",
                 "source": "screen",
                 "explanations": [{"rule": "activity", "detail": "Generating"}]
-            })),
+            }))),
         );
 
+        let reported = serde_json::to_value(&reported).unwrap();
         assert_eq!(reported["source"], "run_report");
-        assert_eq!(reported["screen"], *original);
+        assert_eq!(reported["screen"], serde_json::to_value(&original).unwrap());
         assert_eq!(
-            original["explanations"],
+            serde_json::to_value(&original).unwrap()["explanations"],
             json!([{"rule": "question", "detail": "Proceed?"}])
         );
         assert_eq!(cache["%1"].0, "screen-2");
-        assert_eq!(cache["%1"].1["state"], "working");
-        assert_eq!(cache["%1"].1["explanations"][0]["detail"], "Generating");
+        assert_eq!(cache["%1"].1.state(), "working");
+        assert_eq!(
+            serde_json::to_value(&cache["%1"].1).unwrap()["explanations"][0]["detail"],
+            "Generating"
+        );
     }
 }
