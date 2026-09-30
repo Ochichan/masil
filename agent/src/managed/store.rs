@@ -523,7 +523,7 @@ fn valid_boot_id(value: &str) -> bool {
         })
 }
 
-fn private_parent(path: &Path) -> Result<PathBuf, String> {
+pub(super) fn private_parent(path: &Path) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -549,7 +549,10 @@ fn canonical_snapshot_path(path: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(name))
 }
 
-fn validate_private_metadata(metadata: &fs::Metadata, label: &str) -> Result<(), String> {
+pub(super) fn validate_private_metadata(
+    metadata: &fs::Metadata,
+    label: &str,
+) -> Result<(), String> {
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o077 != 0

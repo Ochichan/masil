@@ -540,6 +540,23 @@ impl App {
         }
     }
 
+    /// Select an agent by identity, clearing a filter or search that hides it.
+    pub(crate) fn select_id(&mut self, id: &str) -> bool {
+        if !self.rows.iter().any(|row| row.id == id) {
+            return false;
+        }
+        if !self.filtered_ids().iter().any(|candidate| candidate == id) {
+            self.filter = Filter::All;
+            self.search.clear();
+            self.search_cursor = 0;
+            self.search_view_start = 0;
+        }
+        self.selected_id = Some(id.to_owned());
+        self.reveal_selection();
+        self.dirty = true;
+        true
+    }
+
     pub fn notify(&mut self, message: String) {
         self.toast = Some(message);
         self.dirty = true;
@@ -641,6 +658,7 @@ impl App {
                         row.core_freshness == "fresh"
                             && !row.session_id.is_empty()
                             && row.session_id != "unverified"
+                            && row.binding != "managed_conflict"
                     })
             }
             Action::PrepareDraft | Action::InterruptAgent => {

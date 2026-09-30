@@ -772,10 +772,7 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
                     Ok(json!({"stage":"pane_closed", "pane_id":agent.pane_id, "run":agent.run}))
                 }
                 Action::Resume { name } => {
-                    let session = agent
-                        .session_id
-                        .as_deref()
-                        .ok_or("no native session reference was reported")?;
+                    let session = manager.resume_session(&agent)?;
                     manager
                         .start(
                             &name,

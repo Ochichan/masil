@@ -100,6 +100,11 @@ impl Engine {
         Ok(engine)
     }
 
+    /// Whether screen detection has rules for this provider.
+    pub fn has_manifest(&self, provider: &str) -> bool {
+        providers::find(provider).is_some_and(|provider| self.manifests.contains_key(provider.id))
+    }
+
     /// Explains the highest-priority rule matched by the current screen.
     #[cfg(test)]
     pub fn explain(&self, provider: &str, screen: &str, title: &str) -> Value {

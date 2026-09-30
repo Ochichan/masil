@@ -1,9 +1,12 @@
 //! Native agent management. Nothing runs until a management command or view is opened.
 mod cli;
+mod durable;
 pub(crate) mod endpoints;
 mod evidence;
+pub(crate) mod find;
 pub(crate) mod fleet;
 mod integration;
+mod operations;
 mod prompt;
 mod remote_cli;
 mod store;
@@ -23,7 +26,9 @@ use std::sync::{Arc, Mutex};
 
 const META: &str = "@masil-managed-agent";
 const TRACKED: &str = "@masil-managed-observation";
-const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}";
+const EVIDENCE: &str = "@masil-agent-run-evidence";
+const STORE_OPTION: &str = "@masil-operation-store";
+const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}\t#{q:@masil-agent-run-evidence}";
 const CAPTURE_BATCH_SIZE: usize = 12;
 const MAX_PS_TTY_ARGUMENT: usize = 4096;
 const TRACKED_REJECTED: &str = "masil-agent-stale";
@@ -32,6 +37,19 @@ struct CaptureRequest {
     pane: String,
     identity: String,
     guard: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Guarded {
+    Applied,
+    Rejected,
+}
+
+struct PreparedLaunch {
+    provider: &'static providers::Provider,
+    cwd: PathBuf,
+    argv: Vec<String>,
+    args: Vec<String>,
 }
 
 enum PreparedEvidence {
@@ -77,6 +95,171 @@ struct Report {
     at: u64,
 }
 
+/// Evidence about one run, kept outside `@masil-managed-agent` so binaries
+/// that predate it still decode the agent metadata. Unknown fields are
+/// ignored for the same reason.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct RunEvidence {
+    run: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    integration: Option<IntegrationSeen>,
+    /// Origin of the metadata report with the same sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<ReportSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ReportSource {
+    sequence: u64,
+    source: String,
+}
+
+/// How `Metadata::session` was established for this run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Binding {
+    session: String,
+    source: BindingSource,
+    sequence: u64,
+    at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
+    /// The resume request that the first report contradicted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested: Option<String>,
+    /// The latest different session reported without a switch event. It stays
+    /// until an explicit switch: a child provider process started inside the
+    /// pane inherits the run identity and can report its own session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conflict: Option<Contradiction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Contradiction {
+    session: String,
+    source: BindingSource,
+    sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BindingSource {
+    /// `start --session`; the provider has not reported it.
+    Requested,
+    /// A provider hook carrying this run's identity reported it.
+    NativeCallback,
+    /// An OpenCode-family callback that declared frontend scope. The scope is
+    /// a payload field, so it is not proof of what the TUI shows.
+    FrontendCallback,
+    /// `agent report --session` from a process holding this run's identity.
+    RunReport,
+}
+
+impl BindingSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::NativeCallback => "native_callback",
+            Self::FrontendCallback => "frontend_callback",
+            Self::RunReport => "run_report",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Requested => 0,
+            Self::RunReport => 1,
+            Self::NativeCallback => 2,
+            Self::FrontendCallback => 3,
+        }
+    }
+}
+
+/// Integration callbacks accepted during this run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct IntegrationSeen {
+    lifecycle: bool,
+    session: bool,
+    sequence: u64,
+    event: String,
+    at: u64,
+}
+
+/// Where a report came from. Only integration hooks are provider-native.
+#[derive(Clone, Copy)]
+pub(crate) enum ReportOrigin<'a> {
+    Run,
+    Callback {
+        event: &'a str,
+        frontend: bool,
+        /// The provider announced a deliberate session change.
+        switch: bool,
+    },
+}
+
+/// What a session report did to the binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindingOutcome {
+    Established,
+    Confirmed,
+    Switched,
+    /// The first report named another session than `start --session`.
+    ReplacedRequest,
+    /// A different session without a switch event. The bound session is kept
+    /// and a lifecycle state in the same report is not applied.
+    Contradicted,
+}
+
+impl BindingOutcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Established => "established",
+            Self::Confirmed => "confirmed",
+            Self::Switched => "switched",
+            Self::ReplacedRequest => "replaced_request",
+            Self::Contradicted => "contradicted",
+        }
+    }
+}
+
+/// Public view of the agent binding. No state claims that the TUI shows this
+/// session; `reported` means a process holding this run's identity said so.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct BindingView {
+    pub state: String,
+    pub session_id: Option<String>,
+    pub source: Option<String>,
+    pub requested_session: Option<String>,
+    pub conflicting_session: Option<String>,
+    pub event: Option<String>,
+    pub sequence: u64,
+    pub observed_at_ms: u64,
+}
+
+/// Evidence-based capability contract for one agent run. Values from an
+/// endpoint that predates it are empty and mean unknown, not unsupported.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct CapabilityView {
+    pub contract: u32,
+    pub state_authority: String,
+    pub session_identity: String,
+    pub prompt_submit: String,
+    pub provider_ack: bool,
+    pub interrupt: String,
+    pub approval_response: bool,
+    pub question_response: bool,
+    pub turn_identity: bool,
+    pub resume: bool,
+    pub integration: String,
+    pub callbacks_seen: bool,
+    pub lifecycle_seen: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Tracked {
@@ -116,8 +299,14 @@ pub(crate) struct Agent {
     pub endpoint_key: String,
     #[serde(default)]
     pub stale: bool,
+    #[serde(default)]
+    pub binding: BindingView,
+    #[serde(default)]
+    pub capabilities: CapabilityView,
     #[serde(skip)]
     metadata: Option<Metadata>,
+    #[serde(skip)]
+    run_evidence: Option<RunEvidence>,
     #[serde(skip)]
     encoded: String,
     #[serde(skip)]
@@ -174,21 +363,8 @@ impl Manager {
     pub async fn boot(&self) -> Result<String, String> {
         let boot = self
             .command(&["display-message", "-p", "#{masil_core_boot_id}"])
-            .await?
-            .trim()
-            .to_owned();
-        if boot.len() != 36
-            || !boot.bytes().enumerate().all(|(i, b)| {
-                if [8, 13, 18, 23].contains(&i) {
-                    b == b'-'
-                } else {
-                    b.is_ascii_hexdigit()
-                }
-            })
-        {
-            return Err("invalid native server identity".into());
-        }
-        Ok(boot)
+            .await?;
+        valid_boot(boot.trim()).map(str::to_owned)
     }
 
     async fn inventory(&self) -> Result<Vec<Vec<String>>, String> {
@@ -393,6 +569,10 @@ impl Manager {
             let metadata = metadata.filter(|m| {
                 m.provider == provider.id && (dead || m.foreground_group == foreground_group)
             });
+            let run_evidence = metadata
+                .as_ref()
+                .and_then(|m| decode::<RunEvidence>(&fields[16]).filter(|e| e.run == m.run));
+            let mut report_authority = None;
             if let Some(report) = metadata.as_ref().and_then(|m| m.report.as_ref())
                 && foreground
                 && now_ms().saturating_sub(report.at) <= 30_000
@@ -401,6 +581,13 @@ impl Manager {
                 if !evidence.visible_blocker() || report.state == "blocked" {
                     state = report.state.clone();
                     evidence = run_report_evidence(evidence, report);
+                    report_authority = Some(
+                        run_evidence
+                            .as_ref()
+                            .and_then(|e| e.report.as_ref())
+                            .filter(|source| source.sequence == report.sequence)
+                            .map_or(REPORT_SOURCE_RUN, |source| source.source.as_str()),
+                    );
                 }
             }
             if dead {
@@ -449,6 +636,22 @@ impl Manager {
                 .unwrap_or_else(|| {
                     format!("{}-{}", provider.id, fields[0].trim_start_matches('%'))
                 });
+            let process = if dead {
+                "exited"
+            } else if foreground {
+                "running"
+            } else {
+                "unknown"
+            };
+            let binding = binding_view(metadata.as_ref(), run_evidence.as_ref());
+            let capabilities = capability_view(
+                provider.id,
+                self.engine.has_manifest(provider.id),
+                run_evidence.as_ref(),
+                process,
+                report_authority,
+                &binding,
+            );
             let agent = Agent {
                 id: name.clone(),
                 name,
@@ -460,14 +663,7 @@ impl Manager {
                 boot: fields[5].clone(),
                 generation: fields[6].clone(),
                 run,
-                process: if dead {
-                    "exited"
-                } else if foreground {
-                    "running"
-                } else {
-                    "unknown"
-                }
-                .into(),
+                process: process.into(),
                 state,
                 session_id: metadata.as_ref().and_then(|m| m.session.clone()),
                 evidence,
@@ -478,7 +674,10 @@ impl Manager {
                 endpoint_label: String::new(),
                 endpoint_key: String::new(),
                 stale: false,
+                binding,
+                capabilities,
                 metadata,
+                run_evidence,
                 encoded: encoded.clone(),
                 foreground_command: fields[7].clone(),
                 tracked,
@@ -618,6 +817,25 @@ impl Manager {
         commands: Vec<Vec<String>>,
         condition: Option<&str>,
     ) -> Result<(), String> {
+        match self
+            .guarded_input_outcome(agent, commands, condition)
+            .await?
+        {
+            Guarded::Applied => Ok(()),
+            Guarded::Rejected => {
+                Err("agent foreground or run changed before input delivery".into())
+            }
+        }
+    }
+
+    /// `Rejected` proves the guard failed before any command ran. An `Err`
+    /// leaves the outcome open: part of the group may have run.
+    async fn guarded_input_outcome(
+        &self,
+        agent: &Agent,
+        commands: Vec<Vec<String>>,
+        condition: Option<&str>,
+    ) -> Result<Guarded, String> {
         if agent.foreground_command.is_empty()
             || !agent
                 .foreground_command
@@ -643,10 +861,120 @@ impl Manager {
             .native
             .guarded_group(&agent.pane_id, &guard, &commands, "masil-agent-stale")
             .await?;
-        if String::from_utf8_lossy(&out.stdout).contains("masil-agent-stale") {
-            return Err("agent foreground or run changed before input delivery".into());
+        if String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line == "masil-agent-stale")
+        {
+            return Ok(Guarded::Rejected);
         }
-        Ok(())
+        Ok(Guarded::Applied)
+    }
+
+    /// Read pane options exactly as a guard format sees them.
+    async fn pane_values(&self, pane: &str, options: &[&str]) -> Result<Vec<String>, String> {
+        crate::pane_id(pane)?;
+        let format = options
+            .iter()
+            .map(|option| format!("#{{{option}}}"))
+            .collect::<Vec<_>>()
+            .join("\t");
+        let output = self
+            .command(&["display-message", "-p", "-t", pane, &format])
+            .await?;
+        let values: Vec<String> = output
+            .strip_suffix('\n')
+            .unwrap_or(&output)
+            .split('\t')
+            .map(str::to_owned)
+            .collect();
+        if values.len() != options.len() {
+            return Err("invalid native option values".into());
+        }
+        Ok(values)
+    }
+
+    /// Set pane options only if each `(option, expected)` still holds. The
+    /// values are hex or nonces, so they are literal inside the guard format.
+    /// `false` means another writer changed one of them first.
+    async fn compare_and_set(
+        &self,
+        pane: &str,
+        expected: &[(&str, &str)],
+        values: &[(&str, String)],
+    ) -> Result<bool, String> {
+        let guard = and(&expected
+            .iter()
+            .map(|(option, value)| format!("#{{==:#{{{option}}},{value}}}"))
+            .collect::<Vec<_>>());
+        let commands = values
+            .iter()
+            .map(|(option, value)| {
+                vec![
+                    "set-option".into(),
+                    "-p".into(),
+                    "-t".into(),
+                    pane.into(),
+                    (*option).into(),
+                    value.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let output = self
+            .native
+            .guarded_group(pane, &guard, &commands, "masil-agent-stale")
+            .await?;
+        Ok(!String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "masil-agent-stale"))
+    }
+
+    /// Open the operation store and check that it is the one this server
+    /// used before. A deleted store is not silently replaced: its receipts
+    /// are what prevents a repeated effect.
+    async fn operation_store(&self) -> Result<operations::Store, String> {
+        let recorded = self
+            .command(&["show-options", "-gqv", STORE_OPTION])
+            .await?
+            .trim()
+            .to_owned();
+        self.operation_store_recorded(&recorded).await
+    }
+
+    /// As `operation_store`, with the server's recorded instance already read
+    /// as part of another format query (saves one native command).
+    async fn operation_store_recorded(&self, recorded: &str) -> Result<operations::Store, String> {
+        let store = operations::Store::open(&self.native.socket)?;
+        let instance = store.instance()?.to_string();
+        if recorded.is_empty() {
+            self.command(&["set-option", "-g", STORE_OPTION, &instance])
+                .await?;
+        } else if recorded != instance {
+            return Err("store_unavailable: the operation store for this server was deleted or replaced while the server kept running, so earlier receipts are gone; inspect the agents, then run `masil-agent agent operations adopt`".into());
+        }
+        let mut store = store;
+        self.maintain(&mut store).await?;
+        Ok(store)
+    }
+
+    /// The session a resume would reopen. A conflicting binding is refused:
+    /// it could be a child provider's session rather than this agent's.
+    pub(crate) fn resume_session<'a>(&self, agent: &'a Agent) -> Result<&'a str, String> {
+        if agent.binding.state == "conflict" {
+            return Err(format!(
+                "native session binding is in conflict (bound {}, also reported {}); start a new agent with --session to choose the conversation",
+                agent.binding.session_id.as_deref().unwrap_or("none"),
+                agent
+                    .binding
+                    .conflicting_session
+                    .as_deref()
+                    .or(agent.binding.requested_session.as_deref())
+                    .unwrap_or("unknown")
+            ));
+        }
+        agent
+            .session_id
+            .as_deref()
+            .ok_or_else(|| "no native session reference was reported".into())
     }
 
     fn option(agent: &Agent, key: &str, value: String) -> Vec<String> {
@@ -700,7 +1028,20 @@ impl Manager {
         session: Option<&str>,
         split: Option<&str>,
     ) -> Result<Value, String> {
-        let _lock = self.lock()?;
+        self.start_with_operation(name, provider, cwd, args, session, split, None)
+            .await
+    }
+
+    /// Checks that must pass before a launch is admitted. Callers hold the lock.
+    async fn prepare_launch(
+        &self,
+        name: &str,
+        provider: &str,
+        cwd: &Path,
+        args: &[String],
+        session: Option<&str>,
+        split: Option<&str>,
+    ) -> Result<PreparedLaunch, String> {
         self.unique_name(name, None).await?;
         let provider = providers::find(provider).ok_or("unknown agent provider")?;
         let cwd = cwd
@@ -710,6 +1051,9 @@ impl Manager {
             return Err("working directory is not a directory".into());
         }
         validate_args(args)?;
+        if let Some(target) = split {
+            crate::pane_id(target)?;
+        }
         let mut argv = if let Some(session) = session {
             providers::resume(provider.id, session)?
         } else {
@@ -718,9 +1062,30 @@ impl Manager {
         argv.extend_from_slice(args);
         let executable = executable(&argv[0])?;
         argv[0] = executable.to_string_lossy().into_owned();
-        let run = nonce()?;
+        Ok(PreparedLaunch {
+            provider,
+            cwd,
+            argv,
+            args: args.to_vec(),
+        })
+    }
+
+    /// Create the pane with `run` as its identity and register it.
+    async fn launch(
+        &self,
+        prepared: PreparedLaunch,
+        name: &str,
+        run: &str,
+        session: Option<&str>,
+        split: Option<&str>,
+    ) -> Result<Value, String> {
+        let PreparedLaunch {
+            provider,
+            cwd,
+            argv,
+            args,
+        } = prepared;
         let mut command: Vec<OsString> = if let Some(target) = split {
-            crate::pane_id(target)?;
             vec![
                 "split-window".into(),
                 "-h".into(),
@@ -739,7 +1104,7 @@ impl Manager {
             cwd.as_os_str().into(),
         ]);
         for (key, value) in [
-            ("MASIL_AGENT_RUN", run.clone()),
+            ("MASIL_AGENT_RUN", run.to_owned()),
             (
                 "MASIL_AGENT_SOCKET",
                 self.native.socket.to_string_lossy().into_owned(),
@@ -777,7 +1142,7 @@ impl Manager {
             provider: provider.id.into(),
             boot: fields[1].into(),
             generation: fields[2].into(),
-            run: run.clone(),
+            run: run.into(),
             argv,
             session: session.map(str::to_owned),
             report: None,
@@ -785,18 +1150,31 @@ impl Manager {
             foreground_group: fields[3]
                 .parse()
                 .map_err(|_| "invalid launch process identity")?,
-            original_args: args.to_vec(),
+            original_args: args,
         };
-        self.command(&[
-            "set-option",
-            "-p",
-            "-t",
-            fields[0],
-            META,
-            &encode(&metadata)?,
-        ])
-        .await
-        .map_err(|e| {
+        let encoded = encode(&metadata)?;
+        let mut registration = vec!["set-option", "-p", "-t", fields[0], META, &encoded];
+        let evidence = session
+            .map(|session| {
+                encode(&RunEvidence {
+                    run: run.into(),
+                    binding: Some(Binding {
+                        session: session.into(),
+                        source: BindingSource::Requested,
+                        sequence: 0,
+                        at: now_ms(),
+                        event: None,
+                        requested: None,
+                        conflict: None,
+                    }),
+                    ..RunEvidence::default()
+                })
+            })
+            .transpose()?;
+        if let Some(evidence) = &evidence {
+            registration.extend([";", "set-option", "-p", "-t", fields[0], EVIDENCE, evidence]);
+        }
+        self.command(&registration).await.map_err(|e| {
             format!(
                 "pane {} was launched, but registration failed: {e}; do not blindly retry",
                 fields[0]
@@ -877,12 +1255,13 @@ impl Manager {
         sequence: u64,
         state: &str,
         session: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<ReportResult, String> {
         let agent = self.get(pane).await?;
         if agent.run != run {
             return Err("stale agent report".into());
         }
-        self.report_snapshot(&agent, sequence, state, session).await
+        self.report_snapshot(&agent, sequence, state, session, ReportOrigin::Run)
+            .await
     }
 
     pub(crate) async fn report_snapshot(
@@ -891,11 +1270,12 @@ impl Manager {
         sequence: u64,
         state: &str,
         session: Option<&str>,
-    ) -> Result<(), String> {
+        origin: ReportOrigin<'_>,
+    ) -> Result<ReportResult, String> {
         if !["idle", "working", "blocked", "unknown"].contains(&state) {
             return Err("invalid agent state".into());
         }
-        self.report_inner(agent, sequence, Some(state), session)
+        self.report_inner(agent, sequence, Some(state), session, origin)
             .await
     }
 
@@ -904,8 +1284,9 @@ impl Manager {
         agent: &Agent,
         sequence: u64,
         session: &str,
-    ) -> Result<(), String> {
-        self.report_inner(agent, sequence, None, Some(session))
+        origin: ReportOrigin<'_>,
+    ) -> Result<ReportResult, String> {
+        self.report_inner(agent, sequence, None, Some(session), origin)
             .await
     }
 
@@ -915,7 +1296,8 @@ impl Manager {
         sequence: u64,
         state: Option<&str>,
         session: Option<&str>,
-    ) -> Result<(), String> {
+        origin: ReportOrigin<'_>,
+    ) -> Result<ReportResult, String> {
         let mut metadata = agent.metadata.clone().ok_or("agent is not managed")?;
         if metadata.run != agent.run || agent.process != "running" {
             return Err("stale agent report".into());
@@ -928,30 +1310,71 @@ impl Manager {
         {
             return Err("report sequence did not advance".into());
         }
+        let mut evidence = agent
+            .run_evidence
+            .clone()
+            .filter(|e| e.run == metadata.run)
+            .unwrap_or_else(|| RunEvidence {
+                run: metadata.run.clone(),
+                ..RunEvidence::default()
+            });
+        let now = now_ms();
+        let mut binding = None;
         if let Some(session) = session {
             if session.is_empty() || session.len() > 512 || session.chars().any(char::is_control) {
                 return Err("invalid session reference".into());
             }
-            metadata.session = Some(session.into());
+            binding = Some(apply_binding(
+                &mut metadata,
+                &mut evidence,
+                session,
+                sequence,
+                now,
+                origin,
+            ));
         }
         metadata.last_sequence = sequence;
+        // State from a report that named another session is not this run's.
+        let state = state.filter(|_| binding != Some(BindingOutcome::Contradicted));
         if let Some(state) = state {
             metadata.report = Some(Report {
                 sequence,
                 state: state.into(),
-                at: now_ms(),
+                at: now,
+            });
+            evidence.report = Some(ReportSource {
+                sequence,
+                source: match origin {
+                    ReportOrigin::Run => REPORT_SOURCE_RUN,
+                    ReportOrigin::Callback { .. } => REPORT_SOURCE_CALLBACK,
+                }
+                .into(),
             });
         }
-        self.guarded_input(agent, vec![Self::option(agent, META, encode(&metadata)?)])
-            .await
+        if let ReportOrigin::Callback { event, .. } = origin {
+            let seen = evidence.integration.get_or_insert_with(Default::default);
+            seen.lifecycle |= state.is_some();
+            seen.session |= session.is_some();
+            seen.sequence = sequence;
+            seen.event = bounded_event(event).unwrap_or_default();
+            seen.at = now;
+        }
+        self.guarded_input(
+            agent,
+            vec![
+                Self::option(agent, META, encode(&metadata)?),
+                Self::option(agent, EVIDENCE, encode(&evidence)?),
+            ],
+        )
+        .await?;
+        Ok(ReportResult {
+            binding,
+            state_applied: state.is_some(),
+        })
     }
 
     pub async fn close(&self, agent: &Agent) -> Result<(), String> {
-        self.guarded(
-            agent,
-            vec![vec!["kill-pane".into(), "-t".into(), agent.pane_id.clone()]],
-        )
-        .await
+        self.close_with_operation(agent, None).await.map(|_| ())
     }
 
     fn lock(&self) -> Result<std::fs::File, String> {
@@ -981,17 +1404,51 @@ impl Manager {
             return Err("agent lock must be a private owner file".into());
         }
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err("another agent management operation is in progress".into());
+            return Err(LOCK_BUSY.into());
         }
         Ok(file)
     }
+
+    /// As `lock`, waiting up to `limit` for another operation to finish, so
+    /// an interrupt is not refused just because a prompt is being delivered.
+    async fn lock_within(&self, limit: std::time::Duration) -> Result<std::fs::File, String> {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            match self.lock() {
+                Err(error) if error == LOCK_BUSY && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+const LOCK_BUSY: &str = "another agent management operation is in progress";
+
+/// Status of the durable operation store for a server socket, without
+/// creating it. `None` when no management command has used one yet.
+pub(crate) fn operation_store_status(socket: &Path) -> Result<Option<Value>, String> {
+    operations::Store::inspect(socket)
 }
 
 impl Agent {
+    /// The desk's binding label. Rows from an endpoint without run evidence
+    /// keep the configured-but-unverified wording.
+    fn binding_label(&self) -> &'static str {
+        match self.binding.state.as_str() {
+            "reported" => "managed_reported",
+            "requested" => "managed_requested",
+            "conflict" => "managed_conflict",
+            "none" => "managed_none",
+            _ => "explicit_unverified",
+        }
+    }
+
     pub fn projection(&self) -> Value {
         let mut projection = json!({"id":self.id,"source_id":self.provider,"session_id":self.session_id.as_deref().unwrap_or("unverified"),"pane_id":self.pane_id,
             "native":{"exists":self.process=="running","activity":if ["idle","working"].contains(&self.state.as_str()){self.state.as_str()}else{"unknown"},"attention":if self.state=="blocked"{"needs_input"}else if self.returned_idle{"returned_idle"}else{"none"},"permission_count":0,"question_count":0,"pending_count":u8::from(self.state=="blocked"||self.returned_idle),"freshness":"fresh","observed_at_ms":now_ms()},
-            "core":{"process":self.process,"pty_generation":self.generation,"freshness":"fresh"},"binding":"explicit_unverified","frontend_verified":false,
+            "core":{"process":self.process,"pty_generation":self.generation,"freshness":"fresh"},"binding":self.binding_label(),"frontend_verified":false,
             "attention":{"revision":self.revision,"acknowledged":self.seen,"pending":self.state=="blocked"||self.returned_idle,"available":self.state=="blocked"||self.returned_idle},
             "capabilities":{"read":true,"input":false,"approval":false,"completion":false,"child_aggregation":false}});
         if !self.endpoint_label.is_empty() {
@@ -1006,6 +1463,246 @@ impl Agent {
     }
 }
 
+/// Static contract for a provider before any run supplies evidence.
+fn provider_contract(engine: &Engine, id: &str) -> Result<Value, String> {
+    let provider = providers::find(id).ok_or("unknown agent provider")?;
+    let integration = integration::target_capability(provider.id);
+    let resume = providers::resume(provider.id, "example").is_ok();
+    Ok(json!({
+        "provider": provider.id,
+        "command": provider.command,
+        "aliases": provider.aliases,
+        "contract": 1,
+        "detection": if engine.has_manifest(provider.id) { "screen_manifest" } else { "none" },
+        "resume": resume,
+        "integration": integration,
+        "state_authority": match integration {
+            Some("full_lifecycle") => "native_callback_when_reported",
+            _ if engine.has_manifest(provider.id) => "screen_detection",
+            _ => "process_only",
+        },
+        "session_binding": match (provider.id, integration, resume) {
+            ("opencode" | "kilo", Some(_), _) => "frontend_callback",
+            (_, Some(_), _) => "native_callback",
+            (_, None, true) => "requested_only",
+            _ => "none",
+        },
+        "prompt_submit": "guarded_paste",
+        "provider_ack": false,
+        "interrupt": "key_delivery",
+        "approval_response": false,
+        "question_response": false,
+        "turn_identity": false,
+    }))
+}
+
+const REPORT_SOURCE_RUN: &str = "run_report";
+const REPORT_SOURCE_CALLBACK: &str = "native_callback";
+
+/// Result of one accepted report.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReportResult {
+    pub binding: Option<BindingOutcome>,
+    pub state_applied: bool,
+}
+
+fn bounded_event(event: &str) -> Option<String> {
+    (!event.is_empty() && event.len() <= 64 && !event.chars().any(char::is_control))
+        .then(|| event.to_owned())
+}
+
+/// Record who reported `session` for this run. The first report may replace a
+/// resume request (kept visible as a conflict). Afterwards only a switch event
+/// changes the session; any other different session is recorded as a conflict
+/// and the bound session stays, because a child provider process in the pane
+/// holds the same run identity.
+fn apply_binding(
+    metadata: &mut Metadata,
+    evidence: &mut RunEvidence,
+    session: &str,
+    sequence: u64,
+    now: u64,
+    origin: ReportOrigin<'_>,
+) -> BindingOutcome {
+    let (source, event, switch) = match origin {
+        ReportOrigin::Run => (BindingSource::RunReport, None, false),
+        ReportOrigin::Callback {
+            event,
+            frontend,
+            switch,
+        } => (
+            if frontend {
+                BindingSource::FrontendCallback
+            } else {
+                BindingSource::NativeCallback
+            },
+            bounded_event(event),
+            switch,
+        ),
+    };
+    let fresh = |requested: Option<String>| Binding {
+        session: session.into(),
+        source,
+        sequence,
+        at: now,
+        event: event.clone(),
+        requested,
+        conflict: None,
+    };
+    let current = metadata.session.clone();
+    // Evidence only describes the session it was recorded for.
+    let bound = evidence
+        .binding
+        .take()
+        .filter(|binding| current.as_deref() == Some(binding.session.as_str()));
+    let (binding, outcome) = match (current.as_deref(), bound) {
+        (None, _) => (fresh(None), BindingOutcome::Established),
+        (Some(current), Some(mut binding)) if current == session => {
+            if binding.source == BindingSource::Requested {
+                // A report confirms the request; the conflict record stays.
+                let conflict = binding.conflict.take();
+                (
+                    Binding {
+                        conflict,
+                        ..fresh(None)
+                    },
+                    BindingOutcome::Confirmed,
+                )
+            } else {
+                if source.rank() > binding.source.rank() {
+                    binding.source = source;
+                    binding.sequence = sequence;
+                    binding.at = now;
+                    binding.event = event.clone();
+                }
+                (binding, BindingOutcome::Confirmed)
+            }
+        }
+        (Some(current), None) if current == session => (fresh(None), BindingOutcome::Confirmed),
+        (
+            Some(current),
+            Some(Binding {
+                source: BindingSource::Requested,
+                conflict: None,
+                ..
+            }),
+        ) => (fresh(Some(current.into())), BindingOutcome::ReplacedRequest),
+        (Some(_), _) if switch => (fresh(None), BindingOutcome::Switched),
+        (Some(current), bound) => {
+            let mut binding = bound.unwrap_or_else(|| Binding {
+                session: current.into(),
+                source: BindingSource::RunReport,
+                sequence: 0,
+                at: 0,
+                event: None,
+                requested: None,
+                conflict: None,
+            });
+            binding.conflict = Some(Contradiction {
+                session: session.into(),
+                source,
+                sequence,
+                event,
+            });
+            evidence.binding = Some(binding);
+            return BindingOutcome::Contradicted;
+        }
+    };
+    metadata.session = Some(binding.session.clone());
+    evidence.binding = Some(binding);
+    outcome
+}
+
+fn binding_view(metadata: Option<&Metadata>, evidence: Option<&RunEvidence>) -> BindingView {
+    let Some(session) = metadata.and_then(|m| m.session.clone()) else {
+        return BindingView {
+            state: "none".into(),
+            ..BindingView::default()
+        };
+    };
+    let Some(binding) = evidence
+        .and_then(|e| e.binding.as_ref())
+        .filter(|binding| binding.session == session)
+    else {
+        // Written by a binary that predates run evidence: origin unknown.
+        return BindingView {
+            state: "unverified".into(),
+            session_id: Some(session),
+            ..BindingView::default()
+        };
+    };
+    let state = if binding.requested.is_some() || binding.conflict.is_some() {
+        "conflict"
+    } else if binding.source == BindingSource::Requested {
+        "requested"
+    } else {
+        "reported"
+    };
+    BindingView {
+        state: state.into(),
+        session_id: Some(session),
+        source: (binding.sequence > 0 || binding.source == BindingSource::Requested)
+            .then(|| binding.source.label().into()),
+        requested_session: binding.requested.clone(),
+        conflicting_session: binding.conflict.as_ref().map(|c| c.session.clone()),
+        event: binding.event.clone(),
+        sequence: binding.sequence,
+        observed_at_ms: binding.at,
+    }
+}
+
+fn capability_view(
+    provider: &str,
+    has_manifest: bool,
+    evidence: Option<&RunEvidence>,
+    process: &str,
+    report_authority: Option<&str>,
+    binding: &BindingView,
+) -> CapabilityView {
+    let running = process == "running";
+    let seen = evidence.and_then(|e| e.integration.as_ref());
+    let state_authority = match report_authority {
+        _ if !running => "process_only",
+        Some(source) => source,
+        None if has_manifest => "screen_detection",
+        None => "process_only",
+    };
+    let session_identity = match (&binding.source, &binding.session_id) {
+        (Some(source), _) => source.as_str(),
+        (None, Some(_)) => "unverified",
+        (None, None) => "none",
+    };
+    CapabilityView {
+        contract: 1,
+        state_authority: state_authority.into(),
+        session_identity: session_identity.into(),
+        prompt_submit: if running {
+            "guarded_paste"
+        } else {
+            "unavailable"
+        }
+        .into(),
+        provider_ack: false,
+        interrupt: if running {
+            "key_delivery"
+        } else {
+            "unavailable"
+        }
+        .into(),
+        approval_response: false,
+        question_response: false,
+        turn_identity: false,
+        resume: binding.session_id.is_some()
+            && binding.state != "conflict"
+            && providers::resume(provider, "example").is_ok(),
+        integration: integration::target_capability(provider)
+            .unwrap_or("none")
+            .into(),
+        callbacks_seen: seen.is_some(),
+        lifecycle_seen: seen.is_some_and(|seen| seen.lifecycle),
+    }
+}
+
 fn run_report_evidence(evidence: Arc<Evidence>, report: &Report) -> Arc<Evidence> {
     Arc::new(Evidence::report_overlay(
         &evidence,
@@ -1013,6 +1710,21 @@ fn run_report_evidence(evidence: Arc<Evidence>, report: &Report) -> Arc<Evidence
         report.sequence,
         report.at,
     ))
+}
+
+fn valid_boot(boot: &str) -> Result<&str, String> {
+    if boot.len() != 36
+        || !boot.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err("invalid native server identity".into());
+    }
+    Ok(boot)
 }
 
 fn valid_name(name: &str) -> bool {
@@ -1128,10 +1840,10 @@ fn records(text: &str) -> Result<Vec<Vec<String>>, String> {
 
 fn validate_inventory(inventory: &[Vec<String>]) -> Result<(), String> {
     for fields in inventory {
-        if fields.len() != 16 || crate::pane_id(&fields[0]).is_err() {
+        if fields.len() != 17 || crate::pane_id(&fields[0]).is_err() {
             return Err("invalid native pane inventory".into());
         }
-        if [&fields[11], &fields[12]]
+        if [&fields[11], &fields[12], &fields[16]]
             .iter()
             .any(|value| value.len() > 16384 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         {
@@ -1413,6 +2125,354 @@ mod tests {
         assert!(validate_args(&["hello\nworld".into()]).is_err());
     }
 
+    fn requested(session: &str) -> (Metadata, RunEvidence) {
+        (
+            Metadata {
+                run: "r1".into(),
+                session: Some(session.into()),
+                ..Metadata::default()
+            },
+            RunEvidence {
+                run: "r1".into(),
+                binding: Some(Binding {
+                    session: session.into(),
+                    source: BindingSource::Requested,
+                    sequence: 0,
+                    at: 1,
+                    event: None,
+                    requested: None,
+                    conflict: None,
+                }),
+                ..RunEvidence::default()
+            },
+        )
+    }
+
+    fn callback(event: &str) -> ReportOrigin<'_> {
+        ReportOrigin::Callback {
+            event,
+            frontend: false,
+            switch: false,
+        }
+    }
+
+    fn switch(event: &str) -> ReportOrigin<'_> {
+        ReportOrigin::Callback {
+            event,
+            frontend: false,
+            switch: true,
+        }
+    }
+
+    fn view(metadata: &Metadata, evidence: &RunEvidence) -> BindingView {
+        binding_view(Some(metadata), Some(evidence))
+    }
+
+    #[test]
+    fn a_confirming_callback_reports_a_requested_session() {
+        let (mut metadata, mut evidence) = requested("ses-a");
+        assert_eq!(view(&metadata, &evidence).state, "requested");
+        let outcome = apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-a",
+            7,
+            10,
+            callback("SessionStart"),
+        );
+        assert_eq!(outcome, BindingOutcome::Confirmed);
+        let view = view(&metadata, &evidence);
+        assert_eq!(view.state, "reported");
+        assert_eq!(view.source.as_deref(), Some("native_callback"));
+        assert_eq!(
+            (view.sequence, view.event.as_deref()),
+            (7, Some("SessionStart"))
+        );
+        assert_eq!(view.requested_session, None);
+    }
+
+    #[test]
+    fn the_first_report_replaces_a_request_and_stays_visible_as_a_conflict() {
+        let (mut metadata, mut evidence) = requested("ses-a");
+        let outcome = apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-b",
+            7,
+            10,
+            callback("SessionStart"),
+        );
+        assert_eq!(outcome, BindingOutcome::ReplacedRequest);
+        assert_eq!(metadata.session.as_deref(), Some("ses-b"));
+        let current = view(&metadata, &evidence);
+        assert_eq!(current.state, "conflict");
+        assert_eq!(current.requested_session.as_deref(), Some("ses-a"));
+
+        // An announced switch clears it; the new session is reported.
+        let outcome = apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-c",
+            9,
+            11,
+            switch("SessionStart"),
+        );
+        assert_eq!(outcome, BindingOutcome::Switched);
+        let current = view(&metadata, &evidence);
+        assert_eq!(
+            (current.state.as_str(), current.session_id.as_deref()),
+            ("reported", Some("ses-c"))
+        );
+    }
+
+    #[test]
+    fn a_later_unannounced_session_is_a_sticky_conflict_that_keeps_the_binding() {
+        let mut metadata = Metadata {
+            run: "r1".into(),
+            ..Metadata::default()
+        };
+        let mut evidence = RunEvidence {
+            run: "r1".into(),
+            ..RunEvidence::default()
+        };
+        assert_eq!(
+            apply_binding(
+                &mut metadata,
+                &mut evidence,
+                "parent",
+                3,
+                10,
+                callback("SessionStart")
+            ),
+            BindingOutcome::Established
+        );
+        // A child provider in a tool call inherits the run identity.
+        assert_eq!(
+            apply_binding(
+                &mut metadata,
+                &mut evidence,
+                "child",
+                4,
+                11,
+                callback("SessionStart")
+            ),
+            BindingOutcome::Contradicted
+        );
+        assert_eq!(metadata.session.as_deref(), Some("parent"));
+        let current = view(&metadata, &evidence);
+        assert_eq!(current.state, "conflict");
+        assert_eq!(current.conflicting_session.as_deref(), Some("child"));
+        // Repeating the bound session does not clear the conflict.
+        assert_eq!(
+            apply_binding(
+                &mut metadata,
+                &mut evidence,
+                "parent",
+                5,
+                12,
+                callback("SessionStart")
+            ),
+            BindingOutcome::Confirmed
+        );
+        assert_eq!(view(&metadata, &evidence).state, "conflict");
+        // Only an announced switch does.
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "resumed",
+            6,
+            13,
+            switch("SessionStart"),
+        );
+        assert_eq!(view(&metadata, &evidence).state, "reported");
+    }
+
+    #[test]
+    fn repeated_sessions_keep_the_strongest_evidence() {
+        let mut metadata = Metadata::default();
+        let mut evidence = RunEvidence::default();
+        let frontend = ReportOrigin::Callback {
+            event: "chat.message",
+            frontend: true,
+            switch: false,
+        };
+        apply_binding(&mut metadata, &mut evidence, "root", 3, 10, frontend);
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "root",
+            4,
+            11,
+            callback("session.idle"),
+        );
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "root",
+            5,
+            12,
+            ReportOrigin::Run,
+        );
+        let current = view(&metadata, &evidence);
+        assert_eq!(current.source.as_deref(), Some("frontend_callback"));
+        assert_eq!(current.sequence, 3);
+
+        let mut metadata = Metadata::default();
+        let mut evidence = RunEvidence::default();
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses",
+            3,
+            10,
+            ReportOrigin::Run,
+        );
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses",
+            4,
+            11,
+            callback("SessionStart"),
+        );
+        assert_eq!(
+            view(&metadata, &evidence).source.as_deref(),
+            Some("native_callback")
+        );
+    }
+
+    #[test]
+    fn evidence_from_another_run_or_session_is_ignored() {
+        assert_eq!(binding_view(None, None).state, "none");
+        let legacy = Metadata {
+            session: Some("old".into()),
+            ..Metadata::default()
+        };
+        assert_eq!(binding_view(Some(&legacy), None).state, "unverified");
+        let (metadata, mut evidence) = requested("ses-a");
+        evidence.binding.as_mut().unwrap().session = "other".into();
+        assert_eq!(view(&metadata, &evidence).state, "unverified");
+        assert_eq!(bounded_event(&"x".repeat(65)), None);
+        assert_eq!(bounded_event("bad\nevent"), None);
+    }
+
+    #[test]
+    fn capabilities_follow_evidence_not_provider_names() {
+        let none = binding_view(None, None);
+        let screen = capability_view("claude", true, None, "running", None, &none);
+        assert_eq!(screen.state_authority, "screen_detection");
+        assert_eq!(screen.session_identity, "none");
+        assert_eq!(screen.integration, "native_session_only");
+        assert!(!screen.callbacks_seen && !screen.resume && !screen.provider_ack);
+        assert!(!screen.approval_response && !screen.turn_identity);
+
+        let mut metadata = Metadata::default();
+        let mut evidence = RunEvidence::default();
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses",
+            2,
+            10,
+            callback("session_start"),
+        );
+        evidence.integration = Some(IntegrationSeen {
+            lifecycle: true,
+            session: true,
+            sequence: 2,
+            event: "agent_start".into(),
+            at: 10,
+        });
+        let binding = view(&metadata, &evidence);
+        let native = capability_view(
+            "pi",
+            true,
+            Some(&evidence),
+            "running",
+            Some(REPORT_SOURCE_CALLBACK),
+            &binding,
+        );
+        assert_eq!(native.state_authority, "native_callback");
+        assert_eq!(native.session_identity, "native_callback");
+        assert!(native.lifecycle_seen && native.callbacks_seen && native.resume);
+
+        let exited = capability_view("pi", true, Some(&evidence), "exited", None, &binding);
+        assert_eq!(exited.state_authority, "process_only");
+        assert_eq!(exited.prompt_submit, "unavailable");
+        assert_eq!(exited.interrupt, "unavailable");
+
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "child",
+            3,
+            11,
+            callback("session_start"),
+        );
+        let conflict = view(&metadata, &evidence);
+        assert!(!capability_view("pi", true, Some(&evidence), "running", None, &conflict).resume);
+    }
+
+    #[test]
+    fn run_evidence_stays_within_the_option_limit() {
+        let (mut metadata, mut evidence) = requested(&"s".repeat(512));
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            &"t".repeat(512),
+            9,
+            10,
+            callback(&"e".repeat(64)),
+        );
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            &"u".repeat(512),
+            10,
+            11,
+            callback(&"e".repeat(64)),
+        );
+        evidence.integration = Some(IntegrationSeen {
+            event: "e".repeat(64),
+            ..IntegrationSeen::default()
+        });
+        evidence.report = Some(ReportSource {
+            sequence: u64::MAX,
+            source: REPORT_SOURCE_CALLBACK.into(),
+        });
+        assert_eq!(
+            decode::<RunEvidence>(&encode(&evidence).unwrap()),
+            Some(evidence)
+        );
+    }
+
+    #[test]
+    fn metadata_keeps_the_schema_older_binaries_decode() {
+        let metadata = Metadata {
+            name: "agent".into(),
+            session: Some("ses".into()),
+            ..Metadata::default()
+        };
+        let json = serde_json::to_value(&metadata).unwrap();
+        let fields: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            fields,
+            [
+                "argv",
+                "boot",
+                "foreground_group",
+                "generation",
+                "last_sequence",
+                "name",
+                "original_args",
+                "provider",
+                "report",
+                "run",
+                "session"
+            ]
+        );
+    }
+
     #[test]
     fn capture_frames_preserve_multiline_unicode_and_reject_ambiguous_markers() {
         let frames = vec![
@@ -1562,7 +2622,10 @@ mod tests {
             endpoint_label: String::new(),
             endpoint_key: String::new(),
             stale: false,
+            binding: BindingView::default(),
+            capabilities: CapabilityView::default(),
             metadata: None,
+            run_evidence: None,
             encoded: String::new(),
             foreground_command: String::new(),
             tracked: Tracked::default(),

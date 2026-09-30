@@ -76,7 +76,12 @@ struct SavedPane {
     cwd: String,
     title: String,
     /// The command a restore runs in the pane's shell, if any.
+    #[serde(default)]
     command: Option<Vec<String>>,
+    /// A native coding-agent session resume command. Unlike ordinary pane
+    /// commands, this does not depend on the restore command allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<Vec<String>>,
     /// The saved pane's ID; a pane listed under several sessions runs its
     /// command once.
     #[serde(default)]
@@ -107,7 +112,7 @@ struct Options {
 
 fn usage() -> String {
     "usage: masil-agent session [--socket MASIL_SOCKET] [--client CLIENT] \
-     save [--auto]|list|restore [NAME]|menu [PAGE]|autosave"
+     save [--auto]|list|preview [NAME]|restore [NAME]|menu [PAGE]|autosave"
         .into()
 }
 
@@ -208,17 +213,21 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
                 .collect::<Vec<_>>();
             Ok((0, Some(serde_json::Value::Array(list).to_string())))
         }
+        ["preview"] | ["preview", _] => {
+            let (name, snapshot) = selected_snapshot(&words, "preview", &text)?;
+            let plan = plan_restore(server, &snapshot)?;
+            let output = serde_json::json!({
+                "stage": "preview",
+                "snapshot": name,
+                "sessions": plan.sessions,
+                "counts": plan.counts,
+            });
+            Ok((0, Some(output.to_string())))
+        }
         ["restore"] | ["restore", _] => {
-            let dir = snapshot_dir()?;
-            let name = match words.get(1) {
-                Some(name) => valid_name(name)?.to_owned(),
-                None => list_snapshots(&dir)?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| text("No saved sessions", "저장된 세션이 없습니다"))?,
-            };
-            let snapshot = load(&dir.join(format!("{name}.json")))?;
-            let report = restore(server, &snapshot, options.client.as_deref())?;
+            let (name, snapshot) = selected_snapshot(&words, "restore", &text)?;
+            let plan = plan_restore(server, &snapshot)?;
+            let report = execute_restore(server, &plan, options.client.as_deref())?;
             let message = if report.restored.is_empty()
                 && report.skipped.is_empty()
                 && report.errors.is_empty()
@@ -287,6 +296,27 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
         ["autosave"] => autosave(server, &options.socket).map(|code| (code, None)),
         _ => Err(usage()),
     }
+}
+
+fn selected_snapshot<F>(
+    words: &[&str],
+    command: &str,
+    text: &F,
+) -> Result<(String, Snapshot), String>
+where
+    F: Fn(&str, &str) -> String,
+{
+    debug_assert_eq!(words.first().copied(), Some(command));
+    let dir = snapshot_dir()?;
+    let name = match words.get(1) {
+        Some(name) => valid_name(name)?.to_owned(),
+        None => list_snapshots(&dir)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| text("No saved sessions", "저장된 세션이 없습니다"))?,
+    };
+    let snapshot = load(&dir.join(format!("{name}.json")))?;
+    Ok((name, snapshot))
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -471,16 +501,18 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
         let group: i32 = f[7].parse().unwrap_or(0);
         // A command whose arguments hold control characters is never typed
         // back: they would edit the shell's line.
-        let command = agents
-            .get(f[3])
-            .cloned()
-            .or_else(|| {
-                (group > 0 && group != pid)
-                    .then(|| process_argv(group))
-                    .flatten()
-                    .filter(|argv| is_allowed(argv, &allowed))
-            })
-            .filter(|argv| safe_argv(argv));
+        // As before the split, an argv with control characters is dropped
+        // here rather than failing the whole snapshot at validation.
+        let resume = agents.get(f[3]).cloned().filter(|argv| safe_argv(argv));
+        let command = if resume.is_none() {
+            (group > 0 && group != pid)
+                .then(|| process_argv(group))
+                .flatten()
+                .filter(|argv| is_allowed(argv, &allowed))
+                .filter(|argv| safe_argv(argv))
+        } else {
+            None
+        };
         window.panes.push(SavedPane {
             index: f[2].parse().map_err(|_| "invalid pane index")?,
             active: f[4] == "1",
@@ -491,6 +523,7 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
                 plain(f[8]).unwrap_or_default()
             },
             command,
+            resume,
             origin: f[3].to_owned(),
         });
     }
@@ -775,6 +808,17 @@ fn validate(snapshot: &Snapshot) -> Result<(), String> {
                 {
                     return Err(format!("invalid command in session {}", session.name));
                 }
+                if let Some(argv) = &pane.resume
+                    && !safe_argv(argv)
+                {
+                    return Err(format!("invalid resume in session {}", session.name));
+                }
+                if pane.command.is_some() && pane.resume.is_some() {
+                    return Err(format!(
+                        "pane has both command and resume in session {}",
+                        session.name
+                    ));
+                }
             }
         }
     }
@@ -916,6 +960,65 @@ fn prune(dir: &Path, kind: Kind) -> Result<(), String> {
 
 // ---------------------------------------------------------------- restore
 
+#[derive(Clone, Debug, Serialize)]
+struct RestoreCounts {
+    sessions: usize,
+    panes: usize,
+    commands: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RestorePlan {
+    sessions: Vec<RestoreSessionPlan>,
+    counts: RestoreCounts,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RestoreSessionPlan {
+    name: String,
+    action: String,
+    windows: Vec<RestoreWindowPlan>,
+    #[serde(skip)]
+    target_name: String,
+    #[serde(skip)]
+    active_window: i64,
+    #[serde(skip)]
+    last_attached: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RestoreWindowPlan {
+    index: i64,
+    name: String,
+    layout_fallback: bool,
+    panes: Vec<RestorePanePlan>,
+    #[serde(skip)]
+    layout: String,
+    #[serde(skip)]
+    zoomed: bool,
+    #[serde(skip)]
+    width: u64,
+    #[serde(skip)]
+    height: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RestorePanePlan {
+    cwd: String,
+    cwd_exists: bool,
+    command: Option<Vec<String>>,
+    command_allowed: bool,
+    resume: Option<Vec<String>>,
+    #[serde(skip)]
+    effective_cwd: String,
+    #[serde(skip)]
+    title: String,
+    #[serde(skip)]
+    active: bool,
+    #[serde(skip)]
+    origin: String,
+}
+
 #[derive(Default)]
 struct Report {
     restored: Vec<String>,
@@ -1001,26 +1104,37 @@ fn has_children(pid: i32) -> bool {
     })
 }
 
-fn restore(server: &Server, snapshot: &Snapshot, client: Option<&str>) -> Result<Report, String> {
+fn session_in_use(server: &Server, name: &str) -> bool {
+    masil(
+        server,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("={name}:"),
+            "#{session_attached}",
+        ],
+    )
+    .is_ok_and(|value| value.trim().parse::<u64>().is_ok_and(|count| count > 0))
+}
+
+fn plan_restore(server: &Server, snapshot: &Snapshot) -> Result<RestorePlan, String> {
     let existing: HashSet<String> = masil(server, &["list-sessions", "-F", "#{session_name}"])
         .unwrap_or_default()
         .lines()
         .map(str::to_owned)
         .collect();
-    let mut report = Report::default();
-    let preferred = snapshot
-        .sessions
-        .iter()
-        .max_by_key(|session| session.last_attached)
-        .map(|session| session.name.clone());
-    // A pane shared by grouped sessions or linked windows runs its command once.
     let mut started = HashSet::new();
+    let mut sessions = Vec::with_capacity(snapshot.sessions.len());
+    let mut counts = RestoreCounts {
+        sessions: 0,
+        panes: 0,
+        commands: 0,
+    };
     for session in &snapshot.sessions {
-        let mut name = session.name.clone();
-        if existing.contains(&name) {
-            if !pristine(server, &name) {
-                // Its panes still run; a grouped session restored later must
-                // not start their commands again.
+        let mut target_name = session.name.clone();
+        let action = if existing.contains(&target_name) {
+            if !pristine(server, &target_name) {
                 started.extend(
                     session
                         .windows
@@ -1029,17 +1143,108 @@ fn restore(server: &Server, snapshot: &Snapshot, client: Option<&str>) -> Result
                         .filter(|pane| !pane.origin.is_empty())
                         .map(|pane| pane.origin.clone()),
                 );
-                report.skipped.push(name);
-                continue;
+                if session_in_use(server, &target_name) {
+                    "skip_in_use"
+                } else {
+                    "skip_open"
+                }
+            } else {
+                target_name = format!("{target_name}-restored");
+                let mut n = 2;
+                while existing.contains(&target_name) {
+                    target_name = format!("{}-restored{n}", session.name);
+                    n += 1;
+                }
+                "create"
             }
-            name = format!("{name}-restored");
-            let mut n = 2;
-            while existing.contains(&name) {
-                name = format!("{}-restored{n}", session.name);
-                n += 1;
+        } else {
+            "create"
+        };
+        let creating = action == "create";
+        let mut windows = Vec::with_capacity(session.windows.len());
+        for window in &session.windows {
+            let (width, height) = layout_size(&window.layout).unwrap_or((80, 24));
+            let layout_fallback = layout_size(&window.layout).is_none();
+            let mut panes = Vec::with_capacity(window.panes.len());
+            for pane in &window.panes {
+                let cwd_exists = Path::new(&pane.cwd).is_dir();
+                // Snapshots contain only commands accepted by the allow-list
+                // when they were captured. Preserve that restore decision.
+                let command_allowed = pane.command.is_some();
+                let has_program = pane.resume.is_some() || command_allowed;
+                let unique_origin = !creating
+                    || !has_program
+                    || pane.origin.is_empty()
+                    || started.insert(pane.origin.clone());
+                let will_run = creating && has_program && unique_origin;
+                if creating {
+                    counts.panes += 1;
+                    counts.commands += usize::from(will_run);
+                }
+                panes.push(RestorePanePlan {
+                    cwd: pane.cwd.clone(),
+                    cwd_exists,
+                    command: pane.command.clone(),
+                    command_allowed,
+                    resume: pane.resume.clone(),
+                    effective_cwd: directory(&pane.cwd),
+                    title: pane.title.clone(),
+                    active: pane.active,
+                    origin: pane.origin.clone(),
+                });
             }
+            windows.push(RestoreWindowPlan {
+                index: window.index,
+                name: window.name.clone(),
+                layout_fallback,
+                panes,
+                layout: window.layout.clone(),
+                zoomed: window.zoomed,
+                width,
+                height,
+            });
         }
-        if let Err(error) = restore_session(server, session, &name, &mut started, &mut report) {
+        if creating {
+            counts.sessions += 1;
+        }
+        sessions.push(RestoreSessionPlan {
+            name: session.name.clone(),
+            action: action.into(),
+            windows,
+            target_name,
+            active_window: session.active_window,
+            last_attached: session.last_attached,
+        });
+    }
+    Ok(RestorePlan { sessions, counts })
+}
+
+fn execute_restore(
+    server: &Server,
+    plan: &RestorePlan,
+    client: Option<&str>,
+) -> Result<Report, String> {
+    let mut report = Report::default();
+    let mut started = HashSet::new();
+    let preferred = plan
+        .sessions
+        .iter()
+        .max_by_key(|session| session.last_attached)
+        .map(|session| session.name.clone());
+    for session in &plan.sessions {
+        if session.action != "create" {
+            started.extend(
+                session
+                    .windows
+                    .iter()
+                    .flat_map(|window| &window.panes)
+                    .filter(|pane| !pane.origin.is_empty())
+                    .map(|pane| pane.origin.clone()),
+            );
+            report.skipped.push(session.name.clone());
+            continue;
+        }
+        if let Err(error) = restore_session(server, session, &mut started, &mut report) {
             report.errors.push(format!("{}: {error}", session.name));
             continue;
         }
@@ -1049,10 +1254,16 @@ fn restore(server: &Server, snapshot: &Snapshot, client: Option<&str>) -> Result
         {
             let _ = masil(
                 server,
-                &["switch-client", "-c", client, "-t", &format!("={name}")],
+                &[
+                    "switch-client",
+                    "-c",
+                    client,
+                    "-t",
+                    &format!("={}", session.target_name),
+                ],
             );
         }
-        if name != session.name {
+        if session.target_name != session.name {
             // Replace the just-started session if it is still untouched and
             // no client uses it; otherwise both stay.
             let old = format!("={}", session.name);
@@ -1074,7 +1285,7 @@ fn restore(server: &Server, snapshot: &Snapshot, client: Option<&str>) -> Result
                     &[
                         "rename-session",
                         "-t",
-                        &format!("={name}"),
+                        &format!("={}", session.target_name),
                         "--",
                         &literal(&session.name),
                     ],
@@ -1107,16 +1318,15 @@ fn layout_size(layout: &str) -> Option<(u64, u64)> {
 
 fn restore_session(
     server: &Server,
-    session: &SavedSession,
-    name: &str,
+    session: &RestoreSessionPlan,
     started: &mut HashSet<String>,
     report: &mut Report,
 ) -> Result<(), String> {
-    let target = |window: &SavedWindow| format!("={name}:{}", window.index);
+    let name = &session.target_name;
+    let target = |window: &RestoreWindowPlan| format!("={name}:{}", window.index);
     for (number, window) in session.windows.iter().enumerate() {
-        let cwd = directory(&window.panes[0].cwd);
+        let cwd = &window.panes[0].effective_cwd;
         if number == 0 {
-            let (width, height) = layout_size(&window.layout).unwrap_or((80, 24));
             masil(
                 server,
                 &[
@@ -1127,11 +1337,11 @@ fn restore_session(
                     "-n",
                     &literal(&window.name),
                     "-c",
-                    &literal(&cwd),
+                    &literal(cwd),
                     "-x",
-                    &width.max(10).to_string(),
+                    &window.width.max(10).to_string(),
                     "-y",
-                    &height.max(5).to_string(),
+                    &window.height.max(5).to_string(),
                 ],
             )?;
             let first = masil(
@@ -1167,7 +1377,7 @@ fn restore_session(
                     "-n",
                     &literal(&window.name),
                     "-c",
-                    &literal(&cwd),
+                    &literal(cwd),
                 ],
             )?;
         }
@@ -1185,7 +1395,7 @@ fn restore_session(
                     "-y",
                     "4",
                     "-c",
-                    &literal(&directory(&pane.cwd)),
+                    &literal(&pane.effective_cwd),
                 ],
             )?;
         }
@@ -1233,8 +1443,13 @@ fn restore_session(
                 );
             }
             if let Some(argv) = pane
-                .command
+                .resume
                 .as_ref()
+                .or_else(|| {
+                    pane.command_allowed
+                        .then_some(pane.command.as_ref())
+                        .flatten()
+                })
                 .filter(|_| pane.origin.is_empty() || started.insert(pane.origin.clone()))
             {
                 let line = shell_line(argv);
@@ -1870,6 +2085,7 @@ mod tests {
             cwd: "/tmp".into(),
             title: String::new(),
             command: Some(vec!["vim".into()]),
+            resume: None,
             origin: "%0".into(),
         };
         let mut snapshot = Snapshot {

@@ -12,6 +12,7 @@ mod input;
 mod managed;
 pub(crate) mod model;
 mod network;
+mod palette;
 mod preferences;
 pub(crate) mod settings;
 mod terminal;

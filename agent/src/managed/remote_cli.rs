@@ -110,6 +110,11 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
                 print(&json!(agent))?;
                 return Ok(0);
             }
+            if command == "capabilities" && args.len() == 1 {
+                // Older endpoints omit the contract; defaults read as unknown, not supported.
+                print(&super::cli::capability_report(&agent))?;
+                return Ok(0);
+            }
             if command == "explain" && args.len() == 1 {
                 print(
                     &json!({"pane_id":agent.pane_id,"provider":agent.provider,"state":agent.state,"evidence":agent.evidence}),

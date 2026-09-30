@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
-use super::Manager;
+use super::{Manager, ReportOrigin};
 
 const MAX_CALLBACK_BYTES: usize = 256 * 1024;
 
@@ -195,6 +195,9 @@ struct MappedCallback {
     child_session: bool,
     root_binding: bool,
     allow_root_switch: bool,
+    /// The provider announced a deliberate session change (resume, clear,
+    /// explicit selection). Other session changes are recorded as conflicts.
+    session_switch: bool,
 }
 
 pub async fn run(manager: &Manager, args: &[String]) -> Result<Value, String> {
@@ -222,6 +225,14 @@ pub async fn run(manager: &Manager, args: &[String]) -> Result<Value, String> {
                 .into(),
         ),
     }
+}
+
+/// The callback capability masil can accept for a provider, if any.
+pub(super) fn target_capability(provider: &str) -> Option<&'static str> {
+    TARGETS
+        .iter()
+        .find(|target| target.id == provider)
+        .map(|target| target.capability.label())
 }
 
 fn target(provider: &str) -> Result<&'static Target, String> {
@@ -686,19 +697,24 @@ async fn hook(
         }
     }
 
-    if let Some(state) = mapped.state {
+    let origin = ReportOrigin::Callback {
+        event: &mapped.event,
+        frontend: mapped.root_binding,
+        switch: mapped.session_switch || mapped.allow_root_switch,
+    };
+    let result = if let Some(state) = mapped.state {
         manager
-            .report_snapshot(&agent, sequence, state, mapped.session.as_deref())
-            .await?;
+            .report_snapshot(&agent, sequence, state, mapped.session.as_deref(), origin)
+            .await?
     } else {
         let session = mapped
             .session
             .as_deref()
             .ok_or("identity callback did not include a session reference")?;
         manager
-            .report_identity_snapshot(&agent, sequence, session)
-            .await?;
-    }
+            .report_identity_snapshot(&agent, sequence, session, origin)
+            .await?
+    };
     Ok(json!({
         "stage": "native_callback_recorded",
         "provider": target.id,
@@ -707,7 +723,9 @@ async fn hook(
         "sequence": sequence,
         "event": mapped.event,
         "state": mapped.state.unwrap_or("unknown"),
+        "state_applied": result.state_applied,
         "session_id": mapped.session,
+        "binding": result.binding.map(|binding| binding.label()),
         "provider_accepted": false,
     }))
 }
@@ -741,6 +759,32 @@ fn map_callback(
     action: Option<&str>,
     payload: &Map<String, Value>,
 ) -> Result<MappedCallback, String> {
+    let mut mapped = map_callback_event(target, action, payload)?;
+    mapped.session_switch = session_switch(payload);
+    Ok(mapped)
+}
+
+/// A deliberate session change announced by the provider: an explicit switch
+/// or reset event, or a session start whose source is resume/clear. A child
+/// provider process starting its own session reports `startup`; compaction
+/// keeps the session, so a different ID with `compact` stays a conflict.
+fn session_switch(payload: &Map<String, Value>) -> bool {
+    let event = callback_event(payload)
+        .map(|event| normalize_event(&event))
+        .unwrap_or_default();
+    let source = first_text(payload, &["source", "reason"]).map(str::to_ascii_lowercase);
+    matches!(event.as_str(), "sessionswitch" | "onsessionreset")
+        || matches!(
+            source.as_deref(),
+            Some("resume" | "clear" | "switch" | "fork" | "reset")
+        )
+}
+
+fn map_callback_event(
+    target: &Target,
+    action: Option<&str>,
+    payload: &Map<String, Value>,
+) -> Result<MappedCallback, String> {
     let session = session_id(target.id, payload);
     let (child_session, root_binding, allow_root_switch) =
         if matches!(target.id, "opencode" | "kilo") {
@@ -757,6 +801,7 @@ fn map_callback(
                 child_session,
                 root_binding,
                 allow_root_switch,
+                session_switch: false,
             });
         }
         if !matches!(action, "idle" | "working" | "blocked") {
@@ -780,6 +825,7 @@ fn map_callback(
             child_session,
             root_binding,
             allow_root_switch,
+            session_switch: false,
         });
     }
 
@@ -799,6 +845,7 @@ fn map_callback(
             child_session: false,
             root_binding: false,
             allow_root_switch: false,
+            session_switch: false,
         });
     }
 
@@ -900,6 +947,7 @@ fn map_lifecycle(
         child_session: false,
         root_binding: false,
         allow_root_switch: false,
+        session_switch: false,
     })
 }
 
@@ -966,6 +1014,7 @@ fn map_open_code(
         child_session,
         root_binding,
         allow_root_switch,
+        session_switch: false,
     })
 }
 

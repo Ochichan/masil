@@ -1281,6 +1281,10 @@ impl App {
         let (binding, binding_tone) = match row.binding.as_str() {
             "explicit_unverified" => (Text::ConfiguredUnverified, Tone::Warn),
             "invalidated" => (Text::BindingInvalidated, Tone::Bad),
+            "managed_reported" => (Text::BindingReported, Tone::Normal),
+            "managed_requested" => (Text::BindingRequested, Tone::Warn),
+            "managed_conflict" => (Text::BindingConflict, Tone::Bad),
+            "managed_none" => (Text::BindingNone, Tone::Muted),
             _ => (Text::StateUnavailable, Tone::Bad),
         };
         entries.push(Entry::Field(
@@ -2153,7 +2157,7 @@ fn plain_json(value: &serde_json::Value) -> String {
     }
 }
 
-fn action_shortcut(action: Action) -> &'static str {
+pub(super) fn action_shortcut(action: Action) -> &'static str {
     match action {
         Action::MarkSeen => "a",
         Action::GoToPane => "g",

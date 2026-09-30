@@ -11,8 +11,11 @@ const HELP: &str = "Native agents (no observer configuration needed):
   masil-agent agent --endpoint ID COMMAND ...
   masil-agent agent [--socket MASIL_SOCKET] list --all
   masil-agent agent [--socket MASIL_SOCKET] list|get TARGET|explain TARGET
+  masil-agent agent [--socket MASIL_SOCKET] find QUERY [--limit N]
+  masil-agent agent [--socket MASIL_SOCKET] capabilities TARGET
+  masil-agent agent capabilities --provider PROVIDER
   masil-agent agent [--socket MASIL_SOCKET] read TARGET [--history]
-  masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER --cwd DIR [--split %N] [--session ID] [-- ARGS...]
+  masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER --cwd DIR [--split %N] [--session ID] [--boot BOOT --operation ID] [-- ARGS...]
   masil-agent agent [--socket MASIL_SOCKET] attach TARGET NAME
   masil-agent agent [--socket MASIL_SOCKET] rename TARGET NAME
   masil-agent agent [--socket MASIL_SOCKET] focus TARGET
@@ -20,9 +23,11 @@ const HELP: &str = "Native agents (no observer configuration needed):
   masil-agent agent [--socket MASIL_SOCKET] draft TARGET TEXT
   masil-agent agent [--socket MASIL_SOCKET] prompt TARGET TEXT [--run RUN --operation N]
   masil-agent agent [--socket MASIL_SOCKET] prompt-receipt TARGET [--run RUN] [--operation N]
-  masil-agent agent [--socket MASIL_SOCKET] interrupt|close TARGET
+  masil-agent agent [--socket MASIL_SOCKET] interrupt|close TARGET [--run RUN --operation ID]
   masil-agent agent [--socket MASIL_SOCKET] wait TARGET --state idle|working|blocked|exited [--timeout SECONDS] [--after-change]
-  masil-agent agent [--socket MASIL_SOCKET] resume TARGET --name NAME [--split %N]
+  masil-agent agent [--socket MASIL_SOCKET] resume TARGET --name NAME [--split %N] [--boot BOOT --operation ID]
+  masil-agent agent [--socket MASIL_SOCKET] operations [list] [--all] [--limit N] | status | reconcile | adopt
+  masil-agent agent [--socket MASIL_SOCKET] operation KEY | operation resolve KEY --as delivered|not-delivered
   masil-agent agent [--socket MASIL_SOCKET] ack TARGET --run RUN --revision REVISION
   masil-agent agent [--socket MASIL_SOCKET] save FILE
   masil-agent agent [--socket MASIL_SOCKET] restore FILE [--allow-fresh]
@@ -36,8 +41,11 @@ const HELP: &str = "Native agents (no observer configuration needed):
 Socket defaults to the current TMUX server. Start creates a new window or split.
 Draft prepares a tmux buffer. Prompt checks idle/foreground identity, pastes, then sends Enter.
 Prompt receipts report delivery, not provider acceptance. Reuse --run RUN --operation N for retries.
+Start, prompt, interrupt and close are recorded in a durable operation store before any effect;
+a retry with the same key returns the recorded result and an unknown outcome is never resent.
 Raw send-keys is explicit keyboard delivery, never provider acceptance.
-Wait reports an observed state, never task success. Native session refs remain unverified.";
+Wait reports an observed state, never task success. A session binding is verified only
+when a provider callback carrying this run's identity reported it; requested resume refs stay unverified.";
 
 pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     if args.is_empty() || args == ["--help"] || args == ["help"] {
@@ -73,8 +81,13 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     }
     if command == "providers" && rest.is_empty() {
         print(
-            &json!({"providers":providers::all().iter().map(|p|json!({"id":p.id,"command":p.command,"aliases":p.aliases,"resume":providers::resume(p.id,"example").is_ok()})).collect::<Vec<_>>()}),
+            &json!({"providers":providers::all().iter().map(|p|json!({"id":p.id,"command":p.command,"aliases":p.aliases,"resume":providers::resume(p.id,"example").is_ok(),"integration":super::integration::target_capability(p.id)})).collect::<Vec<_>>()}),
         )?;
+        return Ok(0);
+    }
+    if command == "capabilities" && rest.len() == 2 && rest[0] == "--provider" {
+        let engine = crate::detection::Engine::load()?;
+        print(&super::provider_contract(&engine, &rest[1])?)?;
         return Ok(0);
     }
     if command == "endpoints" || command == "endpoint" {
@@ -178,6 +191,49 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
     Err(format!("provider could not start: {error}"))
 }
 
+/// A client operation key needs the namespace the client observed.
+fn client_key<'a>(
+    pin: Option<&'a str>,
+    operation: Option<&'a str>,
+    flag: &str,
+) -> Result<Option<super::durable::ClientKey<'a>>, String> {
+    match (pin, operation) {
+        (Some(pin), Some(id)) => Ok(Some(super::durable::ClientKey { pin, id })),
+        (None, None) => Ok(None),
+        _ => Err(format!("--operation ID and {flag} must be given together")),
+    }
+}
+
+fn run_operation(args: &[String]) -> Result<(Option<&str>, Option<&str>), String> {
+    let mut run = None;
+    let mut operation = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--run" if run.is_none() => run = Some(value(args, i)?),
+            "--operation" if operation.is_none() => operation = Some(value(args, i)?),
+            _ => return Err("accepts --run RUN --operation ID".into()),
+        }
+        i += 2;
+    }
+    Ok((run, operation))
+}
+
+/// A keyed retry whose target is gone still has a durable receipt.
+fn keyed_error(error: String, action: &str, key: Option<super::durable::ClientKey<'_>>) -> String {
+    match key {
+        Some(key) => format!(
+            "{error}; its receipt is `masil-agent agent operation run:{}/{action}/{}`",
+            key.pin, key.id
+        ),
+        None => error,
+    }
+}
+
+pub(super) fn capability_report(agent: &Agent) -> serde_json::Value {
+    json!({"pane_id":agent.pane_id,"run":agent.run,"provider":agent.provider,"process":agent.process,"state":agent.state,"binding":agent.binding,"capabilities":agent.capabilities})
+}
+
 fn value(args: &[String], index: usize) -> Result<&str, String> {
     args.get(index + 1)
         .map(String::as_str)
@@ -234,6 +290,10 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                 agents: manager.list_view().await?,
             })?
         }
+        "capabilities" if args.len() == 1 => {
+            let agent = manager.get(&args[0]).await?;
+            print(&capability_report(&agent))?;
+        }
         "get" | "explain" if args.len() == 1 => {
             let agent = manager.get(&args[0]).await?;
             print(&if command == "get" {
@@ -252,6 +312,8 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             let mut cwd = None;
             let mut split = None;
             let mut session = None;
+            let mut boot = None;
+            let mut operation = None;
             let mut extra = Vec::new();
             let mut i = 2;
             while i < args.len() {
@@ -259,6 +321,8 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     "--cwd" if cwd.is_none() => cwd = Some(PathBuf::from(value(args, i)?)),
                     "--split" if split.is_none() => split = Some(value(args, i)?),
                     "--session" if session.is_none() => session = Some(value(args, i)?),
+                    "--boot" if boot.is_none() => boot = Some(value(args, i)?),
+                    "--operation" if operation.is_none() => operation = Some(value(args, i)?),
                     "--" => {
                         extra = args[i + 1..].to_vec();
                         break;
@@ -269,13 +333,14 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             }
             print(
                 &manager
-                    .start(
+                    .start_with_operation(
                         &args[0],
                         &args[1],
                         &cwd.unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?),
                         &extra,
                         session,
                         split,
+                        client_key(boot, operation, "--boot BOOT")?,
                     )
                     .await?,
             )?;
@@ -285,24 +350,34 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             manager.rename(&agent, &args[1]).await?;
             print(&json!({"stage":"registered","pane_id":agent.pane_id,"name":args[1]}))?;
         }
-        "focus" | "interrupt" | "close" if args.len() == 1 => {
+        "focus" if args.len() == 1 => {
             let agent = manager.get(&args[0]).await?;
-            let stage = match command {
-                "focus" => {
-                    manager.focus(&agent).await?;
-                    "selected"
-                }
-                "interrupt" => {
-                    manager.keys(&agent, &["C-c".into()]).await?;
-                    "interrupt_key_delivered"
-                }
-                _ => {
-                    manager.close(&agent).await?;
-                    "pane_closed"
-                }
-            };
-            print(&json!({"stage":stage,"pane_id":agent.pane_id,"run":agent.run}))?;
+            manager.focus(&agent).await?;
+            print(&json!({"stage":"selected","pane_id":agent.pane_id,"run":agent.run}))?;
         }
+        "interrupt" | "close" if !args.is_empty() => {
+            let (run, operation) = run_operation(&args[1..])?;
+            let key = client_key(run, operation, "--run RUN")?;
+            let agent = match manager.get(&args[0]).await {
+                Ok(agent) => agent,
+                Err(error) => return Err(keyed_error(error, command, key)),
+            };
+            if key.is_some_and(|key| key.pin != agent.run) {
+                return Err(keyed_error(
+                    format!("{command} target run changed; this operation cannot be replayed"),
+                    command,
+                    key,
+                ));
+            }
+            print(&if command == "interrupt" {
+                manager.interrupt(&agent, key).await?
+            } else {
+                manager.close_with_operation(&agent, key).await?
+            })?;
+        }
+        "find" => print(&manager.find(args).await?)?,
+        "operations" => print(&manager.operations_command(false, args).await?)?,
+        "operation" if !args.is_empty() => print(&manager.operations_command(true, args).await?)?,
         "ack" if args.len() == 5 && args[1] == "--run" && args[3] == "--revision" => {
             let agent = manager.get(&args[0]).await?;
             if agent.run != args[2] || agent.revision != args[4] {
@@ -385,32 +460,38 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             let agent = manager.get(&args[0]).await?;
             let mut name = None;
             let mut split = None;
+            let mut boot = None;
+            let mut operation = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--name" if name.is_none() => name = Some(value(args, i)?),
                     "--split" if split.is_none() => split = Some(value(args, i)?),
-                    _ => return Err("resume accepts --name NAME and --split %N".into()),
+                    "--boot" if boot.is_none() => boot = Some(value(args, i)?),
+                    "--operation" if operation.is_none() => operation = Some(value(args, i)?),
+                    _ => {
+                        return Err(
+                            "resume accepts --name NAME, --split %N and --boot BOOT --operation ID"
+                                .into(),
+                        );
+                    }
                 }
                 i += 2;
             }
-            print(
-                &manager
-                    .start(
-                        name.ok_or("resume requires a new --name")?,
-                        &agent.provider,
-                        std::path::Path::new(&agent.cwd),
-                        &[],
-                        Some(
-                            agent
-                                .session_id
-                                .as_deref()
-                                .ok_or("no native session reference was reported")?,
-                        ),
-                        split,
-                    )
-                    .await?,
-            )?;
+            let mut outcome = manager
+                .start_with_operation(
+                    name.ok_or("resume requires a new --name")?,
+                    &agent.provider,
+                    std::path::Path::new(&agent.cwd),
+                    &[],
+                    Some(manager.resume_session(&agent)?),
+                    split,
+                    client_key(boot, operation, "--boot BOOT")?,
+                )
+                .await?;
+            // The new run has only a request; the source run's evidence stays separate.
+            outcome["source_binding"] = json!(agent.binding);
+            print(&outcome)?;
         }
         "wait" if args.len() >= 3 => return wait(&manager, args).await,
         "report" => {
@@ -437,7 +518,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                 }
                 i += 2;
             }
-            manager
+            let result = manager
                 .report(
                     pane.ok_or("report requires --pane")?,
                     run.ok_or("report requires --run")?,
@@ -446,7 +527,9 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     session,
                 )
                 .await?;
-            print(&json!({"stage":"report_recorded"}))?;
+            print(
+                &json!({"stage":"report_recorded","binding":result.binding.map(|b| b.label()),"state_applied":result.state_applied}),
+            )?;
         }
         "reload" if args.is_empty() => {
             manager.reload()?;

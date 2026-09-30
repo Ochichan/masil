@@ -298,18 +298,19 @@ impl Fleet {
             self.local.prompt(agent, text).await
         }
     }
-    pub async fn keys(&self, agent: &Agent, keys: &[String]) -> Result<Value, String> {
+    /// Local interrupts are durable operations; an endpoint receives the key.
+    pub async fn interrupt(&self, agent: &Agent) -> Result<Value, String> {
         if let Some(e) = self.remote(agent)? {
             self.action(
                 e,
                 agent,
                 Action::Keys {
-                    keys: keys.to_vec(),
+                    keys: vec!["C-c".into()],
                 },
             )
             .await
         } else {
-            self.local.keys(agent, keys).await
+            self.local.interrupt(agent, None).await
         }
     }
     pub async fn acknowledge(&self, agent: &Agent) -> Result<(), String> {
@@ -344,12 +345,7 @@ impl Fleet {
                     &agent.provider,
                     Path::new(&agent.cwd),
                     &[],
-                    Some(
-                        agent
-                            .session_id
-                            .as_deref()
-                            .ok_or("no native session reference")?,
-                    ),
+                    Some(self.local.resume_session(agent)?),
                     None,
                 )
                 .await

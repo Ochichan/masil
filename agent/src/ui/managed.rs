@@ -1,9 +1,11 @@
 //! Native agent-management desk. The native server is queried only while this view is open.
 
 use super::{
-    model::{App, Effect, Language, Theme},
+    i18n::action_label,
+    model::{Action, App, Effect, Language, Theme},
+    palette::{self, Palette, PaletteResult},
     preferences, terminal,
-    view::{cell_width, ellipsize, wrap_rows},
+    view::{action_shortcut, cell_width, ellipsize, wrap_rows},
 };
 use crate::managed::{
     Agent, Manager,
@@ -596,7 +598,7 @@ fn message(language: Language, english: String, korean: String) -> String {
     }
 }
 
-fn dialog_colors(theme: Theme) -> (Color, Color, Color, Color, Color) {
+pub(super) fn dialog_colors(theme: Theme) -> (Color, Color, Color, Color, Color) {
     match theme {
         Theme::Dark => (
             Color::Rgb(31, 39, 49),
@@ -669,6 +671,7 @@ fn endpoint_status_line(statuses: &[EndpointStatus], language: Language) -> (Str
 enum Work {
     Poll(Result<FleetSnapshot, String>),
     Action(ActionMessage),
+    Panes(Result<(Vec<crate::managed::find::PaneTarget>, bool), String>),
 }
 struct ActionMessage {
     boot: String,
@@ -762,6 +765,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut dialog: Option<Dialog> = None;
+    let mut palette: Option<Palette> = None;
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|error| error.to_string())?;
@@ -777,6 +781,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 terminal.terminal().draw(|frame| {
                     app.draw(frame);
                     if let Some(dialog) = &mut dialog { dialog.draw(frame, app.theme); }
+                    if let Some(palette) = &mut palette { palette.draw(frame, app.theme); }
                 }).map_err(|error| error.to_string())?;
                 app.dirty = false;
             }
@@ -791,7 +796,32 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 }
                 event = events.next() => match event {
                     Some(Ok(event)) => {
-                        if let Some(active) = &mut dialog {
+                        if let Some(active) = &mut palette {
+                            if matches!(event, Event::Resize(_, _)) {
+                                app.handle(event.clone(), Instant::now());
+                            }
+                            let outcome = active.handle(event, Instant::now());
+                            app.dirty = true;
+                            match outcome {
+                                PaletteResult::None => Vec::new(),
+                                PaletteResult::Close => { palette = None; Vec::new() },
+                                PaletteResult::Activate(target) => {
+                                    palette = None;
+                                    activate_palette(target, &mut app, &agents, fleet.clone(), &mut tasks, owned_pane.as_deref(), &current_epoch)
+                                }
+                            }
+                        } else if matches!(&event, Event::Key(key) if key.code == KeyCode::Char(':') && key.modifiers.difference(KeyModifiers::SHIFT).is_empty())
+                            && dialog.is_none()
+                            && app.overlay.is_none()
+                            && app.focus != super::model::Focus::Search
+                        {
+                            let context = selected_agent(&app, &agents).map(crate::managed::find::agent_label);
+                            palette = Some(Palette::new(app.language, palette_items(&app, &agents), context));
+                            let fleet = fleet.clone();
+                            tasks.spawn(async move { Work::Panes(fleet.local.pane_targets().await) });
+                            app.dirty = true;
+                            Vec::new()
+                        } else if let Some(active) = &mut dialog {
                             let outcome = active.handle(event);
                             app.dirty = true;
                             match outcome {
@@ -847,6 +877,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     }
                                     if identity_changed {
                                         dialog = None;
+                                        palette = None;
                                         app.cancel_interactions();
                                         app.overlay = None;
                                         app.ack_in_flight = None;
@@ -873,6 +904,12 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             Err(error) => { app.finish_action(); app.notify(format!("Action failed: {error}")); },
                         },
                         Ok(Work::Action(_)) => {},
+                        Ok(Work::Panes(result)) => {
+                            if let Some(active) = &mut palette {
+                                active.set_panes(result);
+                                app.dirty = true;
+                            }
+                        }
                         Err(error) => { poll_pending = false; app.finish_action(); app.notify(format!("Action failed: {error}")); }
                     }
                     Vec::new()
@@ -903,6 +940,104 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     drop(events);
     drop(terminal);
     result
+}
+
+/// Agents in desk order, then the desk actions for the current selection.
+/// Panes of this server are added once the background query returns.
+fn palette_items(app: &App, agents: &HashMap<String, Agent>) -> Vec<palette::Item> {
+    let mut items: Vec<palette::Item> = app
+        .rows
+        .iter()
+        .filter_map(|row| agents.get(&row.id))
+        .map(|agent| palette::Item {
+            kind: palette::Kind::Agent,
+            label: crate::managed::find::agent_label(agent),
+            detail: crate::managed::find::agent_detail(agent),
+            hint: agent.state.clone(),
+            target: palette::Target::Agent(agent.id.clone()),
+            enabled: !agent.stale,
+            pane: agent.endpoint_id.is_empty().then(|| agent.pane_id.clone()),
+        })
+        .collect();
+    items.extend(
+        app.context_actions()
+            .into_iter()
+            .map(|action| palette::Item {
+                kind: palette::Kind::Action,
+                label: action_label(app.language, action, app.ack_in_flight.is_some(), false)
+                    .to_owned(),
+                detail: String::new(),
+                hint: action_shortcut(action).to_owned(),
+                target: palette::Target::Action(action),
+                enabled: app.action_enabled(action),
+                pane: None,
+            }),
+    );
+    items
+}
+
+/// Run a palette entry through the same guarded paths as keys and clicks.
+fn activate_palette(
+    target: palette::Target,
+    app: &mut App,
+    agents: &HashMap<String, Agent>,
+    fleet: Arc<Fleet>,
+    tasks: &mut JoinSet<Work>,
+    owned_pane: Option<&str>,
+    expected_boot: &str,
+) -> Vec<Effect> {
+    let language = app.language;
+    match target {
+        palette::Target::Agent(id) => {
+            if !agents.contains_key(&id) || !app.select_id(&id) {
+                app.notify(message(
+                    language,
+                    format!("{id} is no longer listed"),
+                    format!("{id}은(는) 더 이상 목록에 없습니다"),
+                ));
+                return Vec::new();
+            }
+            match app.effect_for(Action::GoToPane) {
+                Some(effect) => vec![effect],
+                None => {
+                    app.notify(message(
+                        language,
+                        format!("Selected {id}; its pane cannot be focused now"),
+                        format!("{id} 선택. 지금은 창으로 이동할 수 없습니다"),
+                    ));
+                    Vec::new()
+                }
+            }
+        }
+        palette::Target::Pane(pane) => {
+            let origin = owned_pane.map(str::to_owned);
+            let boot = expected_boot.to_owned();
+            tasks.spawn(async move {
+                let socket = fleet.local.native.socket.clone();
+                let result = fleet
+                    .local
+                    .native
+                    .navigate(
+                        &pane.boot,
+                        &pane.pane_id,
+                        &pane.generation,
+                        origin.as_deref(),
+                        &socket,
+                    )
+                    .await
+                    .map(|_| {
+                        ActionResult::Receipt(message(
+                            language,
+                            format!("Selected pane {}", pane.pane_id),
+                            format!("창 {} 선택 완료", pane.pane_id),
+                        ))
+                    });
+                action_message(boot, None, result)
+            });
+            Vec::new()
+        }
+        palette::Target::Action(action) => app.effect_for(action).into_iter().collect(),
+    }
 }
 
 fn selected_agent<'a>(app: &App, agents: &'a HashMap<String, Agent>) -> Option<&'a Agent> {
@@ -1211,7 +1346,7 @@ fn submit_dialog(
             let epoch = current_epoch.to_owned();
             let target = TargetIdentity::for_agent(&agent);
             tasks.spawn(async move {
-                let result = fleet.keys(&agent, &["C-c".into()]).await.map(|_| {
+                let result = fleet.interrupt(&agent).await.map(|_| {
                     ActionResult::Receipt(message(
                         language,
                         "C-c delivered to the selected pane; provider handling is unverified"
