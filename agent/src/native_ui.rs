@@ -858,7 +858,14 @@ impl Context {
         I: IntoIterator<Item = OsString>,
     {
         let executable = native_executable()?;
-        let mut all = vec![OsString::from("-S"), self.socket.as_os_str().to_owned()];
+        // -u: without a UTF-8 locale the client would print tabs and other
+        // control characters as '_', breaking tab-separated formats, and
+        // replace non-ASCII text. Interactive attaches are not made here.
+        let mut all = vec![
+            OsString::from("-u"),
+            OsString::from("-S"),
+            self.socket.as_os_str().to_owned(),
+        ];
         all.extend(args);
         run_process(executable.as_os_str(), all, input).await
     }
