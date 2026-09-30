@@ -189,6 +189,7 @@ static void
 grid_compact_line(struct grid_line *gl)
 {
 	int			 new_extdsize = 0;
+	int			 dense = 1;
 	struct grid_extd_entry	*new_extddata;
 	struct grid_cell_entry	*gce;
 	struct grid_extd_entry	*gee;
@@ -199,9 +200,14 @@ grid_compact_line(struct grid_line *gl)
 
 	for (px = 0; px < gl->cellsize; px++) {
 		gce = &gl->celldata[px];
-		if (gce->flags & GRID_FLAG_EXTENDED)
+		if (gce->flags & GRID_FLAG_EXTENDED) {
+			if (gce->offset != (u_int)new_extdsize)
+				dense = 0;
 			new_extdsize++;
+		}
 	}
+	if (dense && (u_int)new_extdsize == gl->extdsize)
+		return;
 
 	if (new_extdsize == 0) {
 		free(gl->extddata);
@@ -699,7 +705,7 @@ grid_set_cells(struct grid *gd, u_int px, u_int py, const struct grid_cell *gc,
 	struct grid_line	*gl;
 	struct grid_cell_entry	*gce;
 	struct grid_extd_entry	*gee;
-	u_int			 i;
+	u_int			 i, at, needed;
 
 	if (grid_check_y(gd, __func__, py) != 0)
 		return;
@@ -709,6 +715,31 @@ grid_set_cells(struct grid *gd, u_int px, u_int py, const struct grid_cell *gc,
 	gl = &gd->linedata[py];
 	if (px + slen > gl->cellused)
 		gl->cellused = px + slen;
+
+	/* Reserve new extended cells once for the whole collected run. */
+	if (grid_need_extended_cell(&grid_cleared_entry, gc)) {
+		needed = 0;
+		for (i = 0; i < slen; i++) {
+			if (~gl->celldata[px + i].flags & GRID_FLAG_EXTENDED)
+				needed++;
+		}
+		if (needed != 0) {
+			at = gl->extdsize;
+			if (needed > UINT_MAX - at)
+				fatalx("too many extended cells");
+			gl->extddata = xreallocarray(gl->extddata, at + needed,
+			    sizeof *gl->extddata);
+			gl->extdsize = at + needed;
+			for (i = 0; i < slen; i++) {
+				gce = &gl->celldata[px + i];
+				if (~gce->flags & GRID_FLAG_EXTENDED) {
+					gce->offset = at++;
+					gce->flags = (gc->flags & ~GRID_FLAG_CLEARED) |
+					    GRID_FLAG_EXTENDED;
+				}
+			}
+		}
+	}
 
 	for (i = 0; i < slen; i++) {
 		gce = &gl->celldata[px + i];
@@ -1321,6 +1352,20 @@ grid_reflow_dead(struct grid_line *gl)
 	gl->flags = GRID_LINE_DEAD;
 }
 
+/* Release cells discarded when a line is split or partially joined. */
+static void
+grid_reflow_trim(struct grid_line *gl, u_int used)
+{
+	if (used == 0) {
+		free(gl->celldata);
+		gl->celldata = NULL;
+	} else
+		gl->celldata = xreallocarray(gl->celldata, used,
+		    sizeof *gl->celldata);
+	gl->cellsize = gl->cellused = used;
+	grid_compact_line(gl);
+}
+
 /* Add lines, return the first new one. */
 static struct grid_line *
 grid_reflow_add(struct grid *gd, u_int n)
@@ -1436,7 +1481,7 @@ grid_reflow_join(struct grid *target, struct grid *gd, u_int sx, u_int yy,
 	left = from->cellused - want;
 	if (left != 0) {
 		grid_move_cells(gd, 0, want, yy + lines, left, 8);
-		from->cellsize = from->cellused = left;
+		grid_reflow_trim(from, left);
 		lines--;
 	} else if (!wrapped)
 		gl->flags &= ~GRID_LINE_WRAPPED;
@@ -1506,7 +1551,7 @@ grid_reflow_split(struct grid *target, struct grid *gd, u_int sx, u_int yy,
 		target->linedata[line].flags |= GRID_LINE_WRAPPED;
 
 	/* Move the remainder of the original line. */
-	gl->cellsize = gl->cellused = at;
+	grid_reflow_trim(gl, at);
 	gl->flags |= GRID_LINE_WRAPPED;
 	memcpy(first, gl, sizeof *first);
 	grid_reflow_dead(gl);

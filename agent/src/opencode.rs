@@ -1,6 +1,7 @@
 //! Read-only OpenCode native-session observation.
 
 use crate::observation::{self, NativeSession, SourceConfig, SourceState};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest::{Client, Response, StatusCode, Url, header};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -18,6 +19,7 @@ const MAX_JSON_COLLECTION: usize = 256;
 const MAX_JSON_NODES: usize = 8192;
 const MAX_PENDING_REQUESTS: usize = 256;
 const MAX_STORED_REQUEST_IDS: usize = 16;
+const SESSION_INFO_CONCURRENCY: usize = 4;
 const SSE_YIELD_BATCH: usize = 32;
 const SSE_STREAM_BUDGET: usize = 32;
 const FINITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -543,20 +545,24 @@ async fn snapshot_inner(
     let health = required_json_at(client, config, auth, "/global/health", false).await?;
     let provider_version = parse_health(&health)?.to_owned();
     let status = required_json(client, config, auth, "/session/status").await?;
-    let mut infos = Vec::with_capacity(config.sessions.len());
-    for session in &config.sessions {
-        let path = format!("/session/{}", session.session_id);
-        infos.push(
-            match request_json(client, config, auth, &path, true, true).await? {
-                JsonResponse::Value(value) => Some(project_session_info(
-                    value,
-                    &session.session_id,
-                    &config.directory,
-                )?),
-                JsonResponse::Missing => None,
-            },
-        );
-    }
+    let infos = stream::iter(0..config.sessions.len())
+        .map(|index| async move {
+            let session = &config.sessions[index];
+            let path = format!("/session/{}", session.session_id);
+            Ok(
+                match request_json(client, config, auth, &path, true, true).await? {
+                    JsonResponse::Value(value) => Some(project_session_info(
+                        value,
+                        &session.session_id,
+                        &config.directory,
+                    )?),
+                    JsonResponse::Missing => None,
+                },
+            )
+        })
+        .buffered(SESSION_INFO_CONCURRENCY)
+        .try_collect()
+        .await?;
     let permissions = required_json(client, config, auth, "/permission").await?;
     let questions = required_json(client, config, auth, "/question").await?;
     let mut snapshot = project_snapshot(config, status, infos, permissions, questions)?;
@@ -1064,6 +1070,10 @@ mod tests {
     use super::*;
     use crate::observation::SessionConfig;
     use serde_json::json;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{Mutex, Notify};
 
     fn config() -> SourceConfig {
         SourceConfig {
@@ -1101,6 +1111,190 @@ mod tests {
 
     fn info(id: &str, parent_id: Option<&str>) -> SessionInfoProjection {
         project_session_info(raw_info(id, parent_id), id, "/work/project").unwrap()
+    }
+
+    #[derive(Default)]
+    struct SnapshotFixtureState {
+        request_starts: Vec<String>,
+        session_completions: Vec<String>,
+        active_session_requests: usize,
+        max_active_session_requests: usize,
+    }
+
+    async fn serve_snapshot_request(
+        mut stream: TcpStream,
+        state: Arc<Mutex<SnapshotFixtureState>>,
+        first_batch_ready: Arc<Notify>,
+    ) {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            assert!(request.len() <= 16 * 1024, "fixture request is too large");
+        }
+        let request = std::str::from_utf8(&request).unwrap();
+        let target = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap();
+        let path = target.split('?').next().unwrap();
+
+        let (status, body) = match path {
+            "/global/health" => {
+                state.lock().await.request_starts.push("health".into());
+                (
+                    "200 OK",
+                    json!({"healthy": true, "version": "1.18.32"}).to_string(),
+                )
+            }
+            "/session/status" => {
+                state.lock().await.request_starts.push("status".into());
+                ("200 OK", json!({}).to_string())
+            }
+            "/permission" => {
+                state.lock().await.request_starts.push("permission".into());
+                ("200 OK", json!([]).to_string())
+            }
+            "/question" => {
+                state.lock().await.request_starts.push("question".into());
+                ("200 OK", json!([]).to_string())
+            }
+            path if path.starts_with("/session/") => {
+                let session_id = path.strip_prefix("/session/").unwrap().to_owned();
+                let index: usize = session_id.strip_prefix("ses_").unwrap().parse().unwrap();
+                let reached_limit = {
+                    let mut state = state.lock().await;
+                    state.request_starts.push(format!("session:{session_id}"));
+                    state.active_session_requests += 1;
+                    state.max_active_session_requests = state
+                        .max_active_session_requests
+                        .max(state.active_session_requests);
+                    state.active_session_requests == SESSION_INFO_CONCURRENCY
+                };
+                if reached_limit {
+                    first_batch_ready.notify_one();
+                }
+                if index == 0 {
+                    first_batch_ready.notified().await;
+                    sleep(Duration::from_millis(80)).await;
+                } else {
+                    sleep(Duration::from_millis((6 - index) as u64 * 10)).await;
+                }
+                {
+                    let mut state = state.lock().await;
+                    state.active_session_requests -= 1;
+                    state.session_completions.push(session_id.clone());
+                }
+                if index == 2 {
+                    ("404 Not Found", String::new())
+                } else {
+                    (
+                        "200 OK",
+                        json!({"id": session_id, "directory": "/work/project"}).to_string(),
+                    )
+                }
+            }
+            _ => panic!("unexpected fixture path: {path}"),
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_fetches_session_info_four_at_a_time_without_reordering_results() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(SnapshotFixtureState::default()));
+        let server_state = Arc::clone(&state);
+        let first_batch_ready = Arc::new(Notify::new());
+        let server = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            for _ in 0..10 {
+                let (stream, _) = listener.accept().await.unwrap();
+                requests.spawn(serve_snapshot_request(
+                    stream,
+                    Arc::clone(&server_state),
+                    Arc::clone(&first_batch_ready),
+                ));
+            }
+            while let Some(result) = requests.join_next().await {
+                result.unwrap();
+            }
+        });
+        let config = SourceConfig {
+            id: "source".into(),
+            endpoint: format!("http://{address}/"),
+            directory: "/work/project".into(),
+            username: None,
+            password_env: None,
+            sessions: (0..6)
+                .map(|index| SessionConfig {
+                    id: format!("configured_{index}"),
+                    pane_id: format!("%{index}"),
+                    session_id: format!("ses_{index}"),
+                })
+                .collect(),
+        };
+        let client = Client::builder().no_proxy().build().unwrap();
+        let snapshot = match timeout(
+            Duration::from_secs(3),
+            snapshot_inner(&client, &config, None),
+        )
+        .await
+        {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                server.abort();
+                panic!("snapshot fixture timed out");
+            }
+        };
+        server.await.unwrap();
+
+        assert_eq!(snapshot.provider_version.as_deref(), Some("1.18.32"));
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ses_0", "ses_1", "ses_2", "ses_3", "ses_4", "ses_5"]
+        );
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|session| session.exists)
+                .collect::<Vec<_>>(),
+            [
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(true),
+                Some(true)
+            ]
+        );
+
+        let state = state.lock().await;
+        assert_eq!(state.max_active_session_requests, SESSION_INFO_CONCURRENCY);
+        assert_ne!(state.session_completions[0], "ses_0");
+        assert_eq!(&state.request_starts[..2], ["health", "status"]);
+        assert!(
+            state.request_starts[2..8]
+                .iter()
+                .all(|request| request.starts_with("session:"))
+        );
+        assert_eq!(&state.request_starts[8..], ["permission", "question"]);
     }
 
     #[test]
