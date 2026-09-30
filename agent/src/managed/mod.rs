@@ -1101,7 +1101,7 @@ impl Manager {
             "-F".into(),
             "#{pane_id}\t#{masil_core_boot_id}\t#{masil_pty_generation}\t#{pane_pid}".into(),
             "-c".into(),
-            cwd.as_os_str().into(),
+            format_literal_path(&cwd),
         ]);
         for (key, value) in [
             ("MASIL_AGENT_RUN", run.to_owned()),
@@ -1710,6 +1710,19 @@ fn run_report_evidence(evidence: Arc<Evidence>, report: &Report) -> Arc<Evidence
         report.sequence,
         report.at,
     ))
+}
+
+/// tmux expands formats in a `-c` directory; doubling `#` keeps it literal.
+fn format_literal_path(path: &Path) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut bytes = Vec::with_capacity(path.as_os_str().len());
+    for &byte in path.as_os_str().as_bytes() {
+        bytes.push(byte);
+        if byte == b'#' {
+            bytes.push(b'#');
+        }
+    }
+    OsString::from_vec(bytes)
 }
 
 fn valid_boot(boot: &str) -> Result<&str, String> {
@@ -2470,6 +2483,18 @@ mod tests {
                 "run",
                 "session"
             ]
+        );
+    }
+
+    #[test]
+    fn launch_directories_escape_tmux_formats() {
+        assert_eq!(
+            format_literal_path(Path::new("/w/#{session_name}/#(x)")),
+            OsString::from("/w/##{session_name}/##(x)")
+        );
+        assert_eq!(
+            format_literal_path(Path::new("/plain")),
+            OsString::from("/plain")
         );
     }
 

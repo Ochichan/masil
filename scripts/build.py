@@ -21,6 +21,9 @@ TOOL_HASHES = {
     'automake': '8920c1fc411e13b90bf704ef9db6f29d540e76d232cb3b2c9f4dc4cc599bd990',
 }
 CONFIGURE_FLAGS = ['--disable-debug', '--enable-optimizations', '--enable-utf8proc', '--enable-jemalloc']
+# The pkg-config modules configure.ac probes.
+PKG_MODULES = ['libevent_core', 'libevent', 'tinfow', 'tinfo', 'ncursesw', 'ncurses',
+               'libutf8proc', 'jemalloc']
 
 
 def run(args, cwd, env, name):
@@ -57,6 +60,21 @@ def environment():
     # Apply the same exceptions to both optimized builds; all other diagnostics fail.
     env['CFLAGS'] = '-O2 -Werror -Wno-macro-redefined -Wno-pointer-sign -Wno-deprecated-declarations'
     return env
+
+
+def dependency_flags(env):
+    """Resolved flags of the probed libraries. A Homebrew upgrade moves the
+    Cellar paths baked into a configured Makefile, so a change reconfigures."""
+    pkg_config = shutil.which('pkg-config', path=env['PATH'])
+    if not pkg_config:
+        return {}
+    flags = {}
+    for module in PKG_MODULES:
+        result = subprocess.run([pkg_config, '--cflags', '--libs', module], env=env,
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            flags[module] = result.stdout.strip()
+    return flags
 
 
 def bootstrap(env):
@@ -124,7 +142,8 @@ def build(source, name, env, jobs):
     output.mkdir(exist_ok=True)
     probe_env = env | {'CFLAGS': env['CFLAGS'].replace(' -Werror', '')}
     config_key = json.dumps({'flags': CONFIGURE_FLAGS, 'cflags': env['CFLAGS'],
-                            'probe_cflags': probe_env['CFLAGS'], 'cc': env['CC']}, sort_keys=True)
+                            'probe_cflags': probe_env['CFLAGS'], 'cc': env['CC'],
+                            'dependencies': dependency_flags(env)}, sort_keys=True)
     stamp = output / 'configure-input.json'
     if not (output / 'Makefile').exists() or not stamp.exists() or stamp.read_text() != config_key or configure.stat().st_mtime > (output / 'Makefile').stat().st_mtime:
         if (output / 'Makefile').exists():
