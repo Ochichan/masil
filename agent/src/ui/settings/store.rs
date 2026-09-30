@@ -1,5 +1,6 @@
 //! Saved choices in `settings.conf` and the built-in UI layer text.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -26,30 +27,42 @@ pub(crate) fn settings_path() -> Option<PathBuf> {
     Some(base.join("masil/settings.conf"))
 }
 
-/// User configuration files the core reads after the layer, when present,
-/// in the core's TMUX_CONF order.
+/// User configuration files the core reads after the layer, when present.
+/// The list is the core's TMUX_CONF expanded as tmux.c expand_path does:
+/// plain concatenation, and duplicates compared as strings.
 pub(crate) fn tmux_conf_files() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut files = vec![PathBuf::from("/etc/tmux.conf")];
+    let joined = |base: &OsStr, rest: &str| {
+        let mut path = base.to_owned();
+        path.push(rest);
+        path
+    };
+    // HOME when set and not empty, else the password database, as the core's
+    // find_home.
+    let home = std::env::home_dir().map(PathBuf::into_os_string);
+    let mut files = vec![OsString::from("/etc/tmux.conf")];
     if let Some(home) = &home {
-        files.push(home.join(".tmux.conf"));
+        files.push(joined(home, "/.tmux.conf"));
     }
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
-        files.push(xdg.join("tmux/tmux.conf"));
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        files.push(joined(&xdg, "/tmux/tmux.conf"));
     }
     if let Some(home) = &home {
-        files.push(home.join(".config/tmux/tmux.conf"));
+        files.push(joined(home, "/.config/tmux/tmux.conf"));
     }
-    let mut unique = Vec::new();
+    let mut unique: Vec<OsString> = Vec::new();
     for file in files {
-        if file.is_file() && !unique.contains(&file) {
+        if !unique.contains(&file) {
             unique.push(file);
         }
     }
+    // A relative XDG_CONFIG_HOME names a file in the server's startup
+    // directory, which cannot be recovered here; reading it from this
+    // process's directory would read a different file.
     unique
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_file())
+        .collect()
 }
 
 /// Holds an exclusive lock on the settings directory while alive, so two

@@ -968,17 +968,20 @@ fn flow(widths: &[u16], width: u16) -> (Vec<(u16, u16)>, u16) {
 }
 
 fn usage() -> String {
-    "usage: masil-agent settings [--socket MASIL_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get]".into()
+    "usage: masil-agent settings [--socket MASIL_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get] | --reload-config".into()
 }
 
 /// Runs the settings screen, or applies choices without a screen when any
-/// of --set, --layer, --reset or --get is given.
+/// of --set, --layer, --reset or --get is given. --reload-config re-reads
+/// the user's tmux configuration files in the core's startup order and
+/// prints only errors, for the masil menu's run-shell.
 pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     let mut socket = None;
     let mut sets = Vec::new();
     let mut layer = None;
     let mut reset = false;
     let mut get = false;
+    let mut reload = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1008,10 +1011,26 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
                 get = true;
                 index += 1;
             }
+            "--reload-config" => {
+                reload = true;
+                index += 1;
+            }
             _ => return Err(usage()),
         }
     }
+    if reload && (reset || layer.is_some() || !sets.is_empty() || get) {
+        return Err(usage());
+    }
     let server = Server::locate(socket.as_deref())?;
+    if reload {
+        return Ok(match server.reload_user_config() {
+            Ok(()) => 0,
+            Err(error) => {
+                println!("{error}");
+                1
+            }
+        });
+    }
     let path = store::settings_path();
     if reset || layer.is_some() || !sets.is_empty() || get {
         let mut failed = false;

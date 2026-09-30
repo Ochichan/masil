@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_LIMIT: u64 = 256 * 1024;
+const NO_ANSWER: &str = "masil did not answer";
 
 pub(crate) struct Server {
     binary: PathBuf,
@@ -61,6 +62,28 @@ impl Server {
 
     /// Runs one masil command and returns its standard output.
     pub(crate) fn run(&self, args: &[&str]) -> Result<String, String> {
+        let (success, out, err) = self.execute(args, Some(TIMEOUT))?;
+        if success {
+            Ok(out)
+        } else {
+            // Configuration errors from source-file arrive on standard output.
+            let message = err
+                .lines()
+                .chain(out.lines())
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("masil command failed");
+            Err(message.to_owned())
+        }
+    }
+
+    /// Runs one masil command, waiting at most `timeout` when given, and
+    /// returns whether it succeeded with its standard output and error.
+    fn execute(
+        &self,
+        args: &[&str],
+        timeout: Option<Duration>,
+    ) -> Result<(bool, String, String), String> {
         // -u keeps UTF-8 output, which some list formats rely on, without a
         // UTF-8 locale.
         let mut child = Command::new(&self.binary)
@@ -85,26 +108,21 @@ impl Server {
             let _ = (&mut stderr).take(OUTPUT_LIMIT).read_to_string(&mut text);
             text
         });
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let status = loop {
             if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
                 break status;
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("masil did not answer: {}", args.join(" ")));
+                return Err(format!("{NO_ANSWER}: {}", args.join(" ")));
             }
             std::thread::sleep(Duration::from_millis(10));
         };
         let out = out.join().unwrap_or_default();
         let err = err.join().unwrap_or_default();
-        if status.success() {
-            Ok(out)
-        } else {
-            let message = err.lines().next().unwrap_or("masil command failed").trim();
-            Err(message.to_owned())
-        }
+        Ok((status.success(), out, err))
     }
 
     /// The global value of an option, or None when it is unset.
@@ -130,6 +148,67 @@ impl Server {
             .ok()
             .map(|text| text.trim_end_matches('\n').to_owned())
             .filter(|text| !text.is_empty())
+    }
+
+    /// Whether a session or window value hides the global one: the value of
+    /// this pane's session or window inside masil, else of any session or
+    /// window. Targets are read in chained commands that stay well under the
+    /// client's command size limit; a chain that fails, as when a target
+    /// closes meanwhile, is read again one target at a time.
+    fn hidden(&self, option: &str, scope: Scope, value: &str) -> bool {
+        const CHAIN_BYTES: usize = 12 * 1024;
+        if self.pane.is_some() {
+            return self
+                .local(option, scope)
+                .is_some_and(|local| local != value);
+        }
+        let (targets, flags) = match scope {
+            Scope::Session => (self.run(&["list-sessions", "-F", "#{session_id}"]), "-qv"),
+            Scope::Window => (
+                self.run(&["list-windows", "-a", "-F", "#{window_id}"]),
+                "-wqv",
+            ),
+        };
+        let Ok(targets) = targets else {
+            return false;
+        };
+        // Grouped sessions list their shared windows once per session.
+        let mut unique: Vec<&str> = Vec::new();
+        for target in targets.lines().filter(|line| !line.is_empty()) {
+            if !unique.contains(&target) {
+                unique.push(target);
+            }
+        }
+        let differs = |text: &str| {
+            text.lines()
+                .any(|local| !local.is_empty() && local != value)
+        };
+        let per_command = option.len() + flags.len() + 32;
+        for chunk in unique.chunks((CHAIN_BYTES / per_command).max(1)) {
+            let mut args = Vec::new();
+            for target in chunk {
+                if !args.is_empty() {
+                    args.push(";");
+                }
+                args.extend(["show-options", flags, "-t", target, option]);
+            }
+            match self.run(&args) {
+                Ok(text) if differs(&text) => return true,
+                Ok(_) => {}
+                // A server that stops answering would make every retry wait.
+                Err(error) if error.starts_with(NO_ANSWER) => return false,
+                Err(_) => {
+                    for target in chunk {
+                        match self.run(&["show-options", flags, "-t", target, option]) {
+                            Ok(text) if differs(&text) => return true,
+                            Err(error) if error.starts_with(NO_ANSWER) => return false,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     pub(crate) fn layer_on(&self) -> bool {
@@ -235,6 +314,33 @@ impl Server {
             return Err("unexpected tmux defaults".into());
         }
         Ok(values)
+    }
+
+    /// Re-reads the user's tmux configuration for the masil menu. The menu
+    /// runs this under run-shell -b, so there is no time limit, like the
+    /// core's own source-file; every error line is returned.
+    pub(crate) fn reload_user_config(&self) -> Result<(), String> {
+        let files = store::tmux_conf_files();
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["source-file", "-q"];
+        args.extend(files.iter().filter_map(|path| path.to_str()));
+        let (success, out, err) = self.execute(&args, None)?;
+        if success {
+            return Ok(());
+        }
+        let lines: Vec<&str> = err
+            .lines()
+            .chain(out.lines())
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .collect();
+        Err(if lines.is_empty() {
+            "masil command failed".to_owned()
+        } else {
+            lines.join("\n")
+        })
     }
 
     /// Re-reads the user's tmux configuration so it keeps precedence over
@@ -346,12 +452,13 @@ pub(crate) fn apply(
             effective.as_deref().unwrap_or("(unset)")
         ));
     }
-    let outcome = match server.local(option, scope) {
-        Some(local) if local != value => Outcome::Hidden(match scope {
+    let outcome = if server.hidden(option, scope, value) {
+        Outcome::Hidden(match scope {
             Scope::Session => "session",
             Scope::Window => "window",
-        }),
-        _ => Outcome::Applied,
+        })
+    } else {
+        Outcome::Applied
     };
     finish(saved, outcome)
 }
