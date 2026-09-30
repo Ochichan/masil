@@ -13,6 +13,7 @@ core/Makefile.in
 core/etc/
 # Notes, docs and review records stay local.
 *.md
+!/README.md
 /docs/
 /.impeccable/
 # Test, smoke, benchmark and capture tools stay local.
