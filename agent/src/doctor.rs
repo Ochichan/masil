@@ -243,7 +243,66 @@ async fn diagnose(options: &Options) -> Vec<Check> {
         options.socket.as_deref().filter(|_| server.is_some()),
         recorded,
     ));
+    checks.push(coordinator_check(
+        options.socket.as_deref().filter(|_| server.is_some()),
+    ));
     checks
+}
+
+/// The coordinator for the server, read without starting, stopping or
+/// replacing anything.
+fn coordinator_check(socket: Option<&Path>) -> Check {
+    let id = "coordinator";
+    let Some(socket) = socket else {
+        return Check {
+            id,
+            status: Status::Skip,
+            summary: "the coordinator is checked for a reachable server".into(),
+            detail: json!({}),
+        };
+    };
+    let report = match crate::coordinator::status(socket) {
+        Ok(report) => report,
+        Err(error) => {
+            return Check {
+                id,
+                status: Status::Warn,
+                summary: format!("the coordinator could not be checked: {error}"),
+                detail: json!({}),
+            };
+        }
+    };
+    let state = report["state"].as_str().unwrap_or_default().to_owned();
+    let (status, summary) = match state.as_str() {
+        "running" => (Status::Ok, "the coordinator is running".to_owned()),
+        "not_running" => (
+            Status::Ok,
+            "no coordinator runs and no feature needs one".to_owned(),
+        ),
+        "enabled_but_not_running" => (
+            Status::Warn,
+            "a feature needs the coordinator but none runs; run `masil-agent agent coordinator start`. A server started with -f has no UI layer and does not restart it after a server restart".to_owned(),
+        ),
+        "stale" => (
+            Status::Warn,
+            "a coordinator of an earlier server boot or an older masil-agent answers; the next mutating command replaces it".to_owned(),
+        ),
+        "unresponsive" => (
+            Status::Warn,
+            "a coordinator holds its lock but does not answer; the next mutating command restarts it".to_owned(),
+        ),
+        "socket_path_too_long" => (
+            Status::Warn,
+            "the coordinator socket path beside the server socket is too long for a Unix socket; use a shorter socket path".to_owned(),
+        ),
+        other => (Status::Warn, format!("unexpected coordinator state {other}")),
+    };
+    Check {
+        id,
+        status,
+        summary,
+        detail: report,
+    }
 }
 
 fn binary_check() -> Check {
@@ -949,6 +1008,17 @@ fn operations_check(socket: Option<&Path>, recorded: Option<String>) -> Check {
             summary: "no durable management operation has been recorded for this server".into(),
             detail: json!({"exists": false}),
         },
+        Ok(Some(status))
+            if status["supported"] == false
+                && status["min_reader"].as_i64() > status["reader_generation"].as_i64() =>
+        {
+            Check {
+                id: "operations.store",
+                status: Status::Fail,
+                summary: "a newer masil-agent upgraded the operation store; use that masil-agent and restart long-running masil-agent processes such as agent ui and session autosave".into(),
+                detail: status,
+            }
+        }
         Ok(Some(status)) if status["initialized"] != true || status["supported"] == false => {
             Check {
                 id: "operations.store",
