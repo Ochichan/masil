@@ -1120,7 +1120,10 @@ impl Manager {
         argv[0] = executable.to_string_lossy().into_owned();
         // Codex's shared daemon runs every session with the first TUI's
         // environment, so hooks would name the wrong pane.
-        if provider.id == "codex" && providers::codex_no_daemon(&executable) {
+        if provider.id == "codex"
+            && providers::codex_daemon_flag_applies(&argv[1..])
+            && providers::codex_no_daemon(&executable)
+        {
             argv.insert(1, "--no-daemon".into());
         }
         Ok(PreparedLaunch {

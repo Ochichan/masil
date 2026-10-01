@@ -198,6 +198,42 @@ pub fn identify(command: &str) -> Option<&'static Provider> {
     identify_script(script)
 }
 
+/// Whether `--no-daemon` may be added to a Codex command line: not when the
+/// user already passed it or `--remote`, and not for subcommands that refuse
+/// it (Codex accepts it with `resume` and `fork` and a prompt).
+pub(crate) fn codex_daemon_flag_applies(args: &[String]) -> bool {
+    const REFUSING: &[&str] = &[
+        "exec",
+        "e",
+        "review",
+        "login",
+        "logout",
+        "mcp",
+        "mcp-server",
+        "app-server",
+        "completion",
+        "sandbox",
+        "debug",
+        "apply",
+        "a",
+        "cloud",
+        "agents",
+        "queue",
+        "features",
+        "remote-control",
+        "help",
+    ];
+    if args
+        .iter()
+        .any(|arg| arg == "--no-daemon" || arg == "--remote" || arg.starts_with("--remote="))
+    {
+        return false;
+    }
+    args.iter()
+        .find(|arg| !arg.starts_with('-'))
+        .is_none_or(|first| !REFUSING.contains(&first.as_str()))
+}
+
 /// Whether a Codex executable accepts `--no-daemon` (Codex 0.156 and later),
 /// judged from its local `--help` output and cached by path, size and
 /// modification time. A Codex started with it runs its session in the TUI
@@ -207,13 +243,30 @@ pub(crate) fn codex_no_daemon(executable: &std::path::Path) -> bool {
     use serde_json::{Value, json};
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-    let Ok(metadata) = std::fs::metadata(executable) else {
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    // A shim (mise, asdf, Volta) keeps its own path, size and time when the
+    // tool behind it is upgraded, so an answer also expires after a day.
+    const KEEP_MS: u64 = 24 * 60 * 60 * 1000;
+    const FIRST_DEADLINE: Duration = Duration::from_secs(10);
+    let Ok(target) = std::fs::canonicalize(executable) else {
         return false;
     };
+    let Ok(metadata) = std::fs::metadata(&target) else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
     let key = executable.to_string_lossy().into_owned();
-    let stamp = json!({"size": metadata.size(), "mtime": metadata.mtime(), "mtime_ns": metadata.mtime_nsec()});
+    let stamp = json!({
+        "target": target.to_string_lossy(),
+        "size": metadata.size(),
+        "mtime": metadata.mtime(),
+        "mtime_ns": metadata.mtime_nsec(),
+    });
     let cache = crate::managed::state_base()
         .ok()
         .map(|base| base.join("masil/provider-probe.json"));
@@ -225,14 +278,17 @@ pub(crate) fn codex_no_daemon(executable: &std::path::Path) -> bool {
         .unwrap_or_default();
     if let Some(entry) = entries.get(&key)
         && entry["stamp"] == stamp
+        && entry["at_ms"].as_u64().is_some_and(|at| at + KEEP_MS > now)
     {
         return entry["codex_no_daemon"] == true;
     }
+    // Its own process group, so a timeout ends a wrapper's children too.
     let Ok(mut child) = Command::new(executable)
         .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
     else {
         return false;
@@ -240,34 +296,40 @@ pub(crate) fn codex_no_daemon(executable: &std::path::Path) -> bool {
     let Some(mut stdout) = child.stdout.take() else {
         return false;
     };
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut text = String::new();
         let _ = (&mut stdout).take(256 * 1024).read_to_string(&mut text);
-        text
+        let _ = sender.send(text);
     });
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + FIRST_DEADLINE;
     let finished = loop {
         match child.try_wait() {
             Ok(Some(_)) => break true,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
+            _ => break false,
         }
     };
-    let help = reader.join().unwrap_or_default();
     if !finished {
+        // SAFETY: the child leads its own group; the ID is its own pid.
+        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = child.wait();
         return false;
     }
+    // A grandchild may still hold the pipe; never wait for it beyond a moment.
+    let help = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_default();
     let supported = help.contains("--no-daemon");
-    entries.insert(key, json!({"stamp": stamp, "codex_no_daemon": supported}));
+    entries.insert(
+        key,
+        json!({"stamp": stamp, "at_ms": now, "codex_no_daemon": supported}),
+    );
     if let Some(path) = cache
         && let Some(directory) = path.parent()
         && std::fs::create_dir_all(directory).is_ok()
     {
-        let temporary = path.with_extension("json.tmp");
+        let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
         if std::fs::write(&temporary, Value::Object(entries).to_string()).is_ok() {
             let _ = std::fs::rename(&temporary, &path);
         }
@@ -619,6 +681,27 @@ fn split_command(command: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_codex_daemon_flag_is_added_only_where_codex_accepts_it() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(codex_daemon_flag_applies(&args(&[])));
+        assert!(codex_daemon_flag_applies(&args(&["resume", "ID"])));
+        assert!(codex_daemon_flag_applies(&args(&["fork", "ID"])));
+        assert!(codex_daemon_flag_applies(&args(&[
+            "-m",
+            "o4",
+            "fix the bug"
+        ])));
+        assert!(!codex_daemon_flag_applies(&args(&["--no-daemon"])));
+        assert!(!codex_daemon_flag_applies(&args(&["--remote", "ws://x"])));
+        assert!(!codex_daemon_flag_applies(&args(&["--remote=ws://x"])));
+        assert!(!codex_daemon_flag_applies(&args(&["agents"])));
+        assert!(!codex_daemon_flag_applies(&args(&[
+            "queue", "--thread", "t"
+        ])));
+    }
+
     use super::*;
 
     #[test]

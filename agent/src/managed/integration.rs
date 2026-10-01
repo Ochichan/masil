@@ -662,15 +662,17 @@ async fn hook_from_stdin(
 struct Ancestor {
     group: i32,
     provider: Option<&'static str>,
-    /// A Node, Bun or Python program started with a provider's script: a
-    /// launcher whose direct child may be the provider's native program.
-    launcher: bool,
     /// A shell, as provider hook runners use to start a hook command.
     shell: bool,
 }
 
 const MAX_ANCESTRY: usize = 32;
-const HOOK_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh"];
+/// Shells and wrappers a provider may use to start a hook command; such a
+/// process may sit in its own process group.
+const HOOK_SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh", "yash", "nu", "pwsh",
+    "timeout",
+];
 
 /// The processes from this process's parent up to and including `pane_pid`,
 /// or None when the walk does not reach the pane. Each parent must have
@@ -698,7 +700,6 @@ fn ancestry(pane_pid: i32) -> Option<Vec<Ancestor>> {
         chain.push(Ancestor {
             group: info.group,
             provider: crate::providers::identify_process(&argv).map(|provider| provider.id),
-            launcher: crate::providers::is_runtime(&name.to_ascii_lowercase()),
             shell: HOOK_SHELLS.contains(&name.trim_start_matches('-')),
         });
         if pid == pane_pid {
@@ -718,9 +719,10 @@ fn ancestry(pane_pid: i32) -> Option<Vec<Ancestor>> {
 /// - Between the hook and the pane, a process outside the pane's foreground
 ///   group must be a hook shell; anything else, such as a shared provider
 ///   daemon, is refused whatever its name.
-/// - At most one provider run: a launcher and its direct native child are
-///   one run; any other provider process, like a nested `claude -p` or a
-///   provider's own helper, starts another.
+/// - At most one provider run: adjacent processes of one provider (a
+///   launcher, a waiting shim, the native program) are one run; a provider
+///   process separated by other processes or of another provider, like a
+///   nested `claude -p`, starts another.
 ///
 /// With no provider identified on the path the callback is accepted, as
 /// before this check.
@@ -746,8 +748,9 @@ fn provenance(chain: Option<&[Ancestor]>, provider: &str, foreground: i32) -> Re
     let mut previous: Option<&Ancestor> = None;
     for process in chain {
         if let Some(id) = process.provider {
-            let joins =
-                previous.is_some_and(|child| child.provider == Some(id) && process.launcher);
+            // Adjacent processes of one provider are one run: a launcher, a
+            // shim that waits for its tool, or the provider's own helper.
+            let joins = previous.is_some_and(|child| child.provider == Some(id));
             if !joins {
                 runs.push(id);
             }
@@ -1302,7 +1305,6 @@ mod tests {
         Ancestor {
             group,
             provider,
-            launcher: false,
             shell: false,
         }
     }
@@ -1315,10 +1317,7 @@ mod tests {
     }
 
     fn launcher(group: i32, provider: &'static str) -> Ancestor {
-        Ancestor {
-            launcher: true,
-            ..process(group, Some(provider))
-        }
+        process(group, Some(provider))
     }
 
     #[test]
@@ -1329,6 +1328,13 @@ mod tests {
         // Codex embedded: hook <- sh -lc <- native codex <- node codex (pane).
         let codex = [shell(41), process(21, Some("codex")), launcher(21, "codex")];
         assert!(provenance(Some(&codex), "codex", 21).is_ok());
+        // A shim that waits for its tool joins the tool's run.
+        let shim = [
+            shell(42),
+            process(23, Some("codex")),
+            process(23, Some("codex")),
+        ];
+        assert!(provenance(Some(&shim), "codex", 23).is_ok());
         // Nothing identified on the path: accepted as before the check.
         let unknown = [process(22, None), process(22, None)];
         assert!(provenance(Some(&unknown), "pi", 22).is_ok());
@@ -1370,14 +1376,15 @@ mod tests {
                 .unwrap_err()
                 .contains("nested")
         );
-        // A provider's own helper under its TUI is a second run, not a launcher.
-        let helper = [
+        // The same provider separated by a shell is nested again.
+        let respawned = [
             shell(62),
             process(21, Some("codex")),
+            process(21, None),
             process(21, Some("codex")),
         ];
         assert!(
-            provenance(Some(&helper), "codex", 21)
+            provenance(Some(&respawned), "codex", 21)
                 .unwrap_err()
                 .contains("nested")
         );
@@ -1392,7 +1399,7 @@ mod tests {
                 .unwrap_err()
                 .contains("descend")
         );
-        for refused in [&nested[..], &other[..], &helper[..]] {
+        for refused in [&nested[..], &other[..], &respawned[..]] {
             let error = provenance(Some(refused), "codex", 21).unwrap_err();
             assert!(error.starts_with("identity_mismatch:"), "{error}");
         }
