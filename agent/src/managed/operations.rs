@@ -12,7 +12,23 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const V1: i64 = 1;
+/// A store whose `meta.min_reader` is above this refuses this binary.
+/// Additive changes keep min_reader; only a change older readers would
+/// corrupt raises it.
+pub(super) const READER_GENERATION: i64 = 2;
+/// Live data (pages in use) at which pruning starts and admission stops,
+/// docs/design/performance.md:145-150.
+const SOFT_BYTES: i64 = 128 << 20;
+const HIGH_WATER_BYTES: i64 = 224 << 20;
+/// WAL content that checkpoints could not move, as when a reader holds an
+/// old snapshot; admission stops above it.
+const WAL_PRESSURE_BYTES: i64 = 32 << 20;
+const JOURNAL_LIMIT_BYTES: i64 = 8 << 20;
+const AUTOCHECKPOINT_PAGES: i64 = 2048;
+/// The pre-v2 backup is kept this long after a successful upgrade.
+const BACKUP_KEEP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// SQLite 3.51.3 fixed the WAL-reset corruption bug.
 const MIN_SQLITE: i32 = 3_051_003;
 pub(super) const LEASE_MS: u64 = 30_000;
@@ -64,6 +80,18 @@ INSERT INTO meta VALUES ('store_seq', 0);
 CREATE INDEX operations_state ON operations(state, lease_until_ms);
 CREATE INDEX operations_updated ON operations(updated_ms);
 ";
+
+/// Version 2: feature migrations are recorded by name so that phases can
+/// add tables in any order, and coordinator features are switched on here.
+const V2_SCHEMA: &str = "
+CREATE TABLE schema_features (name TEXT PRIMARY KEY, applied_ms INTEGER NOT NULL);
+CREATE TABLE coordinator_features (name TEXT PRIMARY KEY, enabled_ms INTEGER NOT NULL);
+INSERT INTO meta VALUES ('min_reader', 2);
+";
+
+/// Additive schema per feature, applied once each in any order. Later
+/// phases add entries; names are never reused.
+const FEATURES: &[(&str, &str)] = &[];
 
 #[derive(Debug)]
 pub(super) struct Store {
@@ -206,6 +234,143 @@ fn sql(error: rusqlite::Error) -> String {
     format!("operation store: {error}")
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub(super) const STORE_NEWER: &str = "store_newer";
+
+fn reader_allowed(minimum: Option<i64>) -> Result<(), String> {
+    match minimum {
+        Some(minimum) if minimum > READER_GENERATION => Err(format!(
+            "{STORE_NEWER}: the operation store needs masil-agent reader generation {minimum}; \
+             this process is generation {READER_GENERATION}. Restart long-running masil-agent \
+             processes such as agent ui and session autosave after an upgrade"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn backup_path(store: &Path) -> PathBuf {
+    let mut path = store.as_os_str().to_owned();
+    path.push(".pre-v2.bak");
+    PathBuf::from(path)
+}
+
+/// Copies the store as it is now through a second, read-only connection.
+/// The caller holds the write lock, so no commit can land in between.
+fn take_backup(store: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let backup = backup_path(store);
+    match fs::symlink_metadata(&backup) {
+        // The leftover of an earlier failed attempt.
+        Ok(metadata) if metadata.is_file() => {
+            fs::remove_file(&backup).map_err(|error| format!("store backup: {error}"))?
+        }
+        Ok(_) => return Err(format!("{} is not a regular file", backup.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("store backup: {error}")),
+    }
+    let target = backup
+        .to_str()
+        .ok_or("store backup path is not UTF-8")?
+        .to_owned();
+    let reader = Connection::open_with_flags(
+        store,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(sql)?;
+    reader.busy_timeout(Duration::from_secs(2)).map_err(sql)?;
+    let copied = reader
+        .execute("VACUUM INTO ?1", [&target])
+        .map_err(sql)
+        .and_then(|_| {
+            // The directory is owner-only, so the moment before this is not
+            // visible to other users.
+            fs::set_permissions(&backup, fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("store backup: {error}"))
+        });
+    if let Err(error) = copied {
+        let _ = fs::remove_file(&backup);
+        return Err(error);
+    }
+    Ok(backup)
+}
+
+/// Removes the pre-v2 backup once it is older than the keep period.
+fn expire_backup(store: &Path, now: u64) {
+    let backup = backup_path(store);
+    let Ok(metadata) = fs::symlink_metadata(&backup) else {
+        return;
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis() as u64);
+    if metadata.is_file() && modified.is_some_and(|modified| modified + BACKUP_KEEP_MS <= now) {
+        let _ = fs::remove_file(&backup);
+    }
+}
+
+/// Applies each feature migration not yet recorded, one transaction each.
+/// The check is repeated under the write lock, so concurrent openers apply
+/// a feature once.
+fn apply_features(
+    conn: &mut Connection,
+    features: &[(&str, &str)],
+    now: u64,
+) -> Result<(), String> {
+    if features.is_empty() {
+        return Ok(());
+    }
+    let applied = |conn: &Connection, name: &str| -> Result<bool, String> {
+        conn.query_row(
+            "SELECT 1 FROM schema_features WHERE name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|found| found.is_some())
+        .map_err(sql)
+    };
+    for (name, schema) in features {
+        if applied(conn, name)? {
+            continue;
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        if !applied(&tx, name)? {
+            tx.execute_batch(schema).map_err(sql)?;
+            tx.execute(
+                "INSERT INTO schema_features VALUES (?1, ?2)",
+                params![name, now as i64],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+    }
+    Ok(())
+}
+
+/// Bytes in pages that hold data; freed pages stay in the file.
+fn live_bytes(conn: &Connection) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT ((SELECT page_count FROM pragma_page_count())
+                 - (SELECT freelist_count FROM pragma_freelist_count()))
+                * (SELECT page_size FROM pragma_page_size())",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(sql)
+}
+
 impl Store {
     /// Open the store for one server socket (the environment). It lives in
     /// the private state directory, not beside the socket: temporary
@@ -242,13 +407,24 @@ impl Store {
         )
         .map_err(sql)?;
         conn.busy_timeout(Duration::from_secs(2)).map_err(sql)?;
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(sql)?;
-        if version != SCHEMA_VERSION {
+        let version = Self::user_version(&conn)?;
+        let minimum: Option<i64> = if version >= SCHEMA_VERSION {
+            conn.query_row(
+                "SELECT value FROM meta WHERE name = 'min_reader'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+        } else {
+            None
+        };
+        if version < V1 || reader_allowed(minimum).is_err() {
             return Ok(Some(json!({
                 "path": path,
                 "schema_version": version,
+                "min_reader": minimum,
+                "reader_generation": READER_GENERATION,
                 "initialized": version != 0,
                 "supported": false,
             })));
@@ -261,6 +437,9 @@ impl Store {
             object.remove("fullfsync");
         }
         status["initialized"] = json!(true);
+        if version == V1 {
+            status["migrates_on_next_write"] = json!(true);
+        }
         status["unresolved"] = json!(store.list(true, CAPACITY as usize)?.len());
         Ok(Some(status))
     }
@@ -321,10 +500,11 @@ impl Store {
         // FULL syncs every commit. F_FULLFSYNC is off: every namespace (run,
         // server boot) ends with the OS, so power-loss durability would not
         // prevent any duplicate; `operations status` reports this profile.
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "PRAGMA synchronous=FULL; PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=OFF;
-             PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;",
-        )
+             PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;
+             PRAGMA journal_size_limit={JOURNAL_LIMIT_BYTES}; PRAGMA wal_autocheckpoint={AUTOCHECKPOINT_PAGES};"
+        ))
         .map_err(sql)?;
         let mut store = Self {
             conn,
@@ -334,43 +514,84 @@ impl Store {
         Ok(store)
     }
 
+    fn user_version(conn: &Connection) -> Result<i64, String> {
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(sql)
+    }
+
     fn migrate(&mut self) -> Result<(), String> {
         // The common case needs no write lock.
-        let current: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(sql)?;
-        if current == SCHEMA_VERSION {
-            return Ok(());
-        }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql)?;
-        let version: i64 = tx
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(sql)?;
-        match version {
-            0 => {
-                tx.execute_batch(SCHEMA).map_err(sql)?;
-                let instance = i64::from_str_radix(&super::nonce()?[..15], 16)
-                    .map_err(|error| error.to_string())?;
-                tx.execute("INSERT INTO meta VALUES ('instance', ?1)", [instance])
-                    .map_err(sql)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)
-                    .map_err(sql)?;
+        if Self::user_version(&self.conn)? < SCHEMA_VERSION {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            // Another process may have created or upgraded the store first.
+            match Self::user_version(&tx)? {
+                0 => {
+                    tx.execute_batch(SCHEMA).map_err(sql)?;
+                    tx.execute_batch(V2_SCHEMA).map_err(sql)?;
+                    let instance = i64::from_str_radix(&super::nonce()?[..15], 16)
+                        .map_err(|error| error.to_string())?;
+                    tx.execute("INSERT INTO meta VALUES ('instance', ?1)", [instance])
+                        .map_err(sql)?;
+                    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+                        .map_err(sql)?;
+                    tx.commit().map_err(sql)?;
+                }
+                V1 => {
+                    // The backup is taken while this transaction holds the
+                    // write lock, so it is exactly the state being upgraded.
+                    let backup = take_backup(&self.path)?;
+                    let upgraded = tx
+                        .execute_batch(V2_SCHEMA)
+                        .and_then(|()| tx.pragma_update(None, "user_version", SCHEMA_VERSION))
+                        .and_then(|()| tx.commit());
+                    if let Err(error) = upgraded {
+                        // The live store is still an intact version 1.
+                        let _ = fs::remove_file(&backup);
+                        return Err(sql(error));
+                    }
+                }
+                _ => tx.commit().map_err(sql)?,
             }
-            SCHEMA_VERSION => {}
-            newer => {
-                return Err(format!(
-                    "operation store schema {newer} is newer than this masil-agent; refusing to downgrade"
-                ));
-            }
         }
-        tx.commit().map_err(sql)
+        self.check_reader()?;
+        self.apply_features()?;
+        expire_backup(&self.path, now_ms());
+        Ok(())
+    }
+
+    /// Refuses a store that a newer, incompatible masil-agent has upgraded.
+    fn check_reader(&self) -> Result<(), String> {
+        let minimum: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'min_reader'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        reader_allowed(minimum)
+    }
+
+    fn apply_features(&mut self) -> Result<(), String> {
+        apply_features(&mut self.conn, FEATURES, now_ms())
     }
 
     fn next_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64, String> {
+        // Every write passes here, so a long-lived connection notices a
+        // newer binary raising min_reader before it writes again.
+        let minimum: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'min_reader'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        reader_allowed(minimum)?;
         tx.query_row(
             "UPDATE meta SET value = value + 1 WHERE name = 'store_seq' RETURNING value",
             [],
@@ -410,6 +631,7 @@ impl Store {
         now: u64,
     ) -> Result<Admission, String> {
         let key = key(new.namespace, new.action, new.id);
+        self.check_wal_pressure()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -423,6 +645,9 @@ impl Store {
                     .map_err(sql)?;
                 if count >= CAPACITY {
                     return Err("operation_store_full: resolve or wait for older operations to expire before new durable requests".into());
+                }
+                if live_bytes(&tx)? >= HIGH_WATER_BYTES {
+                    return Err("store_full: the operation store holds 224 MiB of data; resolve or wait for older operations to expire".into());
                 }
                 let seq = Self::next_seq(&tx)?;
                 tx.execute(
@@ -737,7 +962,8 @@ impl Store {
     }
 
     pub fn needs_prune(&self, now: u64) -> Result<bool, String> {
-        self.conn
+        let by_records: bool = self
+            .conn
             .query_row(
                 "SELECT COUNT(*) > ?1 OR COALESCE(MIN(updated_ms), ?2) < ?3 FROM operations",
                 params![
@@ -747,7 +973,36 @@ impl Store {
                 ],
                 |row| row.get(0),
             )
-            .map_err(sql)
+            .map_err(sql)?;
+        Ok(by_records || live_bytes(&self.conn)? >= SOFT_BYTES)
+    }
+
+    /// Refuses admission while the WAL holds more than the pressure limit
+    /// that checkpoints could not move. The file size is checked first:
+    /// journal_size_limit keeps it small unless a reader blocks checkpoints.
+    fn check_wal_pressure(&self) -> Result<(), String> {
+        let mut wal = self.path.as_os_str().to_owned();
+        wal.push("-wal");
+        let size = fs::metadata(PathBuf::from(wal))
+            .map(|metadata| metadata.len() as i64)
+            .unwrap_or(0);
+        if size < WAL_PRESSURE_BYTES {
+            return Ok(());
+        }
+        let (log, moved): (i64, i64) = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(1)?, row.get(2)?))
+            })
+            .map_err(sql)?;
+        let page: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .map_err(sql)?;
+        if (log - moved).max(0) * page >= WAL_PRESSURE_BYTES {
+            return Err("store_busy: a reader holds the operation store's write-ahead log; close long-running masil-agent readers and retry".into());
+        }
+        Ok(())
     }
 
     /// Delete resolved operations whose namespace can no longer be retried:
@@ -786,6 +1041,7 @@ impl Store {
                 .map_err(sql)?
         };
         let total = candidates.len() as i64;
+        let oversize = live_bytes(&tx)? >= SOFT_BYTES;
         let mut removed = 0usize;
         for (id, run, op_boot, _explicit, state, updated) in candidates {
             let active = match &run {
@@ -797,7 +1053,7 @@ impl Store {
             // A live namespace keeps everything: an automatic outcome_unknown
             // record is what `operation resolve` needs to release its slot.
             // Unknown outcomes also stay for the full retention period.
-            let deletable = !active && (old || (over && state != "outcome_unknown"));
+            let deletable = !active && (old || ((over || oversize) && state != "outcome_unknown"));
             if deletable {
                 tx.execute("DELETE FROM operations WHERE id = ?1", [id])
                     .map_err(sql)?;
@@ -832,10 +1088,48 @@ impl Store {
             .map_err(sql)?
             .collect::<Result<serde_json::Map<_, _>, _>>()
             .map_err(sql)?;
+        let version = Self::user_version(&self.conn)?;
+        let (minimum, features) = if version >= SCHEMA_VERSION {
+            let minimum: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT value FROM meta WHERE name = 'min_reader'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql)?;
+            let mut statement = self
+                .conn
+                .prepare("SELECT name FROM schema_features ORDER BY name")
+                .map_err(sql)?;
+            let features = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sql)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql)?;
+            (minimum, features)
+        } else {
+            (None, Vec::new())
+        };
+        let backup = backup_path(&self.path);
+        let backup = fs::symlink_metadata(&backup).ok().map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_millis() as u64);
+            json!({"path": backup, "modified_ms": modified, "kept_ms": BACKUP_KEEP_MS})
+        });
         Ok(json!({
             "path": self.path,
             "sqlite_version": rusqlite::version(),
-            "schema_version": pragma("user_version")?,
+            "schema_version": version,
+            "min_reader": minimum,
+            "reader_generation": READER_GENERATION,
+            "features": features,
+            "live_bytes": live_bytes(&self.conn)?,
+            "backup": backup,
             "journal_mode": pragma("journal_mode")?,
             "synchronous": pragma("synchronous")?,
             "fullfsync": pragma("fullfsync")?,
@@ -1104,9 +1398,16 @@ mod tests {
         let store = Store::open_path(&path).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        store.conn.pragma_update(None, "user_version", 9).unwrap();
+        store
+            .conn
+            .execute("UPDATE meta SET value = 9 WHERE name = 'min_reader'", [])
+            .unwrap();
         drop(store);
-        assert!(Store::open_path(&path).unwrap_err().contains("newer"));
+        assert!(
+            Store::open_path(&path)
+                .unwrap_err()
+                .starts_with(STORE_NEWER)
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1119,6 +1420,186 @@ mod tests {
         assert_eq!(status["synchronous"], 2);
         assert_eq!(status["fullfsync"], 0);
         assert!(rusqlite::version_number() >= MIN_SQLITE);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A store as the version 1 binary left it, with one resolved record.
+    fn version_one(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute("INSERT INTO meta VALUES ('instance', 7)", [])
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        drop(conn);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut store = Store {
+            conn: Connection::open(path).unwrap(),
+            path: path.to_path_buf(),
+        };
+        let ticket = dispatch(store.admit(&request("d1"), json!({}), 100).unwrap());
+        store
+            .finish(&ticket, "delivered", "test", None, 101)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_new_store_starts_at_version_two_without_a_backup() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        let store = Store::open_path(&path).unwrap();
+        assert_eq!(Store::user_version(&store.conn).unwrap(), 2);
+        assert!(!backup_path(&path).exists());
+        let status = store.status().unwrap();
+        assert_eq!(status["min_reader"], 2);
+        assert_eq!(status["features"], json!([]));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_one_upgrades_and_keeps_a_private_backup_of_the_old_store() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        version_one(&path);
+        let store = Store::open_path(&path).unwrap();
+        assert_eq!(Store::user_version(&store.conn).unwrap(), 2);
+        assert_eq!(store.instance().unwrap(), 7);
+        assert!(store.get("run:r1/prompt/1").unwrap().is_some());
+        let backup = backup_path(&path);
+        let mode = fs::metadata(&backup).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // The backup is the version 1 store a downgrade can open.
+        let old = Connection::open(&backup).unwrap();
+        assert_eq!(Store::user_version(&old).unwrap(), 1);
+        let rows: i64 = old
+            .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_upgrade_leaves_version_one_and_no_backup() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        version_one(&path);
+        // The version 2 schema cannot create a table that already exists.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE schema_features (x)")
+            .unwrap();
+        drop(conn);
+        assert!(Store::open_path(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(Store::user_version(&conn).unwrap(), 1);
+        assert!(!backup_path(&path).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_backup_expires_after_the_keep_period() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        version_one(&path);
+        drop(Store::open_path(&path).unwrap());
+        let backup = backup_path(&path);
+        expire_backup(&path, now_ms());
+        assert!(backup.exists());
+        expire_backup(&path, now_ms() + BACKUP_KEEP_MS + 1000);
+        assert!(!backup.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_opens_upgrade_once() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        version_one(&path);
+        let openers: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Store::open_path(&path).map(drop))
+            })
+            .collect();
+        for opener in openers {
+            opener.join().unwrap().unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(Store::user_version(&conn).unwrap(), 2);
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'schema_features'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
+        assert!(backup_path(&path).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_raised_min_reader_stops_an_open_writer() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        let mut store = Store::open_path(&path).unwrap();
+        let other = Connection::open(&path).unwrap();
+        other
+            .execute("UPDATE meta SET value = 3 WHERE name = 'min_reader'", [])
+            .unwrap();
+        let error = store.admit(&request("d1"), json!({}), 100).unwrap_err();
+        assert!(error.starts_with(STORE_NEWER), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_newer_additive_schema_still_opens() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        drop(Store::open_path(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE later (x); INSERT INTO schema_features VALUES ('later', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open_path(&path).unwrap();
+        assert_eq!(store.status().unwrap()["features"], json!(["later"]));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn feature_migrations_apply_once_in_any_order() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        let mut store = Store::open_path(&path).unwrap();
+        let first = [
+            ("alpha", "CREATE TABLE alpha (x)"),
+            ("beta", "CREATE TABLE beta (x)"),
+        ];
+        apply_features(&mut store.conn, &first, 1).unwrap();
+        let second = [
+            ("gamma", "CREATE TABLE gamma (x)"),
+            ("beta", "CREATE TABLE beta (x)"),
+            ("alpha", "CREATE TABLE alpha (x)"),
+        ];
+        apply_features(&mut store.conn, &second, 2).unwrap();
+        apply_features(&mut store.conn, &second, 3).unwrap();
+        assert_eq!(
+            store.status().unwrap()["features"],
+            json!(["alpha", "beta", "gamma"])
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn live_bytes_counts_pages_in_use() {
+        let dir = temp();
+        let store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let live = live_bytes(&store.conn).unwrap();
+        assert!(live > 0 && live < SOFT_BYTES);
+        store.check_wal_pressure().unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
