@@ -140,7 +140,7 @@ struct Envelope {
 impl Endpoint {
     pub async fn call(&self, request: &Request) -> Result<Value, String> {
         if !self.enabled {
-            return Err(format!("endpoint '{}' is disabled", self.id));
+            return Err(format!("target_absent: endpoint '{}' is disabled", self.id));
         }
         self.clone().call_owned(request.clone()).await
     }
@@ -149,8 +149,9 @@ impl Endpoint {
         validate_endpoint(&self)?;
         let input = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
         if input.len() > MAX_INPUT_BYTES {
-            return Err("endpoint request exceeds 262144 bytes".into());
+            return Err("invalid_argument: endpoint request exceeds 262144 bytes".into());
         }
+        let id = self.id.clone();
 
         let mut command = self.command();
         command.process_group(0);
@@ -160,12 +161,25 @@ impl Endpoint {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|error| format!("endpoint '{}' could not start: {error}", self.id))?;
-        let mut process_group =
-            ProcessGroup::new(child.id().ok_or("endpoint process identity unavailable")?)?;
-        let mut stdin = child.stdin.take().ok_or("endpoint stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("endpoint stdout unavailable")?;
-        let stderr = child.stderr.take().ok_or("endpoint stderr unavailable")?;
+            .map_err(|error| endpoint_unreachable(&id, format!("could not start: {error}")))?;
+        let mut process_group = ProcessGroup::new(
+            child
+                .id()
+                .ok_or_else(|| endpoint_unreachable(&id, "process identity unavailable"))?,
+        )
+        .map_err(|error| endpoint_unreachable(&id, error))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| endpoint_unreachable(&id, "stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| endpoint_unreachable(&id, "stdout unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| endpoint_unreachable(&id, "stderr unavailable"))?;
         let output_bytes = Arc::new(Mutex::new(0usize));
         let stdout_bytes = Arc::clone(&output_bytes);
         let stderr_bytes = Arc::clone(&output_bytes);
@@ -193,36 +207,39 @@ impl Endpoint {
                 Err(_) => {
                     process_group.kill();
                     let _ = child.wait().await;
-                    return Err(format!("endpoint '{}' timed out after 8 seconds", self.id));
+                    return Err(endpoint_unreachable(&id, "timed out after 8 seconds"));
                 }
             };
         process_group.disarm();
-        write?;
-        let stdout = stdout?;
-        let stderr = stderr?;
-        let status = status.map_err(|error| format!("endpoint wait failed: {error}"))?;
+        write.map_err(|error| endpoint_unreachable(&id, error))?;
+        let stdout = stdout.map_err(|error| endpoint_unreachable(&id, error))?;
+        let stderr = stderr.map_err(|error| endpoint_unreachable(&id, error))?;
+        let status =
+            status.map_err(|error| endpoint_unreachable(&id, format!("wait failed: {error}")))?;
         if !status.success() {
             let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
-            return Err(if detail.is_empty() {
-                format!("endpoint '{}' exited with {status}", self.id)
+            return Err(if host_key_failure(&detail) {
+                format!("host_key: endpoint '{id}' refused its SSH host key: {detail}")
+            } else if detail.is_empty() {
+                endpoint_unreachable(&id, format!("exited with {status}"))
             } else {
-                format!("endpoint '{}' exited with {status}: {detail}", self.id)
+                endpoint_unreachable(&id, format!("exited with {status}: {detail}"))
             });
         }
         let envelope: Envelope = serde_json::from_slice(&stdout)
-            .map_err(|_| format!("endpoint '{}' returned an invalid RPC response", self.id))?;
+            .map_err(|_| endpoint_unreachable(&id, "returned an invalid RPC response"))?;
         if envelope.version != VERSION {
             return Err(format!(
-                "endpoint '{}' uses unsupported RPC version {}",
-                self.id, envelope.version
+                "unknown_method: endpoint '{id}' uses unsupported RPC version {}",
+                envelope.version
             ));
         }
         match (envelope.ok, envelope.value, envelope.error) {
             (true, Some(value), None) => Ok(value),
             (false, None, Some(error)) if !error.is_empty() && error.len() <= 4096 => Err(error),
-            _ => Err(format!(
-                "endpoint '{}' returned an invalid RPC envelope",
-                self.id
+            _ => Err(endpoint_unreachable(
+                &id,
+                "returned an invalid RPC envelope",
             )),
         }
     }
@@ -256,6 +273,17 @@ impl Endpoint {
             command
         }
     }
+}
+
+fn endpoint_unreachable(id: &str, detail: impl AsRef<str>) -> String {
+    format!("endpoint_unreachable: endpoint '{id}' {}", detail.as_ref())
+}
+
+pub(super) fn host_key_failure(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("host key verification failed")
+        || detail.contains("remote host identification has changed")
+        || detail.contains("host key has changed")
 }
 
 struct ProcessGroup {
@@ -374,12 +402,15 @@ pub(crate) fn configure(args: &[String]) -> Result<Value, String> {
         Some(command @ ("remove" | "enable" | "disable")) if args.len() == 2 => {
             configure_update(command, &args[1])
         }
-        _ => Err("endpoints requires list, add ID --socket PATH [--host USER@HOST] [--binary ABSOLUTE_OR_masil-agent] [--label LABEL], remove ID, enable ID, or disable ID".into()),
+        _ => Err("usage: endpoints requires list, add ID --socket PATH [--host USER@HOST] [--binary ABSOLUTE_OR_masil-agent] [--label LABEL], remove ID, enable ID, or disable ID".into()),
     }
 }
 
 fn configure_add(args: &[String]) -> Result<Value, String> {
-    let id = args.first().ok_or("endpoint add requires an ID")?.clone();
+    let id = args
+        .first()
+        .ok_or("usage: endpoint add requires an ID")?
+        .clone();
     let mut socket = None;
     let mut host = None;
     let mut binary = None;
@@ -388,14 +419,18 @@ fn configure_add(args: &[String]) -> Result<Value, String> {
     while index < args.len() {
         let value = args
             .get(index + 1)
-            .ok_or_else(|| format!("missing value for {}", args[index]))?
+            .ok_or_else(|| format!("usage: missing value for {}", args[index]))?
             .clone();
         match args[index].as_str() {
             "--socket" if socket.is_none() => socket = Some(value),
             "--host" if host.is_none() => host = Some(value),
             "--binary" if binary.is_none() => binary = Some(value),
             "--label" if label.is_none() => label = Some(value),
-            option => return Err(format!("unknown or repeated endpoint option: {option}")),
+            option => {
+                return Err(format!(
+                    "usage: unknown or repeated endpoint option: {option}"
+                ));
+            }
         }
         index += 2;
     }
@@ -403,7 +438,7 @@ fn configure_add(args: &[String]) -> Result<Value, String> {
         label: label.unwrap_or_else(|| id.clone()),
         id,
         enabled: true,
-        socket: socket.ok_or("endpoint add requires --socket PATH")?,
+        socket: socket.ok_or("usage: endpoint add requires --socket PATH")?,
         host,
         binary: binary.unwrap_or_else(|| "masil-agent".into()),
     };
@@ -415,10 +450,13 @@ fn configure_add(args: &[String]) -> Result<Value, String> {
         .iter()
         .any(|candidate| candidate.id == endpoint.id)
     {
-        return Err(format!("endpoint '{}' already exists", endpoint.id));
+        return Err(format!(
+            "invalid_argument: endpoint '{}' already exists",
+            endpoint.id
+        ));
     }
     if endpoints.len() >= MAX_ENDPOINTS {
-        return Err("at most 8 endpoints may be configured".into());
+        return Err("invalid_argument: at most 8 endpoints may be configured".into());
     }
     endpoints.push(endpoint.clone());
     save(&path, &endpoints)?;
@@ -433,7 +471,7 @@ fn configure_update(command: &str, id: &str) -> Result<Value, String> {
     let index = endpoints
         .iter()
         .position(|endpoint| endpoint.id == id)
-        .ok_or_else(|| format!("endpoint '{id}' not found"))?;
+        .ok_or_else(|| format!("target_absent: endpoint '{id}' not found"))?;
     if command == "remove" {
         let endpoint = endpoints.remove(index);
         save(&path, &endpoints)?;
@@ -463,13 +501,18 @@ fn config_path() -> Result<PathBuf, String> {
 
 fn validate_endpoints(endpoints: &[Endpoint]) -> Result<(), String> {
     if endpoints.len() > MAX_ENDPOINTS {
-        return Err("endpoint configuration contains more than 8 endpoints".into());
+        return Err(
+            "invalid_argument: endpoint configuration contains more than 8 endpoints".into(),
+        );
     }
     let mut ids = HashSet::new();
     for endpoint in endpoints {
         validate_endpoint(endpoint)?;
         if !ids.insert(endpoint.id.as_str()) {
-            return Err(format!("duplicate endpoint ID '{}'", endpoint.id));
+            return Err(format!(
+                "invalid_argument: duplicate endpoint ID '{}'",
+                endpoint.id
+            ));
         }
     }
     Ok(())
@@ -480,11 +523,13 @@ fn validate_endpoint(endpoint: &Endpoint) -> Result<(), String> {
     validate_text("endpoint label", &endpoint.label, 1, 64)?;
     validate_text("endpoint socket", &endpoint.socket, 1, 4096)?;
     if !Path::new(&endpoint.socket).is_absolute() {
-        return Err("endpoint socket must be an absolute path".into());
+        return Err("invalid_argument: endpoint socket must be an absolute path".into());
     }
     validate_text("endpoint binary", &endpoint.binary, 1, 4096)?;
     if endpoint.binary != "masil-agent" && !Path::new(&endpoint.binary).is_absolute() {
-        return Err("endpoint binary must be 'masil-agent' or an absolute path".into());
+        return Err(
+            "invalid_argument: endpoint binary must be 'masil-agent' or an absolute path".into(),
+        );
     }
     if let Some(host) = &endpoint.host {
         validate_host(host)?;
@@ -500,7 +545,7 @@ fn validate_id(id: &str) -> Result<(), String> {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte))
     {
-        return Err("endpoint ID must begin with a lowercase letter, use 1-32 lowercase letters, digits, '-' or '_', and cannot be 'local'".into());
+        return Err("invalid_argument: endpoint ID must begin with a lowercase letter, use 1-32 lowercase letters, digits, '-' or '_', and cannot be 'local'".into());
     }
     Ok(())
 }
@@ -510,7 +555,7 @@ fn validate_text(label: &str, value: &str, minimum: usize, maximum: usize) -> Re
         || value.chars().any(|character| character.is_control())
     {
         return Err(format!(
-            "{label} must contain {minimum}-{maximum} bytes without control characters"
+            "invalid_argument: {label} must contain {minimum}-{maximum} bytes without control characters"
         ));
     }
     Ok(())
@@ -521,7 +566,7 @@ fn validate_host(host: &str) -> Result<(), String> {
     let (user, hostname) = host
         .split_once('@')
         .filter(|(_, hostname)| !hostname.contains('@'))
-        .ok_or("endpoint host must use USER@HOST")?;
+        .ok_or("invalid_argument: endpoint host must use USER@HOST")?;
     if user.is_empty()
         || user.len() > 64
         || !user
@@ -533,7 +578,10 @@ fn validate_host(host: &str) -> Result<(), String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-:[]".contains(&byte))
     {
-        return Err("endpoint host must use a bounded USER@HOST without shell characters".into());
+        return Err(
+            "invalid_argument: endpoint host must use a bounded USER@HOST without shell characters"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -646,11 +694,15 @@ impl ConfigLock {
 
 pub(crate) async fn serve(manager: &Manager, bytes: &[u8]) -> Value {
     let result = if bytes.len() > MAX_INPUT_BYTES {
-        Err("RPC request exceeds 262144 bytes".into())
+        Err("invalid_argument: RPC request exceeds 262144 bytes".into())
     } else {
         match decode_request(bytes) {
             Ok(request) => rpc(manager, request).await,
-            Err(error) => Err(format!("invalid RPC request: {error}")),
+            Err(error) if error.starts_with("unknown_method:") => Err(error),
+            Err(error) => Err(format!(
+                "invalid_argument: invalid RPC request: {}",
+                error.strip_prefix("invalid_argument: ").unwrap_or(&error)
+            )),
         }
     };
     match result {
@@ -663,11 +715,11 @@ fn decode_request(bytes: &[u8]) -> Result<Request, String> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     let object = value
         .as_object()
-        .ok_or("RPC request must be a JSON object")?;
+        .ok_or("invalid_argument: RPC request must be a JSON object")?;
     let operation = object
         .get("operation")
         .and_then(Value::as_str)
-        .ok_or("RPC request needs a string operation")?;
+        .ok_or("invalid_argument: RPC request needs a string operation")?;
     let allowed: &[&str] = match operation {
         "list" => &["operation"],
         "view" => &["operation", "args"],
@@ -684,13 +736,17 @@ fn decode_request(bytes: &[u8]) -> Result<Request, String> {
             "session",
             "split",
         ],
-        _ => return Err(format!("unknown RPC operation '{operation}'")),
+        _ => {
+            return Err(format!(
+                "unknown_method: unknown RPC operation '{operation}'"
+            ));
+        }
     };
     if let Some(field) = object
         .keys()
         .find(|field| !allowed.contains(&field.as_str()))
     {
-        return Err(format!("unknown field '{field}'"));
+        return Err(format!("invalid_argument: unknown field '{field}'"));
     }
     serde_json::from_value(value).map_err(|error| error.to_string())
 }
@@ -702,7 +758,9 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
             let agents = manager.list_view().await?;
             let after = manager.boot().await?;
             if before != after {
-                return Err("native server restarted while listing agents".into());
+                return Err(
+                    "identity_mismatch: native server restarted while listing agents".into(),
+                );
             }
             Ok(json!({"boot":before, "agents":agents}))
         }
@@ -801,7 +859,9 @@ fn verify_expected(
         || expected.session_id != actual.session_id
         || (!allow_revision_change && expected.revision != actual.revision)
     {
-        return Err("agent identity or state changed since it was listed".into());
+        return Err(
+            "identity_mismatch: agent identity or state changed since it was listed".into(),
+        );
     }
     Ok(())
 }

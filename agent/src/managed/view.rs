@@ -97,7 +97,7 @@ fn parse_set(args: &[String]) -> Result<SavedView, String> {
         match args[index].as_str() {
             "--provider" => {
                 let provider = providers::find(value)
-                    .ok_or_else(|| format!("unknown agent provider: {value}"))?;
+                    .ok_or_else(|| format!("unknown_provider: unknown agent provider: {value}"))?;
                 providers.insert(provider.id.to_owned());
             }
             "--state" => {
@@ -155,7 +155,7 @@ fn validate_view(view: &SavedView) -> Result<(), String> {
     validate_unique(&view.workspaces, "workspaces")?;
     for provider in &view.providers {
         if providers::find(provider).is_none_or(|found| found.id != provider) {
-            return Err("saved agent view contains an unknown provider".into());
+            return Err("unknown_provider: saved agent view contains an unknown provider".into());
         }
     }
     if view

@@ -376,7 +376,13 @@ impl Store {
     /// the private state directory, not beside the socket: temporary
     /// directories are cleaned while a server can still be running.
     pub fn open(socket: &Path) -> Result<Self, String> {
-        let unavailable = |error: String| format!("store_unavailable: {error}");
+        let unavailable = |error: String| {
+            if super::failure::has_registered_code(&error) {
+                error
+            } else {
+                format!("store_unavailable: {error}")
+            }
+        };
         let directory = state_directory().map_err(unavailable)?;
         Self::open_path(&directory.join(store_name(socket))).map_err(unavailable)
     }
@@ -515,7 +521,7 @@ impl Store {
         }
         if rusqlite::version_number() < MIN_SQLITE {
             return Err(format!(
-                "SQLite {} lacks the WAL-reset fix",
+                "store_unsupported: SQLite {} lacks the WAL-reset fix",
                 rusqlite::version()
             ));
         }
@@ -531,7 +537,9 @@ impl Store {
             .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
             .map_err(sql)?;
         if !mode.eq_ignore_ascii_case("wal") {
-            return Err(format!("operation store journal mode is {mode}"));
+            return Err(format!(
+                "store_unsupported: operation store journal mode is {mode}"
+            ));
         }
         // FULL syncs every commit. F_FULLFSYNC is off: every namespace (run,
         // server boot) ends with the OS, so power-loss durability would not

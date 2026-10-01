@@ -8,7 +8,7 @@
 //! JSON is unchanged from earlier releases; tickets and the fence live in
 //! separate options so older binaries still read it.
 use super::operations::{self, Admission, NewOperation, Record, Store, Ticket};
-use super::{Agent, Guarded, Manager, and, decode, encode, nonce};
+use super::{Agent, Guarded, Manager, and, decode, encode, failure::AfterEffect, nonce};
 use crate::observation::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -250,7 +250,10 @@ impl Manager {
                 || current.session_id != agent.session_id
                 || current.revision != agent.revision
             {
-                return Err("agent changed while preparing the prompt; inspect it again".into());
+                return Err(
+                    "identity_mismatch: agent changed while preparing the prompt; inspect it again"
+                        .into(),
+                );
             }
             if current.state != "idle" || current.process != "running" {
                 return Err("prompt requires an idle, verified foreground agent; blocked, working and unknown states cannot receive a prompt".into());
@@ -324,6 +327,7 @@ impl Manager {
                     Some(text.as_bytes().to_vec()),
                 )
                 .await
+                .map_err(super::server_unreachable)
             {
                 // No input command was sent, so the slot is unused.
                 let _ = store.finish(
@@ -423,14 +427,17 @@ impl Manager {
             let _ = self.command(&["delete-buffer", "-b", &buffer]).await;
             return match result {
                 Ok(Guarded::Applied) => {
-                    finish(&mut store, &ticket, "delivered", "pane_ledger", None)?;
-                    self.prompt_receipt(agent, Some(operation)).await
+                    finish(&mut store, &ticket, "delivered", "pane_ledger", None)
+                        .map_err(String::from)?;
+                    self.prompt_receipt(agent, Some(operation))
+                        .await
+                        .map_err(|error| String::from(AfterEffect::new(error)))
                 }
                 Ok(Guarded::Rejected) => {
                     let _ =
                         store.finish(&ticket, "rejected_before_effect", "guard", None, now_ms());
                     Err(format!(
-                        "prompt operation {operation} was rejected or its delivery is unknown: agent foreground or run changed before input delivery; query prompt-receipt before retrying"
+                        "rejected_before_effect: prompt operation {operation} was rejected or its delivery is unknown: agent foreground or run changed before input delivery; query prompt-receipt before retrying"
                     ))
                 }
                 Err(error) => {
@@ -438,15 +445,14 @@ impl Manager {
                     let (state, evidence) = self
                         .settle_prompt(agent, &ticket.ticket, operation, &sha256(&raw), &fence)
                         .await
-                        .unwrap_or_else(|settle| {
-                            ("outcome_unknown", json!({"settle_error": settle}))
-                        });
+                        .map_err(String::from)?;
                     let mut evidence = evidence;
                     evidence["error"] = json!(error);
-                    let _ = finish(&mut store, &ticket, state, "pane_ledger", Some(evidence));
-                    Err(format!(
+                    finish(&mut store, &ticket, state, "pane_ledger", Some(evidence))
+                        .map_err(String::from)?;
+                    Err(String::from(AfterEffect::new(format!(
                         "prompt operation {operation} was rejected or its delivery is unknown: {error}; query prompt-receipt before retrying"
-                    ))
+                    ))))
                 }
             };
         }
@@ -462,9 +468,9 @@ impl Manager {
         slot: u64,
         ledger_sha256: &str,
         fence: &str,
-    ) -> Result<(&'static str, Value), String> {
+    ) -> Result<(&'static str, Value), AfterEffect> {
         for _ in 0..3 {
-            let pane = self.prompt_ledger(agent).await?;
+            let pane = self.prompt_ledger(agent).await.map_err(AfterEffect::new)?;
             if let Some(entry) = pane.ticket_slot(ticket) {
                 let state = if entry.stage == "delivered" {
                     "delivered"
@@ -498,9 +504,10 @@ impl Manager {
                 .compare_and_set(
                     &agent.pane_id,
                     &[(OPTION, &pane.raw), (FENCE, &pane.fence)],
-                    &[(FENCE, nonce()?)],
+                    &[(FENCE, nonce().map_err(AfterEffect::new)?)],
                 )
-                .await?
+                .await
+                .map_err(AfterEffect::new)?
             {
                 return Ok(("not_applied", json!({"reason": "fenced"})));
             }
@@ -595,14 +602,14 @@ fn finish(
     state: &str,
     source: &str,
     evidence: Option<Value>,
-) -> Result<(), String> {
+) -> Result<(), AfterEffect> {
     store
         .finish(ticket, state, source, evidence.as_ref(), now_ms())
         .map(|_| ())
         .map_err(|error| {
-            format!(
+            AfterEffect::new(format!(
                 "prompt {state}, but its durable receipt could not be committed: {error}; query prompt-receipt"
-            )
+            ))
         })
 }
 

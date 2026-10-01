@@ -6,7 +6,9 @@
 //! read before admission. Reconcile writes a fence the same way before it
 //! reports that an attempt did not apply.
 use super::operations::{self, Admission, NewOperation, Record, Store, Ticket};
-use super::{Agent, Guarded, Manager, and, decode, encode, identity_guard, nonce};
+use super::{
+    Agent, Guarded, Manager, and, decode, encode, failure::AfterEffect, identity_guard, nonce,
+};
 use crate::observation::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -77,6 +79,24 @@ fn effect_receipt(record: &Record) -> Value {
         "operation_key":record.operation_key,"provider_accepted":false})
 }
 
+fn finish_effect(
+    store: &mut Store,
+    ticket: &Ticket,
+    effect: Effect,
+    now: u64,
+) -> Result<Value, AfterEffect> {
+    store
+        .finish(ticket, effect.done(), "native_group", None, now)
+        .map(|record| effect_receipt(&record))
+        .map_err(|error| {
+            AfterEffect::new(format!(
+                "{} applied, but its durable receipt could not be committed: {error}; query `agent operation {}`",
+                effect.action(),
+                ticket.key
+            ))
+        })
+}
+
 fn start_receipt(record: &Record) -> Value {
     record
         .receipts
@@ -142,7 +162,7 @@ impl Manager {
         key: Option<ClientKey<'_>>,
     ) -> Result<Value, String> {
         if agent.process != "running" {
-            return Err("agent is not verified in the foreground".into());
+            return Err("identity_mismatch: agent is not verified in the foreground".into());
         }
         self.effect(agent, Effect::Interrupt, key).await
     }
@@ -165,12 +185,12 @@ impl Manager {
         if let Some(key) = key {
             if !operations::valid_id(key.id) {
                 return Err(
-                    "operation ID must be 1–64 letters, digits, '.', '_', ':' or '-'".into(),
+                    "invalid_argument: operation ID must be 1–64 letters, digits, '.', '_', ':' or '-'".into(),
                 );
             }
             if key.pin != agent.run {
                 return Err(format!(
-                    "{} target run changed; this operation cannot be replayed",
+                    "identity_mismatch: {} target run changed; this operation cannot be replayed",
                     effect.action()
                 ));
             }
@@ -211,7 +231,10 @@ impl Manager {
                     continue;
                 }
                 Admission::NeedsReconcile(_) => {
-                    return Err("operation is still unresolved; see `agent operations`".into());
+                    return Err(
+                        "outcome_unknown: operation is still unresolved; see `agent operations`"
+                            .into(),
+                    );
                 }
             };
             return self
@@ -300,6 +323,7 @@ impl Manager {
                         "masil-agent-stale",
                     )
                     .await
+                    .map_err(super::server_unreachable)
                     .map(|output| {
                         if String::from_utf8_lossy(&output.stdout)
                             .lines()
@@ -314,20 +338,11 @@ impl Manager {
         };
         let now = now_ms();
         match result {
-            Ok(Guarded::Applied) => store
-                .finish(ticket, effect.done(), "native_group", None, now)
-                .map(|record| effect_receipt(&record))
-                .map_err(|error| {
-                    format!(
-                        "{} applied, but its durable receipt could not be committed: {error}; query `agent operation {}`",
-                        effect.action(),
-                        ticket.key
-                    )
-                }),
+            Ok(Guarded::Applied) => finish_effect(store, ticket, effect, now).map_err(String::from),
             Ok(Guarded::Rejected) => {
                 let _ = store.finish(ticket, "rejected_before_effect", "guard", None, now);
                 Err(format!(
-                    "{} was not applied: agent run or operation effects changed first",
+                    "rejected_before_effect: {} was not applied: agent run or operation effects changed first",
                     effect.action()
                 ))
             }
@@ -335,16 +350,22 @@ impl Manager {
                 let (state, mut evidence) = self
                     .settle_effect(agent, effect, &ticket.ticket, &sha256(raw), fence)
                     .await
-                    .unwrap_or_else(|settle| {
-                        ("outcome_unknown", json!({"settle_error": settle}))
-                    });
+                    .map_err(String::from)?;
                 evidence["error"] = json!(error);
-                let _ = store.finish(ticket, state, "reconcile", Some(&evidence), now_ms());
-                Err(format!(
+                store
+                    .finish(ticket, state, "reconcile", Some(&evidence), now_ms())
+                    .map_err(|finish| {
+                        String::from(AfterEffect::new(format!(
+                            "{} outcome receipt could not be committed: {finish}; query `agent operation {}`",
+                            effect.action(),
+                            ticket.key
+                        )))
+                    })?;
+                Err(String::from(AfterEffect::new(format!(
                     "{} outcome is {state}: {error}; query `agent operation {}` before retrying",
                     effect.action(),
                     ticket.key
-                ))
+                ))))
             }
         }
     }
@@ -358,7 +379,7 @@ impl Manager {
         ticket: &str,
         effects_sha256: &str,
         fence: &str,
-    ) -> Result<(&'static str, Value), String> {
+    ) -> Result<(&'static str, Value), AfterEffect> {
         for _ in 0..3 {
             if effect == Effect::Close {
                 // Pane IDs are never reused: a missing pane was closed (by this
@@ -366,7 +387,7 @@ impl Manager {
                 match self.pane_exists(&agent.pane_id).await {
                     Ok(false) => return Ok(("target_absent", json!({"reason": "pane_gone"}))),
                     Ok(true) => {}
-                    Err(error) => return Ok(("outcome_unknown", json!({"error": error}))),
+                    Err(error) => return Err(AfterEffect::new(error)),
                 }
             }
             let current = match self.get(&agent.pane_id).await {
@@ -375,12 +396,18 @@ impl Manager {
                 Ok(_) if effect == Effect::Close => {
                     return Ok(("not_applied", json!({"reason": "run_replaced"})));
                 }
-                Err(error) if effect == Effect::Close && error == "agent target not found" => {
+                Err(error)
+                    if effect == Effect::Close
+                        && super::failure::classify(&error).1 == "target_absent" =>
+                {
                     return Ok(("not_applied", json!({"reason": "run_replaced"})));
                 }
                 _ => return Ok(("outcome_unknown", json!({"reason": "run_not_live"}))),
             };
-            let (raw, current_fence, _) = self.effect_values(&current.pane_id).await?;
+            let (raw, current_fence, _) = self
+                .effect_values(&current.pane_id)
+                .await
+                .map_err(AfterEffect::new)?;
             let effects = Self::effects_for(&agent.run, &raw);
             if let Some(entry) = effects.entries.iter().find(|e| e.ticket == ticket) {
                 return Ok(match (effect, entry.stage.as_str()) {
@@ -405,9 +432,10 @@ impl Manager {
                 .compare_and_set(
                     &current.pane_id,
                     &[(EFFECTS, &raw), (EFFECTS_FENCE, &current_fence)],
-                    &[(EFFECTS_FENCE, nonce()?)],
+                    &[(EFFECTS_FENCE, nonce().map_err(AfterEffect::new)?)],
                 )
-                .await?
+                .await
+                .map_err(AfterEffect::new)?
             {
                 return Ok(("not_applied", json!({"reason": "fenced"})));
             }
@@ -423,6 +451,23 @@ impl Manager {
             .command(&["list-panes", "-a", "-F", "#{pane_id}"])
             .await?;
         Ok(panes.lines().any(|line| line == pane))
+    }
+
+    async fn settle_start_after_effect(&self, run: &str) -> Result<&'static str, AfterEffect> {
+        let inventory = self.inventory().await.map_err(AfterEffect::new)?;
+        super::validate_inventory(&inventory).map_err(AfterEffect::new)?;
+        Ok(inventory
+            .iter()
+            .find(|fields| {
+                decode::<super::Metadata>(&fields[11]).is_some_and(|meta| meta.run == run)
+            })
+            .map_or("outcome_unknown", |fields| {
+                if fields[4] == "1" {
+                    "process_exited"
+                } else {
+                    "process_started"
+                }
+            }))
     }
 
     /// Start with an optional client key pinned to the server boot.
@@ -448,17 +493,17 @@ impl Manager {
         let (boot, recorded) = identity
             .trim_end_matches('\n')
             .split_once('\t')
-            .ok_or("invalid native server identity")?;
+            .ok_or("server_unreachable: invalid native server identity")?;
         let boot = super::valid_boot(boot)?.to_owned();
         if let Some(key) = key {
             if !operations::valid_id(key.id) {
                 return Err(
-                    "operation ID must be 1–64 letters, digits, '.', '_', ':' or '-'".into(),
+                    "invalid_argument: operation ID must be 1–64 letters, digits, '.', '_', ':' or '-'".into(),
                 );
             }
             if key.pin != boot {
                 return Err(
-                    "server restarted since this launch was requested; it cannot be replayed"
+                    "identity_mismatch: server restarted since this launch was requested; it cannot be replayed"
                         .into(),
                 );
             }
@@ -470,7 +515,7 @@ impl Manager {
         };
         let namespace = format!("boot:{boot}");
         let provider_id = crate::providers::find(provider)
-            .ok_or("unknown agent provider")?
+            .ok_or("unknown_provider: unknown agent provider")?
             .id;
         let canonical = cwd
             .canonicalize()
@@ -523,7 +568,10 @@ impl Manager {
                     reconciled = true;
                 }
                 Admission::NeedsReconcile(_) => {
-                    return Err("launch is still unresolved; see `agent operations`".into());
+                    return Err(
+                        "outcome_unknown: launch is still unresolved; see `agent operations`"
+                            .into(),
+                    );
                 }
             }
         };
@@ -537,49 +585,58 @@ impl Manager {
                 store
                     .finish(&ticket, "process_started", "registration", Some(&outcome), now_ms())
                     .map_err(|error| {
-                        format!(
+                        String::from(AfterEffect::new(format!(
                             "agent started, but its durable receipt could not be committed: {error}; query `agent operation {}`",
                             ticket.key
-                        )
+                        )))
                     })?;
                 Ok(outcome)
             }
             Err(error) => {
-                let state = if transport_rejected(&error) && !error.contains("was launched") {
-                    "rejected_before_effect"
-                } else {
-                    self.settle_start(&ticket.ticket)
-                        .await
-                        .unwrap_or("outcome_unknown")
-                };
-                let _ = store.finish(
-                    &ticket,
-                    state,
-                    "launch",
-                    Some(&json!({"error": error})),
-                    now_ms(),
-                );
-                Err(format!("{error} (operation {} is {state})", ticket.key))
+                if transport_rejected(&error) && !error.contains("was launched") {
+                    let _ = store.finish(
+                        &ticket,
+                        "rejected_before_effect",
+                        "launch",
+                        Some(&json!({"error": error})),
+                        now_ms(),
+                    );
+                    return Err(format!(
+                        "rejected_before_effect: {error} (operation {} is rejected_before_effect)",
+                        ticket.key
+                    ));
+                }
+                let state = self
+                    .settle_start_after_effect(&ticket.ticket)
+                    .await
+                    .map_err(String::from)?;
+                store
+                    .finish(
+                        &ticket,
+                        state,
+                        "launch",
+                        Some(&json!({"error": error})),
+                        now_ms(),
+                    )
+                    .map_err(|finish| {
+                        String::from(AfterEffect::new(format!(
+                            "launch outcome receipt could not be committed: {finish}; query `agent operation {}`",
+                            ticket.key
+                        )))
+                    })?;
+                Err(String::from(AfterEffect::new(format!(
+                    "{error} (operation {} is {state})",
+                    ticket.key
+                ))))
             }
         }
     }
 
     /// A launch is known started only when a pane carries its run.
     async fn settle_start(&self, run: &str) -> Result<&'static str, String> {
-        let inventory = self.inventory().await?;
-        super::validate_inventory(&inventory)?;
-        Ok(inventory
-            .iter()
-            .find(|fields| {
-                decode::<super::Metadata>(&fields[11]).is_some_and(|meta| meta.run == run)
-            })
-            .map_or("outcome_unknown", |fields| {
-                if fields[4] == "1" {
-                    "process_exited"
-                } else {
-                    "process_started"
-                }
-            }))
+        self.settle_start_after_effect(run)
+            .await
+            .map_err(String::from)
     }
 
     /// Resolve one attempt whose lease expired. Callers hold the management lock.
@@ -650,14 +707,14 @@ impl Manager {
                 [key] => store
                     .get(key)?
                     .map(|record| json!(record))
-                    .ok_or_else(|| "operation not found; it never existed or its namespace ended and it was deleted".into()),
+                    .ok_or_else(|| "target_absent: operation not found; it never existed or its namespace ended and it was deleted".into()),
                 [command, key, flag, verdict] if command == "resolve" && flag == "--as" => {
                     let delivered = match verdict.as_str() {
                         "delivered" => true,
                         "not-delivered" => false,
-                        _ => return Err("resolve accepts --as delivered|not-delivered".into()),
+                        _ => return Err("usage: resolve accepts --as delivered|not-delivered".into()),
                     };
-                    let record = store.get(key)?.ok_or("operation not found")?;
+                    let record = store.get(key)?.ok_or("target_absent: operation not found")?;
                     if record.state != operations::UNKNOWN {
                         return Err(format!(
                             "only an outcome_unknown operation can be resolved; this one is {}",
@@ -723,7 +780,7 @@ impl Manager {
                                 .get(i + 1)
                                 .and_then(|value| value.parse().ok())
                                 .filter(|value| (1..=512).contains(value))
-                                .ok_or("--limit must be 1–512")?;
+                                .ok_or("invalid_argument: --limit must be 1–512")?;
                             i += 2;
                         }
                         _ => return Err("usage: operations [list] [--all] [--limit N] | status | reconcile | adopt".into()),

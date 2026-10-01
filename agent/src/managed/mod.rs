@@ -1,8 +1,10 @@
 //! Native agent management. Nothing runs until a management command or view is opened.
 mod cli;
+mod commands;
 mod durable;
 pub(crate) mod endpoints;
 mod evidence;
+pub(crate) mod failure;
 pub(crate) mod find;
 pub(crate) mod fleet;
 mod integration;
@@ -32,6 +34,25 @@ const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_
 const CAPTURE_BATCH_SIZE: usize = 12;
 const MAX_PS_TTY_ARGUMENT: usize = 4096;
 const TRACKED_REJECTED: &str = "masil-agent-stale";
+
+pub(super) fn server_unreachable(error: String) -> String {
+    if [
+        "starting native command:",
+        "native command has no",
+        "writing native command:",
+        "closing native command input:",
+        "native command timed out",
+        "waiting for native command:",
+        "reading native command:",
+    ]
+    .iter()
+    .any(|prefix| error.starts_with(prefix))
+    {
+        format!("server_unreachable: {error}")
+    } else {
+        error
+    }
+}
 
 struct CaptureRequest {
     pane: String,
@@ -335,7 +356,7 @@ impl Manager {
     pub fn new(socket: PathBuf, client: Option<String>) -> Result<Self, String> {
         let socket = socket
             .canonicalize()
-            .map_err(|e| format!("native socket: {e}"))?;
+            .map_err(|e| format!("server_unreachable: native socket: {e}"))?;
         Ok(Self {
             native: native_ui::Context { socket, client },
             engine: Engine::load()?,
@@ -356,7 +377,8 @@ impl Manager {
         let result = self
             .native
             .tmux(args.iter().map(OsString::from), None)
-            .await?;
+            .await
+            .map_err(server_unreachable)?;
         String::from_utf8(result.stdout).map_err(|_| "native response is not UTF-8".into())
     }
 
@@ -456,7 +478,9 @@ impl Manager {
             .iter()
             .any(|request| current_by_pane.get(request.pane.as_str()) != Some(&request.identity))
         {
-            return Err("native pane identity changed during observation".into());
+            return Err(
+                "identity_mismatch: native pane identity changed during observation".into(),
+            );
         }
         Ok(prepared)
     }
@@ -490,7 +514,11 @@ impl Manager {
                 )
             })
             .collect::<Vec<_>>();
-        let output = self.native.guarded_groups(&groups).await?;
+        let output = self
+            .native
+            .guarded_groups(&groups)
+            .await
+            .map_err(server_unreachable)?;
         parse_capture_frames(&output.stdout, &frames)
             .ok_or_else(|| "native capture batch framing is ambiguous".into())
     }
@@ -731,12 +759,16 @@ impl Manager {
                 bytes += sizes[end];
                 end += 1;
             }
-            let output = self.native.guarded_groups(&groups[start..end]).await?;
+            let output = self
+                .native
+                .guarded_groups(&groups[start..end])
+                .await
+                .map_err(server_unreachable)?;
             if String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .any(|line| line == TRACKED_REJECTED)
             {
-                return Err("agent run changed before the action".into());
+                return Err("identity_mismatch: agent run changed before the action".into());
             }
             for (agent, encoded) in &updates[start..end] {
                 agents[*agent].tracked_encoded = encoded.clone();
@@ -747,14 +779,19 @@ impl Manager {
     }
 
     pub async fn get(&self, target: &str) -> Result<Agent, String> {
+        if target.starts_with('%') {
+            crate::pane_id(target).map_err(|error| format!("unknown_target_syntax: {error}"))?;
+        }
         let mut matches = self
             .collect(Some(target))
             .await?
             .into_iter()
             .filter(|a| a.pane_id == target || a.name == target);
-        let agent = matches.next().ok_or("agent target not found")?;
+        let agent = matches
+            .next()
+            .ok_or("target_absent: agent target not found")?;
         if matches.next().is_some() {
-            return Err("ambiguous agent name; use a pane ID".into());
+            return Err("unknown_target_syntax: ambiguous agent name; use a pane ID".into());
         }
         Ok(agent)
     }
@@ -787,10 +824,11 @@ impl Manager {
                 &[command],
                 "masil-agent-stale",
             )
-            .await?;
+            .await
+            .map_err(server_unreachable)?;
         let text = String::from_utf8(output.stdout).map_err(|_| "native output is not UTF-8")?;
         if text.trim() == "masil-agent-stale" {
-            return Err("agent run changed before reading".into());
+            return Err("identity_mismatch: agent run changed before reading".into());
         }
         Ok(text)
     }
@@ -800,9 +838,10 @@ impl Manager {
         let out = self
             .native
             .guarded_script(&agent.pane_id, &guard, &commands, "masil-agent-stale")
-            .await?;
+            .await
+            .map_err(server_unreachable)?;
         if String::from_utf8_lossy(&out.stdout).contains("masil-agent-stale") {
-            return Err("agent run changed before the action".into());
+            return Err("identity_mismatch: agent run changed before the action".into());
         }
         Ok(())
     }
@@ -822,9 +861,9 @@ impl Manager {
             .await?
         {
             Guarded::Applied => Ok(()),
-            Guarded::Rejected => {
-                Err("agent foreground or run changed before input delivery".into())
-            }
+            Guarded::Rejected => Err(
+                "identity_mismatch: agent foreground or run changed before input delivery".into(),
+            ),
         }
     }
 
@@ -860,7 +899,8 @@ impl Manager {
         let out = self
             .native
             .guarded_group(&agent.pane_id, &guard, &commands, "masil-agent-stale")
-            .await?;
+            .await
+            .map_err(server_unreachable)?;
         if String::from_utf8_lossy(&out.stdout)
             .lines()
             .any(|line| line == "masil-agent-stale")
@@ -880,7 +920,8 @@ impl Manager {
             .join("\t");
         let output = self
             .command(&["display-message", "-p", "-t", pane, &format])
-            .await?;
+            .await
+            .map_err(server_unreachable)?;
         let values: Vec<String> = output
             .strip_suffix('\n')
             .unwrap_or(&output)
@@ -922,7 +963,8 @@ impl Manager {
         let output = self
             .native
             .guarded_group(pane, &guard, &commands, "masil-agent-stale")
-            .await?;
+            .await
+            .map_err(server_unreachable)?;
         Ok(!String::from_utf8_lossy(&output.stdout)
             .lines()
             .any(|line| line == "masil-agent-stale"))
@@ -949,7 +991,7 @@ impl Manager {
             self.command(&["set-option", "-g", STORE_OPTION, &instance])
                 .await?;
         } else if recorded != instance {
-            return Err("store_unavailable: the operation store for this server was deleted or replaced while the server kept running, so earlier receipts are gone; inspect the agents, then run `masil-agent agent operations adopt`".into());
+            return Err("store_replaced: the operation store for this server was deleted or replaced while the server kept running, so earlier receipts are gone; inspect the agents, then run `masil-agent agent operations adopt`".into());
         }
         let mut store = store;
         self.maintain(&mut store).await?;
@@ -961,7 +1003,7 @@ impl Manager {
     pub(crate) fn resume_session<'a>(&self, agent: &'a Agent) -> Result<&'a str, String> {
         if agent.binding.state == "conflict" {
             return Err(format!(
-                "native session binding is in conflict (bound {}, also reported {}); start a new agent with --session to choose the conversation",
+                "binding_conflict: native session binding is in conflict (bound {}, also reported {}); start a new agent with --session to choose the conversation",
                 agent.binding.session_id.as_deref().unwrap_or("none"),
                 agent
                     .binding
@@ -1043,7 +1085,8 @@ impl Manager {
         split: Option<&str>,
     ) -> Result<PreparedLaunch, String> {
         self.unique_name(name, None).await?;
-        let provider = providers::find(provider).ok_or("unknown agent provider")?;
+        let provider =
+            providers::find(provider).ok_or("unknown_provider: unknown agent provider")?;
         let cwd = cwd
             .canonicalize()
             .map_err(|e| format!("working directory: {e}"))?;
@@ -1052,7 +1095,7 @@ impl Manager {
         }
         validate_args(args)?;
         if let Some(target) = split {
-            crate::pane_id(target)?;
+            crate::pane_id(target).map_err(|error| format!("unknown_target_syntax: {error}"))?;
         }
         let mut argv = if let Some(session) = session {
             providers::resume(provider.id, session)?
@@ -1131,11 +1174,34 @@ impl Manager {
             "exec-managed".into(),
         ]);
         command.extend(argv.iter().map(OsString::from));
-        let result = self.native.tmux(command, None).await?;
-        let line = String::from_utf8(result.stdout).map_err(|_| "invalid launch result")?;
+        let result = self
+            .native
+            .tmux(command, None)
+            .await
+            .map_err(server_unreachable)?;
+        self.finish_launch(result, provider, name, run, session, argv, args)
+            .await
+            .map_err(String::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_launch(
+        &self,
+        result: native_ui::ProcessOutput,
+        provider: &'static providers::Provider,
+        name: &str,
+        run: &str,
+        session: Option<&str>,
+        argv: Vec<String>,
+        args: Vec<String>,
+    ) -> Result<Value, failure::AfterEffect> {
+        let line = String::from_utf8(result.stdout)
+            .map_err(|_| failure::AfterEffect::new("invalid launch result"))?;
         let fields: Vec<_> = line.trim().split('\t').collect();
         if fields.len() != 4 {
-            return Err("launch outcome unknown; inspect panes before retrying".into());
+            return Err(failure::AfterEffect::new(
+                "launch outcome unknown; inspect panes before retrying",
+            ));
         }
         let metadata = Metadata {
             name: name.into(),
@@ -1149,13 +1215,13 @@ impl Manager {
             last_sequence: 0,
             foreground_group: fields[3]
                 .parse()
-                .map_err(|_| "invalid launch process identity")?,
+                .map_err(|_| failure::AfterEffect::new("invalid launch process identity"))?,
             original_args: args,
         };
-        let encoded = encode(&metadata)?;
+        let encoded = encode(&metadata).map_err(failure::AfterEffect::new)?;
         let mut registration = vec!["set-option", "-p", "-t", fields[0], META, &encoded];
-        let evidence = session
-            .map(|session| {
+        let evidence = match session {
+            Some(session) => Some(
                 encode(&RunEvidence {
                     run: run.into(),
                     binding: Some(Binding {
@@ -1169,16 +1235,18 @@ impl Manager {
                     }),
                     ..RunEvidence::default()
                 })
-            })
-            .transpose()?;
+                .map_err(failure::AfterEffect::new)?,
+            ),
+            None => None,
+        };
         if let Some(evidence) = &evidence {
             registration.extend([";", "set-option", "-p", "-t", fields[0], EVIDENCE, evidence]);
         }
         self.command(&registration).await.map_err(|e| {
-            format!(
+            failure::AfterEffect::new(format!(
                 "pane {} was launched, but registration failed: {e}; do not blindly retry",
                 fields[0]
-            )
+            ))
         })?;
         Ok(
             json!({"stage":"process_started","pane_id":fields[0],"run":run,"name":name,"provider":provider.id,"native_session_requested":session,"native_session_verified":false,"provider_accepted":false}),
@@ -1209,13 +1277,20 @@ impl Manager {
                 &self.native.socket,
             )
             .await
+            .map_err(|error| {
+                if error.contains("identity") || error.contains("stale") {
+                    format!("identity_mismatch: {error}")
+                } else {
+                    server_unreachable(error)
+                }
+            })
             .map(|_| ())
     }
 
     pub async fn keys(&self, agent: &Agent, keys: &[String]) -> Result<Value, String> {
         validate_args(keys)?;
         if agent.process != "running" {
-            return Err("agent is not verified in the foreground".into());
+            return Err("identity_mismatch: agent is not verified in the foreground".into());
         }
         let mut args = vec![
             "send-keys".into(),
@@ -1232,7 +1307,7 @@ impl Manager {
 
     pub async fn draft(&self, agent: &Agent, text: &str) -> Result<Value, String> {
         if text.is_empty() || text.len() > 32_768 || text.contains('\0') {
-            return Err("draft must contain 1–32768 bytes without NUL".into());
+            return Err("invalid_argument: draft must contain 1–32768 bytes without NUL".into());
         }
         // Buffer preparation cannot type into a shell or answer an approval prompt.
         self.native
@@ -1242,7 +1317,8 @@ impl Manager {
                     .map(OsString::from),
                 Some(text.as_bytes().to_vec()),
             )
-            .await?;
+            .await
+            .map_err(server_unreachable)?;
         Ok(
             json!({"stage":"draft_prepared","buffer":"masil-agent-draft","pane_id":agent.pane_id,"run":agent.run,"submitted":false}),
         )
@@ -1258,7 +1334,7 @@ impl Manager {
     ) -> Result<ReportResult, String> {
         let agent = self.get(pane).await?;
         if agent.run != run {
-            return Err("stale agent report".into());
+            return Err("identity_mismatch: stale agent report".into());
         }
         self.report_snapshot(&agent, sequence, state, session, ReportOrigin::Run)
             .await
@@ -1300,7 +1376,7 @@ impl Manager {
     ) -> Result<ReportResult, String> {
         let mut metadata = agent.metadata.clone().ok_or("agent is not managed")?;
         if metadata.run != agent.run || agent.process != "running" {
-            return Err("stale agent report".into());
+            return Err("identity_mismatch: stale agent report".into());
         }
         if sequence <= metadata.last_sequence
             || metadata
@@ -1424,7 +1500,7 @@ impl Manager {
     }
 }
 
-const LOCK_BUSY: &str = "another agent management operation is in progress";
+const LOCK_BUSY: &str = "lock_busy: another agent management operation is in progress";
 
 /// Status of the durable operation store for a server socket, without
 /// creating it. `None` when no management command has used one yet.
@@ -1476,7 +1552,7 @@ impl Agent {
 
 /// Static contract for a provider before any run supplies evidence.
 fn provider_contract(engine: &Engine, id: &str) -> Result<Value, String> {
-    let provider = providers::find(id).ok_or("unknown agent provider")?;
+    let provider = providers::find(id).ok_or("unknown_provider: unknown agent provider")?;
     let integration = integration::target_capability(provider.id);
     let resume = providers::resume(provider.id, "example").is_ok();
     Ok(json!({
@@ -1790,7 +1866,9 @@ fn validate_args(args: &[String]) -> Result<(), String> {
         || args.iter().map(String::len).sum::<usize>() > 8192
         || args.iter().any(|a| a.chars().any(char::is_control))
     {
-        return Err("arguments exceed bounds or contain control characters".into());
+        return Err(
+            "invalid_argument: arguments exceed bounds or contain control characters".into(),
+        );
     }
     Ok(())
 }

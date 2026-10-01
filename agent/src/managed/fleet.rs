@@ -75,7 +75,7 @@ impl Fleet {
         let endpoint = endpoints::load()?
             .into_iter()
             .find(|e| e.id == id && e.enabled)
-            .ok_or("unknown or disabled endpoint")?;
+            .ok_or("target_absent: unknown or disabled endpoint")?;
         Ok(key(&endpoint))
     }
     pub async fn poll(&self) -> Result<FleetSnapshot, String> {
@@ -228,7 +228,9 @@ impl Fleet {
     }
     fn remote(&self, agent: &Agent) -> Result<Option<Endpoint>, String> {
         if agent.stale {
-            return Err("endpoint is unavailable; refresh before acting".into());
+            return Err(
+                "endpoint_unreachable: endpoint is unavailable; refresh before acting".into(),
+            );
         }
         if agent.endpoint_id.is_empty() || agent.endpoint_id == "local" {
             return Ok(None);
@@ -236,9 +238,11 @@ impl Fleet {
         let endpoint = endpoints::load()?
             .into_iter()
             .find(|e| e.id == agent.endpoint_id && e.enabled)
-            .ok_or("endpoint was removed or disabled")?;
+            .ok_or("endpoint_unreachable: endpoint was removed or disabled")?;
         if key(&endpoint) != agent.endpoint_key {
-            return Err("endpoint connection changed; refresh before acting".into());
+            return Err(
+                "identity_mismatch: endpoint connection changed; refresh before acting".into(),
+            );
         }
         Ok(Some(endpoint))
     }
@@ -337,7 +341,7 @@ impl Fleet {
                 || current.boot != agent.boot
                 || current.session_id != agent.session_id
             {
-                return Err("agent session changed before resume".into());
+                return Err("identity_mismatch: agent session changed before resume".into());
             }
             self.local
                 .start(
@@ -365,7 +369,7 @@ impl Fleet {
     ) -> Result<Value, String> {
         if endpoint == "local" {
             if expected_key != "local" {
-                return Err("local endpoint identity changed".into());
+                return Err("identity_mismatch: local endpoint identity changed".into());
             }
             return self
                 .local
@@ -375,9 +379,12 @@ impl Fleet {
         let e = endpoints::load()?
             .into_iter()
             .find(|e| e.id == endpoint && e.enabled)
-            .ok_or("unknown or disabled endpoint")?;
+            .ok_or("target_absent: unknown or disabled endpoint")?;
         if key(&e) != expected_key {
-            return Err("endpoint connection changed since the start dialog opened".into());
+            return Err(
+                "identity_mismatch: endpoint connection changed since the start dialog opened"
+                    .into(),
+            );
         }
         e.call(&Request::Start {
             name: name.into(),

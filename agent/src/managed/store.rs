@@ -377,7 +377,7 @@ fn preflight(entry: &SavedAgent, args: &[String]) -> Result<(), String> {
         Some(session) => providers::resume(&entry.provider, session)?,
         None => vec![
             providers::find(&entry.provider)
-                .ok_or("unknown agent provider")?
+                .ok_or("unknown_provider: unknown agent provider")?
                 .command
                 .into(),
         ],
@@ -411,7 +411,7 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
         }
         if providers::find(&entry.provider).is_none() {
             return Err(format!(
-                "snapshot contains unknown provider: {}",
+                "unknown_provider: snapshot contains unknown provider: {}",
                 entry.provider
             ));
         }

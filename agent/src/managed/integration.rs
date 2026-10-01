@@ -239,7 +239,9 @@ fn target(provider: &str) -> Result<&'static Target, String> {
     TARGETS
         .iter()
         .find(|target| target.id == provider)
-        .ok_or_else(|| format!("provider has no verified native integration: {provider}"))
+        .ok_or_else(|| {
+            format!("unknown_provider: provider has no verified native integration: {provider}")
+        })
 }
 
 fn target_status(target: &Target) -> Value {
@@ -674,7 +676,7 @@ async fn hook(
 
     let agent = manager.get(&pane).await?;
     if agent.run != run || agent.provider != target.id || agent.process != "running" {
-        return Err("stale or mismatched integration callback".into());
+        return Err("identity_mismatch: stale or mismatched integration callback".into());
     }
     if matches!(target.id, "opencode" | "kilo") {
         if mapped.child_session {

@@ -2,13 +2,13 @@
 use super::{
     Agent, Manager,
     endpoints::{self, Action, Endpoint, Expected, Request},
-    fleet,
+    failure, fleet,
 };
 use serde_json::{Value, json};
 use std::{
     io::Read,
-    os::unix::process::CommandExt,
     path::PathBuf,
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -16,7 +16,7 @@ pub(super) fn run(id: &str, command: &str, args: &[String]) -> Result<i32, Strin
     let endpoint = endpoints::load()?
         .into_iter()
         .find(|e| e.id == id && e.enabled)
-        .ok_or("unknown or disabled endpoint")?;
+        .ok_or("target_absent: unknown or disabled endpoint")?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -34,9 +34,9 @@ where
         .map_err(|e| e.to_string())?;
     tokio::select! {
         result = operation => result,
-        _ = tokio::signal::ctrl_c() => Err("agent request interrupted; inspect its receipt before retrying".into()),
-        _ = terminate.recv() => Err("agent request terminated; outcome may be unknown".into()),
-        _ = hangup.recv() => Err("agent connection lost; outcome may be unknown".into()),
+        _ = tokio::signal::ctrl_c() => Err("outcome_unknown: agent request interrupted; inspect its receipt before retrying".into()),
+        _ = terminate.recv() => Err("outcome_unknown: agent request terminated; outcome may be unknown".into()),
+        _ = hangup.recv() => Err("outcome_unknown: agent connection lost; outcome may be unknown".into()),
     }
 }
 async fn get(endpoint: &Endpoint, target: &str) -> Result<Agent, String> {
@@ -45,7 +45,8 @@ async fn get(endpoint: &Endpoint, target: &str) -> Result<Agent, String> {
             target: target.into(),
         })
         .await?;
-    serde_json::from_value(value).map_err(|e| format!("invalid remote agent: {e}"))
+    serde_json::from_value(value)
+        .map_err(|e| format!("endpoint_unreachable: invalid remote agent: {e}"))
 }
 async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i32, String> {
     let value = match command {
@@ -83,12 +84,15 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
                     extra = args[i + 1..].to_vec();
                     break;
                 }
-                let value = args.get(i + 1).ok_or("missing start option value")?.clone();
+                let value = args
+                    .get(i + 1)
+                    .ok_or("usage: missing start option value")?
+                    .clone();
                 match args[i].as_str() {
                     "--cwd" if cwd.is_none() => cwd = Some(value),
                     "--session" if session.is_none() => session = Some(value),
                     "--split" if split.is_none() => split = Some(value),
-                    _ => return Err("invalid remote start option".into()),
+                    _ => return Err("usage: invalid remote start option".into()),
                 }
                 i += 2;
             }
@@ -96,7 +100,7 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
                 .call(&Request::Start {
                     name: args[0].clone(),
                     provider: args[1].clone(),
-                    cwd: cwd.ok_or("remote start requires an explicit --cwd")?,
+                    cwd: cwd.ok_or("usage: remote start requires an explicit --cwd")?,
                     args: extra,
                     session,
                     split,
@@ -104,7 +108,9 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
                 .await?
         }
         _ => {
-            let target = args.first().ok_or("remote command requires a target")?;
+            let target = args
+                .first()
+                .ok_or("usage: remote command requires a target")?;
             let agent = get(&endpoint, target).await?;
             if command == "get" && args.len() == 1 {
                 print(&json!(agent))?;
@@ -151,7 +157,9 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
                 },
                 "ack" if args.len() == 5 && args[1] == "--run" && args[3] == "--revision" => {
                     if args[2] != agent.run || args[4] != agent.revision {
-                        return Err("attention changed since it was displayed".into());
+                        return Err(
+                            "identity_mismatch: attention changed since it was displayed".into(),
+                        );
                     }
                     Action::Ack
                 }
@@ -162,7 +170,7 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
                 "prompt-receipt" => Action::Receipt {
                     operation: operation(&agent, &args[1..])?,
                 },
-                _ => return Err("unsupported remote command or invalid arguments".into()),
+                _ => return Err("usage: unsupported remote command or invalid arguments".into()),
             };
             endpoint
                 .call(&Request::Action {
@@ -172,29 +180,47 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
                 .await?
         }
     };
+    let stage = value
+        .get("stage")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     print(&value)?;
-    Ok(0)
+    Ok(match command {
+        "start" | "resume" | "prompt" | "close" => failure::recorded_exit_code(
+            if stage == "pending" {
+                "dispatching"
+            } else {
+                stage
+            },
+            false,
+        ),
+        _ => 0,
+    })
 }
 fn operation(agent: &Agent, args: &[String]) -> Result<Option<u64>, String> {
     let mut run = None;
     let mut operation = None;
     if !args.len().is_multiple_of(2) {
-        return Err("missing prompt option value".into());
+        return Err("usage: missing prompt option value".into());
     }
     for pair in args.chunks_exact(2) {
         match pair[0].as_str() {
             "--run" if run.is_none() => run = Some(pair[1].as_str()),
             "--operation" if operation.is_none() => {
-                operation = Some(pair[1].parse().map_err(|_| "invalid operation number")?)
+                operation = Some(
+                    pair[1]
+                        .parse()
+                        .map_err(|_| "invalid_argument: invalid operation number")?,
+                )
             }
-            _ => return Err("prompt accepts --run RUN --operation N".into()),
+            _ => return Err("usage: prompt accepts --run RUN --operation N".into()),
         }
     }
     if operation.is_some() && run.is_none() {
-        return Err("prompt operation requires the original --run".into());
+        return Err("usage: prompt operation requires the original --run".into());
     }
     if run.is_some_and(|r| r != agent.run) {
-        return Err("prompt target run changed".into());
+        return Err("identity_mismatch: prompt target run changed".into());
     }
     Ok(operation)
 }
@@ -209,19 +235,23 @@ async fn wait(endpoint: &Endpoint, initial: &Agent, args: &[String]) -> Result<i
             i += 1;
             continue;
         }
-        let value = args.get(i + 1).ok_or("missing wait option value")?;
+        let value = args.get(i + 1).ok_or("usage: missing wait option value")?;
         match args[i].as_str() {
             "--state" if state.is_none() => state = Some(value.as_str()),
-            "--timeout" => timeout = value.parse::<f64>().map_err(|_| "invalid wait timeout")?,
-            _ => return Err("invalid wait option".into()),
+            "--timeout" => {
+                timeout = value
+                    .parse::<f64>()
+                    .map_err(|_| "invalid_argument: invalid wait timeout")?
+            }
+            _ => return Err("usage: invalid wait option".into()),
         }
         i += 2;
     }
     let desired = state
         .filter(|s| ["idle", "working", "blocked", "exited"].contains(s))
-        .ok_or("invalid wait state")?;
+        .ok_or("invalid_argument: invalid wait state")?;
     if !timeout.is_finite() || !(0.0..=86400.0).contains(&timeout) {
-        return Err("invalid wait timeout".into());
+        return Err("invalid_argument: invalid wait timeout".into());
     }
     let until = Instant::now() + Duration::from_secs_f64(timeout);
     let mut changed = !after_change;
@@ -230,11 +260,16 @@ async fn wait(endpoint: &Endpoint, initial: &Agent, args: &[String]) -> Result<i
             Ok(a) if a.run == initial.run && a.boot == initial.boot => a,
             Ok(_) => {
                 print(&json!({"stage":"run_changed","run":initial.run}))?;
-                return Ok(3);
+                return Ok(5);
             }
             Err(e) => {
                 print(&json!({"stage":"unavailable","run":initial.run,"error":e}))?;
-                return Ok(3);
+                let (class, code) = failure::classify(&e);
+                return Ok(if code == "target_absent" {
+                    5
+                } else {
+                    class.exit_code()
+                });
             }
         };
         changed |= value.state != initial.state || value.revision != initial.revision;
@@ -244,9 +279,15 @@ async fn wait(endpoint: &Endpoint, initial: &Agent, args: &[String]) -> Result<i
             )?;
             return Ok(0);
         }
+        if value.state == "exited" || value.process == "exited" {
+            print(
+                &json!({"stage":"state_observed","run":value.run,"state":"exited","task_success":null}),
+            )?;
+            return Ok(5);
+        }
         if Instant::now() >= until {
             print(&json!({"stage":"timeout","run":initial.run}))?;
-            return Ok(4);
+            return Ok(6);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -263,14 +304,14 @@ pub(super) async fn serve(manager: &Manager) -> Result<i32, String> {
 }
 pub(super) fn endpoint_connect(args: &[String]) -> Result<i32, String> {
     if args.len() != 7 {
-        return Err("invalid endpoint connection identity".into());
+        return Err("invalid_argument: invalid endpoint connection identity".into());
     }
     let endpoint = endpoints::load()?
         .into_iter()
         .find(|e| e.id == args[0] && e.enabled)
-        .ok_or("unknown or disabled endpoint")?;
+        .ok_or("target_absent: unknown or disabled endpoint")?;
     if fleet::key(&endpoint) != args[1] {
-        return Err("endpoint connection changed".into());
+        return Err("identity_mismatch: endpoint connection changed".into());
     }
     exec_connection(&endpoint, &args[2..])
 }
@@ -320,14 +361,55 @@ fn exec_connection(endpoint: &Endpoint, identity: &[String]) -> Result<i32, Stri
         command
     };
     command.env_remove("TMUX").env_remove("TMUX_PANE");
+    let child = command.stderr(Stdio::piped()).spawn().map_err(|error| {
+        format!("endpoint_unreachable: could not connect native terminal: {error}")
+    })?;
+    let output = child.wait_with_output().map_err(|error| {
+        format!("endpoint_unreachable: native terminal connection failed: {error}")
+    })?;
+    let detail = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        if !detail.is_empty() {
+            eprint!("{detail}");
+        }
+        return Ok(output.status.code().unwrap_or(0));
+    }
+    if endpoints::host_key_failure(&detail) {
+        return Err(format!(
+            "host_key: endpoint '{}' refused its SSH host key: {}",
+            endpoint.id,
+            detail.trim()
+        ));
+    }
+    if let Some(error) = forwarded_managed_error(&detail) {
+        return Err(error);
+    }
     Err(format!(
-        "could not connect native terminal: {}",
-        command.exec()
+        "endpoint_unreachable: native terminal connection exited with {}{}",
+        output.status,
+        if detail.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", detail.trim())
+        }
     ))
 }
+
+/// A direct terminal connection has no RPC envelope, but an endpoint that
+/// reached `masil-agent` still writes the ordinary managed boundary error.
+/// Preserve its registered class rather than turning a stale identity into a
+/// transport failure at the calling endpoint.
+fn forwarded_managed_error(detail: &str) -> Option<String> {
+    let (prefix, message) = detail.rsplit_once("]: ")?;
+    let code = prefix.rsplit_once("masil-agent: error[")?.1;
+    let message = message.trim_end();
+    let (_, classified) = failure::classify(&format!("{code}: {message}"));
+    (code == classified).then(|| message.to_owned())
+}
+
 pub(super) fn open_native(socket: &str, args: &[String]) -> Result<i32, String> {
     if args.len() != 5 {
-        return Err("invalid native connection identity".into());
+        return Err("invalid_argument: invalid native connection identity".into());
     }
     let lease = &args[4];
     validate_lease(lease)?;
@@ -342,7 +424,7 @@ pub(super) fn open_native(socket: &str, args: &[String]) -> Result<i32, String> 
         || agent.run != args[3]
         || agent.process != "running"
     {
-        return Err("native agent changed before connection".into());
+        return Err("identity_mismatch: native agent changed before connection".into());
     }
     let guard = super::and(&[
         super::identity_guard(&agent),
@@ -370,7 +452,7 @@ pub(super) fn open_native(socket: &str, args: &[String]) -> Result<i32, String> 
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .spawn()
-        .map_err(|e| format!("could not attach native terminal: {e}"))?;
+        .map_err(|e| format!("server_unreachable: could not attach native terminal: {e}"))?;
     let pid = child.id().to_string();
     let option = format!("@masil-agent-lease-{lease}");
     let registered = runtime.block_on(async {
@@ -382,7 +464,7 @@ pub(super) fn open_native(socket: &str, args: &[String]) -> Result<i32, String> 
                 manager.command(&["set-option","-g",&option,&value]).await?;
                 return Ok::<(),String>(());
             }
-            if child.try_wait().map_err(|e| e.to_string())?.is_some() || Instant::now() >= until { return Err("native connection was refused or unavailable".into()); }
+            if child.try_wait().map_err(|e| e.to_string())?.is_some() || Instant::now() >= until { return Err("server_unreachable: native connection was refused or unavailable".into()); }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     });
@@ -397,7 +479,7 @@ pub(super) fn open_native(socket: &str, args: &[String]) -> Result<i32, String> 
 }
 fn validate_lease(lease: &str) -> Result<(), String> {
     if lease.len() != 32 || !lease.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("invalid native connection lease".into());
+        return Err("invalid_argument: invalid native connection lease".into());
     }
     Ok(())
 }
@@ -412,7 +494,7 @@ pub(super) async fn connection_status(
     let value: Value =
         super::decode(raw.trim()).ok_or("native connection is starting or no longer exists")?;
     if value["boot"] != agent.boot || value["run"] != agent.run || value["pane"] != agent.pane_id {
-        return Err("native connection identity changed".into());
+        return Err("identity_mismatch: native connection identity changed".into());
     }
     let clients = manager
         .command(&[

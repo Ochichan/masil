@@ -1,56 +1,38 @@
-use super::{Agent, Manager, validate_args};
+use super::{Agent, Manager, commands, failure, validate_args};
 use crate::providers;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const HELP: &str = "Native agents (no observer configuration needed):
-  masil-agent agent [--socket MASIL_SOCKET] [--client CLIENT] providers
-  masil-agent agent endpoints list|add|remove|enable|disable ...
-  masil-agent agent --endpoint ID COMMAND ...
-  masil-agent agent [--socket MASIL_SOCKET] list --all
-  masil-agent agent [--socket MASIL_SOCKET] list|get TARGET|explain TARGET
-  masil-agent agent [--socket MASIL_SOCKET] find QUERY [--limit N]
-  masil-agent agent [--socket MASIL_SOCKET] capabilities TARGET
-  masil-agent agent capabilities --provider PROVIDER
-  masil-agent agent [--socket MASIL_SOCKET] read TARGET [--history]
-  masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER --cwd DIR [--split %N] [--session ID] [--boot BOOT --operation ID] [-- ARGS...]
-  masil-agent agent [--socket MASIL_SOCKET] attach TARGET NAME
-  masil-agent agent [--socket MASIL_SOCKET] rename TARGET NAME
-  masil-agent agent [--socket MASIL_SOCKET] focus TARGET
-  masil-agent agent [--socket MASIL_SOCKET] send-keys TARGET KEY...
-  masil-agent agent [--socket MASIL_SOCKET] draft TARGET TEXT
-  masil-agent agent [--socket MASIL_SOCKET] prompt TARGET TEXT [--run RUN --operation N]
-  masil-agent agent [--socket MASIL_SOCKET] prompt-receipt TARGET [--run RUN] [--operation N]
-  masil-agent agent [--socket MASIL_SOCKET] interrupt|close TARGET [--run RUN --operation ID]
-  masil-agent agent [--socket MASIL_SOCKET] wait TARGET --state idle|working|blocked|exited [--timeout SECONDS] [--after-change]
-  masil-agent agent [--socket MASIL_SOCKET] resume TARGET --name NAME [--split %N] [--boot BOOT --operation ID]
-  masil-agent agent [--socket MASIL_SOCKET] operations [list] [--all] [--limit N] | status | reconcile | adopt
-  masil-agent agent [--socket MASIL_SOCKET] operation KEY | operation resolve KEY --as delivered|not-delivered
-  masil-agent agent [--socket MASIL_SOCKET] ack TARGET --run RUN --revision REVISION
-  masil-agent agent [--socket MASIL_SOCKET] save FILE
-  masil-agent agent [--socket MASIL_SOCKET] restore FILE [--allow-fresh]
-  masil-agent agent [--socket MASIL_SOCKET] view get|clear|set [--provider ID] [--state STATE] [--workspace NAME] [--sort priority|name|provider|workspace]
-  masil-agent agent [--socket MASIL_SOCKET] integration status [PROVIDER]
-  masil-agent agent [--socket MASIL_SOCKET] integration export PROVIDER [--directory ABSOLUTE_PATH]
-  masil-agent agent [--socket MASIL_SOCKET] reload
-  masil-agent agent [--socket MASIL_SOCKET] coordinator status|start|stop
-  masil-agent agent [--socket MASIL_SOCKET] report --pane %N --run RUN --sequence N --state STATE [--session ID]
-  masil-agent agent [--socket MASIL_SOCKET] ui|sidebar [--lang en|ko] [--theme dark|light|terminal]
-
-Socket defaults to the current TMUX server. Start creates a new window or split.
-Draft prepares a tmux buffer. Prompt checks idle/foreground identity, pastes, then sends Enter.
-Prompt receipts report delivery, not provider acceptance. Reuse --run RUN --operation N for retries.
-Start, prompt, interrupt and close are recorded in a durable operation store before any effect;
-a retry with the same key returns the recorded result and an unknown outcome is never resent.
-Raw send-keys is explicit keyboard delivery, never provider acceptance.
-Wait reports an observed state, never task success. A session binding is verified only
-when a provider callback carrying this run's identity reported it; requested resume refs stay unverified.";
-
 pub(crate) fn run(args: &[String]) -> Result<i32, String> {
+    match run_inner(args) {
+        Err(error) if is_integration_hook(args) => {
+            eprintln!("masil-agent: {error}");
+            Ok(0)
+        }
+        result => result,
+    }
+}
+
+fn is_integration_hook(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if matches!(argument.as_str(), "--socket" | "--client" | "--endpoint") {
+            index += 2;
+        } else {
+            break;
+        }
+    }
+    matches!(
+        args.get(index..),
+        Some([command, action, ..]) if command == "integration" && action == "hook"
+    )
+}
+
+fn run_inner(args: &[String]) -> Result<i32, String> {
     if args.is_empty() || args == ["--help"] || args == ["help"] {
-        println!("{HELP}");
+        println!("{}", commands::help());
         return Ok(0);
     }
     let mut index = 0;
@@ -74,12 +56,15 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
             _ => break,
         }
     }
-    let command = args.get(index).ok_or("missing agent command")?;
+    let command = args.get(index).ok_or("usage: missing agent command")?;
     let rest = &args[index + 1..];
     if ["help", "--help", "-h"].contains(&command.as_str()) && rest.is_empty() {
-        println!("{HELP}");
+        println!("{}", commands::help());
         return Ok(0);
     }
+    commands::verb(command).ok_or_else(|| {
+        format!("usage: unknown agent command '{command}'; see masil-agent agent --help")
+    })?;
     if command == "providers" && rest.is_empty() {
         print(
             &json!({"providers":providers::all().iter().map(|p|json!({"id":p.id,"command":p.command,"aliases":p.aliases,"resume":providers::resume(p.id,"example").is_ok(),"integration":super::integration::target_capability(p.id)})).collect::<Vec<_>>()}),
@@ -100,7 +85,12 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     }
     if let Some(endpoint) = endpoint {
         if socket.is_some() || client.is_some() {
-            return Err("--endpoint cannot be combined with --socket or --client".into());
+            return Err("usage: --endpoint cannot be combined with --socket or --client".into());
+        }
+        if !commands::supports_remote(command) {
+            return Err(format!(
+                "usage: {command} is not available with --endpoint; see masil-agent agent --help"
+            ));
         }
         return super::remote_cli::run(&endpoint, command, rest);
     }
@@ -111,12 +101,14 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
                 .and_then(|v| v.rsplitn(3, ',').last().map(str::to_owned))
         })
         .or_else(|| std::env::var("MASIL_AGENT_SOCKET").ok())
-        .ok_or("specify --socket PATH or run this command inside masil")?;
+        .ok_or("usage: specify --socket PATH or run this command inside masil")?;
     if command == "ui" || command == "sidebar" {
         let socket = PathBuf::from(&socket)
             .canonicalize()
-            .map_err(|e| format!("native socket: {e}"))?;
-        let socket = socket.to_str().ok_or("native socket path is not UTF-8")?;
+            .map_err(|e| format!("server_unreachable: native socket: {e}"))?;
+        let socket = socket
+            .to_str()
+            .ok_or("invalid_argument: native socket path is not UTF-8")?;
         let mut args = rest.to_vec();
         if let Some(client) = client {
             args.extend(["--client".into(), client]);
@@ -157,11 +149,12 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
     validate_args(args)?;
     let program = args
         .first()
-        .ok_or("managed launcher requires an executable")?;
-    let pane = std::env::var("TMUX_PANE").map_err(|_| "managed launcher needs TMUX_PANE")?;
-    crate::pane_id(&pane)?;
-    let run =
-        std::env::var("MASIL_AGENT_RUN").map_err(|_| "managed launcher needs a run identity")?;
+        .ok_or("usage: managed launcher requires an executable")?;
+    let pane = std::env::var("TMUX_PANE")
+        .map_err(|_| "invalid_argument: managed launcher needs TMUX_PANE")?;
+    crate::pane_id(&pane).map_err(|error| format!("unknown_target_syntax: {error}"))?;
+    let run = std::env::var("MASIL_AGENT_RUN")
+        .map_err(|_| "invalid_argument: managed launcher needs a run identity")?;
     let native = crate::native_ui::Context {
         socket: socket.into(),
         client: None,
@@ -180,15 +173,16 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
                                 .map(std::ffi::OsString::from),
                             None,
                         )
-                        .await?;
+                        .await
+                        .map_err(super::server_unreachable)?;
                     let encoded = String::from_utf8(output.stdout)
-                        .map_err(|_| "invalid launch registration")?;
+                        .map_err(|_| "outcome_unknown: invalid launch registration")?;
                     if let Some(meta) = super::decode::<super::Metadata>(encoded.trim()) {
                         if meta.run != run
                             || meta.argv != args
                             || meta.foreground_group != std::process::id() as i32
                         {
-                            return Err("managed launch registration does not match this process"
+                            return Err("identity_mismatch: managed launch registration does not match this process"
                                 .to_string());
                         }
                         return Ok(());
@@ -197,7 +191,7 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
                 }
             })
             .await
-            .map_err(|_| "managed launch registration timed out".to_string())?
+            .map_err(|_| "wait_timeout: managed launch registration timed out".to_string())?
         })?;
     let error = std::process::Command::new(program).args(&args[1..]).exec();
     Err(format!("provider could not start: {error}"))
@@ -212,7 +206,9 @@ fn client_key<'a>(
     match (pin, operation) {
         (Some(pin), Some(id)) => Ok(Some(super::durable::ClientKey { pin, id })),
         (None, None) => Ok(None),
-        _ => Err(format!("--operation ID and {flag} must be given together")),
+        _ => Err(format!(
+            "usage: --operation ID and {flag} must be given together"
+        )),
     }
 }
 
@@ -224,7 +220,7 @@ fn run_operation(args: &[String]) -> Result<(Option<&str>, Option<&str>), String
         match args[i].as_str() {
             "--run" if run.is_none() => run = Some(value(args, i)?),
             "--operation" if operation.is_none() => operation = Some(value(args, i)?),
-            _ => return Err("accepts --run RUN --operation ID".into()),
+            _ => return Err("usage: accepts --run RUN --operation ID".into()),
         }
         i += 2;
     }
@@ -249,7 +245,7 @@ pub(super) fn capability_report(agent: &Agent) -> serde_json::Value {
 fn value(args: &[String], index: usize) -> Result<&str, String> {
     args.get(index + 1)
         .map(String::as_str)
-        .ok_or_else(|| format!("missing value for {}", args[index]))
+        .ok_or_else(|| format!("usage: missing value for {}", args[index]))
 }
 
 fn print<T: Serialize + ?Sized>(value: &T) -> Result<(), String> {
@@ -258,6 +254,18 @@ fn print<T: Serialize + ?Sized>(value: &T) -> Result<(), String> {
         serde_json::to_string_pretty(value).map_err(|e| e.to_string())?
     );
     Ok(())
+}
+
+/// Prints a durable result and returns the exit status of the stage it
+/// shows, so the status always agrees with the printed stage.
+async fn print_record(_manager: &Manager, value: &Value, query: bool) -> Result<i32, String> {
+    let stage = value
+        .get("stage")
+        .or_else(|| value.get("state"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    print(value)?;
+    Ok(stage.map_or(0, |stage| failure::recorded_exit_code(&stage, query)))
 }
 
 async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result<i32, String> {
@@ -339,23 +347,24 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                         extra = args[i + 1..].to_vec();
                         break;
                     }
-                    other => return Err(format!("unknown or repeated start option: {other}")),
+                    other => {
+                        return Err(format!("usage: unknown or repeated start option: {other}"));
+                    }
                 }
                 i += 2;
             }
-            print(
-                &manager
-                    .start_with_operation(
-                        &args[0],
-                        &args[1],
-                        &cwd.unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?),
-                        &extra,
-                        session,
-                        split,
-                        client_key(boot, operation, "--boot BOOT")?,
-                    )
-                    .await?,
-            )?;
+            let outcome = manager
+                .start_with_operation(
+                    &args[0],
+                    &args[1],
+                    &cwd.unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?),
+                    &extra,
+                    session,
+                    split,
+                    client_key(boot, operation, "--boot BOOT")?,
+                )
+                .await?;
+            return print_record(&manager, &outcome, false).await;
         }
         "rename" | "attach" if args.len() == 2 => {
             let agent = manager.get(&args[0]).await?;
@@ -376,24 +385,30 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             };
             if key.is_some_and(|key| key.pin != agent.run) {
                 return Err(keyed_error(
-                    format!("{command} target run changed; this operation cannot be replayed"),
+                    format!(
+                        "identity_mismatch: {command} target run changed; this operation cannot be replayed"
+                    ),
                     command,
                     key,
                 ));
             }
-            print(&if command == "interrupt" {
+            let outcome = if command == "interrupt" {
                 manager.interrupt(&agent, key).await?
             } else {
                 manager.close_with_operation(&agent, key).await?
-            })?;
+            };
+            return print_record(&manager, &outcome, false).await;
         }
         "find" => print(&manager.find(args).await?)?,
         "operations" => print(&manager.operations_command(false, args).await?)?,
-        "operation" if !args.is_empty() => print(&manager.operations_command(true, args).await?)?,
+        "operation" if !args.is_empty() => {
+            let record = manager.operations_command(true, args).await?;
+            return print_record(&manager, &record, args.len() == 1).await;
+        }
         "ack" if args.len() == 5 && args[1] == "--run" && args[3] == "--revision" => {
             let agent = manager.get(&args[0]).await?;
             if agent.run != args[2] || agent.revision != args[4] {
-                return Err("attention changed since it was displayed".into());
+                return Err("identity_mismatch: attention changed since it was displayed".into());
             }
             manager.acknowledge(&agent).await?;
             print(&json!({"stage":"seen","revision":agent.revision}))?;
@@ -418,26 +433,26 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                         operation = Some(
                             value(args, i)?
                                 .parse::<u64>()
-                                .map_err(|_| "invalid prompt operation")?,
+                                .map_err(|_| "invalid_argument: invalid prompt operation")?,
                         );
                     }
-                    _ => return Err("prompt accepts --run RUN --operation N".into()),
+                    _ => return Err("usage: prompt accepts --run RUN --operation N".into()),
                 }
                 i += 2;
             }
             if operation.is_some() && run.is_none() {
                 return Err(
-                    "prompt operation requires --run from the original agent observation".into(),
+                    "usage: prompt operation requires --run from the original agent observation"
+                        .into(),
                 );
             }
             if run.is_some_and(|run| run != agent.run) {
-                return Err("prompt target run changed; this operation cannot be replayed".into());
+                return Err("identity_mismatch: prompt target run changed; this operation cannot be replayed".into());
             }
-            print(
-                &manager
-                    .prompt_with_operation(&agent, &args[1], operation)
-                    .await?,
-            )?;
+            let outcome = manager
+                .prompt_with_operation(&agent, &args[1], operation)
+                .await?;
+            return print_record(&manager, &outcome, false).await;
         }
         "prompt-receipt" if !args.is_empty() => {
             let agent = manager.get(&args[0]).await?;
@@ -451,20 +466,24 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                         operation = Some(
                             value(args, i)?
                                 .parse::<u64>()
-                                .map_err(|_| "invalid prompt operation")?,
+                                .map_err(|_| "invalid_argument: invalid prompt operation")?,
                         );
                     }
-                    _ => return Err("prompt-receipt accepts --run RUN --operation N".into()),
+                    _ => return Err("usage: prompt-receipt accepts --run RUN --operation N".into()),
                 }
                 i += 2;
             }
             if operation.is_some() && run.is_none() {
                 return Err(
-                    "prompt operation requires --run from the original agent observation".into(),
+                    "usage: prompt operation requires --run from the original agent observation"
+                        .into(),
                 );
             }
             if run.is_some_and(|run| run != agent.run) {
-                return Err("prompt target run changed; its receipt is unavailable".into());
+                return Err(
+                    "identity_mismatch: prompt target run changed; its receipt is unavailable"
+                        .into(),
+                );
             }
             print(&manager.prompt_receipt(&agent, operation).await?)?;
         }
@@ -483,7 +502,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     "--operation" if operation.is_none() => operation = Some(value(args, i)?),
                     _ => {
                         return Err(
-                            "resume accepts --name NAME, --split %N and --boot BOOT --operation ID"
+                            "usage: resume accepts --name NAME, --split %N and --boot BOOT --operation ID"
                                 .into(),
                         );
                     }
@@ -492,7 +511,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             }
             let mut outcome = manager
                 .start_with_operation(
-                    name.ok_or("resume requires a new --name")?,
+                    name.ok_or("usage: resume requires a new --name")?,
                     &agent.provider,
                     std::path::Path::new(&agent.cwd),
                     &[],
@@ -503,7 +522,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                 .await?;
             // The new run has only a request; the source run's evidence stays separate.
             outcome["source_binding"] = json!(agent.binding);
-            print(&outcome)?;
+            return print_record(&manager, &outcome, false).await;
         }
         "wait" if args.len() >= 3 => return wait(&manager, args).await,
         "report" => {
@@ -521,21 +540,21 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                         sequence = Some(
                             value(args, i)?
                                 .parse::<u64>()
-                                .map_err(|_| "invalid sequence")?,
+                                .map_err(|_| "invalid_argument: invalid sequence")?,
                         )
                     }
                     "--state" if state.is_none() => state = Some(value(args, i)?),
                     "--session" if session.is_none() => session = Some(value(args, i)?),
-                    _ => return Err("invalid report options".into()),
+                    _ => return Err("usage: invalid report options".into()),
                 }
                 i += 2;
             }
             let result = manager
                 .report(
-                    pane.ok_or("report requires --pane")?,
-                    run.ok_or("report requires --run")?,
-                    sequence.ok_or("report requires --sequence")?,
-                    state.ok_or("report requires --state")?,
+                    pane.ok_or("usage: report requires --pane")?,
+                    run.ok_or("usage: report requires --run")?,
+                    sequence.ok_or("usage: report requires --sequence")?,
+                    state.ok_or("usage: report requires --state")?,
                     session,
                 )
                 .await?;
@@ -551,7 +570,8 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         _ => {
             return Err(format!(
-                "invalid agent command or arguments; see masil-agent agent --help\n{HELP}"
+                "usage: invalid agent command or arguments; see masil-agent agent --help\n{}",
+                commands::help()
             ));
         }
     }
@@ -569,24 +589,24 @@ async fn wait(manager: &Manager, args: &[String]) -> Result<i32, String> {
             "--timeout" => {
                 timeout = value(args, i)?
                     .parse::<f64>()
-                    .map_err(|_| "invalid timeout")?
+                    .map_err(|_| "invalid_argument: invalid timeout")?
             }
             "--after-change" if !after => {
                 after = true;
                 i += 1;
                 continue;
             }
-            _ => return Err("invalid wait options".into()),
+            _ => return Err("usage: invalid wait options".into()),
         }
         i += 2;
     }
     if !(0.05..=300.0).contains(&timeout) {
-        return Err("timeout must be 0.05–300 seconds".into());
+        return Err("invalid_argument: timeout must be 0.05–300 seconds".into());
     }
-    let state = state.ok_or("wait requires --state")?;
+    let state = state.ok_or("usage: wait requires --state")?;
     validate_args(&[state.into()])?;
     if !["idle", "working", "blocked", "exited", "unknown"].contains(&state) {
-        return Err("unsupported wait state".into());
+        return Err("invalid_argument: unsupported wait state".into());
     }
     let initial = manager.get(&args[0]).await?;
     let deadline = Instant::now() + Duration::from_secs_f64(timeout);
@@ -595,10 +615,12 @@ async fn wait(manager: &Manager, args: &[String]) -> Result<i32, String> {
         let agent = match manager.get(&initial.pane_id).await {
             Ok(agent) => agent,
             Err(error) => {
+                let absent = failure::classify(&error).1 == "target_absent";
+                let reason = error.strip_prefix("target_absent: ").unwrap_or(&error);
                 print(
-                    &json!({"outcome":if error=="agent target not found"{"target_removed"}else{"observation_lost"},"reason":error,"pane_id":initial.pane_id,"run":initial.run}),
+                    &json!({"outcome":if absent{"target_removed"}else{"observation_lost"},"reason":reason,"pane_id":initial.pane_id,"run":initial.run}),
                 )?;
-                return Ok(3);
+                return Ok(if absent { 5 } else { 6 });
             }
         };
         if agent.boot != initial.boot
@@ -606,7 +628,7 @@ async fn wait(manager: &Manager, args: &[String]) -> Result<i32, String> {
             || agent.run != initial.run
         {
             print(&json!({"outcome":"run_changed","pane_id":initial.pane_id,"run":initial.run}))?;
-            return Ok(3);
+            return Ok(5);
         }
         changed |= agent.state != initial.state;
         if agent.state == state && (!after || changed) {
@@ -617,15 +639,38 @@ async fn wait(manager: &Manager, args: &[String]) -> Result<i32, String> {
         }
         if agent.state == "exited" {
             print(&json!({"outcome":"process_exited","pane_id":agent.pane_id,"run":agent.run}))?;
-            return Ok(3);
+            return Ok(5);
         }
         if Instant::now() >= deadline {
             print(&json!({"outcome":"timeout","pane_id":agent.pane_id,"run":agent.run}))?;
-            return Ok(4);
+            return Ok(6);
         }
         tokio::time::sleep(
             Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_catalog_verb_reaches_a_dispatcher_before_unknown_command_rejection() {
+        for verb in commands::VERBS {
+            let args = vec![
+                "--socket".to_owned(),
+                "/dev/null".to_owned(),
+                verb.name.to_owned(),
+                "__deliberately_invalid__".to_owned(),
+            ];
+            let error = run(&args).expect_err(verb.name);
+            assert!(
+                !error.starts_with("usage: unknown agent command"),
+                "{} was rejected before its dispatcher: {error}",
+                verb.name
+            );
+        }
     }
 }
