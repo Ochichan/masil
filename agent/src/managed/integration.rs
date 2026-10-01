@@ -903,18 +903,36 @@ async fn hook(
         frontend: mapped.root_binding,
         switch: mapped.session_switch || mapped.allow_root_switch,
     };
-    let result = if let Some(state) = mapped.state {
-        manager
-            .report_snapshot(&agent, sequence, state, mapped.session.as_deref(), origin)
-            .await?
-    } else {
-        let session = mapped
-            .session
-            .as_deref()
-            .ok_or("identity callback did not include a session reference")?;
-        manager
-            .report_identity_snapshot(&agent, sequence, session, origin)
-            .await?
+    let mut agent = agent;
+    let mut retried = false;
+    let result = loop {
+        let attempt = if let Some(state) = mapped.state {
+            manager
+                .report_snapshot(&agent, sequence, state, mapped.session.as_deref(), origin)
+                .await
+        } else {
+            let session = mapped
+                .session
+                .as_deref()
+                .ok_or("identity callback did not include a session reference")?;
+            manager
+                .report_identity_snapshot(&agent, sequence, session, origin)
+                .await
+        };
+        match attempt {
+            // Another writer changed the pane between the read and this
+            // write: read again and let the usual checks decide once more.
+            Err(error) if error == super::REPORT_REJECTED && !retried => {
+                retried = true;
+                agent = manager.get(&pane).await?;
+                if agent.run != run || agent.provider != target.id || agent.process != "running" {
+                    return Err(
+                        "identity_mismatch: stale or mismatched integration callback".into(),
+                    );
+                }
+            }
+            attempt => break attempt?,
+        }
     };
     Ok(Some(json!({
         "stage": "native_callback_recorded",

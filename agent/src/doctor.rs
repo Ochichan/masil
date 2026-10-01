@@ -330,11 +330,11 @@ fn coordinator_check(socket: Option<&Path>) -> Check {
         ),
         "enabled_but_not_running" => (
             Status::Warn,
-            "a feature needs the coordinator but none runs; run `masil-agent agent coordinator start`. A server started with -f has no UI layer and does not restart it after a server restart".to_owned(),
+            "a feature needs the coordinator but none runs; run `masil-agent agent coordinator start`. Autosave brings it back within 30 seconds; a server started with -f or with the UI layer off has no autosave".to_owned(),
         ),
         "stale" => (
             Status::Warn,
-            "a coordinator of an earlier server boot or an older masil-agent answers; the next mutating command replaces it".to_owned(),
+            "a coordinator of an earlier server boot, an older masil-agent or a replaced executable answers; the next mutating command or autosave replaces it".to_owned(),
         ),
         "unresponsive" => (
             Status::Warn,
@@ -345,6 +345,34 @@ fn coordinator_check(socket: Option<&Path>) -> Check {
             "the coordinator socket path beside the server socket is too long for a Unix socket; use a shorter socket path".to_owned(),
         ),
         other => (Status::Warn, format!("unexpected coordinator state {other}")),
+    };
+    // A coordinator that runs another binary or reads other detection
+    // manifests can judge a screen differently from this command.
+    let running = &report["coordinator"];
+    let own_exe = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .ok();
+    let (status, summary) = if state != "running" {
+        (status, summary)
+    } else if running["exe"]["path"].as_str().map(Path::new) != own_exe.as_deref() {
+        (
+            Status::Warn,
+            format!(
+                "the coordinator runs {}, not this masil-agent",
+                running["exe"]["path"]
+                    .as_str()
+                    .unwrap_or("an unknown executable")
+            ),
+        )
+    } else if running["detection_dir"].as_str().map(Path::new)
+        != crate::detection::override_directory().as_deref()
+    {
+        (
+            Status::Warn,
+            "the coordinator reads detection overrides from another directory than this command (XDG_CONFIG_HOME differs from the server's)".to_owned(),
+        )
+    } else {
+        (status, summary)
     };
     Check {
         id,

@@ -12,6 +12,7 @@ mod integration;
 mod operations;
 mod prompt;
 mod remote_cli;
+pub(crate) mod resident;
 mod store;
 mod view;
 
@@ -35,6 +36,14 @@ const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_
 const CAPTURE_BATCH_SIZE: usize = 12;
 const MAX_PS_TTY_ARGUMENT: usize = 4096;
 const TRACKED_REJECTED: &str = "masil-agent-stale";
+/// How long a reported state overrides the screen.
+const REPORT_FRESH_MS: u64 = 30_000;
+/// Panes per server that agent management handles.
+const MAX_PANES: usize = 64;
+const TRACKED_LOST: &str = "identity_mismatch: agent run changed before the action";
+/// A report that lost its guard to a concurrent write; the caller may read
+/// the agent again and retry.
+pub(super) const REPORT_REJECTED: &str = "identity_mismatch: agent state changed before the report";
 
 pub(super) fn server_unreachable(error: String) -> String {
     if [
@@ -364,6 +373,8 @@ pub(crate) struct Manager {
     pub native: native_ui::Context,
     engine: Engine,
     cache: Mutex<HashMap<String, (String, Arc<Evidence>)>>,
+    /// Set only in the coordinator, whose Manager lives across ticks.
+    resident: Option<resident::Resident>,
 }
 
 impl Manager {
@@ -375,6 +386,7 @@ impl Manager {
             native: native_ui::Context { socket, client },
             engine: Engine::load()?,
             cache: Mutex::new(HashMap::new()),
+            resident: None,
         })
     }
 
@@ -406,7 +418,7 @@ impl Manager {
     async fn inventory(&self) -> Result<Vec<Vec<String>>, String> {
         let output = self.command(&["list-panes", "-a", "-F", FORMAT]).await?;
         let records = records(&output)?;
-        if records.len() > 64 {
+        if records.len() > MAX_PANES {
             return Err("agent management supports at most 64 panes per server".into());
         }
         Ok(records)
@@ -541,7 +553,42 @@ impl Manager {
         self.collect(None).await
     }
 
+    /// The agents, with each changed tracked state written. A concurrent
+    /// writer can win a pane's update; one more pass finds that change
+    /// already written. A targeted call ignores lost writes of other panes.
     async fn collect(&self, target: Option<&str>) -> Result<Vec<Agent>, String> {
+        let mut retried = false;
+        loop {
+            let result = self.collect_once(target).await;
+            let lost = match &result {
+                Ok((agents, uncommitted)) => uncommitted.iter().any(|pane| match target {
+                    None => true,
+                    Some(target) => {
+                        pane == target
+                            || agents
+                                .iter()
+                                .any(|agent| &agent.pane_id == pane && agent.name == target)
+                    }
+                }),
+                Err(error) => error.starts_with("identity_mismatch"),
+            };
+            if lost && !retried {
+                retried = true;
+                continue;
+            }
+            return match result {
+                Ok(_) if lost => Err(TRACKED_LOST.into()),
+                result => result.map(|(agents, _)| agents),
+            };
+        }
+    }
+
+    /// One pass of `collect`; also returns the panes whose tracked write did
+    /// not commit.
+    async fn collect_once(
+        &self,
+        target: Option<&str>,
+    ) -> Result<(Vec<Agent>, Vec<String>), String> {
         let inventory = self.inventory().await?;
         validate_inventory(&inventory)?;
         let identified = identify_foregrounds(&inventory).await;
@@ -618,7 +665,7 @@ impl Manager {
             let mut report_authority = None;
             if let Some(report) = metadata.as_ref().and_then(|m| m.report.as_ref())
                 && foreground
-                && now_ms().saturating_sub(report.at) <= 30_000
+                && now_ms().saturating_sub(report.at) <= REPORT_FRESH_MS
             {
                 // A visible blocker is stronger than a hook claiming idle/working.
                 if !evidence.visible_blocker() || report.state == "blocked" {
@@ -654,6 +701,12 @@ impl Manager {
             let changed = previous.run != run
                 || previous.state != state
                 || (state == "blocked" && previous.report_sequence != sequence);
+            // The coordinator stands back where another writer judged the
+            // same screen differently, so the two never trade writes.
+            let changed = changed
+                && self.resident.as_ref().is_none_or(|resident| {
+                    resident.may_write(&fields[0], &fields[14], &fields[12], now_ms())
+                });
             let returned_idle = previous.run == run
                 && state == "idle"
                 && (previous.state == "working" || previous.returned_idle);
@@ -765,10 +818,10 @@ impl Manager {
                 .collect(),
         )
         .await;
-        if !uncommitted.is_empty() {
-            return Err("identity_mismatch: agent run changed before the action".into());
+        if let Some(resident) = &self.resident {
+            resident.remember(&agents, target.is_none());
         }
-        Ok(agents)
+        Ok((agents, uncommitted))
     }
 
     /// Writes each pane's tracked revision under its own guard and returns
@@ -1491,14 +1544,24 @@ impl Manager {
             seen.event = bounded_event(event).unwrap_or_default();
             seen.at = now;
         }
-        self.guarded_input(
-            agent,
-            vec![
-                Self::option(agent, META, encode(&metadata)?),
-                Self::option(agent, EVIDENCE, encode(&evidence)?),
-            ],
-        )
-        .await?;
+        let outcome = self
+            .guarded_input_outcome(
+                agent,
+                vec![
+                    Self::option(agent, META, encode(&metadata)?),
+                    Self::option(agent, EVIDENCE, encode(&evidence)?),
+                ],
+                None,
+            )
+            .await?;
+        if matches!(outcome, Guarded::Rejected) {
+            return Err(REPORT_REJECTED.into());
+        }
+        // A report changes state without output; a watching coordinator
+        // looks again now rather than at its next full pass.
+        if self.resident.is_none() {
+            crate::coordinator::poke(&self.native.socket);
+        }
         Ok(ReportResult {
             binding,
             state_applied: state.is_some(),

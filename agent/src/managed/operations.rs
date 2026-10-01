@@ -504,7 +504,8 @@ impl Store {
 
     /// Coordinator features switched on in the store for `socket` under the
     /// state directory `base`, read without creating or changing anything.
-    /// Empty when no store or no version 2 store exists yet.
+    /// Empty when no store or no version 2 store exists yet. The inbox is a
+    /// feature while its own switch is on, so the two never disagree.
     pub fn enabled_features(base: &Path, socket: &Path) -> Result<Vec<String>, String> {
         let socket = socket
             .canonicalize()
@@ -528,14 +529,21 @@ impl Store {
         if Self::user_version(&conn)? < SCHEMA_VERSION {
             return Ok(Vec::new());
         }
+        // A newer masil-agent owns this store: this one starts nothing for it.
+        Self::check_reader_in(&conn)?;
         let mut statement = conn
             .prepare("SELECT name FROM coordinator_features ORDER BY name")
             .map_err(sql)?;
-        statement
+        let mut features = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(sql)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(sql)
+            .map_err(sql)?;
+        if Self::inbox_enabled_in(&conn)? && !features.iter().any(|name| name == "inbox") {
+            features.push("inbox".into());
+            features.sort();
+        }
+        Ok(features)
     }
 
     /// Random identity of this database, recorded in the server so that a
@@ -1585,6 +1593,46 @@ impl Store {
         Ok(changed)
     }
 
+    /// Runs with open attention events, for the coordinator's check of runs
+    /// whose pane is gone.
+    pub fn open_runs(&self) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT run FROM inbox_events
+                 WHERE resolved_ms IS NULL AND source != 'operation' AND run != ''",
+            )
+            .map_err(sql)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)
+    }
+
+    /// Resolves the open events of a run that ended, observed before `before`;
+    /// later events belong to a pane the caller had not seen yet.
+    pub fn resolve_ended_run(&mut self, run: &str, before: u64, now: u64) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        if !Self::inbox_enabled_in(&tx)? {
+            return Ok(0);
+        }
+        let changed = tx
+            .execute(
+                "UPDATE inbox_events SET resolved_ms = ?3, resolution = 'run_ended'
+                 WHERE run = ?1 AND resolved_ms IS NULL AND source != 'operation'
+                   AND observed_ms < ?2",
+                params![run, before as i64, now as i64],
+            )
+            .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(changed)
+    }
+
     /// Marks events read by ID; unknown IDs are reported back.
     pub fn ack_events(&mut self, ids: &[i64], now: u64) -> Result<Vec<i64>, String> {
         let tx = self
@@ -2521,6 +2569,30 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(resolutions(&store), INBOX_KEEP);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_ended_run_resolves_only_events_seen_before_it_ended() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        store
+            .record_event(&event("a", "r1", "blocked", 10))
+            .unwrap();
+        store
+            .record_event(&event("b", "r1", "blocked", 30))
+            .unwrap();
+        store
+            .record_event(&event("c", "r2", "blocked", 10))
+            .unwrap();
+        let ticket = dispatch(store.admit(&request("d1"), json!({}), 5).unwrap());
+        store.finish(&ticket, UNKNOWN, "test", None, 6).unwrap();
+        let mut runs = store.open_runs().unwrap();
+        runs.sort();
+        assert_eq!(runs, ["r1", "r2"]);
+        assert_eq!(store.resolve_ended_run("r1", 20, 40).unwrap(), 1);
+        assert_eq!(unread(&store), ["b", "c", "run:r1/prompt/1"]);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -26,12 +26,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 static POKES: AtomicUsize = AtomicUsize::new(0);
 
 /// Protocol and feature generation; a client replaces an older coordinator.
-pub(crate) const GENERATION: u64 = 1;
+/// 2: features, `reload`, the screen watch and the executable identity.
+pub(crate) const GENERATION: u64 = 2;
 const REQUEST_FRAME: usize = 8 * 1024;
 const RESPONSE_FRAME: usize = 64 * 1024;
 const CLIENT_LIMIT: usize = 32;
 const DEADLINE: Duration = Duration::from_secs(3);
 const DEFAULT_IDLE: Duration = Duration::from_secs(600);
+const DEFAULT_WATCH: Duration = Duration::from_secs(2);
+/// Features, the executable and the store are checked this often.
+const SUPERVISE_EVERY: Duration = Duration::from_secs(30);
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
 const SPAWN_WAIT: Duration = Duration::from_secs(2);
 const LOCK_RETRY: Duration = Duration::from_secs(1);
@@ -401,6 +405,40 @@ fn current(value: &Value, server: &ServerInfo) -> bool {
         && value["generation"]
             .as_u64()
             .is_some_and(|g| g >= GENERATION)
+        && exe_unchanged(&value["exe"])
+}
+
+/// The executable this process runs, as a path and the file's identity, so
+/// a rebuilt binary is noticed and its coordinator replaced.
+fn exe_identity() -> Value {
+    let Ok(path) = std::env::current_exe().and_then(|path| path.canonicalize()) else {
+        return Value::Null;
+    };
+    match fs::metadata(&path) {
+        Ok(metadata) => json!({
+            "path": path,
+            "dev": metadata.dev(),
+            "ino": metadata.ino(),
+            "size": metadata.size(),
+            "mtime_ns": metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128,
+        }),
+        Err(_) => Value::Null,
+    }
+}
+
+/// Whether the file a coordinator recorded as its executable is still the
+/// same file. An unknown identity counts as changed.
+fn exe_unchanged(recorded: &Value) -> bool {
+    let Some(path) = recorded["path"].as_str() else {
+        return false;
+    };
+    fs::metadata(path).is_ok_and(|metadata| {
+        recorded["dev"].as_u64() == Some(metadata.dev())
+            && recorded["ino"].as_u64() == Some(metadata.ino())
+            && recorded["size"].as_u64() == Some(metadata.size())
+            && recorded["mtime_ns"].as_i64().map(i128::from)
+                == Some(metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128)
+    })
 }
 
 /// Reports the coordinator for `socket` without starting, stopping or
@@ -432,11 +470,9 @@ pub(crate) fn status(socket: &Path) -> Result<Value, String> {
     Ok(report)
 }
 
-/// Starts the coordinator for `socket` unless a current one answers. Only
-/// mutating commands call this. A coordinator of an earlier server boot or
-/// an older generation is stopped and replaced; a stuck one is nudged to
-/// rebind its socket, then terminated.
-pub(crate) fn ensure(socket: &Path) -> Result<Value, String> {
+/// The server, if this process uses its state directory; a command with
+/// another one would act on a store the server never reads.
+pub(crate) fn check_state(socket: &Path) -> Result<ServerInfo, String> {
     let server = server_info(socket)?;
     let own = crate::managed::state_base()?;
     let same_state = match (own.canonicalize(), server.state.canonicalize()) {
@@ -450,6 +486,15 @@ pub(crate) fn ensure(socket: &Path) -> Result<Value, String> {
             server.state.display()
         ));
     }
+    Ok(server)
+}
+
+/// Starts the coordinator for `socket` unless a current one answers. Only
+/// mutating commands call this. A coordinator of an earlier server boot or
+/// an older generation is stopped and replaced; a stuck one is nudged to
+/// rebind its socket, then terminated.
+pub(crate) fn ensure(socket: &Path) -> Result<Value, String> {
+    let server = check_state(socket)?;
     let paths = paths(socket, &server.state)?;
     private_directory(
         paths
@@ -534,8 +579,28 @@ fn idle_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// The quiet watch tick in milliseconds; 0 keeps the default. For tests.
+fn watch_ms() -> u64 {
+    std::env::var("MASIL_AGENTD_WATCH_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|ms| (100..=60_000).contains(ms))
+        .unwrap_or(0)
+}
+
 fn spawn(socket: &Path, paths: &Paths, server: &ServerInfo) -> Result<(), String> {
     let agent = std::env::current_exe()
+        .map(|path| {
+            // Linux names a replaced executable "<path> (deleted)"; the new
+            // one at the same path is the one to start.
+            match path
+                .to_str()
+                .and_then(|text| text.strip_suffix(" (deleted)"))
+            {
+                Some(text) => PathBuf::from(text),
+                None => path,
+            }
+        })
         .and_then(|path| path.canonicalize())
         .map_err(|error| format!("locating masil-agent: {error}"))?;
     let text = |path: &Path, what: &str| -> Result<String, String> {
@@ -552,10 +617,11 @@ fn spawn(socket: &Path, paths: &Paths, server: &ServerInfo) -> Result<(), String
     let server_socket = text(&paths.server, "server socket")?;
     let state = text(&server.state, "state")?;
     let idle = idle_seconds().to_string();
+    let watch = watch_ms().to_string();
     // Values arrive as run-shell arguments, which tmux substitutes without
     // expanding them again; q/s quotes each for the shell. A missing binary
     // exits 0, because a non-zero job status is printed into the pane.
-    let script = "[ -x #{q/s:1} ] || exit 0; exec #{q/s:1} agentd --socket #{q/s:2} --state-dir #{q/s:3} --idle-seconds #{q/s:4} </dev/null >/dev/null 2>&1";
+    let script = "[ -x #{q/s:1} ] || exit 0; exec #{q/s:1} agentd --socket #{q/s:2} --state-dir #{q/s:3} --idle-seconds #{q/s:4} --watch-ms #{q/s:5} </dev/null >/dev/null 2>&1";
     masil(
         socket,
         &[
@@ -566,9 +632,42 @@ fn spawn(socket: &Path, paths: &Paths, server: &ServerInfo) -> Result<(), String
             &server_socket,
             &state,
             &idle,
+            &watch,
         ],
     )
     .map(drop)
+}
+
+/// Starts the coordinator without waiting, unless one answers or holds the
+/// lock (starting or stuck). For commands that must not wait on it.
+pub(crate) fn spawn_detached(socket: &Path) {
+    let Ok(server) = check_state(socket) else {
+        return;
+    };
+    let Ok(paths) = paths(socket, &server.state) else {
+        return;
+    };
+    if hello(&paths.listen).is_some() || lock_held(&paths.lock).unwrap_or(true) {
+        return;
+    }
+    if paths
+        .lock
+        .parent()
+        .is_some_and(|directory| private_directory(directory).is_ok())
+    {
+        let _ = spawn(socket, &paths, &server);
+    }
+}
+
+/// Asks a running coordinator to read its features and detection manifests
+/// again. Never starts one; failures are ignored.
+pub(crate) fn reload(socket: &Path) {
+    let Ok(state) = crate::managed::state_base() else {
+        return;
+    };
+    if let Ok(paths) = paths(socket, &state) {
+        let _ = request(&paths.listen, "reload", HELLO_TIMEOUT);
+    }
 }
 
 /// Tells a running coordinator that the inbox changed. Never starts one,
@@ -609,6 +708,27 @@ pub(crate) fn stop(socket: &Path) -> Result<Value, String> {
     Ok(json!({"state": "stopped"}))
 }
 
+/// For autosave while the inbox is on: brings back a coordinator that ended
+/// or runs a replaced executable. A current one costs one hello and no
+/// process; a store that a newer masil-agent upgraded starts nothing.
+pub(crate) fn revive(socket: &Path) {
+    let Ok(state) = crate::managed::state_base() else {
+        return;
+    };
+    let Ok(paths) = paths(socket, &state) else {
+        return;
+    };
+    let answering = hello(&paths.listen).is_some_and(|value| {
+        value["generation"]
+            .as_u64()
+            .is_some_and(|generation| generation >= GENERATION)
+            && exe_unchanged(&value["exe"])
+    });
+    if !answering {
+        restart_if_enabled(socket);
+    }
+}
+
 /// Starts the coordinator after a server (re)start when a feature that needs
 /// it is switched on. Called by session autosave; creates nothing and
 /// starts nothing otherwise.
@@ -629,12 +749,14 @@ struct Options {
     socket: PathBuf,
     state: PathBuf,
     idle: Duration,
+    watch: Duration,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut socket = None;
     let mut state = None;
     let mut idle = 0u64;
+    let mut watch = 0u64;
     let mut index = 0;
     while index < args.len() {
         let value = args.get(index + 1).ok_or("missing value")?;
@@ -642,9 +764,11 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--socket" => socket = Some(PathBuf::from(value)),
             "--state-dir" => state = Some(PathBuf::from(value)),
             "--idle-seconds" => idle = value.parse().map_err(|_| "invalid idle seconds")?,
+            "--watch-ms" => watch = value.parse().map_err(|_| "invalid watch interval")?,
             _ => {
                 return Err(
-                    "usage: masil-agent agentd --socket S --state-dir DIR --idle-seconds N".into(),
+                    "usage: masil-agent agentd --socket S --state-dir DIR --idle-seconds N [--watch-ms N]"
+                        .into(),
                 );
             }
         }
@@ -661,10 +785,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
     } else {
         DEFAULT_IDLE
     };
+    let watch = if (100..=60_000).contains(&watch) {
+        Duration::from_millis(watch)
+    } else {
+        DEFAULT_WATCH
+    };
     Ok(Options {
         socket,
         state,
         idle,
+        watch,
     })
 }
 
@@ -802,27 +932,148 @@ fn serve_locked(
         watch_parent(server.pid)?;
         let (listener, guard) = bind(&paths.listen)?;
         write_record(lock, &server, started)?;
-        let identity = json!({
-            "generation": GENERATION,
-            "pid": std::process::id(),
-            "server_pid": server.pid,
-            "boot": server.boot,
-            "state_dir": options.state,
-            "started_ms": started,
-            "features": [],
+        let shared = Arc::new(Shared {
+            identity: json!({
+                "generation": GENERATION,
+                "pid": std::process::id(),
+                "server_pid": server.pid,
+                "boot": server.boot,
+                "state_dir": options.state,
+                "detection_dir": crate::detection::override_directory(),
+                "started_ms": started,
+                "exe": exe_identity(),
+            }),
+            features: std::sync::Mutex::new(Vec::new()),
+            control: Arc::new(crate::managed::resident::WatchControl::default()),
+            reload: tokio::sync::Notify::new(),
+            stop: Arc::new(tokio::sync::Notify::new()),
+            last_active: Arc::new(std::sync::Mutex::new(Instant::now())),
+            watch: std::sync::Mutex::new(None),
         });
-        accept_loop(
+        let supervisor = tokio::spawn(supervise(
+            shared.clone(),
+            options.socket.clone(),
+            options.state.clone(),
+            options.watch,
+            paths.log.clone(),
+        ));
+        let result = accept_loop(
             listener,
             guard,
             &paths.listen,
-            identity,
+            &shared,
             &mut signals,
             options.idle,
             limit,
             &paths.log,
         )
-        .await
+        .await;
+        supervisor.abort();
+        // A pass that wrote a tracked state also writes its inbox event:
+        // let it finish rather than drop it half way.
+        shared.control.stopping.store(true, Ordering::SeqCst);
+        shared.control.wake.notify_one();
+        let watch = shared.watch.lock().ok().and_then(|mut watch| watch.take());
+        if let Some(watch) = watch {
+            let _ = tokio::time::timeout(DEADLINE, watch).await;
+        }
+        result
     })
+}
+
+/// What the accept loop, the clients and the supervisor share.
+struct Shared {
+    identity: Value,
+    features: std::sync::Mutex<Vec<String>>,
+    control: Arc<crate::managed::resident::WatchControl>,
+    /// Wakes the supervisor to read the features again.
+    reload: tokio::sync::Notify,
+    stop: Arc<tokio::sync::Notify>,
+    last_active: Arc<std::sync::Mutex<Instant>>,
+    /// The running screen watch, awaited when the process ends.
+    watch: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Shared {
+    fn identity(&self) -> Value {
+        let mut identity = self.identity.clone();
+        identity["features"] = json!(self.features());
+        identity
+    }
+
+    fn features(&self) -> Vec<String> {
+        self.features
+            .lock()
+            .map(|features| features.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Keeps the work in step with the store's features: the screen watch runs
+/// while the inbox is on. Also ends the process when its executable was
+/// replaced, so the next start runs the new one.
+async fn supervise(
+    shared: Arc<Shared>,
+    socket: PathBuf,
+    state: PathBuf,
+    watch: Duration,
+    log_path: PathBuf,
+) {
+    loop {
+        let (socket_for_read, state_for_read) = (socket.clone(), state.clone());
+        // A failed read keeps the last list.
+        if let Ok(Ok(features)) = tokio::task::spawn_blocking(move || {
+            crate::managed::coordinator_features(&state_for_read, &socket_for_read)
+        })
+        .await
+            && let Ok(mut current) = shared.features.lock()
+            && *current != features
+        {
+            if features.is_empty()
+                && let Ok(mut last) = shared.last_active.lock()
+            {
+                // Idle time counts from the moment the last feature went.
+                *last = Instant::now();
+            }
+            *current = features;
+        }
+        let wanted = shared.features().iter().any(|feature| feature == "inbox");
+        if let Ok(mut watcher) = shared.watch.lock() {
+            if wanted
+                && watcher
+                    .as_ref()
+                    .is_none_or(tokio::task::JoinHandle::is_finished)
+            {
+                match crate::managed::Manager::resident(socket.clone(), watch) {
+                    Ok(manager) => {
+                        let path = log_path.clone();
+                        *watcher = Some(tokio::spawn(crate::managed::resident::watch(
+                            manager,
+                            shared.control.clone(),
+                            watch,
+                            move |message: &str| log(&path, message),
+                            shared.stop.clone(),
+                        )));
+                    }
+                    Err(error) => log(&log_path, &format!("watch: {error}")),
+                }
+            } else if !wanted && let Some(handle) = watcher.take() {
+                handle.abort();
+            }
+        }
+        if !exe_unchanged(&shared.identity["exe"]) {
+            log(&log_path, "the masil-agent executable changed; exiting");
+            shared.stop.notify_one();
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(SUPERVISE_EVERY) => {}
+            _ = shared.reload.notified() => {
+                shared.control.reload.store(true, Ordering::SeqCst);
+                shared.control.wake.notify_one();
+            }
+        }
+    }
 }
 
 fn write_starting(lock: &File, started: u64) -> Result<(), String> {
@@ -959,7 +1210,7 @@ async fn accept_loop(
     listener: std::os::unix::net::UnixListener,
     guard: ipc::SocketGuard,
     path: &Path,
-    identity: Value,
+    shared: &Arc<Shared>,
     signals: &mut Signals,
     idle: Duration,
     limit: usize,
@@ -969,15 +1220,17 @@ async fn accept_loop(
         tokio::net::UnixListener::from_std(listener).map_err(|error| error.to_string())?;
     let mut guard = Some(guard);
     let clients = Arc::new(AtomicUsize::new(0));
-    let last_active = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let stop = Arc::new(tokio::sync::Notify::new());
-    let identity = Arc::new(identity);
+    let last_active = shared.last_active.clone();
+    let stop = shared.stop.clone();
+    // A feature is work: the process stays while one is on.
+    let busy =
+        |clients: &AtomicUsize| clients.load(Ordering::SeqCst) > 0 || !shared.features().is_empty();
     loop {
         let quiet_since = *last_active.lock().map_err(|_| "poisoned")?;
-        let deadline = if clients.load(Ordering::SeqCst) == 0 {
-            quiet_since + idle
-        } else {
+        let deadline = if busy(&clients) {
             Instant::now() + idle
+        } else {
+            quiet_since + idle
         };
         tokio::select! {
             accepted = listener.accept() => {
@@ -1001,11 +1254,11 @@ async fn accept_loop(
                     continue;
                 }
                 clients.fetch_add(1, Ordering::SeqCst);
-                let (clients, last_active, stop, identity) =
-                    (clients.clone(), last_active.clone(), stop.clone(), identity.clone());
+                let (clients, last_active, shared) =
+                    (clients.clone(), last_active.clone(), shared.clone());
                 let idle_seconds = idle.as_secs();
                 tokio::spawn(async move {
-                    serve_client(stream, &identity, &clients, idle_seconds, &stop).await;
+                    serve_client(stream, &shared, &clients, idle_seconds).await;
                     if clients.fetch_sub(1, Ordering::SeqCst) == 1
                         && let Ok(mut last) = last_active.lock()
                     {
@@ -1034,7 +1287,7 @@ async fn accept_loop(
                 }
             }
             _ = tokio::time::sleep_until(deadline.into()) => {
-                let quiet = clients.load(Ordering::SeqCst) == 0
+                let quiet = !busy(&clients)
                     && last_active.lock().map(|last| last.elapsed() >= idle).unwrap_or(true);
                 if quiet {
                     break;
@@ -1051,10 +1304,9 @@ async fn accept_loop(
 
 async fn serve_client(
     mut stream: tokio::net::UnixStream,
-    identity: &Value,
+    shared: &Shared,
     clients: &AtomicUsize,
     idle_seconds: u64,
-    stop: &tokio::sync::Notify,
 ) {
     loop {
         let Ok(Ok(body)) =
@@ -1062,14 +1314,14 @@ async fn serve_client(
         else {
             return;
         };
-        let (response, stopping) = respond(&body, identity, clients, idle_seconds);
+        let (response, stopping) = respond(&body, shared, clients, idle_seconds);
         let written = tokio::time::timeout(
             DEADLINE,
             ipc::write_frame(&mut stream, &response, RESPONSE_FRAME),
         )
         .await;
         if stopping {
-            stop.notify_one();
+            shared.stop.notify_one();
             return;
         }
         if !matches!(written, Ok(Ok(()))) {
@@ -1080,7 +1332,7 @@ async fn serve_client(
 
 fn respond(
     body: &[u8],
-    identity: &Value,
+    shared: &Shared,
     clients: &AtomicUsize,
     idle_seconds: u64,
 ) -> (Value, bool) {
@@ -1114,12 +1366,15 @@ fn respond(
     }
     let ok = |value: Value| json!({"v": 1, "id": id.clone(), "ok": true, "value": value});
     match object.get("method").and_then(Value::as_str) {
-        Some("hello") => (ok(identity.clone()), false),
+        Some("hello") => (ok(shared.identity()), false),
         Some("status") => {
-            let mut value = identity.clone();
+            let mut value = shared.identity();
             value["clients"] = json!(clients.load(Ordering::SeqCst));
             value["idle_seconds"] = json!(idle_seconds);
             value["pokes"] = json!(POKES.load(Ordering::SeqCst));
+            if let Ok(report) = shared.control.report.lock() {
+                value["watch"] = json!(*report);
+            }
             // Names only, to show what the environment allowlist kept.
             let mut names: Vec<String> = std::env::vars_os()
                 .map(|(name, _)| name.to_string_lossy().into_owned())
@@ -1129,10 +1384,17 @@ fn respond(
             (ok(value), false)
         }
         Some("stop") => (ok(json!({"stopping": true})), true),
-        // A producer wrote to the inbox; later phases wake consumers here.
+        // A report or inbox write: the watch looks at the panes now.
         Some("poke") => {
             POKES.fetch_add(1, Ordering::SeqCst);
+            shared.control.wake.notify_one();
             (ok(json!({})), false)
+        }
+        // Features or manifests changed; the reply is the identity before
+        // the supervisor reads them.
+        Some("reload") => {
+            shared.reload.notify_one();
+            (ok(shared.identity()), false)
         }
         _ => (failure(&id, "unknown_method", "unknown method"), false),
     }
@@ -1142,16 +1404,32 @@ fn respond(
 mod tests {
     use super::*;
 
+    fn shared() -> Shared {
+        Shared {
+            identity: json!({"generation": GENERATION}),
+            features: std::sync::Mutex::new(vec!["inbox".into()]),
+            control: Arc::default(),
+            reload: tokio::sync::Notify::new(),
+            stop: Arc::default(),
+            last_active: Arc::new(std::sync::Mutex::new(Instant::now())),
+            watch: std::sync::Mutex::new(None),
+        }
+    }
+
     #[test]
     fn requests_need_the_envelope_and_a_known_method() {
-        let identity = json!({"generation": GENERATION});
+        let shared = shared();
         let clients = AtomicUsize::new(2);
-        let call = |text: &str| respond(text.as_bytes(), &identity, &clients, 60);
+        let call = |text: &str| respond(text.as_bytes(), &shared, &clients, 60);
         let (hello, stop) = call(r#"{"v":1,"id":"a","method":"hello"}"#);
         assert_eq!(hello["value"]["generation"], GENERATION);
         assert!(!stop);
+        assert_eq!(hello["value"]["features"], json!(["inbox"]));
         let (status, _) = call(r#"{"v":1,"id":"a","method":"status","params":{}}"#);
         assert_eq!(status["value"]["clients"], 2);
+        assert_eq!(status["value"]["watch"]["ticks"], 0);
+        assert!(!call(r#"{"v":1,"id":"a","method":"reload"}"#).1);
+        assert!(!call(r#"{"v":1,"id":"a","method":"poke"}"#).1);
         assert!(call(r#"{"v":1,"id":"a","method":"stop"}"#).1);
         assert_eq!(
             call(r#"{"v":1,"id":"a","method":"later"}"#).0["error"]["code"],
@@ -1179,6 +1457,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(options.idle, DEFAULT_IDLE);
+        assert_eq!(options.watch, DEFAULT_WATCH);
         assert!(parse(&["--socket".into(), "relative".into()]).is_err());
         assert_eq!(digest16(Path::new("/tmp/a")).len(), 16);
     }

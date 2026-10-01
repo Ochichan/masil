@@ -58,13 +58,30 @@ fn now_ms() -> u64 {
 }
 
 /// Appends one line to a small log in the state directory; inbox writes
-/// must not print, since a hook's output belongs to its provider.
+/// must not print, since a hook's output belongs to its provider. A
+/// long-lived process logs each error code at most once a minute.
 pub(super) fn log(name: &str, value: &Value) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     const LIMIT: u64 = 64 * 1024;
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
     if cfg!(test) {
         return;
+    }
+    let code = value["error"]
+        .as_str()
+        .map(|error| error.split(':').next().unwrap_or(error).to_owned())
+        .unwrap_or_default();
+    if let Ok(mut last) = LAST.get_or_init(Default::default).lock() {
+        let now = now_ms();
+        if last
+            .get(&code)
+            .is_some_and(|at| now.saturating_sub(*at) < 60_000)
+        {
+            return;
+        }
+        last.insert(code, now);
     }
     let Ok(base) = super::operations::state_base() else {
         return;
@@ -144,7 +161,7 @@ impl Manager {
     /// The store instance to write to when the inbox is on. After a server
     /// start the server knows neither the switch nor the store, so the
     /// first producer fills both from the existing store.
-    async fn inbox_instance(&self) -> Option<String> {
+    pub(super) async fn inbox_instance(&self) -> Option<String> {
         let text = self
             .command(&[
                 "display-message",
@@ -196,6 +213,16 @@ impl Manager {
         if effects.is_empty() {
             return;
         }
+        // The coordinator keeps its connection and is the one poked.
+        if self.is_resident() {
+            if let Err(error) = self
+                .with_resident_store(move |store| apply(store, &effects))
+                .await
+            {
+                log("inbox.log", &json!({"error": error}));
+            }
+            return;
+        }
         let Some(instance) = self.inbox_instance().await else {
             return;
         };
@@ -217,7 +244,17 @@ impl Manager {
 /// Switches the inbox on or off. Enable sets the cached switch first and
 /// disable clears the store's switch first, so a failure part way leaves
 /// the cache on, which only costs a store open per event.
+///
+/// The coordinator watches while the inbox is on: enable starts it, and
+/// both tell a running one to read its features again. A coordinator that
+/// does not start leaves the inbox on; commands still write their events.
 pub(super) async fn set_enabled(manager: &Manager, enabled: bool) -> Result<Value, String> {
+    // The store must be the server's: another state directory would switch
+    // an inbox that no producer reads.
+    let socket = manager.native.socket.clone();
+    tokio::task::spawn_blocking(move || crate::coordinator::check_state(&socket))
+        .await
+        .map_err(|error| error.to_string())??;
     if enabled {
         manager
             .command(&["set-option", "-gq", "@masil-inbox", "on"])
@@ -230,7 +267,27 @@ pub(super) async fn set_enabled(manager: &Manager, enabled: bool) -> Result<Valu
             .command(&["set-option", "-gq", "@masil-inbox", "off"])
             .await?;
     }
-    Ok(json!({"inbox": if enabled { "on" } else { "off" }}))
+    let socket = manager.native.socket.clone();
+    let coordinator = tokio::task::spawn_blocking(move || {
+        if !enabled {
+            crate::coordinator::reload(&socket);
+            return None;
+        }
+        Some(match crate::coordinator::ensure(&socket) {
+            Ok(_) => {
+                crate::coordinator::reload(&socket);
+                "running".to_owned()
+            }
+            Err(error) => format!("error: {error}"),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut value = json!({"inbox": if enabled { "on" } else { "off" }});
+    if let Some(coordinator) = coordinator {
+        value["coordinator"] = json!(coordinator);
+    }
+    Ok(value)
 }
 
 /// The inbox read-only: an absent store or table is an empty inbox.
@@ -339,9 +396,27 @@ pub(super) async fn command(manager: &Manager, args: &[String]) -> Result<Value,
                 }
                 None => false,
             };
-            Ok(
-                json!({"enabled": stored, "cache": cached, "repaired": repaired, "recording": recording}),
-            )
+            let socket = manager.native.socket.clone();
+            let coordinator =
+                tokio::task::spawn_blocking(move || crate::coordinator::status(&socket))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map(|status| {
+                        let watch = &status["coordinator"]["watch"];
+                        json!({
+                            "state": status["state"],
+                            "last_tick_ms": watch["last_tick_ms"],
+                            "last_error": watch["last_error"],
+                        })
+                    })
+                    .unwrap_or_else(|error| json!({"state": "unknown", "last_error": error}));
+            Ok(json!({
+                "enabled": stored,
+                "cache": cached,
+                "repaired": repaired,
+                "recording": recording,
+                "coordinator": coordinator,
+            }))
         }
         _ => Err(usage()),
     }

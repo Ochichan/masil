@@ -124,15 +124,16 @@ pub(super) fn launch_digest(
 
 impl Manager {
     /// Runs of live panes, as `collect` names them, and the server boot.
-    async fn live_runs(&self) -> Result<(HashSet<String>, String), String> {
+    pub(super) async fn live_runs(&self) -> Result<(HashSet<String>, String), String> {
         let inventory = self.inventory().await?;
         super::validate_inventory(&inventory)?;
         let boot = match inventory.first() {
             Some(fields) => fields[5].clone(),
             None => self.boot().await?,
         };
-        // Both names a pane's run can have: stale metadata makes `collect`
-        // fall back to the synthetic one, so keep either alive.
+        // Every name a pane's run can have: stale metadata makes `collect`
+        // fall back to the synthetic one, and a stopped agent (Ctrl-Z) is
+        // no longer the foreground but keeps its tracked run.
         let runs = inventory
             .iter()
             .flat_map(|fields| {
@@ -140,6 +141,7 @@ impl Manager {
                 decode::<super::Metadata>(&fields[11])
                     .map(|meta| meta.run)
                     .into_iter()
+                    .chain(decode::<super::Tracked>(&fields[12]).map(|tracked| tracked.run))
                     .chain([synthetic])
             })
             .collect();

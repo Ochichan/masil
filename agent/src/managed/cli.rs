@@ -368,6 +368,20 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     client_key(boot, operation, "--boot BOOT")?,
                 )
                 .await?;
+            // A new agent needs watching: start a coordinator that should be
+            // running and is not, without waiting for it (D1).
+            let socket = manager.native.socket.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let enabled = super::state_base()
+                    .and_then(|base| super::coordinator_features(&base, &socket))
+                    .is_ok_and(|features| !features.is_empty());
+                if enabled {
+                    crate::coordinator::spawn_detached(&socket);
+                    // A running one looks at the new pane now.
+                    crate::coordinator::poke(&socket);
+                }
+            })
+            .await;
             return print_record(&manager, &outcome, false).await;
         }
         "rename" | "attach" if args.len() == 2 => {
@@ -569,6 +583,8 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "reload" if args.is_empty() => {
             manager.reload()?;
+            let socket = manager.native.socket.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::coordinator::reload(&socket)).await;
             print(
                 &json!({"stage":"manifests_validated","note":"new commands and views load current overrides"}),
             )?;

@@ -1053,7 +1053,7 @@ fn unavailable_explanation(provider: &str, warning: &str) -> Value {
     explanation
 }
 
-fn override_directory() -> Option<PathBuf> {
+pub(crate) fn override_directory() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(path).join("masil").join("agent-detection"));
     }
