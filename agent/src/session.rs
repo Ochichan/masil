@@ -506,7 +506,7 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
         let resume = agents.get(f[3]).cloned().filter(|argv| safe_argv(argv));
         let command = if resume.is_none() {
             (group > 0 && group != pid)
-                .then(|| process_argv(group))
+                .then(|| crate::process::argv(group))
                 .flatten()
                 .filter(|argv| is_allowed(argv, &allowed))
                 .filter(|argv| safe_argv(argv))
@@ -610,78 +610,6 @@ fn resumable_agents(socket: &str) -> HashMap<String, Vec<String>> {
         }
     }
     map
-}
-
-/// The exact argv of a process.
-#[cfg(target_os = "macos")]
-fn process_argv(pid: i32) -> Option<Vec<String>> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    let mut argmax: libc::c_int = 0;
-    let mut size = std::mem::size_of::<libc::c_int>();
-    // SAFETY: the buffers match the sizes passed to sysctl.
-    let ok = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            2,
-            (&mut argmax as *mut libc::c_int).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if ok != 0 || argmax <= 0 {
-        return None;
-    }
-    let mut buffer = vec![0u8; argmax as usize];
-    let mut size = buffer.len();
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-    // SAFETY: as above; the kernel writes at most size bytes.
-    let ok = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            buffer.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if ok != 0 || size < 4 {
-        return None;
-    }
-    parse_procargs(&buffer[..size])
-}
-
-#[cfg(target_os = "macos")]
-fn parse_procargs(buffer: &[u8]) -> Option<Vec<String>> {
-    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
-    if argc <= 0 || argc as usize > MAX_ARGS {
-        return None;
-    }
-    let rest = &buffer[4..];
-    // The executable path, then NUL padding, then argc arguments.
-    let path_end = rest.iter().position(|&b| b == 0)?;
-    let mut position = path_end;
-    while rest.get(position) == Some(&0) {
-        position += 1;
-    }
-    let mut argv = Vec::new();
-    for part in rest[position..].split(|&b| b == 0).take(argc as usize) {
-        argv.push(String::from_utf8(part.to_vec()).ok()?);
-    }
-    (argv.len() == argc as usize).then_some(argv)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn process_argv(pid: i32) -> Option<Vec<String>> {
-    let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let mut argv = Vec::new();
-    for part in bytes.split(|&b| b == 0) {
-        if !part.is_empty() {
-            argv.push(String::from_utf8(part.to_vec()).ok()?);
-        }
-    }
-    (!argv.is_empty() && argv.len() <= MAX_ARGS).then_some(argv)
 }
 
 // ---------------------------------------------------------------- storage
@@ -2127,20 +2055,5 @@ mod tests {
         assert!(validate(&snapshot).is_err());
         assert!(!safe_argv(&["tail".into(), "a\u{3}".into()]));
         assert_eq!(clean("a\tb"), "a_b");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn procargs_layout_is_parsed() {
-        let mut buffer = 2i32.to_ne_bytes().to_vec();
-        buffer.extend_from_slice(b"/usr/bin/vim\0\0\0vim\0a b\0HOME=/x\0");
-        assert_eq!(
-            parse_procargs(&buffer),
-            Some(vec!["vim".to_string(), "a b".to_string()])
-        );
-        assert_eq!(
-            process_argv(std::process::id() as i32).map(|argv| !argv.is_empty()),
-            Some(true)
-        );
     }
 }

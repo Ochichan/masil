@@ -198,6 +198,107 @@ pub fn identify(command: &str) -> Option<&'static Provider> {
     identify_script(script)
 }
 
+/// Whether a Codex executable accepts `--no-daemon` (Codex 0.156 and later),
+/// judged from its local `--help` output and cached by path, size and
+/// modification time. A Codex started with it runs its session in the TUI
+/// process, so provider hooks carry that pane's environment rather than the
+/// shared daemon's. An unreadable or slow probe means no.
+pub(crate) fn codex_no_daemon(executable: &std::path::Path) -> bool {
+    use serde_json::{Value, json};
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let Ok(metadata) = std::fs::metadata(executable) else {
+        return false;
+    };
+    let key = executable.to_string_lossy().into_owned();
+    let stamp = json!({"size": metadata.size(), "mtime": metadata.mtime(), "mtime_ns": metadata.mtime_nsec()});
+    let cache = crate::managed::state_base()
+        .ok()
+        .map(|base| base.join("masil/provider-probe.json"));
+    let mut entries = cache
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(entry) = entries.get(&key)
+        && entry["stamp"] == stamp
+    {
+        return entry["codex_no_daemon"] == true;
+    }
+    let Ok(mut child) = Command::new(executable)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return false;
+    };
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = (&mut stdout).take(256 * 1024).read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let help = reader.join().unwrap_or_default();
+    if !finished {
+        return false;
+    }
+    let supported = help.contains("--no-daemon");
+    entries.insert(key, json!({"stamp": stamp, "codex_no_daemon": supported}));
+    if let Some(path) = cache
+        && let Some(directory) = path.parent()
+        && std::fs::create_dir_all(directory).is_ok()
+    {
+        let temporary = path.with_extension("json.tmp");
+        if std::fs::write(&temporary, Value::Object(entries).to_string()).is_ok() {
+            let _ = std::fs::rename(&temporary, &path);
+        }
+    }
+    supported
+}
+
+/// Identifies the provider a running process belongs to from its argv. A
+/// runtime (Node, Bun, Python) is judged by its script; any other program
+/// by its executable name, whatever arguments follow, so a provider's own
+/// helper processes such as `codex app-server` count as that provider.
+pub(crate) fn identify_process(argv: &[String]) -> Option<&'static Provider> {
+    let first = argv.first()?;
+    let runtime = normalize_name(first);
+    if matches!(runtime.as_str(), "node" | "nodejs" | "bun") {
+        if runtime == "node" && cursor_bundled_node(argv) {
+            return find("cursor");
+        }
+        return identify_script(runtime_script(
+            argv,
+            &["-e", "--eval", "-p", "--print"],
+            &[],
+        )?);
+    }
+    if is_python_runtime(&runtime) {
+        return identify_script(runtime_script(argv, &["-c"], &["-m"])?);
+    }
+    // normalize_name trims the padding a process title rewrite leaves.
+    identify_executable(first)
+}
+
 fn cursor_bundled_node(argv: &[String]) -> bool {
     let Some((runtime_parent, runtime_name)) = argv.first().and_then(|path| parent_and_name(path))
     else {

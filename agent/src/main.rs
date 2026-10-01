@@ -13,6 +13,7 @@ mod managed;
 mod native_ui;
 mod observation;
 mod opencode;
+mod process;
 mod providers;
 mod session;
 mod ui;

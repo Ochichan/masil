@@ -657,6 +657,144 @@ async fn hook_from_stdin(
     hook(manager, target, action.map(String::as_str), &bytes).await
 }
 
+/// One process between the hook and the pane.
+#[derive(Clone, Debug, PartialEq)]
+struct Ancestor {
+    group: i32,
+    provider: Option<&'static str>,
+    /// A Node, Bun or Python program started with a provider's script: a
+    /// launcher whose direct child may be the provider's native program.
+    launcher: bool,
+    /// A shell, as provider hook runners use to start a hook command.
+    shell: bool,
+}
+
+const MAX_ANCESTRY: usize = 32;
+const HOOK_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh"];
+
+/// The processes from this process's parent up to and including `pane_pid`,
+/// or None when the walk does not reach the pane. Each parent must have
+/// started no later than its child, so a reused process ID cannot be
+/// spliced into the path.
+fn ancestry(pane_pid: i32) -> Option<Vec<Ancestor>> {
+    // SAFETY: getppid has no preconditions.
+    let first = unsafe { libc::getppid() };
+    let mut pid = first;
+    let mut child_started = u64::MAX;
+    let mut chain = Vec::new();
+    for _ in 0..MAX_ANCESTRY {
+        if pid <= 1 {
+            return None;
+        }
+        let info = crate::process::info(pid)?;
+        if info.started > child_started {
+            return None;
+        }
+        let argv = crate::process::argv(pid).unwrap_or_default();
+        let name = argv
+            .first()
+            .map(|program| program.trim().rsplit('/').next().unwrap_or_default())
+            .unwrap_or_default();
+        chain.push(Ancestor {
+            group: info.group,
+            provider: crate::providers::identify_process(&argv).map(|provider| provider.id),
+            launcher: crate::providers::is_runtime(&name.to_ascii_lowercase()),
+            shell: HOOK_SHELLS.contains(&name.trim_start_matches('-')),
+        });
+        if pid == pane_pid {
+            // SAFETY: as above; the parent must not have changed meanwhile.
+            return (unsafe { libc::getppid() } == first).then_some(chain);
+        }
+        child_started = info.started;
+        pid = info.parent;
+    }
+    None
+}
+
+/// Refuses a callback only on evidence that it did not come from the pane's
+/// own provider; it is accident prevention within one user, not proof of
+/// origin, and passing it authorizes nothing.
+/// - The hook must descend from the pane.
+/// - Between the hook and the pane, a process outside the pane's foreground
+///   group must be a hook shell; anything else, such as a shared provider
+///   daemon, is refused whatever its name.
+/// - At most one provider run: a launcher and its direct native child are
+///   one run; any other provider process, like a nested `claude -p` or a
+///   provider's own helper, starts another.
+///
+/// With no provider identified on the path the callback is accepted, as
+/// before this check.
+fn provenance(chain: Option<&[Ancestor]>, provider: &str, foreground: i32) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "identity_mismatch: callback did not come from this pane's provider process ({why})"
+        ))
+    };
+    let Some(chain) = chain else {
+        return refuse("it does not descend from the pane");
+    };
+    let below_pane = &chain[..chain.len().saturating_sub(1)];
+    if below_pane
+        .iter()
+        .any(|process| process.group != foreground && !process.shell)
+    {
+        return refuse(
+            "a process outside the pane's foreground group, such as a shared provider daemon",
+        );
+    }
+    let mut runs: Vec<&'static str> = Vec::new();
+    let mut previous: Option<&Ancestor> = None;
+    for process in chain {
+        if let Some(id) = process.provider {
+            let joins =
+                previous.is_some_and(|child| child.provider == Some(id) && process.launcher);
+            if !joins {
+                runs.push(id);
+            }
+        }
+        previous = Some(process);
+    }
+    match runs.as_slice() {
+        [] => Ok(()),
+        [only] if *only != provider => refuse("another provider's process"),
+        [_] => Ok(()),
+        _ => refuse("a nested provider"),
+    }
+}
+
+/// Appends a refused callback to a bounded log that doctor reports, since a
+/// hook's stderr is rarely shown by the provider.
+fn log_refusal(provider: &str, pane: &str, reason: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    const LIMIT: u64 = 64 * 1024;
+    let Ok(base) = super::operations::state_base() else {
+        return;
+    };
+    let directory = base.join("masil");
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let path = directory.join("integration-refusals.log");
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > LIMIT) {
+        let _ = std::fs::rename(&path, directory.join("integration-refusals.log.1"));
+    }
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        let line = json!({"at_ms": at, "provider": provider, "pane": pane, "reason": reason});
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 async fn hook(
     manager: &Manager,
     target: &Target,
@@ -677,6 +815,14 @@ async fn hook(
     let agent = manager.get(&pane).await?;
     if agent.run != run || agent.provider != target.id || agent.process != "running" {
         return Err("identity_mismatch: stale or mismatched integration callback".into());
+    }
+    // The environment names the pane, but a shared provider daemon or a
+    // nested provider carries another pane's environment; the process tree
+    // decides. A managed pane's process is its foreground group leader.
+    let foreground = agent.foreground_group;
+    if let Err(error) = provenance(ancestry(foreground).as_deref(), target.id, foreground) {
+        log_refusal(target.id, &pane, &error);
+        return Err(error);
     }
     if matches!(target.id, "opencode" | "kilo") {
         if mapped.child_session {
@@ -1151,6 +1297,107 @@ fn normalize_event(event: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn process(group: i32, provider: Option<&'static str>) -> Ancestor {
+        Ancestor {
+            group,
+            provider,
+            launcher: false,
+            shell: false,
+        }
+    }
+
+    fn shell(group: i32) -> Ancestor {
+        Ancestor {
+            shell: true,
+            ..process(group, None)
+        }
+    }
+
+    fn launcher(group: i32, provider: &'static str) -> Ancestor {
+        Ancestor {
+            launcher: true,
+            ..process(group, Some(provider))
+        }
+    }
+
+    #[test]
+    fn callbacks_from_the_panes_own_provider_are_accepted() {
+        // hook <- sh (own session) <- claude <- zsh (pane).
+        let claude = [shell(40), process(20, Some("claude")), process(20, None)];
+        assert!(provenance(Some(&claude), "claude", 20).is_ok());
+        // Codex embedded: hook <- sh -lc <- native codex <- node codex (pane).
+        let codex = [shell(41), process(21, Some("codex")), launcher(21, "codex")];
+        assert!(provenance(Some(&codex), "codex", 21).is_ok());
+        // Nothing identified on the path: accepted as before the check.
+        let unknown = [process(22, None), process(22, None)];
+        assert!(provenance(Some(&unknown), "pi", 22).is_ok());
+    }
+
+    #[test]
+    fn shared_daemons_nested_providers_and_outside_calls_are_refused() {
+        // hook <- sh <- app-server daemon (own group, any name) <- TUI <- node.
+        for daemon_name in [Some("codex"), None] {
+            let daemon = [
+                shell(50),
+                process(45, daemon_name),
+                process(21, Some("codex")),
+                launcher(21, "codex"),
+            ];
+            let error = provenance(Some(&daemon), "codex", 21).unwrap_err();
+            assert!(error.contains("shared provider daemon"), "{error}");
+        }
+        // hook <- sh <- claude -p <- bash <- codex (pane).
+        let nested = [
+            shell(60),
+            process(21, Some("claude")),
+            process(21, None),
+            process(21, Some("codex")),
+        ];
+        assert!(
+            provenance(Some(&nested), "codex", 21)
+                .unwrap_err()
+                .contains("nested")
+        );
+        // A shell that execs its last command leaves the providers adjacent.
+        let exec_nested = [
+            shell(61),
+            process(21, Some("claude")),
+            process(21, Some("codex")),
+        ];
+        assert!(
+            provenance(Some(&exec_nested), "codex", 21)
+                .unwrap_err()
+                .contains("nested")
+        );
+        // A provider's own helper under its TUI is a second run, not a launcher.
+        let helper = [
+            shell(62),
+            process(21, Some("codex")),
+            process(21, Some("codex")),
+        ];
+        assert!(
+            provenance(Some(&helper), "codex", 21)
+                .unwrap_err()
+                .contains("nested")
+        );
+        let other = [process(21, Some("opencode")), process(21, None)];
+        assert!(
+            provenance(Some(&other), "claude", 21)
+                .unwrap_err()
+                .contains("another")
+        );
+        assert!(
+            provenance(None, "claude", 21)
+                .unwrap_err()
+                .contains("descend")
+        );
+        for refused in [&nested[..], &other[..], &helper[..]] {
+            let error = provenance(Some(refused), "codex", 21).unwrap_err();
+            assert!(error.starts_with("identity_mismatch:"), "{error}");
+        }
+    }
+
     use super::*;
 
     fn object(source: &str) -> Map<String, Value> {

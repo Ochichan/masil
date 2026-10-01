@@ -1118,6 +1118,11 @@ impl Manager {
         argv.extend_from_slice(args);
         let executable = executable(&argv[0])?;
         argv[0] = executable.to_string_lossy().into_owned();
+        // Codex's shared daemon runs every session with the first TUI's
+        // environment, so hooks would name the wrong pane.
+        if provider.id == "codex" && providers::codex_no_daemon(&executable) {
+            argv.insert(1, "--no-daemon".into());
+        }
         Ok(PreparedLaunch {
             provider,
             cwd,

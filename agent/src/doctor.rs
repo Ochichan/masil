@@ -246,7 +246,56 @@ async fn diagnose(options: &Options) -> Vec<Check> {
     checks.push(coordinator_check(
         options.socket.as_deref().filter(|_| server.is_some()),
     ));
+    checks.push(callbacks_check());
     checks
+}
+
+/// Integration callbacks refused in the last day because they did not come
+/// from their pane's own provider process; a provider rarely shows a hook's
+/// error output.
+fn callbacks_check() -> Check {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    let id = "integration.callbacks";
+    let path = crate::managed::state_base()
+        .ok()
+        .map(|base| base.join("masil/integration-refusals.log"));
+    let text = path
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let now = now_ms();
+    let recent: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["at_ms"].as_u64().is_some_and(|at| at + DAY_MS >= now))
+        .collect();
+    if recent.is_empty() {
+        return Check {
+            id,
+            status: Status::Ok,
+            summary: "no integration callback was refused in the last day".into(),
+            detail: json!({"refused": 0}),
+        };
+    }
+    let mut counts = serde_json::Map::new();
+    for entry in &recent {
+        let key = format!(
+            "{}: {}",
+            entry["provider"].as_str().unwrap_or("?"),
+            crate::managed::failure::human(entry["reason"].as_str().unwrap_or("?"))
+        );
+        let count = counts.get(&key).and_then(Value::as_u64).unwrap_or(0);
+        counts.insert(key, json!(count + 1));
+    }
+    Check {
+        id,
+        status: Status::Warn,
+        summary: format!(
+            "{} integration callback(s) were refused in the last day because they did not come from their pane's provider process; for Codex, start it with masil or with --no-daemon",
+            recent.len()
+        ),
+        detail: json!({"refused": recent.len(), "by_reason": counts}),
+    }
 }
 
 /// The coordinator for the server, read without starting, stopping or
