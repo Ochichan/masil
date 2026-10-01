@@ -91,7 +91,59 @@ INSERT INTO meta VALUES ('min_reader', 2);
 
 /// Additive schema per feature, applied once each in any order. Later
 /// phases add entries; names are never reused.
-const FEATURES: &[(&str, &str)] = &[];
+const FEATURES: &[(&str, &str)] = &[("inbox", INBOX_SCHEMA)];
+
+/// Durable attention events (docs/inbox.md). AUTOINCREMENT keeps public IDs
+/// unique after pruning; a resolution may arrive before its request.
+const INBOX_SCHEMA: &str = "
+CREATE TABLE inbox_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  store_seq INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  source_ref TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  pane TEXT NOT NULL,
+  run TEXT NOT NULL,
+  revision INTEGER,
+  kind TEXT NOT NULL,
+  native_ref TEXT,
+  summary TEXT,
+  observed_ms INTEGER NOT NULL,
+  acked_ms INTEGER,
+  resolved_ms INTEGER,
+  resolution TEXT,
+  UNIQUE (source, source_ref)
+);
+CREATE INDEX inbox_open ON inbox_events(resolved_ms, acked_ms, store_seq);
+CREATE INDEX inbox_run ON inbox_events(run, store_seq);
+CREATE TABLE inbox_resolutions (
+  source TEXT NOT NULL,
+  source_ref TEXT NOT NULL,
+  resolved_ms INTEGER NOT NULL,
+  resolution TEXT NOT NULL,
+  PRIMARY KEY (source, source_ref)
+);
+INSERT INTO meta VALUES ('inbox_fence', 0);
+INSERT INTO meta VALUES ('inbox_enabled', 0);
+INSERT INTO meta VALUES ('inbox_dropped', 0);
+";
+const INBOX_KEEP: i64 = 4096;
+const INBOX_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const INBOX_SUMMARY_BYTES: usize = 2048;
+
+/// One attention event as a producer reports it.
+pub(super) struct InboxEvent<'a> {
+    pub source: &'a str,
+    pub source_ref: &'a str,
+    pub provider: &'a str,
+    pub pane: &'a str,
+    pub run: &'a str,
+    pub revision: Option<i64>,
+    pub kind: &'a str,
+    pub native_ref: Option<&'a str>,
+    pub summary: Option<Value>,
+    pub observed_ms: u64,
+}
 
 #[derive(Debug)]
 pub(super) struct Store {
@@ -901,6 +953,22 @@ impl Store {
             })
             .map_err(sql)?;
         let record = Self::record_in(&tx, &key)?.ok_or("operation disappeared")?;
+        if state == UNKNOWN {
+            // An unknown outcome needs a person; the inbox records it once.
+            let event = InboxEvent {
+                source: "operation",
+                source_ref: &record.operation_key,
+                provider: "",
+                pane: &record.target,
+                run: record.run.as_deref().unwrap_or(""),
+                revision: None,
+                kind: "operation_unknown",
+                native_ref: Some(&record.operation_key),
+                summary: Some(json!({"action": record.action})),
+                observed_ms: now,
+            };
+            Self::inbox_insert_in(&tx, &event)?;
+        }
         tx.commit().map_err(sql)?;
         Ok(record)
     }
@@ -1111,6 +1179,490 @@ impl Store {
         }
         tx.commit().map_err(sql)?;
         Ok(removed)
+    }
+
+    /// Opens the existing store for `socket` without creating anything, for
+    /// event producers: None when there is no store yet or its instance is
+    /// not the one the server recorded.
+    pub fn open_existing(socket: &Path, instance: &str) -> Result<Option<Self>, String> {
+        let Ok(directory) = state_base().map(|base| base.join("masil/operations")) else {
+            return Ok(None);
+        };
+        let Ok(directory) = directory.canonicalize() else {
+            return Ok(None);
+        };
+        let path = directory.join(store_name(socket));
+        if fs::symlink_metadata(&path).is_err() {
+            return Ok(None);
+        }
+        let store = Self::open_path(&path)?;
+        // Producers never wait long: an event is best-effort.
+        store
+            .conn
+            .busy_timeout(Duration::from_millis(200))
+            .map_err(sql)?;
+        Ok((store.instance()?.to_string() == instance).then_some(store))
+    }
+
+    /// The store for `socket` opened read-only without creating anything;
+    /// None when it does not exist or predates schema 2.
+    fn readonly(socket: &Path) -> Result<Option<Self>, String> {
+        let Ok(socket) = socket.canonicalize() else {
+            return Ok(None);
+        };
+        let Ok(directory) = state_base().map(|base| base.join("masil/operations")) else {
+            return Ok(None);
+        };
+        let Ok(directory) = directory.canonicalize() else {
+            return Ok(None);
+        };
+        let path = directory.join(store_name(&socket));
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return Ok(None);
+        };
+        super::store::validate_private_metadata(&metadata, "operation store")?;
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(sql)?;
+        conn.busy_timeout(Duration::from_millis(200)).map_err(sql)?;
+        if Self::user_version(&conn)? < SCHEMA_VERSION {
+            return Ok(None);
+        }
+        Ok(Some(Self { conn, path }))
+    }
+
+    /// The store's inbox switch, read without creating or changing anything.
+    pub fn inbox_flag(socket: &Path) -> bool {
+        Self::readonly(socket)
+            .ok()
+            .flatten()
+            .is_some_and(|store| store.inbox_enabled().unwrap_or(false))
+    }
+
+    /// The inbox read without creating or changing anything; None when there
+    /// is no store or no inbox table yet.
+    pub fn inbox_readonly(socket: &Path, all: bool, limit: usize) -> Result<Option<Value>, String> {
+        let Some(store) = Self::readonly(socket)? else {
+            return Ok(None);
+        };
+        let has_table: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'inbox_events')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if !has_table {
+            return Ok(None);
+        }
+        let mut value = store.inbox(all, limit)?;
+        value["enabled"] = json!(store.inbox_enabled()?);
+        Ok(Some(value))
+    }
+
+    /// Whether the inbox is switched on; false before the inbox feature
+    /// exists in this store.
+    pub fn inbox_enabled(&self) -> Result<bool, String> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'inbox_enabled'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(sql)?
+            == Some(1))
+    }
+
+    pub fn set_inbox_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        tx.execute(
+            "UPDATE meta SET value = ?1 WHERE name = 'inbox_enabled'",
+            [i64::from(enabled)],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
+    /// Records one attention event if the inbox is on; an existing event
+    /// with the same source key is left as it is. Returns the new event ID.
+    pub fn record_event(&mut self, event: &InboxEvent<'_>) -> Result<Option<i64>, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let id = Self::inbox_insert_in(&tx, event)?;
+        tx.commit().map_err(sql)?;
+        Ok(id)
+    }
+
+    fn inbox_insert_in(
+        tx: &rusqlite::Transaction<'_>,
+        event: &InboxEvent<'_>,
+    ) -> Result<Option<i64>, String> {
+        let enabled: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'inbox_enabled'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        if enabled != Some(1) {
+            return Ok(None);
+        }
+        if event.source == "screen" {
+            // A provider callback already recorded this request, or the
+            // turn's end, more precisely than the screen can.
+            let covered: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM inbox_events
+                       WHERE run = ?1 AND source LIKE 'hook:%' AND (
+                         (?2 = 'blocked' AND kind IN ('blocked', 'approval_requested', 'question_asked')
+                            AND resolved_ms IS NULL)
+                         OR (?2 = 'returned_idle' AND kind = 'turn_completed' AND observed_ms >= ?3)))",
+                    params![event.run, event.kind, event.observed_ms.saturating_sub(30_000) as i64],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            if covered {
+                return Ok(None);
+            }
+        }
+        let seq = Self::next_seq(tx)?;
+        // A resolution seen first makes a late request arrive resolved.
+        let resolution: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT resolved_ms, resolution FROM inbox_resolutions WHERE source = ?1 AND source_ref = ?2",
+                params![event.source, event.source_ref],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql)?;
+        let summary = event
+            .summary
+            .as_ref()
+            .map(Value::to_string)
+            .filter(|text| text.len() <= INBOX_SUMMARY_BYTES);
+        let inserted = tx
+            .execute(
+                "INSERT INTO inbox_events (store_seq, source, source_ref, provider, pane, run, revision,
+                   kind, native_ref, summary, observed_ms, resolved_ms, resolution)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT (source, source_ref) DO NOTHING",
+                params![
+                    seq,
+                    event.source,
+                    event.source_ref,
+                    event.provider,
+                    event.pane,
+                    event.run,
+                    event.revision,
+                    event.kind,
+                    event.native_ref,
+                    summary,
+                    event.observed_ms as i64,
+                    resolution.as_ref().map(|(at, _)| *at),
+                    resolution.as_ref().map(|(_, why)| why.as_str()),
+                ],
+            )
+            .map_err(sql)?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        let id = tx.last_insert_rowid();
+        if event.source.starts_with("hook:")
+            && matches!(
+                event.kind,
+                "blocked" | "approval_requested" | "question_asked"
+            )
+        {
+            // The callback describes the screen's `blocked` more precisely.
+            tx.execute(
+                "UPDATE inbox_events SET resolved_ms = ?2, resolution = 'covered'
+                 WHERE run = ?1 AND source = 'screen' AND kind = 'blocked' AND resolved_ms IS NULL",
+                params![event.run, event.observed_ms as i64],
+            )
+            .map_err(sql)?;
+        }
+        Self::inbox_prune_in(tx, event.observed_ms)?;
+        Ok(Some(id))
+    }
+
+    /// Keeps at most INBOX_KEEP events for INBOX_RETENTION_MS, removing read
+    /// or resolved events first; unread ones removed over the cap are counted.
+    fn inbox_prune_in(tx: &rusqlite::Transaction<'_>, now: u64) -> Result<(), String> {
+        let fence: i64 = tx
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'inbox_fence'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        tx.execute(
+            "DELETE FROM inbox_events WHERE observed_ms < ?1",
+            [now.saturating_sub(INBOX_RETENTION_MS) as i64],
+        )
+        .map_err(sql)?;
+        let count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM inbox_events", [], |row| row.get(0))
+            .map_err(sql)?;
+        if count <= INBOX_KEEP {
+            return Ok(());
+        }
+        let over = count - INBOX_KEEP;
+        let removed_read = tx
+            .execute(
+                "DELETE FROM inbox_events WHERE id IN (
+                   SELECT id FROM inbox_events
+                   WHERE acked_ms IS NOT NULL OR resolved_ms IS NOT NULL OR store_seq <= ?1
+                   ORDER BY store_seq LIMIT ?2)",
+                params![fence, over],
+            )
+            .map_err(sql)? as i64;
+        let unread = over - removed_read;
+        if unread > 0 {
+            tx.execute(
+                "DELETE FROM inbox_events WHERE id IN (
+                   SELECT id FROM inbox_events ORDER BY store_seq LIMIT ?1)",
+                [unread],
+            )
+            .map_err(sql)?;
+            tx.execute(
+                "UPDATE meta SET value = value + ?1 WHERE name = 'inbox_dropped'",
+                [unread],
+            )
+            .map_err(sql)?;
+        }
+        tx.execute(
+            "DELETE FROM inbox_resolutions WHERE resolved_ms < ?1",
+            [now.saturating_sub(INBOX_RETENTION_MS) as i64],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Marks the open request with this source key resolved, or remembers
+    /// the resolution for a request that has not arrived yet.
+    pub fn resolve_event(
+        &mut self,
+        source: &str,
+        source_ref: &str,
+        resolution: &str,
+        now: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let changed = tx
+            .execute(
+                "UPDATE inbox_events SET resolved_ms = ?3, resolution = ?4
+                 WHERE source = ?1 AND source_ref = ?2 AND resolved_ms IS NULL",
+                params![source, source_ref, now as i64, resolution],
+            )
+            .map_err(sql)?;
+        if changed == 0 {
+            tx.execute(
+                "INSERT INTO inbox_resolutions VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (source, source_ref) DO NOTHING",
+                params![source, source_ref, now as i64, resolution],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)
+    }
+
+    /// Resolves a run's open attention events of the given kinds.
+    pub fn resolve_run(
+        &mut self,
+        run: &str,
+        kinds: &[&str],
+        resolution: &str,
+        now: u64,
+    ) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let mut changed = 0;
+        for kind in kinds {
+            changed += tx
+                .execute(
+                    "UPDATE inbox_events SET resolved_ms = ?3, resolution = ?4
+                     WHERE run = ?1 AND kind = ?2 AND resolved_ms IS NULL",
+                    params![run, kind, now as i64, resolution],
+                )
+                .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(changed)
+    }
+
+    /// Marks events read by ID; unknown IDs are reported back.
+    pub fn ack_events(&mut self, ids: &[i64], now: u64) -> Result<Vec<i64>, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let mut missing = Vec::new();
+        for id in ids {
+            let found: Option<i64> = tx
+                .query_row("SELECT id FROM inbox_events WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(sql)?;
+            if found.is_none() {
+                missing.push(*id);
+                continue;
+            }
+            tx.execute(
+                "UPDATE inbox_events SET acked_ms = ?2 WHERE id = ?1 AND acked_ms IS NULL",
+                params![id, now as i64],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(missing)
+    }
+
+    /// Marks a run's events read up to the screen event of `revision`, or
+    /// up to the run's newest event when that revision left no event.
+    pub fn ack_run(&mut self, run: &str, revision: i64, now: u64) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let through: Option<i64> = tx
+            .query_row(
+                "SELECT COALESCE(
+                   (SELECT store_seq FROM inbox_events WHERE run = ?1 AND source = 'screen' AND revision = ?2),
+                   (SELECT MAX(store_seq) FROM inbox_events WHERE run = ?1))",
+                params![run, revision],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        let Some(through) = through else {
+            return Ok(0);
+        };
+        let changed = tx
+            .execute(
+                "UPDATE inbox_events SET acked_ms = ?3
+                 WHERE run = ?1 AND store_seq <= ?2 AND acked_ms IS NULL",
+                params![run, through, now as i64],
+            )
+            .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(changed)
+    }
+
+    /// Marks everything up to `through` (default: now) read; events written
+    /// later stay unread.
+    pub fn read_all(&mut self, through: Option<i64>) -> Result<i64, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let latest: i64 = tx
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'store_seq'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        let through = through.unwrap_or(latest).min(latest);
+        tx.execute(
+            "UPDATE meta SET value = MAX(value, ?1) WHERE name = 'inbox_fence'",
+            [through],
+        )
+        .map_err(sql)?;
+        let fence: i64 = tx
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'inbox_fence'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(fence)
+    }
+
+    /// Events newest last; unread and unresolved ones only unless `all`.
+    pub fn inbox(&self, all: bool, limit: usize) -> Result<Value, String> {
+        let fence: i64 = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'inbox_fence'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .unwrap_or(0);
+        let dropped: i64 = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'inbox_dropped'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .unwrap_or(0);
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, store_seq, source, provider, pane, run, revision, kind, native_ref, summary,
+                        observed_ms, acked_ms, resolved_ms, resolution
+                 FROM (SELECT * FROM inbox_events
+                       WHERE ?1 OR (acked_ms IS NULL AND resolved_ms IS NULL AND store_seq > ?2)
+                       ORDER BY store_seq DESC LIMIT ?3)
+                 ORDER BY store_seq",
+            )
+            .map_err(sql)?;
+        let events = statement
+            .query_map(params![all, fence, limit as i64], |row| {
+                let summary: Option<String> = row.get(9)?;
+                let seq: i64 = row.get(1)?;
+                let acked: Option<i64> = row.get(11)?;
+                let resolved: Option<i64> = row.get(12)?;
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "seq": seq,
+                    "source": row.get::<_, String>(2)?,
+                    "provider": row.get::<_, String>(3)?,
+                    "pane": row.get::<_, String>(4)?,
+                    "run": row.get::<_, String>(5)?,
+                    "revision": row.get::<_, Option<i64>>(6)?,
+                    "kind": row.get::<_, String>(7)?,
+                    "native_ref": row.get::<_, Option<String>>(8)?,
+                    "summary": summary.and_then(|text| serde_json::from_str::<Value>(&text).ok()),
+                    "observed_ms": row.get::<_, i64>(10)?,
+                    "read": acked.is_some() || seq <= fence,
+                    "resolved_ms": resolved,
+                    "resolution": row.get::<_, Option<String>>(13)?,
+                }))
+            })
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?;
+        Ok(json!({"events": events, "fence": fence, "dropped": dropped}))
     }
 
     pub fn status(&self) -> Result<Value, String> {
@@ -1502,7 +2054,7 @@ mod tests {
         assert!(!backup_path(&path).exists());
         let status = store.status().unwrap();
         assert_eq!(status["min_reader"], 2);
-        assert_eq!(status["features"], json!([]));
+        assert_eq!(status["features"], json!(["inbox"]));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1614,7 +2166,10 @@ mod tests {
         .unwrap();
         drop(conn);
         let store = Store::open_path(&path).unwrap();
-        assert_eq!(store.status().unwrap()["features"], json!(["later"]));
+        assert_eq!(
+            store.status().unwrap()["features"],
+            json!(["inbox", "later"])
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1637,7 +2192,7 @@ mod tests {
         apply_features(&mut store.conn, &second, 3).unwrap();
         assert_eq!(
             store.status().unwrap()["features"],
-            json!(["alpha", "beta", "gamma"])
+            json!(["alpha", "beta", "gamma", "inbox"])
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1649,6 +2204,138 @@ mod tests {
         let live = live_bytes(&store.conn).unwrap();
         assert!(live > 0 && live < SOFT_BYTES);
         store.check_wal_pressure().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn event<'a>(source_ref: &'a str, run: &'a str, kind: &'a str, at: u64) -> InboxEvent<'a> {
+        InboxEvent {
+            source: "hook:opencode",
+            source_ref,
+            provider: "opencode",
+            pane: "%1",
+            run,
+            revision: None,
+            kind,
+            native_ref: Some(source_ref),
+            summary: Some(json!({"tool": "bash"})),
+            observed_ms: at,
+        }
+    }
+
+    fn unread(store: &Store) -> Vec<String> {
+        store.inbox(false, 100).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["native_ref"].as_str().unwrap_or("").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_inbox_records_nothing_until_enabled_and_each_key_once() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        assert_eq!(
+            store
+                .record_event(&event("p1", "r1", "approval_requested", 10))
+                .unwrap(),
+            None
+        );
+        store.set_inbox_enabled(true).unwrap();
+        let first = store
+            .record_event(&event("p1", "r1", "approval_requested", 10))
+            .unwrap();
+        assert!(first.is_some());
+        assert_eq!(
+            store
+                .record_event(&event("p1", "r1", "approval_requested", 11))
+                .unwrap(),
+            None
+        );
+        assert_eq!(unread(&store), ["p1"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_resolution_before_its_request_makes_the_request_arrive_resolved() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        store
+            .resolve_event("hook:opencode", "p2", "replied", 5)
+            .unwrap();
+        store
+            .record_event(&event("p2", "r1", "approval_requested", 6))
+            .unwrap();
+        store
+            .record_event(&event("p3", "r1", "approval_requested", 7))
+            .unwrap();
+        assert_eq!(unread(&store), ["p3"]);
+        store
+            .resolve_event("hook:opencode", "p3", "replied", 8)
+            .unwrap();
+        assert!(unread(&store).is_empty());
+        let all = store.inbox(true, 100).unwrap();
+        assert_eq!(all["events"][0]["resolution"], "replied");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reading_all_keeps_later_events_unread_and_runs_ack_through_a_revision() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        store.record_event(&event("a", "r1", "blocked", 1)).unwrap();
+        let fence = store.read_all(None).unwrap();
+        store.record_event(&event("b", "r1", "blocked", 2)).unwrap();
+        assert_eq!(unread(&store), ["b"]);
+        // A stale reader cannot move the fence backwards.
+        assert_eq!(store.read_all(Some(1)).unwrap(), fence);
+        let screen = |source_ref, revision, at| InboxEvent {
+            source: "screen",
+            revision: Some(revision),
+            ..event(source_ref, "r2", "blocked", at)
+        };
+        store.record_event(&screen("r2:9", 9, 3)).unwrap();
+        store.record_event(&screen("r2:10", 10, 4)).unwrap();
+        assert_eq!(store.ack_run("r2", 9, 5).unwrap(), 1);
+        assert_eq!(unread(&store), ["b", "r2:10"]);
+        let missing = store.ack_events(&[999], 6).unwrap();
+        assert_eq!(missing, [999]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_inbox_keeps_its_cap_and_counts_dropped_unread_events() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        for index in 0..(INBOX_KEEP + 3) {
+            let key = format!("k{index}");
+            store
+                .record_event(&event(&key, "r1", "blocked", 100))
+                .unwrap();
+        }
+        let inbox = store.inbox(true, 10).unwrap();
+        assert_eq!(inbox["dropped"], 3);
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM inbox_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, INBOX_KEEP);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_outcome_becomes_an_inbox_event() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        let ticket = dispatch(store.admit(&request("d1"), json!({}), 100).unwrap());
+        store.finish(&ticket, UNKNOWN, "test", None, 101).unwrap();
+        let inbox = store.inbox(false, 10).unwrap();
+        assert_eq!(inbox["events"][0]["kind"], "operation_unknown");
+        assert_eq!(inbox["events"][0]["native_ref"], "run:r1/prompt/1");
         fs::remove_dir_all(dir).unwrap();
     }
 

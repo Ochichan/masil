@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Inbox writes reported to this process since it started.
+static POKES: AtomicUsize = AtomicUsize::new(0);
+
 /// Protocol and feature generation; a client replaces an older coordinator.
 pub(crate) const GENERATION: u64 = 1;
 const REQUEST_FRAME: usize = 8 * 1024;
@@ -568,6 +571,28 @@ fn spawn(socket: &Path, paths: &Paths, server: &ServerInfo) -> Result<(), String
     .map(drop)
 }
 
+/// Tells a running coordinator that the inbox changed. Never starts one,
+/// waits at most 50 ms and ignores every failure.
+pub(crate) fn poke(socket: &Path) {
+    let Ok(state) = crate::managed::state_base() else {
+        return;
+    };
+    let Ok(paths) = paths(socket, &state) else {
+        return;
+    };
+    let Ok(mut stream) = StdUnixStream::connect(&paths.listen) else {
+        return;
+    };
+    let timeout = Some(Duration::from_millis(50));
+    if stream.set_write_timeout(timeout).is_err() || stream.set_read_timeout(timeout).is_err() {
+        return;
+    }
+    let body = json!({"v": 1, "id": "poke", "method": "poke"}).to_string();
+    let _ = stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .and_then(|()| stream.write_all(body.as_bytes()));
+}
+
 /// Stops a running coordinator for `socket`; reports `not_running` if none.
 pub(crate) fn stop(socket: &Path) -> Result<Value, String> {
     let server = server_info(socket)?;
@@ -1094,6 +1119,7 @@ fn respond(
             let mut value = identity.clone();
             value["clients"] = json!(clients.load(Ordering::SeqCst));
             value["idle_seconds"] = json!(idle_seconds);
+            value["pokes"] = json!(POKES.load(Ordering::SeqCst));
             // Names only, to show what the environment allowlist kept.
             let mut names: Vec<String> = std::env::vars_os()
                 .map(|(name, _)| name.to_string_lossy().into_owned())
@@ -1103,6 +1129,11 @@ fn respond(
             (ok(value), false)
         }
         Some("stop") => (ok(json!({"stopping": true})), true),
+        // A producer wrote to the inbox; later phases wake consumers here.
+        Some("poke") => {
+            POKES.fetch_add(1, Ordering::SeqCst);
+            (ok(json!({})), false)
+        }
         _ => (failure(&id, "unknown_method", "unknown method"), false),
     }
 }

@@ -401,6 +401,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "find" => print(&manager.find(args).await?)?,
         "operations" => print(&manager.operations_command(false, args).await?)?,
+        "inbox" => print(&super::inbox::command(&manager, args).await?)?,
         "operation" if !args.is_empty() => {
             let record = manager.operations_command(true, args).await?;
             return print_record(&manager, &record, args.len() == 1).await;

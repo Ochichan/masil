@@ -815,7 +815,13 @@ async fn hook(
     let sequence = callback_sequence()?;
     let mapped = map_callback(target, action.filter(|action| !action.is_empty()), payload)?;
 
-    let agent = manager.get(&pane).await?;
+    // A concurrent list or desk poll may win the tracked update; read again.
+    let agent = match manager.get(&pane).await {
+        Err(error) if error.contains("agent run changed before the action") => {
+            manager.get(&pane).await?
+        }
+        result => result?,
+    };
     if agent.run != run || agent.provider != target.id || agent.process != "running" {
         return Err("identity_mismatch: stale or mismatched integration callback".into());
     }
@@ -848,6 +854,20 @@ async fn hook(
         }
     }
 
+    // The event is recorded before the state, which stays sequence-gated, so
+    // a late callback still reaches the inbox; a contradicted binding (a
+    // different session with no switch) records nothing.
+    let contradicted = mapped.session.as_deref().is_some_and(|session| {
+        agent
+            .session_id
+            .as_deref()
+            .is_some_and(|bound| bound != session)
+    }) && !(mapped.session_switch || mapped.allow_root_switch);
+    if !contradicted {
+        manager
+            .inbox_apply(callback_effects(target.id, &pane, &run, sequence, &mapped))
+            .await;
+    }
     let origin = ReportOrigin::Callback {
         event: &mapped.event,
         frontend: mapped.root_binding,
@@ -879,6 +899,32 @@ async fn hook(
         "binding": result.binding.map(|binding| binding.label()),
         "provider_accepted": false,
     }))
+}
+
+/// Inbox effects of one accepted callback. A reported `blocked` is an event
+/// keyed per callback, since hooks are not redelivered.
+fn callback_effects(
+    provider: &str,
+    pane: &str,
+    run: &str,
+    sequence: u64,
+    mapped: &MappedCallback,
+) -> Vec<super::inbox::Effect> {
+    let mut effects = Vec::new();
+    if mapped.state == Some("blocked") {
+        effects.push(super::inbox::Effect::Event {
+            source: format!("hook:{provider}"),
+            source_ref: format!("blocked:{run}:{sequence}"),
+            provider: provider.into(),
+            pane: pane.into(),
+            run: run.into(),
+            revision: None,
+            kind: "blocked",
+            native_ref: None,
+            summary: Some(json!({"event": mapped.event})),
+        });
+    }
+    effects
 }
 
 fn required_env(name: &str) -> Result<String, String> {

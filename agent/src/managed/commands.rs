@@ -179,6 +179,13 @@ pub(crate) const VERBS: &[Verb] = &[
         remote: true,
     },
     Verb {
+        name: "inbox",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] inbox [list] [--all] [--limit N] | ack ID... | read-all [--through SEQ] | enable | disable | status",
+        mutating: true,
+        target_stage: None,
+        remote: false,
+    },
+    Verb {
         name: "operations",
         usage: "masil-agent agent [--socket MASIL_SOCKET] operations [list] [--all] [--limit N] | status | reconcile | adopt",
         mutating: true,

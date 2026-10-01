@@ -7,6 +7,7 @@ mod evidence;
 pub(crate) mod failure;
 pub(crate) mod find;
 pub(crate) mod fleet;
+mod inbox;
 mod integration;
 mod operations;
 mod prompt;
@@ -550,6 +551,7 @@ impl Manager {
         let mut agents = Vec::new();
         let mut tracked_groups = Vec::new();
         let mut tracked_updates = Vec::new();
+        let mut inbox_effects = Vec::new();
         let mut seen_panes = HashSet::new();
         for fields in inventory {
             // A linked window can occur in more than one session.
@@ -668,8 +670,17 @@ impl Manager {
                     returned_idle,
                 }
             } else {
-                previous
+                previous.clone()
             };
+            if changed {
+                inbox_effects.extend(screen_effects(
+                    provider.id,
+                    &fields[0],
+                    &previous,
+                    &tracked,
+                    dead,
+                ));
+            }
             let revision = tracked.revision.to_string();
             let name = metadata
                 .as_ref()
@@ -744,6 +755,9 @@ impl Manager {
         }
         self.write_tracked_updates(&mut agents, &tracked_groups, &tracked_updates)
             .await?;
+        // Only after the tracked revisions are committed: a lost CAS above
+        // records nothing.
+        self.inbox_apply(inbox_effects).await;
         Ok(agents)
     }
 
@@ -1281,7 +1295,13 @@ impl Manager {
         let mut tracked = agent.tracked.clone();
         tracked.seen = true;
         self.guarded(agent, vec![Self::option(agent, TRACKED, encode(&tracked)?)])
-            .await
+            .await?;
+        self.inbox_apply(vec![inbox::Effect::AckRun {
+            run: agent.run.clone(),
+            revision: i64::try_from(agent.tracked.revision).unwrap_or(i64::MAX),
+        }])
+        .await;
+        Ok(())
     }
 
     pub async fn focus(&self, agent: &Agent) -> Result<(), String> {
@@ -1519,6 +1539,56 @@ impl Manager {
             }
         }
     }
+}
+
+/// Inbox effects of one tracked change seen on screen: the run's open
+/// requests resolve when it leaves `blocked` or ends, and a new `blocked`
+/// or a return to idle is an event.
+fn screen_effects(
+    provider: &str,
+    pane: &str,
+    previous: &Tracked,
+    tracked: &Tracked,
+    dead: bool,
+) -> Vec<inbox::Effect> {
+    let mut effects = Vec::new();
+    let run = tracked.run.clone();
+    if !previous.run.is_empty() && previous.run != run {
+        effects.push(inbox::Effect::ResolveRun {
+            run: previous.run.clone(),
+            kinds: inbox::ALL,
+            resolution: "run_ended",
+        });
+    } else if previous.state == "blocked" && tracked.state != "blocked" {
+        effects.push(inbox::Effect::ResolveRun {
+            run: run.clone(),
+            kinds: inbox::WAITING,
+            resolution: "left_blocked",
+        });
+    }
+    let event = |kind: &'static str| inbox::Effect::Event {
+        source: "screen".into(),
+        source_ref: format!("{run}:{}", tracked.revision),
+        provider: provider.into(),
+        pane: pane.into(),
+        run: run.clone(),
+        revision: i64::try_from(tracked.revision).ok(),
+        kind,
+        native_ref: None,
+        summary: None,
+    };
+    if dead || tracked.state == "exited" {
+        effects.push(inbox::Effect::ResolveRun {
+            run: run.clone(),
+            kinds: inbox::ALL,
+            resolution: "run_ended",
+        });
+    } else if tracked.state == "blocked" {
+        effects.push(event("blocked"));
+    } else if tracked.returned_idle && tracked.state == "idle" {
+        effects.push(event("returned_idle"));
+    }
+    effects
 }
 
 const LOCK_BUSY: &str = "lock_busy: another agent management operation is in progress";
