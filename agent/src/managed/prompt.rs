@@ -232,7 +232,7 @@ impl Manager {
                     .find(|r| r.operation == operation)
                 else {
                     return self.retained_prompt(agent, operation).await.map_err(|_| {
-                        "prompt receipt expired; the operation will not be repeated".into()
+                        "outcome_unknown: prompt receipt expired; the operation will not be repeated".into()
                     });
                 };
                 if receipt.digest != digest {
@@ -312,7 +312,7 @@ impl Manager {
                 }
                 Admission::NeedsReconcile(_) => {
                     return Err(
-                        "prompt operation is still unresolved; see `agent operations`".into(),
+                        "outcome_unknown: prompt operation is still unresolved; see `agent operations`".into(),
                     );
                 }
             };
@@ -429,9 +429,16 @@ impl Manager {
                 Ok(Guarded::Applied) => {
                     finish(&mut store, &ticket, "delivered", "pane_ledger", None)
                         .map_err(String::from)?;
-                    self.prompt_receipt(agent, Some(operation))
+                    // Delivery is committed; a failed read of the pane's
+                    // receipt does not make it unknown.
+                    Ok(self
+                        .prompt_receipt(agent, Some(operation))
                         .await
-                        .map_err(|error| String::from(AfterEffect::new(error)))
+                        .unwrap_or_else(|_| {
+                            json!({"operation": operation, "run": agent.run, "stage": "delivered",
+                                   "provider_accepted": false, "task_success": null,
+                                   "operation_key": ticket.key})
+                        }))
                 }
                 Ok(Guarded::Rejected) => {
                     let _ =
@@ -442,10 +449,16 @@ impl Manager {
                 }
                 Err(error) => {
                     // Part of the group may have run; settle from the ledger.
+                    // A failed settle read still records the attempt as unknown.
                     let (state, evidence) = self
                         .settle_prompt(agent, &ticket.ticket, operation, &sha256(&raw), &fence)
                         .await
-                        .map_err(String::from)?;
+                        .unwrap_or_else(|settle| {
+                            (
+                                "outcome_unknown",
+                                json!({"settle_error": settle.to_string()}),
+                            )
+                        });
                     let mut evidence = evidence;
                     evidence["error"] = json!(error);
                     finish(&mut store, &ticket, state, "pane_ledger", Some(evidence))

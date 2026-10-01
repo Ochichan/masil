@@ -74,6 +74,16 @@ pub(crate) fn classify(message: &str) -> (Class, &'static str) {
     leading_code(message).map_or((Class::Failed, "failed"), |(code, class)| (class, code))
 }
 
+/// The message without its leading registered code tokens, for people:
+/// `outcome_unknown: server_unreachable: timed out` becomes `timed out`.
+pub(crate) fn human(message: &str) -> &str {
+    let mut rest = message;
+    while let Some((code, _)) = leading_code(rest) {
+        rest = rest[code.len() + 1..].trim_start();
+    }
+    rest
+}
+
 pub(crate) fn has_registered_code(message: &str) -> bool {
     leading_code(message).is_some()
 }
@@ -100,12 +110,13 @@ impl fmt::Display for AfterEffect {
 
 impl std::error::Error for AfterEffect {}
 
+/// After an effect, every failure is an unknown outcome (class 6): a
+/// transport or lookup code underneath does not make the effect absent.
 impl From<AfterEffect> for String {
     fn from(error: AfterEffect) -> Self {
-        if has_registered_code(&error.0) {
-            error.0
-        } else {
-            format!("outcome_unknown: {}", error.0)
+        match leading_code(&error.0) {
+            Some((_, Class::Unknown)) => error.0,
+            _ => format!("outcome_unknown: {}", error.0),
         }
     }
 }
@@ -136,6 +147,19 @@ pub(crate) fn recorded_exit_code(stage: &str, query: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_text_drops_leading_codes_only() {
+        assert_eq!(
+            human("outcome_unknown: server_unreachable: native command timed out"),
+            "native command timed out"
+        );
+        assert_eq!(human("plain: not a code"), "plain: not a code");
+        assert_eq!(
+            human("target_absent: agent target not found"),
+            "agent target not found"
+        );
+    }
 
     #[test]
     fn classifies_registered_leading_codes_and_defaults_to_failed() {
@@ -182,14 +206,20 @@ mod tests {
     }
 
     #[test]
-    fn after_effect_preserves_codes_or_marks_the_outcome_unknown() {
+    fn after_an_effect_every_failure_is_an_unknown_outcome() {
+        for message in [
+            "receipt write failed",
+            "store_busy: retry later",
+            "server_unreachable: native command timed out",
+            "target_absent: agent target not found",
+        ] {
+            let converted = String::from(AfterEffect::new(message));
+            assert_eq!(classify(&converted).0, Class::Unknown, "{converted}");
+            assert_eq!(converted, format!("outcome_unknown: {message}"));
+        }
         assert_eq!(
-            String::from(AfterEffect::new("store_busy: retry later")),
-            "store_busy: retry later"
-        );
-        assert_eq!(
-            String::from(AfterEffect::new("receipt write failed")),
-            "outcome_unknown: receipt write failed"
+            String::from(AfterEffect::new("wait_timeout: no change")),
+            "wait_timeout: no change"
         );
     }
 

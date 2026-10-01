@@ -347,10 +347,16 @@ impl Manager {
                 ))
             }
             Err(error) => {
+                // A failed settle read still records the attempt as unknown.
                 let (state, mut evidence) = self
                     .settle_effect(agent, effect, &ticket.ticket, &sha256(raw), fence)
                     .await
-                    .map_err(String::from)?;
+                    .unwrap_or_else(|settle| {
+                        (
+                            "outcome_unknown",
+                            json!({"settle_error": settle.to_string()}),
+                        )
+                    });
                 evidence["error"] = json!(error);
                 store
                     .finish(ticket, state, "reconcile", Some(&evidence), now_ms())
@@ -531,7 +537,7 @@ impl Manager {
             if record.state == operations::DISPATCHING {
                 if record.lease_until_ms > now_ms() {
                     return Err(format!(
-                        "operation {} is in progress; query its receipt before retrying",
+                        "outcome_unknown: operation {} is in progress; query its receipt before retrying",
                         record.operation_key
                     ));
                 }
@@ -609,7 +615,7 @@ impl Manager {
                 let state = self
                     .settle_start_after_effect(&ticket.ticket)
                     .await
-                    .map_err(String::from)?;
+                    .unwrap_or("outcome_unknown");
                 store
                     .finish(
                         &ticket,

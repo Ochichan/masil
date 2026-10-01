@@ -624,10 +624,10 @@ impl Store {
         apply_features(&mut self.conn, FEATURES, now_ms())
     }
 
-    fn next_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64, String> {
-        // Every write passes here, so a long-lived connection notices a
-        // newer binary raising min_reader before it writes again.
-        let minimum: Option<i64> = tx
+    /// Run inside every write transaction, so a long-lived connection
+    /// notices a newer binary raising min_reader before it writes again.
+    fn check_reader_in(conn: &Connection) -> Result<(), String> {
+        let minimum: Option<i64> = conn
             .query_row(
                 "SELECT value FROM meta WHERE name = 'min_reader'",
                 [],
@@ -635,7 +635,11 @@ impl Store {
             )
             .optional()
             .map_err(sql)?;
-        reader_allowed(minimum)?;
+        reader_allowed(minimum)
+    }
+
+    fn next_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64, String> {
+        Self::check_reader_in(tx)?;
         tx.query_row(
             "UPDATE meta SET value = value + 1 WHERE name = 'store_seq' RETURNING value",
             [],
@@ -735,7 +739,7 @@ impl Store {
                 if record.state == DISPATCHING {
                     if record.lease_until_ms > now {
                         return Err(format!(
-                            "operation {key} is in progress; query its receipt before retrying"
+                            "outcome_unknown: operation {key} is in progress; query its receipt before retrying"
                         ));
                     }
                     return Ok(Admission::NeedsReconcile(record));
@@ -1084,6 +1088,7 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(sql)?
         };
+        Self::check_reader_in(&tx)?;
         let total = candidates.len() as i64;
         let oversize = live_bytes(&tx)? >= SOFT_BYTES;
         let mut removed = 0usize;

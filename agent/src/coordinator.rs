@@ -353,6 +353,22 @@ fn hello(listen: &Path) -> Option<Value> {
     request(listen, "hello", HELLO_TIMEOUT).ok()
 }
 
+enum Probe {
+    Answer(Value),
+    /// A live coordinator replied with an error, such as being busy.
+    Busy,
+    /// No reply: nothing accepted the connection, or the reply did not come.
+    Silent,
+}
+
+fn probe(listen: &Path, timeout: Duration) -> Probe {
+    match request(listen, "hello", timeout) {
+        Ok(value) => Probe::Answer(value),
+        Err(error) if !error.starts_with("coordinator_unavailable") => Probe::Busy,
+        Err(_) => Probe::Silent,
+    }
+}
+
 fn wait_unlocked(lock: &Path, limit: Duration) -> Result<bool, String> {
     let deadline = Instant::now() + limit;
     while lock_held(lock)? {
@@ -448,6 +464,16 @@ pub(crate) fn ensure(socket: &Path) -> Result<Value, String> {
             }
         }
         None if lock_held(&paths.lock)? => {
+            // A holder that has not recorded its boot is still starting.
+            if holder(&paths.lock).is_none_or(|record| record.get("boot").is_none()) {
+                let deadline = Instant::now() + SPAWN_WAIT + COMMAND_TIMEOUT;
+                while Instant::now() < deadline {
+                    if let Some(value) = hello(&paths.listen).filter(|v| current(v, &server)) {
+                        return Ok(value);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
             let same_boot =
                 holder(&paths.lock).is_some_and(|record| record["boot"] == server.boot.as_str());
             if same_boot && signal_holder(&paths.lock, libc::SIGUSR1) {
@@ -459,6 +485,14 @@ pub(crate) fn ensure(socket: &Path) -> Result<Value, String> {
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
+            }
+            match probe(&paths.listen, COMMAND_TIMEOUT) {
+                Probe::Answer(value) if current(&value, &server) => return Ok(value),
+                // Alive but busy: never terminate a working process.
+                Probe::Busy => {
+                    return Err("coordinator_unavailable: the coordinator is busy; retry".into());
+                }
+                _ => {}
             }
             signal_holder(&paths.lock, libc::SIGTERM);
             wait_unlocked(&paths.lock, SPAWN_WAIT)?;
@@ -554,10 +588,10 @@ pub(crate) fn stop(socket: &Path) -> Result<Value, String> {
 /// it is switched on. Called by session autosave; creates nothing and
 /// starts nothing otherwise.
 pub(crate) fn restart_if_enabled(socket: &Path) {
-    let Ok(server) = server_info(socket) else {
-        return;
-    };
-    let enabled = crate::managed::coordinator_features(&server.state, socket)
+    // Autosave runs in the server's environment, so its own state directory
+    // is the server's; no masil process starts unless a feature is on.
+    let enabled = crate::managed::state_base()
+        .and_then(|base| crate::managed::coordinator_features(&base, socket))
         .is_ok_and(|features| !features.is_empty());
     if enabled {
         let _ = ensure(socket);
@@ -705,6 +739,23 @@ fn serve(options: Options, paths: &Paths, limit: usize) -> Result<(), String> {
     let Some(lock) = acquire(&paths.lock, LOCK_RETRY)? else {
         return Ok(());
     };
+    // The record names this process from the moment it holds the lock, so no
+    // caller signals a previous holder's pid, which may have been reused.
+    let started = now_ms();
+    write_starting(&lock, started)?;
+    let result = serve_locked(&options, paths, limit, &lock, started);
+    clear_record(&lock);
+    drop(lock);
+    result
+}
+
+fn serve_locked(
+    options: &Options,
+    paths: &Paths,
+    limit: usize,
+    lock: &File,
+    started: u64,
+) -> Result<(), String> {
     let server = server_info(&options.socket)?;
     if server.state != options.state {
         return Err(format!(
@@ -717,7 +768,6 @@ fn serve(options: Options, paths: &Paths, limit: usize) -> Result<(), String> {
     if unsafe { libc::getppid() } != server.pid {
         return Err("not started by the server's run-shell; exiting".into());
     }
-    let started = now_ms();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -726,7 +776,7 @@ fn serve(options: Options, paths: &Paths, limit: usize) -> Result<(), String> {
         let mut signals = Signals::new()?;
         watch_parent(server.pid)?;
         let (listener, guard) = bind(&paths.listen)?;
-        write_record(&lock, &server, started)?;
+        write_record(lock, &server, started)?;
         let identity = json!({
             "generation": GENERATION,
             "pid": std::process::id(),
@@ -747,9 +797,20 @@ fn serve(options: Options, paths: &Paths, limit: usize) -> Result<(), String> {
             &paths.log,
         )
         .await
-    })?;
-    drop(lock);
-    Ok(())
+    })
+}
+
+fn write_starting(lock: &File, started: u64) -> Result<(), String> {
+    let record =
+        json!({"pid": std::process::id(), "started_ms": started, "generation": GENERATION});
+    let mut file = lock;
+    file.set_len(0)
+        .and_then(|()| file.write_all(record.to_string().as_bytes()))
+        .map_err(|error| format!("coordinator lock record: {error}"))
+}
+
+fn clear_record(lock: &File) {
+    let _ = lock.set_len(0);
 }
 
 fn write_record(lock: &File, server: &ServerInfo, started: u64) -> Result<(), String> {
@@ -897,10 +958,23 @@ async fn accept_loop(
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { continue };
                 let Ok(std_stream) = stream.into_std() else { continue };
-                if !ipc::peer_is_owner(&std_stream) || clients.load(Ordering::SeqCst) >= limit {
+                if !ipc::peer_is_owner(&std_stream) {
                     continue;
                 }
-                let Ok(stream) = tokio::net::UnixStream::from_std(std_stream) else { continue };
+                let Ok(mut stream) = tokio::net::UnixStream::from_std(std_stream) else { continue };
+                if clients.load(Ordering::SeqCst) >= limit {
+                    // A reply, so callers see a busy coordinator, not a dead one.
+                    tokio::spawn(async move {
+                        let busy = json!({"v": 1, "id": null, "ok": false,
+                            "error": {"code": "coordinator_busy", "message": "too many connections"}});
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            ipc::write_frame(&mut stream, &busy, RESPONSE_FRAME),
+                        )
+                        .await;
+                    });
+                    continue;
+                }
                 clients.fetch_add(1, Ordering::SeqCst);
                 let (clients, last_active, stop, identity) =
                     (clients.clone(), last_active.clone(), stop.clone(), identity.clone());

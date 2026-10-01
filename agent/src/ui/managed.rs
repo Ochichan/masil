@@ -649,6 +649,7 @@ fn endpoint_status_line(statuses: &[EndpointStatus], language: Language) -> (Str
                 let error = status
                     .error
                     .as_deref()
+                    .map(crate::managed::failure::human)
                     .unwrap_or(word(language, "unavailable", "사용 불가"))
                     .chars()
                     .filter(|character| !character.is_control())
@@ -901,7 +902,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                         Ok(Work::Action(message)) if message.target.as_ref().is_some_and(|target| target.same_run(&agents)) || (message.target.is_none() && message.boot == current_epoch) => match message.result {
                             Ok(ActionResult::Receipt(receipt)) => { app.finish_action(); app.notify(receipt); },
                             Ok(ActionResult::Details { id, value }) => app.set_details(&id, value),
-                            Err(error) => { app.finish_action(); app.notify(format!("Action failed: {error}")); },
+                            Err(error) => { app.finish_action(); app.notify(format!("Action failed: {}", crate::managed::failure::human(&error))); },
                         },
                         Ok(Work::Action(_)) => {},
                         Ok(Work::Panes(result)) => {

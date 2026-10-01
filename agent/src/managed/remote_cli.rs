@@ -7,8 +7,8 @@ use super::{
 use serde_json::{Value, json};
 use std::{
     io::Read,
+    os::unix::process::CommandExt,
     path::PathBuf,
-    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -264,9 +264,12 @@ async fn wait(endpoint: &Endpoint, initial: &Agent, args: &[String]) -> Result<i
             }
             Err(e) => {
                 print(&json!({"stage":"unavailable","run":initial.run,"error":e}))?;
+                // No result from the endpoint is transient unless the
+                // endpoint said why: an error without a code, as from an older
+                // endpoint, is still only a missing result.
                 let (class, code) = failure::classify(&e);
-                return Ok(if code == "target_absent" {
-                    5
+                return Ok(if code == "failed" {
+                    4
                 } else {
                     class.exit_code()
                 });
@@ -361,50 +364,10 @@ fn exec_connection(endpoint: &Endpoint, identity: &[String]) -> Result<i32, Stri
         command
     };
     command.env_remove("TMUX").env_remove("TMUX_PANE");
-    let child = command.stderr(Stdio::piped()).spawn().map_err(|error| {
-        format!("endpoint_unreachable: could not connect native terminal: {error}")
-    })?;
-    let output = child.wait_with_output().map_err(|error| {
-        format!("endpoint_unreachable: native terminal connection failed: {error}")
-    })?;
-    let detail = String::from_utf8_lossy(&output.stderr);
-    if output.status.success() {
-        if !detail.is_empty() {
-            eprint!("{detail}");
-        }
-        return Ok(output.status.code().unwrap_or(0));
-    }
-    if endpoints::host_key_failure(&detail) {
-        return Err(format!(
-            "host_key: endpoint '{}' refused its SSH host key: {}",
-            endpoint.id,
-            detail.trim()
-        ));
-    }
-    if let Some(error) = forwarded_managed_error(&detail) {
-        return Err(error);
-    }
     Err(format!(
-        "endpoint_unreachable: native terminal connection exited with {}{}",
-        output.status,
-        if detail.trim().is_empty() {
-            String::new()
-        } else {
-            format!(": {}", detail.trim())
-        }
+        "endpoint_unreachable: could not connect native terminal: {}",
+        command.exec()
     ))
-}
-
-/// A direct terminal connection has no RPC envelope, but an endpoint that
-/// reached `masil-agent` still writes the ordinary managed boundary error.
-/// Preserve its registered class rather than turning a stale identity into a
-/// transport failure at the calling endpoint.
-fn forwarded_managed_error(detail: &str) -> Option<String> {
-    let (prefix, message) = detail.rsplit_once("]: ")?;
-    let code = prefix.rsplit_once("masil-agent: error[")?.1;
-    let message = message.trim_end();
-    let (_, classified) = failure::classify(&format!("{code}: {message}"));
-    (code == classified).then(|| message.to_owned())
 }
 
 pub(super) fn open_native(socket: &str, args: &[String]) -> Result<i32, String> {

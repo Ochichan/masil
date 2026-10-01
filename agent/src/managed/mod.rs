@@ -54,6 +54,19 @@ pub(super) fn server_unreachable(error: String) -> String {
     }
 }
 
+/// A guarded group that never started, or that tmux refused, ran nothing;
+/// any later transport error leaves part of the group possibly applied.
+fn group_error(error: String) -> String {
+    if error.starts_with("starting native command:")
+        || error.starts_with("native command failed:")
+        || error.starts_with("native command exited with exit status")
+    {
+        server_unreachable(error)
+    } else {
+        format!("outcome_unknown: {error}")
+    }
+}
+
 struct CaptureRequest {
     pane: String,
     identity: String,
@@ -900,7 +913,7 @@ impl Manager {
             .native
             .guarded_group(&agent.pane_id, &guard, &commands, "masil-agent-stale")
             .await
-            .map_err(server_unreachable)?;
+            .map_err(group_error)?;
         if String::from_utf8_lossy(&out.stdout)
             .lines()
             .any(|line| line == "masil-agent-stale")
