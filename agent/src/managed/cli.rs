@@ -299,7 +299,11 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     .await?,
             )?;
         }
-        "integration" => print(&super::integration::run(&manager, args).await?)?,
+        "integration" => {
+            if let Some(value) = super::integration::run(&manager, args).await? {
+                print(&value)?;
+            }
+        }
         "list" if args.is_empty() || args == ["--json"] => {
             #[derive(Serialize)]
             struct AgentList {

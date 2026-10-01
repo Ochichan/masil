@@ -1,8 +1,10 @@
 //! Optional provider hook bridge. This module never edits provider configuration.
 
 use std::io::Read;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use regex::Regex;
 use serde_json::{Map, Value, json};
 
 use super::{Manager, ReportOrigin};
@@ -54,12 +56,12 @@ const TARGETS: &[Target] = &[
     Target {
         id: "claude",
         capability: Capability::SessionOnly,
-        events: &["SessionStart"],
+        events: &["SessionStart", "PermissionRequest", "Notification", "Stop"],
     },
     Target {
         id: "codex",
         capability: Capability::SessionOnly,
-        events: &["SessionStart"],
+        events: &["SessionStart", "Stop"],
     },
     Target {
         id: "copilot",
@@ -198,21 +200,24 @@ struct MappedCallback {
     /// The provider announced a deliberate session change (resume, clear,
     /// explicit selection). Other session changes are recorded as conflicts.
     session_switch: bool,
+    /// This callback records an inbox event only. It must not change the
+    /// pane's reported state or session binding.
+    event_only: bool,
 }
 
-pub async fn run(manager: &Manager, args: &[String]) -> Result<Value, String> {
+pub async fn run(manager: &Manager, args: &[String]) -> Result<Option<Value>, String> {
     match args {
-        [command] if command == "status" => Ok(json!({
+        [command] if command == "status" => Ok(Some(json!({
             "installed": false,
             "targets": TARGETS.iter().map(target_status).collect::<Vec<_>>(),
-        })),
+        }))),
         [command, provider] if command == "status" => {
             let target = target(provider)?;
-            Ok(target_status(target))
+            Ok(Some(target_status(target)))
         }
-        [command, provider] if command == "export" => export(target(provider)?, None),
+        [command, provider] if command == "export" => export(target(provider)?, None).map(Some),
         [command, provider, flag, directory] if command == "export" && flag == "--directory" => {
-            export(target(provider)?, Some(directory))
+            export(target(provider)?, Some(directory)).map(Some)
         }
         [command, provider] if command == "hook" => {
             hook_from_stdin(manager, target(provider)?, None).await
@@ -443,7 +448,8 @@ function send(action: string, payload: unknown) {
 }
 function session(event: any, ctx: any) {
   return { hook_event_name: event?.type, source: event?.reason,
-    session_id: ctx?.sessionManager?.getSessionId?.() };
+    session_id: ctx?.sessionManager?.getSessionId?.(),
+    event: { type: event?.type, toolName: event?.toolName, toolCallId: event?.toolCallId } };
 }
 export default function (pi: any) {
 __LISTENERS__
@@ -572,10 +578,15 @@ fn registration_fragment(target: &Target, hook_path: &std::path::Path) -> Value 
         |action: &str| json!({"hooks":[{"type":"command","command":command(action),"timeout":10}]});
     match target.id {
         "claude" => {
-            json!({"format":"settings.json fragment","hooks":{"SessionStart":[{"matcher":"^(startup|resume|clear|compact|fork)$","hooks":[{"type":"command","command":command("session"),"timeout":10}]}]}})
+            json!({"format":"settings.json fragment","hooks":{
+                "SessionStart":[{"matcher":"^(startup|resume|clear|compact|fork)$","hooks":[{"type":"command","command":command("session"),"timeout":10}]}],
+                "PermissionRequest":[{"hooks":[{"type":"command","command":command(""),"timeout":10}]}],
+                "Notification":[{"matcher":"permission_prompt|elicitation_dialog","hooks":[{"type":"command","command":command(""),"timeout":10}]}],
+                "Stop":[{"hooks":[{"type":"command","command":command(""),"timeout":10}]}],
+            }})
         }
         "codex" => {
-            json!({"format":"hooks.json fragment","hooks":{"SessionStart":[nested("session")]},"enable":"set features.hooks=true in config.toml"})
+            json!({"format":"hooks.json fragment","hooks":{"SessionStart":[nested("session")],"Stop":[nested("")]},"enable":"set features.hooks=true in config.toml"})
         }
         "droid" | "qodercli" | "qwen" => {
             json!({"format":"JSON hooks fragment","hooks":{"SessionStart":[nested("session")]}})
@@ -614,24 +625,27 @@ fn registration_fragment(target: &Target, hook_path: &std::path::Path) -> Value 
         }
         "kimi" => {
             let actions = [
-                ("SessionStart", "session"),
-                ("UserPromptSubmit", "working"),
-                ("PermissionRequest", "blocked"),
-                ("PermissionResult", "working"),
-                ("Stop", "idle"),
-                ("Interrupt", "idle"),
+                ("SessionStart", "session", None),
+                ("UserPromptSubmit", "working", None),
+                ("PreToolUse", "blocked", Some("^AskUserQuestion$")),
+                ("PermissionRequest", "blocked", None),
+                ("PermissionResult", "working", None),
+                ("Stop", "idle", None),
+                ("Interrupt", "idle", None),
             ];
             let content = actions
                 .into_iter()
-                .map(|(event, action)| {
+                .map(|(event, action, matcher)| {
+                    let matcher = matcher
+                        .map_or_else(String::new, |matcher| format!("matcher = {matcher:?}\n"));
                     format!(
-                        "[[hooks]]\nevent = {event:?}\ncommand = {:?}\ntimeout = 10\n",
-                        command(action)
+                        "[[hooks]]\nevent = {event:?}\n{matcher}command = {:?}\ntimeout = 10\n",
+                        command(action),
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            json!({"format":"config.toml fragment","content":content,"limitation":"PreToolUse AskUserQuestion matcher entries require a manual provider-specific merge"})
+            json!({"format":"config.toml fragment","content":content})
         }
         _ => json!({"format":"manual","limitation":"adapter requires provider registration"}),
     }
@@ -645,7 +659,7 @@ async fn hook_from_stdin(
     manager: &Manager,
     target: &Target,
     action: Option<&String>,
-) -> Result<Value, String> {
+) -> Result<Option<Value>, String> {
     let mut bytes = Vec::new();
     std::io::stdin()
         .take(MAX_CALLBACK_BYTES as u64 + 1)
@@ -803,7 +817,7 @@ async fn hook(
     target: &Target,
     action: Option<&str>,
     bytes: &[u8],
-) -> Result<Value, String> {
+) -> Result<Option<Value>, String> {
     let payload: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid hook callback JSON: {error}"))?;
     let payload = payload
@@ -832,6 +846,20 @@ async fn hook(
     if let Err(error) = provenance(ancestry(foreground).as_deref(), target.id, foreground) {
         log_refusal(target.id, &pane, &error);
         return Err(error);
+    }
+    if mapped.event_only {
+        if let (Some(callback_session), Some(bound_session)) =
+            (mapped.session.as_deref(), agent.session_id.as_deref())
+            && callback_session != bound_session
+        {
+            return Ok(None);
+        }
+        manager
+            .inbox_apply(callback_effects(
+                target.id, &pane, &run, sequence, &mapped, payload,
+            ))
+            .await;
+        return Ok(None);
     }
     if matches!(target.id, "opencode" | "kilo") {
         if mapped.child_session {
@@ -865,7 +893,9 @@ async fn hook(
     }) && !(mapped.session_switch || mapped.allow_root_switch);
     if !contradicted {
         manager
-            .inbox_apply(callback_effects(target.id, &pane, &run, sequence, &mapped))
+            .inbox_apply(callback_effects(
+                target.id, &pane, &run, sequence, &mapped, payload,
+            ))
             .await;
     }
     let origin = ReportOrigin::Callback {
@@ -886,7 +916,7 @@ async fn hook(
             .report_identity_snapshot(&agent, sequence, session, origin)
             .await?
     };
-    Ok(json!({
+    Ok(Some(json!({
         "stage": "native_callback_recorded",
         "provider": target.id,
         "pane_id": pane,
@@ -898,7 +928,7 @@ async fn hook(
         "session_id": mapped.session,
         "binding": result.binding.map(|binding| binding.label()),
         "provider_accepted": false,
-    }))
+    })))
 }
 
 /// Inbox effects of one accepted callback. A reported `blocked` is an event
@@ -909,22 +939,628 @@ fn callback_effects(
     run: &str,
     sequence: u64,
     mapped: &MappedCallback,
+    payload: &Map<String, Value>,
 ) -> Vec<super::inbox::Effect> {
+    let source = format!("hook:{provider}");
+    let event = callback_event(payload).unwrap_or_else(|| mapped.event.clone());
+    let event = normalize_event(&event);
+    let summary = callback_summary(provider, &event, payload);
     let mut effects = Vec::new();
-    if mapped.state == Some("blocked") {
-        effects.push(super::inbox::Effect::Event {
-            source: format!("hook:{provider}"),
-            source_ref: format!("blocked:{run}:{sequence}"),
-            provider: provider.into(),
-            pane: pane.into(),
-            run: run.into(),
-            revision: None,
-            kind: "blocked",
-            native_ref: None,
-            summary: Some(json!({"event": mapped.event})),
-        });
+    let mut requested = false;
+
+    match (provider, event.as_str()) {
+        ("opencode" | "kilo", "permissionasked" | "permissionaskedv2") => {
+            if let Some(id) = callback_id(payload, &["id"]) {
+                let source_ref = request_ref(&id);
+                effects.push(callback_event_effect(
+                    provider,
+                    pane,
+                    run,
+                    "approval_requested",
+                    source_ref,
+                    Some(id),
+                    summary.clone(),
+                ));
+                requested = true;
+            }
+        }
+        ("opencode" | "kilo", "questionasked" | "questionaskedv2") => {
+            if let Some(id) = callback_id(payload, &["id"]) {
+                let source_ref = request_ref(&id);
+                effects.push(callback_event_effect(
+                    provider,
+                    pane,
+                    run,
+                    "question_asked",
+                    source_ref,
+                    Some(id),
+                    summary.clone(),
+                ));
+                requested = true;
+            }
+        }
+        ("opencode" | "kilo", "permissionreplied" | "permissionrepliedv2") => {
+            if let Some(id) = callback_id(payload, &["requestID", "requestId", "request_id"]) {
+                effects.push(resolve_effect(&source, &id, "replied"));
+            }
+        }
+        ("opencode" | "kilo", "questionreplied" | "questionrepliedv2") => {
+            if let Some(id) = callback_id(payload, &["requestID", "requestId", "request_id"]) {
+                effects.push(resolve_effect(&source, &id, "replied"));
+            }
+        }
+        ("opencode" | "kilo", "questionrejected" | "questionrejectedv2") => {
+            if let Some(id) = callback_id(payload, &["requestID", "requestId", "request_id"]) {
+                effects.push(resolve_effect(&source, &id, "rejected"));
+            }
+        }
+        ("kimi", "permissionrequest") => {
+            let id = callback_id(payload, &["toolCallId", "tool_call_id"]);
+            let source_ref = id
+                .as_deref()
+                .map(request_ref)
+                .unwrap_or_else(|| callback_ref("approval_requested", run, sequence));
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "approval_requested",
+                source_ref,
+                id,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+        ("kimi", "permissionresult") => {
+            if let Some(id) = callback_id(payload, &["toolCallId", "tool_call_id"]) {
+                effects.push(resolve_effect(&source, &id, "decided"));
+            }
+        }
+        ("kimi", "pretooluse")
+            if callback_tool(payload)
+                .is_some_and(|tool| tool.eq_ignore_ascii_case("AskUserQuestion")) =>
+        {
+            let id = callback_id(payload, &["toolCallId", "tool_call_id"]);
+            let source_ref = id
+                .as_deref()
+                .map(request_ref)
+                .unwrap_or_else(|| callback_ref("question_asked", run, sequence));
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "question_asked",
+                source_ref,
+                id,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+        ("omp", "toolapprovalrequested") => {
+            let id = callback_id(payload, &["toolCallId", "tool_call_id"]);
+            let source_ref = id
+                .as_deref()
+                .map(request_ref)
+                .unwrap_or_else(|| callback_ref("approval_requested", run, sequence));
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "approval_requested",
+                source_ref,
+                id,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+        ("omp", "toolapprovalresolved") => {
+            if let Some(id) = callback_id(payload, &["toolCallId", "tool_call_id"]) {
+                effects.push(resolve_effect(&source, &id, "decided"));
+            }
+        }
+        ("omp", "toolexecutionstart")
+            if callback_tool(payload).is_some_and(|tool| tool.eq_ignore_ascii_case("ask")) =>
+        {
+            let id = callback_id(payload, &["toolCallId", "tool_call_id"]);
+            let source_ref = id
+                .as_deref()
+                .map(request_ref)
+                .unwrap_or_else(|| callback_ref("question_asked", run, sequence));
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "question_asked",
+                source_ref,
+                id,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+        ("omp", "toolexecutionend")
+            if callback_tool(payload).is_some_and(|tool| tool.eq_ignore_ascii_case("ask")) =>
+        {
+            if let Some(id) = callback_id(payload, &["toolCallId", "tool_call_id"]) {
+                effects.push(resolve_effect(&source, &id, "completed"));
+            }
+        }
+        ("mastracode", "permissionrequest") => {
+            let id = callback_id(
+                payload,
+                &[
+                    "toolCallId",
+                    "tool_call_id",
+                    "requestID",
+                    "requestId",
+                    "request_id",
+                    "permissionID",
+                    "permissionId",
+                    "permission_id",
+                    "id",
+                ],
+            );
+            let source_ref = id
+                .as_deref()
+                .map(request_ref)
+                .unwrap_or_else(|| callback_ref("approval_requested", run, sequence));
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "approval_requested",
+                source_ref,
+                id,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+        ("mastracode", "permissionresult") => {
+            if let Some(id) = callback_id(
+                payload,
+                &[
+                    "toolCallId",
+                    "tool_call_id",
+                    "requestID",
+                    "requestId",
+                    "request_id",
+                    "permissionID",
+                    "permissionId",
+                    "permission_id",
+                    "id",
+                ],
+            ) {
+                effects.push(resolve_effect(&source, &id, "decided"));
+            }
+        }
+        ("claude", "permissionrequest") => {
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "approval_requested",
+                callback_ref("approval_requested", run, sequence),
+                None,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+        ("claude", "notification") => {
+            match callback_text(payload, &["notification_type", "notificationType"])
+                .map(normalize_event)
+                .as_deref()
+            {
+                Some("permissionprompt") => {
+                    effects.push(callback_event_effect(
+                        provider,
+                        pane,
+                        run,
+                        "blocked",
+                        callback_ref("blocked", run, sequence),
+                        None,
+                        summary.clone(),
+                    ));
+                    requested = true;
+                }
+                Some("elicitationdialog") => {
+                    effects.push(callback_event_effect(
+                        provider,
+                        pane,
+                        run,
+                        "question_asked",
+                        callback_ref("question_asked", run, sequence),
+                        None,
+                        summary.clone(),
+                    ));
+                    requested = true;
+                }
+                _ => {}
+            }
+        }
+        ("claude", "stop") => {
+            let id = callback_id(payload, &["prompt_id", "promptId"]);
+            let source_ref = id
+                .as_deref()
+                .map(|id| format!("turn_completed:{run}:{id}"))
+                .unwrap_or_else(|| callback_ref("turn_completed", run, sequence));
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "turn_completed",
+                source_ref,
+                id,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+        ("codex", "stop") => {
+            let id = callback_id(payload, &["turn_id", "turnId"]);
+            let source_ref = id
+                .as_deref()
+                .map(|id| format!("turn_completed:{run}:{id}"))
+                .unwrap_or_else(|| callback_ref("turn_completed", run, sequence));
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "turn_completed",
+                source_ref,
+                id,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+        _ => {}
+    }
+
+    if !requested && event == "blocked" && provider == "kimi" {
+        let id = callback_id(payload, &["toolCallId", "tool_call_id"]);
+        let kind = callback_tool(payload)
+            .is_some_and(|tool| tool.eq_ignore_ascii_case("AskUserQuestion"))
+            .then_some("question_asked")
+            .or_else(|| id.as_ref().map(|_| "approval_requested"));
+        if let Some(kind) = kind {
+            let source_ref = id
+                .as_deref()
+                .map(request_ref)
+                .unwrap_or_else(|| callback_ref(kind, run, sequence));
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                kind,
+                source_ref,
+                id,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+    }
+    if !requested && event == "blocked" && provider == "mastracode" {
+        let id = callback_id(
+            payload,
+            &[
+                "toolCallId",
+                "tool_call_id",
+                "requestID",
+                "requestId",
+                "request_id",
+                "permissionID",
+                "permissionId",
+                "permission_id",
+                "id",
+            ],
+        );
+        let source_ref = id
+            .as_deref()
+            .map(request_ref)
+            .unwrap_or_else(|| callback_ref("approval_requested", run, sequence));
+        effects.push(callback_event_effect(
+            provider,
+            pane,
+            run,
+            "approval_requested",
+            source_ref,
+            id,
+            summary.clone(),
+        ));
+        requested = true;
+    }
+    if event == "working"
+        && provider == "kimi"
+        && let Some(id) = callback_id(payload, &["toolCallId", "tool_call_id"])
+        && callback_text(payload, &["decision"]).is_some()
+    {
+        effects.push(resolve_effect(&source, &id, "decided"));
+    }
+    if event == "working"
+        && provider == "mastracode"
+        && let Some(id) = callback_id(
+            payload,
+            &[
+                "toolCallId",
+                "tool_call_id",
+                "requestID",
+                "requestId",
+                "request_id",
+                "permissionID",
+                "permissionId",
+                "permission_id",
+                "id",
+            ],
+        )
+        && callback_text(payload, &["decision", "result"]).is_some()
+    {
+        effects.push(resolve_effect(&source, &id, "decided"));
+    }
+
+    if !requested && mapped.state == Some("blocked") {
+        effects.push(callback_event_effect(
+            provider,
+            pane,
+            run,
+            "blocked",
+            callback_ref("blocked", run, sequence),
+            None,
+            summary,
+        ));
     }
     effects
+}
+
+fn callback_event_effect(
+    provider: &str,
+    pane: &str,
+    run: &str,
+    kind: &'static str,
+    source_ref: String,
+    native_ref: Option<String>,
+    summary: Option<Value>,
+) -> super::inbox::Effect {
+    super::inbox::Effect::Event {
+        source: format!("hook:{provider}"),
+        source_ref,
+        provider: provider.into(),
+        pane: pane.into(),
+        run: run.into(),
+        revision: None,
+        kind,
+        native_ref,
+        summary,
+    }
+}
+
+fn callback_ref(kind: &str, run: &str, sequence: u64) -> String {
+    format!("{kind}:{run}:{sequence}")
+}
+
+fn request_ref(id: &str) -> String {
+    format!("request:{id}")
+}
+
+fn resolve_effect(source: &str, id: &str, resolution: &'static str) -> super::inbox::Effect {
+    super::inbox::Effect::Resolve {
+        source: source.into(),
+        source_ref: request_ref(id),
+        resolution,
+    }
+}
+
+fn callback_value<'a>(payload: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
+    let event = payload.get("event").and_then(Value::as_object);
+    for object in [Some(payload), event].into_iter().flatten() {
+        if let Some(value) = keys.iter().find_map(|key| object.get(*key)) {
+            return Some(value);
+        }
+    }
+    for object in [Some(payload), event].into_iter().flatten() {
+        if let Some(properties) = object.get("properties").and_then(Value::as_object)
+            && let Some(value) = keys.iter().find_map(|key| properties.get(*key))
+        {
+            return Some(value);
+        }
+        if let Some(input) = object
+            .get("inputData")
+            .or_else(|| object.get("input_data"))
+            .and_then(Value::as_object)
+            && let Some(value) = keys.iter().find_map(|key| input.get(*key))
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn callback_text<'a>(payload: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
+    callback_value(payload, keys)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn callback_id(payload: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    callback_text(payload, keys)
+        .filter(|value| valid_text(value))
+        .map(str::to_owned)
+}
+
+fn callback_tool(payload: &Map<String, Value>) -> Option<String> {
+    callback_text(payload, &["tool_name", "toolName", "tool"])
+        .or_else(|| {
+            callback_value(payload, &["tool"])
+                .and_then(Value::as_object)
+                .and_then(|tool| first_text(tool, &["name", "tool_name", "toolName"]))
+        })
+        .map(str::to_owned)
+}
+
+fn callback_input_text<'a>(payload: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
+    callback_value(payload, &["tool_input", "toolInput"])
+        .and_then(Value::as_object)
+        .and_then(|input| first_text(input, keys))
+}
+
+fn callback_command(payload: &Map<String, Value>) -> Option<String> {
+    callback_text(payload, &["command"])
+        .or_else(|| callback_input_text(payload, &["command", "cmd", "script"]))
+        .or_else(|| callback_value(payload, &["tool_input", "toolInput"]).and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn callback_file_path(payload: &Map<String, Value>) -> Option<String> {
+    callback_text(payload, &["file_path", "filePath", "path"])
+        .or_else(|| callback_input_text(payload, &["file_path", "filePath", "path"]))
+        .map(str::to_owned)
+}
+
+fn callback_url(payload: &Map<String, Value>) -> Option<String> {
+    callback_text(payload, &["url"])
+        .or_else(|| callback_input_text(payload, &["url"]))
+        .map(str::to_owned)
+}
+
+fn callback_summary(provider: &str, event: &str, payload: &Map<String, Value>) -> Option<Value> {
+    let mut summary = Map::new();
+    let tool = callback_tool(payload);
+    if let Some(tool) = tool.as_deref() {
+        summary.insert("tool".into(), json!(summary_text(tool, 120, 256)));
+        let tool = tool.to_ascii_lowercase();
+        if is_shell_tool(&tool) {
+            if let Some(command) = callback_command(payload) {
+                summary.insert("command".into(), json!(summary_text(&command, 120, 480)));
+            }
+        } else if is_file_tool(&tool) {
+            if let Some(path) = callback_file_path(payload) {
+                summary.insert("file_path".into(), json!(summary_text(&path, 256, 512)));
+            }
+        } else if is_fetch_tool(&tool)
+            && let Some(url) = callback_url(payload)
+        {
+            summary.insert(
+                "url".into(),
+                json!(summary_text(url_without_query(&url), 256, 512)),
+            );
+        }
+    }
+    if matches!(provider, "opencode" | "kilo")
+        && matches!(event, "permissionasked" | "permissionaskedv2")
+    {
+        if let Some(permission) = callback_text(payload, &["permission"]) {
+            summary.insert(
+                "permission".into(),
+                json!(summary_text(permission, 120, 256)),
+            );
+        }
+        if let Some(patterns) = callback_value(payload, &["patterns"]).and_then(Value::as_array) {
+            let patterns = patterns
+                .iter()
+                .filter_map(Value::as_str)
+                .take(3)
+                .map(|pattern| Value::String(summary_text(pattern, 120, 128)))
+                .collect::<Vec<_>>();
+            if !patterns.is_empty() {
+                summary.insert("patterns".into(), Value::Array(patterns));
+            }
+        }
+    }
+    if summary.is_empty() {
+        return None;
+    }
+    let summary = Value::Object(summary);
+    (summary.to_string().len() <= 2048).then_some(summary)
+}
+
+fn is_shell_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "bash" | "sh" | "zsh" | "fish" | "pwsh" | "powershell" | "shell"
+    ) || tool.contains("shell")
+}
+
+fn is_file_tool(tool: &str) -> bool {
+    [
+        "read", "write", "edit", "patch", "file", "glob", "grep", "search",
+    ]
+    .iter()
+    .any(|name| tool.contains(name))
+}
+
+fn is_fetch_tool(tool: &str) -> bool {
+    tool.contains("fetch") || tool.contains("http")
+}
+
+fn url_without_query(url: &str) -> &str {
+    let end = [url.find('?'), url.find('#')]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(url.len());
+    &url[..end]
+}
+
+struct Redactors {
+    assignment: Regex,
+    authorization: Regex,
+    option_equals: Regex,
+    option_value: Regex,
+    short_option: Regex,
+    bearer: Regex,
+    openai_key: Regex,
+    github_token: Regex,
+}
+
+fn redactors() -> &'static Redactors {
+    static REDACTORS: OnceLock<Redactors> = OnceLock::new();
+    REDACTORS.get_or_init(|| Redactors {
+        assignment: Regex::new(r#"(?i)\b([a-z_][a-z0-9_]*)=(?:\"[^\"]*\"|'[^']*'|\S+)"#).expect("valid assignment redaction regex"),
+        authorization: Regex::new(r"(?i)\bauthorization\s*:\s*[^\r\n]*").expect("valid authorization redaction regex"),
+        option_equals: Regex::new(r"(?i)(--(?:password|passwd|token|secret|api[-_]?key|auth)=)\S+").expect("valid option redaction regex"),
+        option_value: Regex::new(r#"(?i)(--(?:password|passwd|token|secret|api[-_]?key|auth)\s+)(?:\"[^\"]*\"|'[^']*'|\S+)"#).expect("valid option-value redaction regex"),
+        short_option: Regex::new(r#"(?i)(^|\s)(-p\s+)(?:\"[^\"]*\"|'[^']*'|\S+)"#).expect("valid short-option redaction regex"),
+        bearer: Regex::new(r"(?i)(\bbearer\s+)[a-z0-9._~+/=-]+").expect("valid bearer redaction regex"),
+        openai_key: Regex::new(r"\bsk-[a-zA-Z0-9_-]+\b").expect("valid OpenAI-key redaction regex"),
+        github_token: Regex::new(r"\bghp_[a-zA-Z0-9]+\b").expect("valid GitHub-token redaction regex"),
+    })
+}
+
+fn redact_text(value: &str) -> String {
+    let redactors = redactors();
+    let value = redactors
+        .authorization
+        .replace_all(value, "Authorization: ***");
+    let value = redactors
+        .assignment
+        .replace_all(&value, |captures: &regex::Captures<'_>| {
+            let key = &captures[1];
+            let sensitive = ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "AUTH"]
+                .iter()
+                .any(|needle| key.to_ascii_uppercase().contains(needle));
+            if sensitive {
+                format!("{key}=***")
+            } else {
+                captures[0].into()
+            }
+        });
+    let value = redactors.option_equals.replace_all(&value, "$1***");
+    let value = redactors.option_value.replace_all(&value, "$1***");
+    let value = redactors.short_option.replace_all(&value, "$1$2***");
+    let value = redactors.bearer.replace_all(&value, "$1***");
+    let value = redactors.openai_key.replace_all(&value, "***");
+    redactors
+        .github_token
+        .replace_all(&value, "***")
+        .into_owned()
+}
+
+fn summary_text(value: &str, max_chars: usize, max_bytes: usize) -> String {
+    let value: String = redact_text(value).chars().take(max_chars).collect();
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].into()
 }
 
 fn required_env(name: &str) -> Result<String, String> {
@@ -999,6 +1635,7 @@ fn map_callback_event(
                 root_binding,
                 allow_root_switch,
                 session_switch: false,
+                event_only: false,
             });
         }
         if !matches!(action, "idle" | "working" | "blocked") {
@@ -1023,6 +1660,7 @@ fn map_callback_event(
             root_binding,
             allow_root_switch,
             session_switch: false,
+            event_only: false,
         });
     }
 
@@ -1031,6 +1669,7 @@ fn map_callback_event(
         if !event.is_empty() && !session_event_allowed(target.id, &event) {
             return Err(format!("unmapped {} callback event: {event}", target.id));
         }
+        let event_only = event_only_callback(target.id, &event);
         return Ok(MappedCallback {
             state: None,
             session,
@@ -1043,6 +1682,7 @@ fn map_callback_event(
             root_binding: false,
             allow_root_switch: false,
             session_switch: false,
+            event_only,
         });
     }
 
@@ -1052,9 +1692,12 @@ fn map_callback_event(
 fn session_event_allowed(provider: &str, event: &str) -> bool {
     let normalized = normalize_event(event);
     match provider {
-        "claude" | "codex" | "copilot" | "droid" | "qodercli" | "qwen" => {
-            normalized == "sessionstart"
-        }
+        "claude" => matches!(
+            normalized.as_str(),
+            "sessionstart" | "permissionrequest" | "notification" | "stop"
+        ),
+        "codex" => matches!(normalized.as_str(), "sessionstart" | "stop"),
+        "copilot" | "droid" | "qodercli" | "qwen" => normalized == "sessionstart",
         "cursor" => normalized == "sessionstart",
         "devin" => matches!(
             normalized.as_str(),
@@ -1073,6 +1716,13 @@ fn session_event_allowed(provider: &str, event: &str) -> bool {
         "grok" => normalized == "sessionstart",
         _ => false,
     }
+}
+
+fn event_only_callback(provider: &str, event: &str) -> bool {
+    matches!(
+        (provider, normalize_event(event).as_str()),
+        ("claude", "permissionrequest" | "notification" | "stop") | ("codex", "stop")
+    )
 }
 
 fn map_lifecycle(
@@ -1097,12 +1747,12 @@ fn map_lifecycle(
             "agentstart" | "toolapprovalresolved" => Some("working"),
             "toolapprovalrequested" => Some("blocked"),
             "toolexecutionstart"
-                if first_text(payload, &["tool_name", "toolName"]) == Some("ask") =>
+                if callback_tool(payload).is_some_and(|tool| tool.eq_ignore_ascii_case("ask")) =>
             {
                 Some("blocked")
             }
             "toolexecutionend"
-                if first_text(payload, &["tool_name", "toolName"]) == Some("ask") =>
+                if callback_tool(payload).is_some_and(|tool| tool.eq_ignore_ascii_case("ask")) =>
             {
                 Some("working")
             }
@@ -1114,7 +1764,8 @@ fn map_lifecycle(
             "userpromptsubmit" | "posttooluse" | "posttoolusefailure" | "subagentstart"
             | "precompact" | "permissionresult" => Some("working"),
             "pretooluse"
-                if first_text(payload, &["tool_name", "toolName"]) == Some("AskUserQuestion") =>
+                if callback_tool(payload)
+                    .is_some_and(|tool| tool.eq_ignore_ascii_case("AskUserQuestion")) =>
             {
                 Some("blocked")
             }
@@ -1145,6 +1796,7 @@ fn map_lifecycle(
         root_binding: false,
         allow_root_switch: false,
         session_switch: false,
+        event_only: false,
     })
 }
 
@@ -1181,20 +1833,25 @@ fn map_open_code(
         .and_then(Value::as_object)
         .unwrap_or(event_object);
     let (child_session, root_binding, allow_root_switch) = open_code_provenance(payload);
-    let state = match event.as_str() {
-        "chat.message"
-        | "tool.execute.before"
-        | "tool.execute.after"
-        | "permission.replied"
-        | "question.replied"
-        | "question.rejected"
-        | "session.compacted" => Some("working"),
-        "permission.asked" | "question.asked" | "session.error" => Some("blocked"),
-        "session.idle" => Some("idle"),
-        "session.created" if provider == "kilo" => None,
-        "session.updated" => None,
-        "masil.session.selected" if root_binding => None,
-        "session.status" => match status_name(properties).as_deref() {
+    let normalized = normalize_event(&event);
+    let state = match normalized.as_str() {
+        "chatmessage"
+        | "toolexecutebefore"
+        | "toolexecuteafter"
+        | "permissionreplied"
+        | "permissionrepliedv2"
+        | "questionreplied"
+        | "questionrepliedv2"
+        | "questionrejected"
+        | "questionrejectedv2"
+        | "sessioncompacted" => Some("working"),
+        "permissionasked" | "permissionaskedv2" | "questionasked" | "questionaskedv2"
+        | "sessionerror" => Some("blocked"),
+        "sessionidle" => Some("idle"),
+        "sessioncreated" if provider == "kilo" => None,
+        "sessionupdated" => None,
+        "masilsessionselected" if root_binding => None,
+        "sessionstatus" => match status_name(properties).as_deref() {
             Some("idle") => Some("idle"),
             Some("active" | "busy" | "pending" | "retry" | "running" | "streaming" | "working") => {
                 Some("working")
@@ -1212,6 +1869,7 @@ fn map_open_code(
         root_binding,
         allow_root_switch,
         session_switch: false,
+        event_only: false,
     })
 }
 
@@ -1451,6 +2109,7 @@ mod tests {
         }
     }
 
+    use super::super::inbox::Effect;
     use super::*;
 
     fn object(source: &str) -> Map<String, Value> {
@@ -1551,6 +2210,327 @@ mod tests {
         );
     }
 
+    fn effects(provider: &str, source: &str) -> Vec<Effect> {
+        let payload = object(source);
+        let mapped = map_callback(target(provider).unwrap(), None, &payload).unwrap();
+        callback_effects(provider, "%1", "run-1", 7, &mapped, &payload)
+    }
+
+    fn action_effects(provider: &str, action: &str, source: &str) -> Vec<Effect> {
+        let payload = object(source);
+        let mapped = map_callback(target(provider).unwrap(), Some(action), &payload).unwrap();
+        callback_effects(provider, "%1", "run-1", 7, &mapped, &payload)
+    }
+
+    #[test]
+    fn open_code_and_kilo_requests_use_one_cross_kind_key() {
+        let asked = effects(
+            "opencode",
+            r#"{"event":{"type":"permission.asked.v2","properties":{"id":"permission-1","sessionID":"session-1","permission":"bash","patterns":["src/**","Cargo.toml","README.md","one-more"],"tool":"Bash","command":"TOKEN=secret echo ok"}}}"#,
+        );
+        match asked.as_slice() {
+            [
+                Effect::Event {
+                    source,
+                    source_ref,
+                    kind,
+                    native_ref,
+                    summary,
+                    ..
+                },
+            ] => {
+                assert_eq!(source, "hook:opencode");
+                assert_eq!(source_ref, "request:permission-1");
+                assert_eq!(*kind, "approval_requested");
+                assert_eq!(native_ref.as_deref(), Some("permission-1"));
+                assert_eq!(summary.as_ref().unwrap()["permission"], "bash");
+                assert_eq!(
+                    summary.as_ref().unwrap()["patterns"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    3
+                );
+                assert_eq!(summary.as_ref().unwrap()["command"], "TOKEN=*** echo ok");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+
+        let replied = effects(
+            "kilo",
+            r#"{"event":{"type":"permission.replied","properties":{"requestID":"permission-1","reply":"allow"}}}"#,
+        );
+        assert_eq!(
+            replied,
+            vec![Effect::Resolve {
+                source: "hook:kilo".into(),
+                source_ref: "request:permission-1".into(),
+                resolution: "replied",
+            }]
+        );
+
+        let rejected = effects(
+            "opencode",
+            r#"{"event":{"type":"question.rejected.v2","properties":{"request_id":"question-1"}}}"#,
+        );
+        assert_eq!(
+            rejected,
+            vec![Effect::Resolve {
+                source: "hook:opencode".into(),
+                source_ref: "request:question-1".into(),
+                resolution: "rejected",
+            }]
+        );
+
+        let blocked = effects(
+            "opencode",
+            r#"{"event":{"type":"session.error","properties":{"sessionID":"session-1"}}}"#,
+        );
+        assert!(matches!(
+            blocked.as_slice(),
+            [Effect::Event {
+                source_ref,
+                kind: "blocked",
+                summary: None,
+                ..
+            }] if source_ref == "blocked:run-1:7"
+        ));
+    }
+
+    #[test]
+    fn kimi_omp_and_mastracode_requests_and_resolutions_are_keyed() {
+        let kimi = effects(
+            "kimi",
+            r#"{"hook_event_name":"PermissionRequest","toolCallId":"kimi-1","toolName":"Bash","toolInput":{"command":"--token hidden"},"turnId":"turn-1"}"#,
+        );
+        assert!(matches!(
+            kimi.as_slice(),
+            [Effect::Event {
+                source_ref,
+                kind: "approval_requested",
+                native_ref: Some(native_ref),
+                summary: Some(summary),
+                ..
+            }] if source_ref == "request:kimi-1"
+                && native_ref == "kimi-1"
+                && summary["command"] == "--token ***"
+        ));
+        assert_eq!(
+            effects(
+                "kimi",
+                r#"{"hook_event_name":"PermissionResult","tool_call_id":"kimi-1","decision":"allow"}"#,
+            ),
+            vec![Effect::Resolve {
+                source: "hook:kimi".into(),
+                source_ref: "request:kimi-1".into(),
+                resolution: "decided",
+            }]
+        );
+        assert!(matches!(
+            effects(
+                "kimi",
+                r#"{"hook_event_name":"PreToolUse","toolCallId":"kimi-question","toolName":"AskUserQuestion"}"#,
+            )
+            .as_slice(),
+            [Effect::Event {
+                source_ref,
+                kind: "question_asked",
+                ..
+            }] if source_ref == "request:kimi-question"
+        ));
+
+        assert!(matches!(
+            effects(
+                "omp",
+                r#"{"hook_event_name":"tool_approval_requested","toolCallId":"omp-1","toolName":"Bash"}"#,
+            )
+            .as_slice(),
+            [Effect::Event {
+                source_ref,
+                kind: "approval_requested",
+                ..
+            }] if source_ref == "request:omp-1"
+        ));
+        assert_eq!(
+            effects(
+                "omp",
+                r#"{"hook_event_name":"tool_approval_resolved","tool_call_id":"omp-1"}"#,
+            ),
+            vec![Effect::Resolve {
+                source: "hook:omp".into(),
+                source_ref: "request:omp-1".into(),
+                resolution: "decided",
+            }]
+        );
+        assert!(matches!(
+            effects(
+                "omp",
+                r#"{"hook_event_name":"tool_execution_start","toolCallId":"omp-question","toolName":"ask"}"#,
+            )
+            .as_slice(),
+            [Effect::Event {
+                source_ref,
+                kind: "question_asked",
+                ..
+            }] if source_ref == "request:omp-question"
+        ));
+        assert_eq!(
+            effects(
+                "omp",
+                r#"{"hook_event_name":"tool_execution_end","toolCallId":"omp-question","toolName":"ask"}"#,
+            ),
+            vec![Effect::Resolve {
+                source: "hook:omp".into(),
+                source_ref: "request:omp-question".into(),
+                resolution: "completed",
+            }]
+        );
+
+        assert!(matches!(
+            effects(
+                "mastracode",
+                r#"{"hook_event_name":"PermissionRequest","permission_id":"mastra-1"}"#,
+            )
+            .as_slice(),
+            [Effect::Event {
+                source_ref,
+                kind: "approval_requested",
+                ..
+            }] if source_ref == "request:mastra-1"
+        ));
+        assert_eq!(
+            effects(
+                "mastracode",
+                r#"{"hook_event_name":"PermissionResult","permission_id":"mastra-1"}"#,
+            ),
+            vec![Effect::Resolve {
+                source: "hook:mastracode".into(),
+                source_ref: "request:mastra-1".into(),
+                resolution: "decided",
+            }]
+        );
+
+        assert!(matches!(
+            action_effects(
+                "kimi",
+                "blocked",
+                r#"{"inputData":{"toolCallId":"kimi-exported-question","toolName":"AskUserQuestion"}}"#,
+            )
+            .as_slice(),
+            [Effect::Event {
+                source_ref,
+                kind: "question_asked",
+                ..
+            }] if source_ref == "request:kimi-exported-question"
+        ));
+        assert_eq!(
+            action_effects(
+                "kimi",
+                "working",
+                r#"{"inputData":{"toolCallId":"kimi-exported-result","decision":"allow"}}"#,
+            ),
+            vec![Effect::Resolve {
+                source: "hook:kimi".into(),
+                source_ref: "request:kimi-exported-result".into(),
+                resolution: "decided",
+            }]
+        );
+    }
+
+    #[test]
+    fn claude_and_codex_event_only_callbacks_only_make_inbox_effects() {
+        let claude_permission = object(
+            r#"{"hook_event_name":"PermissionRequest","session_id":"session-1","prompt_id":"prompt-1","tool_name":"AskUserQuestion","tool_input":"private prompt"}"#,
+        );
+        let mapped = map_callback(target("claude").unwrap(), None, &claude_permission).unwrap();
+        assert!(mapped.event_only);
+        let permission_effects =
+            callback_effects("claude", "%1", "run-1", 7, &mapped, &claude_permission);
+        assert!(matches!(
+            permission_effects.as_slice(),
+            [Effect::Event {
+                source_ref,
+                kind: "approval_requested",
+                summary: Some(summary),
+                ..
+            }] if source_ref == "approval_requested:run-1:7"
+                && summary["tool"] == "AskUserQuestion"
+                && summary.get("prompt_id").is_none()
+        ));
+
+        assert!(matches!(
+            effects(
+                "claude",
+                r#"{"hook_event_name":"Notification","notification_type":"elicitation_dialog","message":"private question"}"#,
+            )
+            .as_slice(),
+            [Effect::Event {
+                kind: "question_asked",
+                source_ref,
+                ..
+            }] if source_ref == "question_asked:run-1:7"
+        ));
+        assert!(effects(
+            "claude",
+            r#"{"hook_event_name":"Notification","notification_type":"unrelated","message":"ignored"}"#,
+        )
+        .is_empty());
+        assert!(matches!(
+            effects(
+                "claude",
+                r#"{"hook_event_name":"Stop","session_id":"session-1","prompt_id":"prompt-1","last_assistant_message":"private answer"}"#,
+            )
+            .as_slice(),
+            [Effect::Event {
+                kind: "turn_completed",
+                source_ref,
+                summary: None,
+                ..
+            }] if source_ref == "turn_completed:run-1:prompt-1"
+        ));
+
+        let codex_stop = object(
+            r#"{"hook_event_name":"Stop","session_id":"session-1","turn_id":"turn-1","last_assistant_message":"private answer"}"#,
+        );
+        let mapped = map_callback(target("codex").unwrap(), None, &codex_stop).unwrap();
+        assert!(mapped.event_only);
+        assert!(matches!(
+            callback_effects("codex", "%1", "run-1", 7, &mapped, &codex_stop).as_slice(),
+            [Effect::Event {
+                kind: "turn_completed",
+                source_ref,
+                summary: None,
+                ..
+            }] if source_ref == "turn_completed:run-1:turn-1"
+        ));
+    }
+
+    #[test]
+    fn summaries_redact_before_they_are_truncated() {
+        let redacted = redact_text(
+            "API_TOKEN=first --password=third --token fourth -p fifth sk-secret ghp_secret",
+        );
+        assert!(redacted.contains("API_TOKEN=***"));
+        assert!(redacted.contains("--password=***"));
+        assert!(redacted.contains("--token ***"));
+        assert!(redacted.contains("-p ***"));
+        assert!(!redacted.contains("first"));
+        assert!(!redacted.contains("second"));
+        assert!(!redacted.contains("third"));
+        assert!(!redacted.contains("fourth"));
+        assert!(!redacted.contains("fifth"));
+        assert!(!redacted.contains("sk-secret"));
+        assert!(!redacted.contains("ghp_secret"));
+        assert_eq!(
+            redact_text("Authorization: Bearer second"),
+            "Authorization: ***"
+        );
+        assert_eq!(
+            summary_text(&format!("TOKEN={}", "x".repeat(512)), 120, 480),
+            "TOKEN=***"
+        );
+    }
+
     #[test]
     fn exported_script_quotes_the_executable_and_never_embeds_callback_data() {
         let exported = export(target("codex").unwrap(), None).unwrap();
@@ -1568,5 +2548,24 @@ mod tests {
         assert!(plugin.contains("child.stdin.on(\"error\""));
         assert!(plugin.contains("child.kill()"));
         assert!(!plugin.contains("retry"));
+
+        let claude =
+            registration_fragment(target("claude").unwrap(), std::path::Path::new("/tmp/hook"));
+        assert_eq!(
+            claude["hooks"]["Notification"][0]["matcher"],
+            "permission_prompt|elicitation_dialog"
+        );
+        assert_eq!(claude["hooks"]["Stop"][0]["hooks"][0]["timeout"], 10);
+        let codex =
+            registration_fragment(target("codex").unwrap(), std::path::Path::new("/tmp/hook"));
+        assert!(codex["hooks"].get("Stop").is_some());
+        let kimi =
+            registration_fragment(target("kimi").unwrap(), std::path::Path::new("/tmp/hook"));
+        assert!(
+            kimi["content"]
+                .as_str()
+                .unwrap()
+                .contains("event = \"PreToolUse\"\nmatcher = \"^AskUserQuestion$\"")
+        );
     }
 }
