@@ -1896,11 +1896,15 @@ fn autosave_lock(dir: &Path, socket: &str) -> Result<Option<File>, String> {
 /// One saver runs per socket; it stops when no server answers there or the
 /// masil UI layer is turned off, and waits while @masil-autosave is off or 0.
 fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
+    // Before the saver lock: when the server restarts on this socket within
+    // one check, the earlier saver keeps the lock and this one exits.
+    crate::coordinator::restart_if_enabled(Path::new(socket));
     let dir = snapshot_dir()?;
     let Some(_lock) = autosave_lock(&dir, socket)? else {
         return Ok(0);
     };
     let mut last = std::time::Instant::now();
+    let mut boot = None;
     loop {
         std::thread::sleep(AUTOSAVE_CHECK);
         // A server restarted on the same socket is saved by this saver; its
@@ -1910,7 +1914,7 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
             &[
                 "display-message",
                 "-p",
-                "#{@masil-agent}\u{1f}#{@masil-ui}\u{1f}#{@masil-autosave}",
+                "#{@masil-agent}\u{1f}#{@masil-ui}\u{1f}#{@masil-autosave}\u{1f}#{masil_core_boot_id}",
             ],
         ) else {
             // A slow reply is no reason to stop; a socket nobody listens on is.
@@ -1920,9 +1924,15 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
             continue;
         };
         let fields: Vec<_> = state.trim_end_matches('\n').split('\u{1f}').collect();
-        let [agent, ui, value] = fields.as_slice() else {
+        let [agent, ui, value, current] = fields.as_slice() else {
             continue;
         };
+        // A server restarted on this socket: start its coordinator if a
+        // feature needs one.
+        if boot.as_deref().is_some_and(|boot| boot != *current) {
+            crate::coordinator::restart_if_enabled(Path::new(socket));
+        }
+        boot = Some((*current).to_owned());
         // The core sets @masil-agent only when it loads the layer.
         if agent.is_empty() || *ui == "off" {
             return Ok(0);

@@ -1,6 +1,7 @@
 //! Observer CLI and opt-in terminal management UI. No daemon autostart.
 mod agent_stream;
 mod attention;
+mod coordinator;
 mod daemon;
 mod detection;
 mod doctor;
@@ -702,6 +703,9 @@ fn execute() -> Result<i32, String> {
     }
     if args[0] == "agent" {
         return managed::run(&args[1..]);
+    }
+    if args[0] == "agentd" {
+        return coordinator::run(&args[1..]);
     }
     if args.len() < 3 || args[0] != "--socket" {
         return Err("expected --socket PATH command".into());

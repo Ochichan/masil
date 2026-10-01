@@ -28,6 +28,17 @@ impl Drop for SocketGuard {
     }
 }
 
+impl SocketGuard {
+    /// Whether the path still names the socket this guard bound.
+    pub(crate) fn still_bound(&self) -> bool {
+        fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            metadata.file_type().is_socket()
+                && metadata.dev() == self.dev
+                && metadata.ino() == self.ino
+        })
+    }
+}
+
 pub(crate) fn private_parent(path: &Path, what: &str) -> Result<(), String> {
     let parent = path
         .parent()

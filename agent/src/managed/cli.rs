@@ -35,6 +35,7 @@ const HELP: &str = "Native agents (no observer configuration needed):
   masil-agent agent [--socket MASIL_SOCKET] integration status [PROVIDER]
   masil-agent agent [--socket MASIL_SOCKET] integration export PROVIDER [--directory ABSOLUTE_PATH]
   masil-agent agent [--socket MASIL_SOCKET] reload
+  masil-agent agent [--socket MASIL_SOCKET] coordinator status|start|stop
   masil-agent agent [--socket MASIL_SOCKET] report --pane %N --run RUN --sequence N --state STATE [--session ID]
   masil-agent agent [--socket MASIL_SOCKET] ui|sidebar [--lang en|ko] [--theme dark|light|terminal]
 
@@ -121,6 +122,17 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
             args.extend(["--client".into(), client]);
         }
         return crate::ui::run_managed(socket, &args, command == "sidebar");
+    }
+    if command == "coordinator" {
+        let socket = PathBuf::from(&socket);
+        let report = match rest {
+            [action] if action == "status" => crate::coordinator::status(&socket)?,
+            [action] if action == "start" => crate::coordinator::ensure(&socket)?,
+            [action] if action == "stop" => crate::coordinator::stop(&socket)?,
+            _ => return Err("usage: masil-agent agent coordinator status|start|stop".into()),
+        };
+        print(&report)?;
+        return Ok(0);
     }
     if command == "exec-managed" {
         return launch_registered(&socket, rest);

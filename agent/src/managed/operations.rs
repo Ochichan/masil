@@ -187,7 +187,7 @@ pub(super) fn valid_id(id: &str) -> bool {
 
 /// `$XDG_STATE_HOME/masil/operations`, else `~/.local/state/masil/operations`,
 /// owner-only and canonical: SQLITE_OPEN_NOFOLLOW rejects any symlinked component.
-fn state_base() -> Result<PathBuf, String> {
+pub(super) fn state_base() -> Result<PathBuf, String> {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -442,6 +442,42 @@ impl Store {
         }
         status["unresolved"] = json!(store.list(true, CAPACITY as usize)?.len());
         Ok(Some(status))
+    }
+
+    /// Coordinator features switched on in the store for `socket` under the
+    /// state directory `base`, read without creating or changing anything.
+    /// Empty when no store or no version 2 store exists yet.
+    pub fn enabled_features(base: &Path, socket: &Path) -> Result<Vec<String>, String> {
+        let socket = socket
+            .canonicalize()
+            .map_err(|error| format!("native socket: {error}"))?;
+        let Ok(directory) = base.join("masil/operations").canonicalize() else {
+            return Ok(Vec::new());
+        };
+        let path = directory.join(store_name(&socket));
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return Ok(Vec::new());
+        };
+        super::store::validate_private_metadata(&metadata, "operation store")?;
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(sql)?;
+        conn.busy_timeout(Duration::from_secs(2)).map_err(sql)?;
+        if Self::user_version(&conn)? < SCHEMA_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = conn
+            .prepare("SELECT name FROM coordinator_features ORDER BY name")
+            .map_err(sql)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)
     }
 
     /// Random identity of this database, recorded in the server so that a

@@ -1432,6 +1432,17 @@ pub(crate) fn operation_store_status(socket: &Path) -> Result<Option<Value>, Str
     operations::Store::inspect(socket)
 }
 
+/// The state directory this process uses for operation stores, from its own
+/// environment: absolute XDG_STATE_HOME, else HOME/.local/state.
+pub(crate) fn state_base() -> Result<std::path::PathBuf, String> {
+    operations::state_base()
+}
+
+/// Coordinator features switched on for `socket` in the stores under `base`.
+pub(crate) fn coordinator_features(base: &Path, socket: &Path) -> Result<Vec<String>, String> {
+    operations::Store::enabled_features(base, socket)
+}
+
 impl Agent {
     /// The desk's binding label. Rows from an endpoint without run evidence
     /// keep the configured-but-unverified wording.
