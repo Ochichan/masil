@@ -5,6 +5,7 @@ mod daemon;
 mod detection;
 mod doctor;
 mod finder;
+mod ipc;
 mod layout;
 mod managed;
 mod native_ui;

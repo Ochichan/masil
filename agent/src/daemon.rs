@@ -4,6 +4,7 @@
 //! or provider process and it does not read terminal screen contents.
 
 use crate::attention::{AckError, AttentionBook, AttentionState};
+use crate::ipc;
 use crate::observation::{self, Config, NativeSession, SourceState};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -14,8 +15,8 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -112,26 +113,6 @@ struct ProjectionData {
     observations: Vec<Value>,
 }
 
-struct SocketGuard {
-    path: PathBuf,
-    dev: u64,
-    ino: u64,
-}
-
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
-            return;
-        };
-        if metadata.file_type().is_socket()
-            && metadata.dev() == self.dev
-            && metadata.ino() == self.ino
-        {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
 struct CoreLock(File);
 
 impl Drop for CoreLock {
@@ -218,22 +199,6 @@ fn bounded(value: &Value, depth: usize) -> bool {
     }
 }
 
-fn private_parent(path: &Path) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or("manager socket requires an absolute parent directory")?;
-    let metadata = fs::metadata(parent).map_err(|_| "manager socket parent is unavailable")?;
-    if !path.is_absolute()
-        || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err("manager socket must be in a private owner directory".into());
-    }
-    Ok(())
-}
-
 fn lock_core(core: &Path) -> Result<(CoreLock, PathBuf), String> {
     let canonical = fs::canonicalize(core).map_err(|_| "core bridge is unavailable")?;
     let metadata = fs::metadata(&canonical).map_err(|_| "core bridge is unavailable")?;
@@ -282,77 +247,6 @@ fn lock_core(core: &Path) -> Result<(CoreLock, PathBuf), String> {
         );
     }
     Ok((CoreLock(file), canonical))
-}
-
-fn bind_manager(path: &Path) -> Result<(StdUnixListener, SocketGuard), String> {
-    private_parent(path)?;
-    match fs::symlink_metadata(path) {
-        Ok(_) => return Err("refusing existing manager socket path".into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err("cannot inspect manager socket path".into()),
-    }
-    let listener = StdUnixListener::bind(path).map_err(|_| "cannot bind manager socket")?;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(_) => return Err("cannot inspect bound manager socket".into()),
-    };
-    let guard = SocketGuard {
-        path: path.to_owned(),
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    };
-    if !metadata.file_type().is_socket() {
-        return Err("bound manager path is not a Unix socket".into());
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|_| "cannot make manager socket private")?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|_| "cannot make manager socket nonblocking")?;
-    Ok((listener, guard))
-}
-
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-fn peer_is_owner(stream: &StdUnixStream) -> bool {
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    unsafe {
-        libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) == 0 && uid == libc::geteuid()
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn peer_is_owner(stream: &StdUnixStream) -> bool {
-    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        ) == 0
-            && credentials.uid == libc::geteuid()
-    }
-}
-
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "linux"
-)))]
-fn peer_is_owner(_stream: &StdUnixStream) -> bool {
-    false
 }
 
 #[derive(Debug, Deserialize)]
@@ -443,39 +337,6 @@ fn valid_revision(value: &str) -> bool {
         && value.len() <= 20
         && value.bytes().all(|byte| byte.is_ascii_digit())
         && value.parse::<u64>().is_ok()
-}
-
-async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
-    let mut header = [0; 4];
-    stream
-        .read_exact(&mut header)
-        .await
-        .map_err(|_| "incomplete request frame")?;
-    let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > REQUEST_FRAME {
-        return Err("request exceeds frame limit".into());
-    }
-    let mut body = vec![0; length];
-    stream
-        .read_exact(&mut body)
-        .await
-        .map_err(|_| "incomplete request frame")?;
-    Ok(body)
-}
-
-async fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<(), String> {
-    let body = serde_json::to_vec(value).map_err(|_| "cannot encode response")?;
-    if body.is_empty() || body.len() > RESPONSE_FRAME {
-        return Err("response exceeds frame limit".into());
-    }
-    stream
-        .write_all(&(body.len() as u32).to_be_bytes())
-        .await
-        .map_err(|_| "cannot write response")?;
-    stream
-        .write_all(&body)
-        .await
-        .map_err(|_| "cannot write response".to_string())
 }
 
 fn error_response(request_id: &str, code: &str, message: &str) -> Value {
@@ -827,14 +688,22 @@ async fn handle_watch(
             "capacity",
             "watch subscriber limit reached",
         );
-        let _ = timeout(DEADLINE, write_frame(&mut stream, &value)).await;
+        let _ = timeout(
+            DEADLINE,
+            ipc::write_frame(&mut stream, &value, RESPONSE_FRAME),
+        )
+        .await;
         return;
     };
     let mut receiver = state.projection_sender.subscribe();
     let first = refresh_projection(&state);
     let frame = watch_frame(&request.request_id, &first);
     if !matches!(
-        timeout(DEADLINE, write_frame(&mut stream, &frame)).await,
+        timeout(
+            DEADLINE,
+            ipc::write_frame(&mut stream, &frame, RESPONSE_FRAME),
+        )
+        .await,
         Ok(Ok(()))
     ) {
         return;
@@ -844,7 +713,11 @@ async fn handle_watch(
     if latest.revision != first.revision {
         let frame = watch_frame(&request.request_id, &latest);
         if !matches!(
-            timeout(DEADLINE, write_frame(&mut stream, &frame)).await,
+            timeout(
+                DEADLINE,
+                ipc::write_frame(&mut stream, &frame, RESPONSE_FRAME),
+            )
+            .await,
             Ok(Ok(()))
         ) {
             return;
@@ -866,7 +739,11 @@ async fn handle_watch(
                 let snapshot = receiver.borrow_and_update().clone();
                 let frame = watch_frame(&request.request_id, &snapshot);
                 if !matches!(
-                    timeout(DEADLINE, write_frame(&mut stream, &frame)).await,
+                    timeout(
+                        DEADLINE,
+                        ipc::write_frame(&mut stream, &frame, RESPONSE_FRAME),
+                    )
+                    .await,
                     Ok(Ok(()))
                 ) {
                     return;
@@ -883,7 +760,7 @@ async fn handle_client(
     stop: watch::Sender<bool>,
     streams: Arc<Semaphore>,
 ) {
-    let body = match timeout(DEADLINE, read_frame(&mut stream)).await {
+    let body = match timeout(DEADLINE, ipc::read_frame(&mut stream, REQUEST_FRAME)).await {
         Ok(Ok(body)) => body,
         _ => return,
     };
@@ -891,7 +768,11 @@ async fn handle_client(
         Ok(request) => request,
         Err((request_id, message)) => {
             let value = error_response(&request_id, "invalid_request", &message);
-            let _ = timeout(DEADLINE, write_frame(&mut stream, &value)).await;
+            let _ = timeout(
+                DEADLINE,
+                ipc::write_frame(&mut stream, &value, RESPONSE_FRAME),
+            )
+            .await;
             return;
         }
     };
@@ -902,7 +783,11 @@ async fn handle_client(
     let should_stop = request.kind == "stop";
     let value = response(&state, &request);
     if matches!(
-        timeout(DEADLINE, write_frame(&mut stream, &value)).await,
+        timeout(
+            DEADLINE,
+            ipc::write_frame(&mut stream, &value, RESPONSE_FRAME),
+        )
+        .await,
         Ok(Ok(()))
     ) && should_stop
     {
@@ -1458,7 +1343,7 @@ async fn run(listener: StdUnixListener, core: PathBuf, config: Config) -> Result
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { continue; };
                 let Ok(standard) = stream.into_std() else { continue; };
-                if !peer_is_owner(&standard) { continue; }
+                if !ipc::peer_is_owner(&standard) { continue; }
                 let Ok(stream) = UnixStream::from_std(standard) else { continue; };
                 let Ok(permit) = clients.clone().try_acquire_owned() else { continue; };
                 let state = Arc::clone(&state);
@@ -1489,7 +1374,7 @@ async fn run(listener: StdUnixListener, core: PathBuf, config: Config) -> Result
 pub fn serve(socket: &Path, core: &Path, config: Config) -> Result<i32, String> {
     observation::validate(&config)?;
     let (_lock, canonical_core) = lock_core(core)?;
-    let (listener, _socket_guard) = bind_manager(socket)?;
+    let (listener, _socket_guard) = ipc::bind_private_socket(socket, "manager")?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(2)
