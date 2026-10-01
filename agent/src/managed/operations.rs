@@ -690,7 +690,7 @@ impl Store {
         reader_allowed(minimum)
     }
 
-    fn next_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64, String> {
+    fn next_seq(tx: &Connection) -> Result<i64, String> {
         Self::check_reader_in(tx)?;
         tx.query_row(
             "UPDATE meta SET value = value + 1 WHERE name = 'store_seq' RETURNING value",
@@ -866,7 +866,7 @@ impl Store {
         if state == DISPATCHING || state == UNKNOWN {
             return Err("invalid operation transition".into());
         }
-        let tx = self
+        let mut tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
@@ -884,6 +884,16 @@ impl Store {
         Self::append(&tx, record.op, state, source, evidence, now)?;
         let updated =
             Self::record_in(&tx, &record.operation_key)?.ok_or("operation disappeared")?;
+        let source_ref = format!("{}:{}", record.operation_key, record.ticket);
+        Self::inbox_best_effort(&mut tx, |conn| {
+            conn.execute(
+                "UPDATE inbox_events SET resolved_ms = ?2, resolution = 'settled'
+                 WHERE source = 'operation' AND source_ref = ?1 AND resolved_ms IS NULL",
+                params![source_ref, now as i64],
+            )
+            .map(drop)
+            .map_err(sql)
+        })?;
         tx.commit().map_err(sql)?;
         Ok(updated)
     }
@@ -922,7 +932,7 @@ impl Store {
         if state == DISPATCHING {
             return Err("invalid operation transition".into());
         }
-        let tx = self
+        let mut tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
@@ -954,10 +964,13 @@ impl Store {
             .map_err(sql)?;
         let record = Self::record_in(&tx, &key)?.ok_or("operation disappeared")?;
         if state == UNKNOWN {
-            // An unknown outcome needs a person; the inbox records it once.
+            // An unknown outcome needs a person; the inbox records each
+            // attempt's once. Best-effort: a failed insert is rolled back
+            // to the savepoint and the transition still commits.
+            let source_ref = format!("{}:{}", record.operation_key, record.ticket);
             let event = InboxEvent {
                 source: "operation",
-                source_ref: &record.operation_key,
+                source_ref: &source_ref,
                 provider: "",
                 pane: &record.target,
                 run: record.run.as_deref().unwrap_or(""),
@@ -967,7 +980,9 @@ impl Store {
                 summary: Some(json!({"action": record.action})),
                 observed_ms: now,
             };
-            Self::inbox_insert_in(&tx, &event)?;
+            Self::inbox_best_effort(&mut tx, |conn| {
+                Self::inbox_insert_in(conn, &event).map(drop)
+            })?;
         }
         tx.commit().map_err(sql)?;
         Ok(record)
@@ -1235,6 +1250,14 @@ impl Store {
         Ok(Some(Self { conn, path }))
     }
 
+    /// The store's inbox switch and instance, read without creating or
+    /// changing anything; None when there is no store.
+    pub fn inbox_probe(socket: &Path) -> Option<(bool, String)> {
+        let store = Self::readonly(socket).ok().flatten()?;
+        let instance = store.instance().ok()?.to_string();
+        Some((store.inbox_enabled().unwrap_or(false), instance))
+    }
+
     /// The store's inbox switch, read without creating or changing anything.
     pub fn inbox_flag(socket: &Path) -> bool {
         Self::readonly(socket)
@@ -1268,8 +1291,11 @@ impl Store {
     /// Whether the inbox is switched on; false before the inbox feature
     /// exists in this store.
     pub fn inbox_enabled(&self) -> Result<bool, String> {
-        Ok(self
-            .conn
+        Self::inbox_enabled_in(&self.conn)
+    }
+
+    fn inbox_enabled_in(conn: &Connection) -> Result<bool, String> {
+        Ok(conn
             .query_row(
                 "SELECT value FROM meta WHERE name = 'inbox_enabled'",
                 [],
@@ -1278,6 +1304,23 @@ impl Store {
             .optional()
             .map_err(sql)?
             == Some(1))
+    }
+
+    /// Runs an inbox write inside a savepoint of an operation's
+    /// transaction. A failure is logged and rolled back to the savepoint, so
+    /// the operation still commits.
+    fn inbox_best_effort(
+        tx: &mut rusqlite::Transaction<'_>,
+        write: impl FnOnce(&Connection) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let savepoint = tx.savepoint().map_err(sql)?;
+        match write(&savepoint) {
+            Ok(()) => savepoint.commit().map_err(sql),
+            Err(error) => {
+                super::inbox::log("inbox.log", &json!({"error": error}));
+                Ok(())
+            }
+        }
     }
 
     pub fn set_inbox_enabled(&mut self, enabled: bool) -> Result<(), String> {
@@ -1306,32 +1349,25 @@ impl Store {
         Ok(id)
     }
 
-    fn inbox_insert_in(
-        tx: &rusqlite::Transaction<'_>,
-        event: &InboxEvent<'_>,
-    ) -> Result<Option<i64>, String> {
-        let enabled: Option<i64> = tx
-            .query_row(
-                "SELECT value FROM meta WHERE name = 'inbox_enabled'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql)?;
-        if enabled != Some(1) {
+    fn inbox_insert_in(tx: &Connection, event: &InboxEvent<'_>) -> Result<Option<i64>, String> {
+        if !Self::inbox_enabled_in(tx)? {
             return Ok(None);
         }
+        if live_bytes(tx)? >= HIGH_WATER_BYTES {
+            return Err("store_full: the operation store holds 224 MiB of data".into());
+        }
         if event.source == "screen" {
-            // A provider callback already recorded this request, or the
-            // turn's end, more precisely than the screen can.
+            // A provider callback already recorded this request more
+            // precisely than the screen can. A run whose turn ends a hook
+            // records needs no screen return to idle.
             let covered: bool = tx
                 .query_row(
                     "SELECT EXISTS (SELECT 1 FROM inbox_events
                        WHERE run = ?1 AND source LIKE 'hook:%' AND (
                          (?2 = 'blocked' AND kind IN ('blocked', 'approval_requested', 'question_asked')
                             AND resolved_ms IS NULL)
-                         OR (?2 = 'returned_idle' AND kind = 'turn_completed' AND observed_ms >= ?3)))",
-                    params![event.run, event.kind, event.observed_ms.saturating_sub(30_000) as i64],
+                         OR (?2 = 'returned_idle' AND kind = 'turn_completed')))",
+                    params![event.run, event.kind],
                     |row| row.get(0),
                 )
                 .map_err(sql)?;
@@ -1377,31 +1413,63 @@ impl Store {
                 ],
             )
             .map_err(sql)?;
-        if inserted == 0 {
-            return Ok(None);
+        let id = (inserted != 0).then(|| tx.last_insert_rowid());
+        // Also for a repeated callback: a turn can end twice with one ID
+        // when another Stop hook made it continue.
+        if event.source.starts_with("hook:") {
+            match event.kind {
+                "blocked" | "approval_requested" | "question_asked" => {
+                    // The callback describes the screen's `blocked` more precisely.
+                    tx.execute(
+                        "UPDATE inbox_events SET resolved_ms = ?2, resolution = 'covered'
+                         WHERE run = ?1 AND source = 'screen' AND kind = 'blocked'
+                           AND resolved_ms IS NULL",
+                        params![event.run, event.observed_ms as i64],
+                    )
+                    .map_err(sql)?;
+                }
+                "turn_completed" => {
+                    // Nothing in the run waits for the person once its turn
+                    // ended, and a screen return to idle is this turn end.
+                    tx.execute(
+                        "UPDATE inbox_events SET resolved_ms = ?2, resolution = 'turn_completed'
+                         WHERE run = ?1 AND resolved_ms IS NULL
+                           AND kind IN ('blocked', 'approval_requested', 'question_asked')",
+                        params![event.run, event.observed_ms as i64],
+                    )
+                    .map_err(sql)?;
+                    tx.execute(
+                        "UPDATE inbox_events SET resolved_ms = ?2, resolution = 'covered'
+                         WHERE run = ?1 AND source = 'screen' AND kind = 'returned_idle'
+                           AND resolved_ms IS NULL",
+                        params![event.run, event.observed_ms as i64],
+                    )
+                    .map_err(sql)?;
+                }
+                _ => {}
+            }
         }
-        let id = tx.last_insert_rowid();
-        if event.source.starts_with("hook:")
-            && matches!(
-                event.kind,
-                "blocked" | "approval_requested" | "question_asked"
-            )
-        {
-            // The callback describes the screen's `blocked` more precisely.
-            tx.execute(
-                "UPDATE inbox_events SET resolved_ms = ?2, resolution = 'covered'
-                 WHERE run = ?1 AND source = 'screen' AND kind = 'blocked' AND resolved_ms IS NULL",
-                params![event.run, event.observed_ms as i64],
-            )
-            .map_err(sql)?;
+        if id.is_some() {
+            Self::inbox_prune_in(tx, event.observed_ms)?;
         }
-        Self::inbox_prune_in(tx, event.observed_ms)?;
-        Ok(Some(id))
+        Ok(id)
     }
 
     /// Keeps at most INBOX_KEEP events for INBOX_RETENTION_MS, removing read
     /// or resolved events first; unread ones removed over the cap are counted.
-    fn inbox_prune_in(tx: &rusqlite::Transaction<'_>, now: u64) -> Result<(), String> {
+    fn inbox_prune_in(tx: &Connection, now: u64) -> Result<(), String> {
+        // A resolution waits only for a request that has not arrived yet.
+        tx.execute(
+            "DELETE FROM inbox_resolutions WHERE resolved_ms < ?1",
+            [now.saturating_sub(INBOX_RETENTION_MS) as i64],
+        )
+        .map_err(sql)?;
+        tx.execute(
+            "DELETE FROM inbox_resolutions WHERE rowid IN (
+               SELECT rowid FROM inbox_resolutions ORDER BY resolved_ms DESC LIMIT -1 OFFSET ?1)",
+            [INBOX_KEEP],
+        )
+        .map_err(sql)?;
         let fence: i64 = tx
             .query_row(
                 "SELECT value FROM meta WHERE name = 'inbox_fence'",
@@ -1444,11 +1512,6 @@ impl Store {
             )
             .map_err(sql)?;
         }
-        tx.execute(
-            "DELETE FROM inbox_resolutions WHERE resolved_ms < ?1",
-            [now.saturating_sub(INBOX_RETENTION_MS) as i64],
-        )
-        .map_err(sql)?;
         Ok(())
     }
 
@@ -1466,20 +1529,31 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
         Self::check_reader_in(&tx)?;
-        let changed = tx
-            .execute(
+        if !Self::inbox_enabled_in(&tx)? {
+            return Ok(());
+        }
+        let known: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM inbox_events WHERE source = ?1 AND source_ref = ?2)",
+                params![source, source_ref],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if known {
+            tx.execute(
                 "UPDATE inbox_events SET resolved_ms = ?3, resolution = ?4
                  WHERE source = ?1 AND source_ref = ?2 AND resolved_ms IS NULL",
                 params![source, source_ref, now as i64, resolution],
             )
             .map_err(sql)?;
-        if changed == 0 {
+        } else {
             tx.execute(
                 "INSERT INTO inbox_resolutions VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT (source, source_ref) DO NOTHING",
                 params![source, source_ref, now as i64, resolution],
             )
             .map_err(sql)?;
+            Self::inbox_prune_in(&tx, now)?;
         }
         tx.commit().map_err(sql)
     }
@@ -2336,6 +2410,117 @@ mod tests {
         let inbox = store.inbox(false, 10).unwrap();
         assert_eq!(inbox["events"][0]["kind"], "operation_unknown");
         assert_eq!(inbox["events"][0]["native_ref"], "run:r1/prompt/1");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settling_an_unknown_outcome_resolves_its_event_and_inbox_failures_never_fail_it() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        let ticket = dispatch(store.admit(&request("d1"), json!({}), 100).unwrap());
+        let unknown = store.finish(&ticket, UNKNOWN, "test", None, 101).unwrap();
+        assert_eq!(unread(&store), ["run:r1/prompt/1"]);
+        store
+            .settle_unknown(&unknown, "user_confirmed_delivered", "user", None, 102)
+            .unwrap();
+        assert!(unread(&store).is_empty());
+        assert_eq!(
+            store.inbox(true, 10).unwrap()["events"][0]["resolution"],
+            "settled"
+        );
+
+        store.conn.execute("DROP TABLE inbox_events", []).unwrap();
+        let other = NewOperation {
+            id: "2",
+            ..request("d2")
+        };
+        let ticket = dispatch(store.admit(&other, json!({}), 200).unwrap());
+        let record = store.finish(&ticket, UNKNOWN, "test", None, 201).unwrap();
+        assert_eq!(record.state, UNKNOWN);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_hook_turn_end_resolves_the_run_and_replaces_screen_returns_to_idle() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        let screen = |source_ref, kind, at| InboxEvent {
+            source: "screen",
+            ..event(source_ref, "r1", kind, at)
+        };
+        store
+            .record_event(&event("ask", "r1", "approval_requested", 1))
+            .unwrap();
+        store
+            .record_event(&screen("r1:4", "returned_idle", 2))
+            .unwrap();
+        store
+            .record_event(&event("turn-1", "r1", "turn_completed", 3))
+            .unwrap();
+        assert_eq!(unread(&store), ["turn-1"]);
+        // Without a time window: the run's turn ends come from the hook.
+        assert_eq!(
+            store
+                .record_event(&screen("r1:6", "returned_idle", 600_000))
+                .unwrap(),
+            None
+        );
+        // The same turn ending again still resolves what it raised since.
+        store
+            .record_event(&event("ask-2", "r1", "approval_requested", 600_000))
+            .unwrap();
+        store
+            .record_event(&event("turn-1", "r1", "turn_completed", 600_001))
+            .unwrap();
+        assert_eq!(unread(&store), ["turn-1"]);
+        // Another run still gets screen events.
+        assert!(
+            store
+                .record_event(&InboxEvent {
+                    source: "screen",
+                    ..event("r2:1", "r2", "returned_idle", 600_001)
+                })
+                .unwrap()
+                .is_some()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resolutions_are_kept_only_for_requests_not_seen_yet() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let resolutions = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM inbox_resolutions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        store
+            .resolve_event("hook:opencode", "off", "replied", 1)
+            .unwrap();
+        assert_eq!(resolutions(&store), 0);
+        store.set_inbox_enabled(true).unwrap();
+        store
+            .record_event(&event("p1", "r1", "approval_requested", 2))
+            .unwrap();
+        store
+            .resolve_run("r1", &["approval_requested"], "left_blocked", 3)
+            .unwrap();
+        store
+            .resolve_event("hook:opencode", "p1", "replied", 4)
+            .unwrap();
+        assert_eq!(resolutions(&store), 0);
+        for index in 0..(INBOX_KEEP + 2) {
+            store
+                .resolve_event("hook:opencode", &format!("early{index}"), "replied", 5)
+                .unwrap();
+        }
+        assert_eq!(resolutions(&store), INBOX_KEEP);
         fs::remove_dir_all(dir).unwrap();
     }
 

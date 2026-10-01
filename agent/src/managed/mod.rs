@@ -551,7 +551,7 @@ impl Manager {
         let mut agents = Vec::new();
         let mut tracked_groups = Vec::new();
         let mut tracked_updates = Vec::new();
-        let mut inbox_effects = Vec::new();
+        let mut inbox_effects: Vec<(String, Vec<inbox::Effect>)> = Vec::new();
         let mut seen_panes = HashSet::new();
         for fields in inventory {
             // A linked window can occur in more than one session.
@@ -673,12 +673,9 @@ impl Manager {
                 previous.clone()
             };
             if changed {
-                inbox_effects.extend(screen_effects(
-                    provider.id,
-                    &fields[0],
-                    &previous,
-                    &tracked,
-                    dead,
+                inbox_effects.push((
+                    fields[0].clone(),
+                    screen_effects(provider.id, &fields[0], &previous, &tracked, dead),
                 ));
             }
             let revision = tracked.revision.to_string();
@@ -747,26 +744,41 @@ impl Manager {
                     agent.pane_id.clone(),
                     identity_guard(&agent),
                     vec![Self::option(&agent, TRACKED, encoded.clone())],
-                    TRACKED_REJECTED.into(),
+                    // A group index: display-message runs strftime, which
+                    // would eat the `%` of a pane ID.
+                    format!("{TRACKED_REJECTED} {}", tracked_groups.len()),
                 ));
                 tracked_updates.push((agents.len(), encoded));
             }
             agents.push(agent);
         }
-        self.write_tracked_updates(&mut agents, &tracked_groups, &tracked_updates)
+        let uncommitted = self
+            .write_tracked_updates(&mut agents, &tracked_groups, &tracked_updates)
             .await?;
-        // Only after the tracked revisions are committed: a lost CAS above
-        // records nothing.
-        self.inbox_apply(inbox_effects).await;
+        // Only the panes whose tracked revision committed: a lost CAS
+        // records nothing, and the next poll sees that change again.
+        self.inbox_apply(
+            inbox_effects
+                .into_iter()
+                .filter(|(pane, _)| !uncommitted.contains(pane))
+                .flat_map(|(_, effects)| effects)
+                .collect(),
+        )
+        .await;
+        if !uncommitted.is_empty() {
+            return Err("identity_mismatch: agent run changed before the action".into());
+        }
         Ok(agents)
     }
 
+    /// Writes each pane's tracked revision under its own guard and returns
+    /// the panes whose write did not commit.
     async fn write_tracked_updates(
         &self,
         agents: &mut [Agent],
         groups: &[native_ui::GuardedGroup],
         updates: &[(usize, String)],
-    ) -> Result<(), String> {
+    ) -> Result<Vec<String>, String> {
         if groups.len() != updates.len() {
             return Err("invalid tracked update batch".into());
         }
@@ -791,18 +803,21 @@ impl Manager {
                 .guarded_groups(&groups[start..end])
                 .await
                 .map_err(server_unreachable)?;
-            if String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line == TRACKED_REJECTED)
-            {
-                return Err("identity_mismatch: agent run changed before the action".into());
+            let rejected = rejected_groups(&String::from_utf8_lossy(&output.stdout), start..end);
+            if !rejected.is_empty() {
+                // Groups after this batch were never sent.
+                return Ok(rejected
+                    .into_iter()
+                    .chain(end..groups.len())
+                    .map(|index| groups[index].0.clone())
+                    .collect());
             }
             for (agent, encoded) in &updates[start..end] {
                 agents[*agent].tracked_encoded = encoded.clone();
             }
             start = end;
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     pub async fn get(&self, target: &str) -> Result<Agent, String> {
@@ -1539,6 +1554,25 @@ impl Manager {
             }
         }
     }
+}
+
+/// Indexes of the guarded tracked groups in `batch` that printed their
+/// rejection marker. An unreadable marker counts the whole batch.
+fn rejected_groups(stdout: &str, batch: std::ops::Range<usize>) -> Vec<usize> {
+    let mut rejected = Vec::new();
+    for marker in stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(TRACKED_REJECTED))
+    {
+        match marker
+            .strip_prefix(' ')
+            .and_then(|index| index.parse().ok())
+        {
+            Some(index) if batch.contains(&index) => rejected.push(index),
+            _ => return batch.collect(),
+        }
+    }
+    rejected
 }
 
 /// Inbox effects of one tracked change seen on screen: the run's open
@@ -2293,6 +2327,16 @@ async fn identify_foreground(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tracked_rejections_name_their_groups() {
+        let stdout = format!("{TRACKED_REJECTED} 4\nother\n{TRACKED_REJECTED} 6\n");
+        assert_eq!(rejected_groups(&stdout, 3..7), [4, 6]);
+        assert!(rejected_groups("", 0..2).is_empty());
+        for unreadable in [TRACKED_REJECTED.to_owned(), format!("{TRACKED_REJECTED} 9")] {
+            assert_eq!(rejected_groups(&unreadable, 3..5), [3, 4]);
+        }
+    }
+
     use super::*;
     #[test]
     fn native_escaping_preserves_delimiters_and_never_executes() {

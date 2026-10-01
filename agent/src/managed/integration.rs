@@ -398,23 +398,23 @@ fn shell_bridge(provider: &str, executable: &str) -> String {
 fn typescript_extension(provider: &str, executable: &str) -> String {
     let listeners = if provider == "pi" {
         r#"
-  pi.on("session_start", (event: any, ctx: any) => send("session", session(event, ctx)));
-  pi.on("agent_start", (event: any, ctx: any) => send("working", session(event, ctx)));
-  pi.on("agent_settled", (event: any, ctx: any) => send("idle", session(event, ctx)));
+  pi.on("session_start", (event: any, ctx: any) => send("session", session("session_start", event, ctx)));
+  pi.on("agent_start", (event: any, ctx: any) => send("working", session("agent_start", event, ctx)));
+  pi.on("agent_settled", (event: any, ctx: any) => send("idle", session("agent_settled", event, ctx)));
 "#
     } else {
         r#"
   if (process.env.OMPCODE === "1") return;
-  pi.on("session_start", (event: any, ctx: any) => send("session", session(event, ctx)));
-  pi.on("session_switch", (event: any, ctx: any) => send("session", session(event, ctx)));
-  pi.on("agent_start", (event: any, ctx: any) => send("working", session(event, ctx)));
-  pi.on("tool_approval_requested", (event: any, ctx: any) => send("blocked", session(event, ctx)));
-  pi.on("tool_approval_resolved", (event: any, ctx: any) => send("working", session(event, ctx)));
-  pi.on("tool_execution_start", (event: any, ctx: any) => { if (event?.toolName === "ask") send("blocked", session(event, ctx)); });
-  pi.on("tool_execution_end", (event: any, ctx: any) => { if (event?.toolName === "ask") send("working", session(event, ctx)); });
+  pi.on("session_start", (event: any, ctx: any) => send("session", session("session_start", event, ctx)));
+  pi.on("session_switch", (event: any, ctx: any) => send("session", session("session_switch", event, ctx)));
+  pi.on("agent_start", (event: any, ctx: any) => send("working", session("agent_start", event, ctx)));
+  pi.on("tool_approval_requested", (event: any, ctx: any) => send("blocked", session("tool_approval_requested", event, ctx)));
+  pi.on("tool_approval_resolved", (event: any, ctx: any) => send("working", session("tool_approval_resolved", event, ctx)));
+  pi.on("tool_execution_start", (event: any, ctx: any) => { if (event?.toolName === "ask") send("blocked", session("tool_execution_start", event, ctx)); });
+  pi.on("tool_execution_end", (event: any, ctx: any) => { if (event?.toolName === "ask") send("working", session("tool_execution_end", event, ctx)); });
   pi.on("agent_end", (event: any, ctx: any) => {
     const failed = [...(Array.isArray(event?.messages) ? event.messages : [])].reverse().find((message: any) => message?.role === "assistant")?.stopReason === "error";
-    if (event?.willContinue !== true && !failed) send("idle", session(event, ctx));
+    if (event?.willContinue !== true && !failed) send("idle", session("agent_end", event, ctx));
   });
 "#
     };
@@ -446,8 +446,8 @@ function send(action: string, payload: unknown) {
   child.on("close", () => clearTimeout(timeout));
   child.stdin.end(body);
 }
-function session(event: any, ctx: any) {
-  return { hook_event_name: event?.type, source: event?.reason,
+function session(name: string, event: any, ctx: any) {
+  return { hook_event_name: name, source: event?.reason,
     session_id: ctx?.sessionManager?.getSessionId?.(),
     event: { type: event?.type, toolName: event?.toolName, toolCallId: event?.toolCallId } };
 }
@@ -581,7 +581,7 @@ fn registration_fragment(target: &Target, hook_path: &std::path::Path) -> Value 
             json!({"format":"settings.json fragment","hooks":{
                 "SessionStart":[{"matcher":"^(startup|resume|clear|compact|fork)$","hooks":[{"type":"command","command":command("session"),"timeout":10}]}],
                 "PermissionRequest":[{"hooks":[{"type":"command","command":command(""),"timeout":10}]}],
-                "Notification":[{"matcher":"permission_prompt|elicitation_dialog","hooks":[{"type":"command","command":command(""),"timeout":10}]}],
+                "Notification":[{"matcher":"elicitation_dialog","hooks":[{"type":"command","command":command(""),"timeout":10}]}],
                 "Stop":[{"hooks":[{"type":"command","command":command(""),"timeout":10}]}],
             }})
         }
@@ -949,8 +949,8 @@ fn callback_effects(
     let mut requested = false;
 
     match (provider, event.as_str()) {
-        ("opencode" | "kilo", "permissionasked" | "permissionaskedv2") => {
-            if let Some(id) = callback_id(payload, &["id"]) {
+        ("opencode" | "kilo", "permissionasked" | "permissionv2asked") => {
+            if let Some(id) = open_code_property(payload, &["id"]) {
                 let source_ref = request_ref(&id);
                 effects.push(callback_event_effect(
                     provider,
@@ -964,8 +964,8 @@ fn callback_effects(
                 requested = true;
             }
         }
-        ("opencode" | "kilo", "questionasked" | "questionaskedv2") => {
-            if let Some(id) = callback_id(payload, &["id"]) {
+        ("opencode" | "kilo", "questionasked" | "questionv2asked") => {
+            if let Some(id) = open_code_property(payload, &["id"]) {
                 let source_ref = request_ref(&id);
                 effects.push(callback_event_effect(
                     provider,
@@ -979,18 +979,21 @@ fn callback_effects(
                 requested = true;
             }
         }
-        ("opencode" | "kilo", "permissionreplied" | "permissionrepliedv2") => {
-            if let Some(id) = callback_id(payload, &["requestID", "requestId", "request_id"]) {
+        ("opencode" | "kilo", "permissionreplied" | "permissionv2replied") => {
+            if let Some(id) = open_code_property(payload, &["requestID", "requestId", "request_id"])
+            {
                 effects.push(resolve_effect(&source, &id, "replied"));
             }
         }
-        ("opencode" | "kilo", "questionreplied" | "questionrepliedv2") => {
-            if let Some(id) = callback_id(payload, &["requestID", "requestId", "request_id"]) {
+        ("opencode" | "kilo", "questionreplied" | "questionv2replied") => {
+            if let Some(id) = open_code_property(payload, &["requestID", "requestId", "request_id"])
+            {
                 effects.push(resolve_effect(&source, &id, "replied"));
             }
         }
-        ("opencode" | "kilo", "questionrejected" | "questionrejectedv2") => {
-            if let Some(id) = callback_id(payload, &["requestID", "requestId", "request_id"]) {
+        ("opencode" | "kilo", "questionrejected" | "questionv2rejected") => {
+            if let Some(id) = open_code_property(payload, &["requestID", "requestId", "request_id"])
+            {
                 effects.push(resolve_effect(&source, &id, "rejected"));
             }
         }
@@ -1144,37 +1147,24 @@ fn callback_effects(
             ));
             requested = true;
         }
-        ("claude", "notification") => {
-            match callback_text(payload, &["notification_type", "notificationType"])
+        // `permission_prompt` is the dialog PermissionRequest already
+        // recorded, so only a question is an event.
+        ("claude", "notification")
+            if callback_text(payload, &["notification_type", "notificationType"])
                 .map(normalize_event)
                 .as_deref()
-            {
-                Some("permissionprompt") => {
-                    effects.push(callback_event_effect(
-                        provider,
-                        pane,
-                        run,
-                        "blocked",
-                        callback_ref("blocked", run, sequence),
-                        None,
-                        summary.clone(),
-                    ));
-                    requested = true;
-                }
-                Some("elicitationdialog") => {
-                    effects.push(callback_event_effect(
-                        provider,
-                        pane,
-                        run,
-                        "question_asked",
-                        callback_ref("question_asked", run, sequence),
-                        None,
-                        summary.clone(),
-                    ));
-                    requested = true;
-                }
-                _ => {}
-            }
+                == Some("elicitationdialog") =>
+        {
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "question_asked",
+                callback_ref("question_asked", run, sequence),
+                None,
+                summary.clone(),
+            ));
+            requested = true;
         }
         ("claude", "stop") => {
             let id = callback_id(payload, &["prompt_id", "promptId"]);
@@ -1346,6 +1336,19 @@ fn resolve_effect(source: &str, id: &str, resolution: &'static str) -> super::in
     }
 }
 
+/// A field of an OpenCode or Kilo event's `properties`. The event's own
+/// top-level `id` names the event, not the request.
+fn open_code_property(payload: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    let event = payload
+        .get("event")
+        .and_then(Value::as_object)
+        .unwrap_or(payload);
+    let properties = event.get("properties").and_then(Value::as_object)?;
+    first_text(properties, keys)
+        .filter(|value| valid_text(value))
+        .map(str::to_owned)
+}
+
 fn callback_value<'a>(payload: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
     let event = payload.get("event").and_then(Value::as_object);
     for object in [Some(payload), event].into_iter().flatten() {
@@ -1442,7 +1445,7 @@ fn callback_summary(provider: &str, event: &str, payload: &Map<String, Value>) -
         }
     }
     if matches!(provider, "opencode" | "kilo")
-        && matches!(event, "permissionasked" | "permissionaskedv2")
+        && matches!(event, "permissionasked" | "permissionv2asked")
     {
         if let Some(permission) = callback_text(payload, &["permission"]) {
             summary.insert(
@@ -1497,58 +1500,80 @@ fn url_without_query(url: &str) -> &str {
     &url[..end]
 }
 
+/// Patterns for secrets in a summary. They over-redact rather than miss:
+/// a summary is a hint for the person, not a record of the command.
 struct Redactors {
-    assignment: Regex,
+    url_userinfo: Regex,
+    header: Regex,
     authorization: Regex,
-    option_equals: Regex,
-    option_value: Regex,
-    short_option: Regex,
+    json_field: Regex,
+    assignment: Regex,
+    option: Regex,
+    basic_user: Regex,
+    login_password: Regex,
+    mysql_password: Regex,
     bearer: Regex,
-    openai_key: Regex,
-    github_token: Regex,
+    token: Regex,
 }
 
 fn redactors() -> &'static Redactors {
     static REDACTORS: OnceLock<Redactors> = OnceLock::new();
+    const NAMES: &str = "password|passwd|pass|token|secret|key|auth|cookie|credential";
     REDACTORS.get_or_init(|| Redactors {
-        assignment: Regex::new(r#"(?i)\b([a-z_][a-z0-9_]*)=(?:\"[^\"]*\"|'[^']*'|\S+)"#).expect("valid assignment redaction regex"),
-        authorization: Regex::new(r"(?i)\bauthorization\s*:\s*[^\r\n]*").expect("valid authorization redaction regex"),
-        option_equals: Regex::new(r"(?i)(--(?:password|passwd|token|secret|api[-_]?key|auth)=)\S+").expect("valid option redaction regex"),
-        option_value: Regex::new(r#"(?i)(--(?:password|passwd|token|secret|api[-_]?key|auth)\s+)(?:\"[^\"]*\"|'[^']*'|\S+)"#).expect("valid option-value redaction regex"),
-        short_option: Regex::new(r#"(?i)(^|\s)(-p\s+)(?:\"[^\"]*\"|'[^']*'|\S+)"#).expect("valid short-option redaction regex"),
-        bearer: Regex::new(r"(?i)(\bbearer\s+)[a-z0-9._~+/=-]+").expect("valid bearer redaction regex"),
-        openai_key: Regex::new(r"\bsk-[a-zA-Z0-9_-]+\b").expect("valid OpenAI-key redaction regex"),
-        github_token: Regex::new(r"\bghp_[a-zA-Z0-9]+\b").expect("valid GitHub-token redaction regex"),
+        url_userinfo: Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@")
+            .expect("valid URL userinfo redaction regex"),
+        header: Regex::new(&format!(
+            r#"(?i)((?:-H|--header)[\s=]*['"]?[a-z0-9_-]*(?:{NAMES})[a-z0-9_-]*\s*:)[^\r\n'"]*"#
+        ))
+        .expect("valid header redaction regex"),
+        authorization: Regex::new(r#"(?i)\b(authorization\s*:)[^\r\n'"]*"#)
+            .expect("valid authorization redaction regex"),
+        json_field: Regex::new(&format!(
+            r#"(?i)("[a-z0-9_-]*(?:{NAMES})[a-z0-9_-]*"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|[^,}}\s]+)"#
+        ))
+        .expect("valid JSON field redaction regex"),
+        // The key may sit anywhere in a token: `?page=2&api_key=x`,
+        // `--from-literal=password=x`, `a=1,auth.password=x`.
+        assignment: Regex::new(&format!(
+            r#"(?i)([a-z0-9_.-]*(?:{NAMES})[a-z0-9_.-]*=)(?:"[^"]*"|'[^']*'|[^\s&,;]+)"#
+        ))
+        .expect("valid assignment redaction regex"),
+        // The option name must end in a secret's name: `--access-token x`,
+        // but not `--max-tokens 512` or `--password-stdin`.
+        option: Regex::new(&format!(
+            r#"(?i)(--[a-z0-9-]*(?:{NAMES}))(=|\s+)(?:"[^"]*"|'[^']*'|\S+)"#
+        ))
+        .expect("valid option redaction regex"),
+        basic_user: Regex::new(r#"(?i)(^|\s)(-u\s*|--user[=\s]\s*)(?:"[^"]*:[^"]*"|'[^']*:[^']*'|\S*:\S*)"#)
+            .expect("valid basic-auth redaction regex"),
+        login_password: Regex::new(
+            r"(?i)(\b(?:sshpass|(?:docker|podman|buildah|skopeo)\s+login)\b[^|;&\n]*?\s-p\s*)\S+",
+        )
+        .expect("valid login password redaction regex"),
+        mysql_password: Regex::new(r"(?i)(\b(?:mysql|mariadb)[a-z]*\b[^|;&\n]*?\s-p)\S+")
+            .expect("valid MySQL password redaction regex"),
+        bearer: Regex::new(r"(?i)(\bbearer\s+)[a-z0-9._~+/=-]+")
+            .expect("valid bearer redaction regex"),
+        token: Regex::new(
+            r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+)",
+        )
+        .expect("valid token redaction regex"),
     })
 }
 
 fn redact_text(value: &str) -> String {
     let redactors = redactors();
-    let value = redactors
-        .authorization
-        .replace_all(value, "Authorization: ***");
-    let value = redactors
-        .assignment
-        .replace_all(&value, |captures: &regex::Captures<'_>| {
-            let key = &captures[1];
-            let sensitive = ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "AUTH"]
-                .iter()
-                .any(|needle| key.to_ascii_uppercase().contains(needle));
-            if sensitive {
-                format!("{key}=***")
-            } else {
-                captures[0].into()
-            }
-        });
-    let value = redactors.option_equals.replace_all(&value, "$1***");
-    let value = redactors.option_value.replace_all(&value, "$1***");
-    let value = redactors.short_option.replace_all(&value, "$1$2***");
+    let value = redactors.url_userinfo.replace_all(value, "$1***@");
+    let value = redactors.header.replace_all(&value, "$1 ***");
+    let value = redactors.authorization.replace_all(&value, "$1 ***");
+    let value = redactors.json_field.replace_all(&value, "$1\"***\"");
+    let value = redactors.assignment.replace_all(&value, "$1***");
+    let value = redactors.option.replace_all(&value, "$1$2***");
+    let value = redactors.basic_user.replace_all(&value, "$1$2***");
+    let value = redactors.login_password.replace_all(&value, "$1***");
+    let value = redactors.mysql_password.replace_all(&value, "$1***");
     let value = redactors.bearer.replace_all(&value, "$1***");
-    let value = redactors.openai_key.replace_all(&value, "***");
-    redactors
-        .github_token
-        .replace_all(&value, "***")
-        .into_owned()
+    redactors.token.replace_all(&value, "***").into_owned()
 }
 
 fn summary_text(value: &str, max_chars: usize, max_bytes: usize) -> String {
@@ -1839,13 +1864,13 @@ fn map_open_code(
         | "toolexecutebefore"
         | "toolexecuteafter"
         | "permissionreplied"
-        | "permissionrepliedv2"
+        | "permissionv2replied"
         | "questionreplied"
-        | "questionrepliedv2"
+        | "questionv2replied"
         | "questionrejected"
-        | "questionrejectedv2"
+        | "questionv2rejected"
         | "sessioncompacted" => Some("working"),
-        "permissionasked" | "permissionaskedv2" | "questionasked" | "questionaskedv2"
+        "permissionasked" | "permissionv2asked" | "questionasked" | "questionv2asked"
         | "sessionerror" => Some("blocked"),
         "sessionidle" => Some("idle"),
         "sessioncreated" if provider == "kilo" => None,
@@ -2226,7 +2251,7 @@ mod tests {
     fn open_code_and_kilo_requests_use_one_cross_kind_key() {
         let asked = effects(
             "opencode",
-            r#"{"event":{"type":"permission.asked.v2","properties":{"id":"permission-1","sessionID":"session-1","permission":"bash","patterns":["src/**","Cargo.toml","README.md","one-more"],"tool":"Bash","command":"TOKEN=secret echo ok"}}}"#,
+            r#"{"event":{"id":"evt_1","type":"permission.v2.asked","properties":{"id":"permission-1","sessionID":"session-1","permission":"bash","patterns":["src/**","Cargo.toml","README.md","one-more"],"tool":"Bash","command":"TOKEN=secret echo ok"}}}"#,
         );
         match asked.as_slice() {
             [
@@ -2258,7 +2283,7 @@ mod tests {
 
         let replied = effects(
             "kilo",
-            r#"{"event":{"type":"permission.replied","properties":{"requestID":"permission-1","reply":"allow"}}}"#,
+            r#"{"event":{"id":"evt_2","type":"permission.replied","properties":{"requestID":"permission-1","reply":"allow"}}}"#,
         );
         assert_eq!(
             replied,
@@ -2271,7 +2296,7 @@ mod tests {
 
         let rejected = effects(
             "opencode",
-            r#"{"event":{"type":"question.rejected.v2","properties":{"request_id":"question-1"}}}"#,
+            r#"{"event":{"id":"evt_3","type":"question.v2.rejected","properties":{"request_id":"question-1"}}}"#,
         );
         assert_eq!(
             rejected,
@@ -2470,11 +2495,13 @@ mod tests {
                 ..
             }] if source_ref == "question_asked:run-1:7"
         ));
-        assert!(effects(
-            "claude",
-            r#"{"hook_event_name":"Notification","notification_type":"unrelated","message":"ignored"}"#,
-        )
-        .is_empty());
+        for kind in ["unrelated", "permission_prompt"] {
+            assert!(effects(
+                "claude",
+                &format!(r#"{{"hook_event_name":"Notification","notification_type":"{kind}","message":"ignored"}}"#),
+            )
+            .is_empty());
+        }
         assert!(matches!(
             effects(
                 "claude",
@@ -2507,20 +2534,8 @@ mod tests {
 
     #[test]
     fn summaries_redact_before_they_are_truncated() {
-        let redacted = redact_text(
-            "API_TOKEN=first --password=third --token fourth -p fifth sk-secret ghp_secret",
-        );
-        assert!(redacted.contains("API_TOKEN=***"));
-        assert!(redacted.contains("--password=***"));
-        assert!(redacted.contains("--token ***"));
-        assert!(redacted.contains("-p ***"));
-        assert!(!redacted.contains("first"));
-        assert!(!redacted.contains("second"));
-        assert!(!redacted.contains("third"));
-        assert!(!redacted.contains("fourth"));
-        assert!(!redacted.contains("fifth"));
-        assert!(!redacted.contains("sk-secret"));
-        assert!(!redacted.contains("ghp_secret"));
+        let redacted = redact_text("API_TOKEN=first --password=third --token fourth");
+        assert_eq!(redacted, "API_TOKEN=*** --password=*** --token ***");
         assert_eq!(
             redact_text("Authorization: Bearer second"),
             "Authorization: ***"
@@ -2529,6 +2544,64 @@ mod tests {
             summary_text(&format!("TOKEN={}", "x".repeat(512)), 120, 480),
             "TOKEN=***"
         );
+        let secrets = [
+            ("curl -u admin:hunter2 https://example.com", "hunter2"),
+            (
+                "curl -H 'X-Api-Key: k3y-value' https://example.com",
+                "k3y-value",
+            ),
+            (
+                r#"curl -d '{"password":"hunter2"}' https://example.com"#,
+                "hunter2",
+            ),
+            ("mysql -u app -phunter2 db", "hunter2"),
+            ("gh api --access-token s3cr3t-value /user", "s3cr3t-value"),
+            ("tool --client-secret s3cr3t-value", "s3cr3t-value"),
+            (
+                "git clone https://oauth2:glpat-abcdefghijklmnopqrst@gitlab.com/x",
+                "glpat",
+            ),
+            ("psql postgres://app:hunter2@db/app", "hunter2"),
+            ("echo sk-proj-abcdefghijklmnop", "abcdefghijklmnop"),
+            ("echo ghs_abcdefghijklmnopqrstuvwx", "ghs_"),
+            ("echo github_pat_abcdefghijklmnopqrstuvwx", "github_pat_"),
+            ("echo AKIAABCDEFGHIJKLMNOP", "AKIA"),
+            ("echo xoxb-1234567890-abcdefgh", "xoxb-"),
+            ("curl -H 'Cookie: session=abc123' x", "abc123"),
+            (
+                "curl 'https://x/items?page=2&api_key=SECRETVALUE'",
+                "SECRETVALUE",
+            ),
+            (
+                "kubectl create secret generic x --from-literal=password=hunter2",
+                "hunter2",
+            ),
+            (
+                "helm install x --set-string image=a,auth.password=SECRETVALUE",
+                "SECRETVALUE",
+            ),
+            ("docker login -u bob -p hunter2 registry.io", "hunter2"),
+            ("sshpass -p hunter2 ssh host", "hunter2"),
+        ];
+        for (command, secret) in secrets {
+            let redacted = redact_text(command);
+            assert!(!redacted.contains(secret), "{command} -> {redacted}");
+        }
+        for command in [
+            "mkdir -p src/x",
+            "git push -u origin main",
+            "find . -path './target' -prune",
+            "cargo test --locked",
+            "mysql -p db",
+            "cargo test auth::tests::login && cargo clippy --all-targets",
+            "rg -n token: src/config.yaml",
+            "docker run -v ~/.ssh/keys:/keys alpine ls",
+            "docker login --password-stdin registry.example.com",
+            "git commit --author alice",
+            "tool --max-tokens 512",
+        ] {
+            assert_eq!(redact_text(command), command);
+        }
     }
 
     #[test]
@@ -2553,7 +2626,7 @@ mod tests {
             registration_fragment(target("claude").unwrap(), std::path::Path::new("/tmp/hook"));
         assert_eq!(
             claude["hooks"]["Notification"][0]["matcher"],
-            "permission_prompt|elicitation_dialog"
+            "elicitation_dialog"
         );
         assert_eq!(claude["hooks"]["Stop"][0]["hooks"][0]["timeout"], 10);
         let codex =

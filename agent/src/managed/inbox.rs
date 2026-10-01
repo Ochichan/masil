@@ -63,6 +63,9 @@ pub(super) fn log(name: &str, value: &Value) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     const LIMIT: u64 = 64 * 1024;
+    if cfg!(test) {
+        return;
+    }
     let Ok(base) = super::operations::state_base() else {
         return;
     };
@@ -87,10 +90,13 @@ pub(super) fn log(name: &str, value: &Value) {
     }
 }
 
+/// Applies every effect, past failures, so one pane's failed event does
+/// not cost another pane its resolution; returns the first error.
 fn apply(store: &mut Store, effects: &[Effect]) -> Result<(), String> {
     let now = now_ms();
+    let mut first_error = None;
     for effect in effects {
-        match effect {
+        let applied = match effect {
             Effect::Event {
                 source,
                 source_ref,
@@ -101,8 +107,8 @@ fn apply(store: &mut Store, effects: &[Effect]) -> Result<(), String> {
                 kind,
                 native_ref,
                 summary,
-            } => {
-                store.record_event(&InboxEvent {
+            } => store
+                .record_event(&InboxEvent {
                     source,
                     source_ref,
                     provider,
@@ -113,31 +119,31 @@ fn apply(store: &mut Store, effects: &[Effect]) -> Result<(), String> {
                     native_ref: native_ref.as_deref(),
                     summary: summary.clone(),
                     observed_ms: now,
-                })?;
-            }
+                })
+                .map(drop),
             Effect::Resolve {
                 source,
                 source_ref,
                 resolution,
-            } => store.resolve_event(source, source_ref, resolution, now)?,
+            } => store.resolve_event(source, source_ref, resolution, now),
             Effect::ResolveRun {
                 run,
                 kinds,
                 resolution,
-            } => {
-                store.resolve_run(run, kinds, resolution, now)?;
-            }
-            Effect::AckRun { run, revision } => {
-                store.ack_run(run, *revision, now)?;
-            }
+            } => store.resolve_run(run, kinds, resolution, now).map(drop),
+            Effect::AckRun { run, revision } => store.ack_run(run, *revision, now).map(drop),
+        };
+        if let Err(error) = applied {
+            first_error.get_or_insert(error);
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 impl Manager {
-    /// The store instance to write to when the inbox is on, filling the
-    /// server's cached switch once after a server start.
+    /// The store instance to write to when the inbox is on. After a server
+    /// start the server knows neither the switch nor the store, so the
+    /// first producer fills both from the existing store.
     async fn inbox_instance(&self) -> Option<String> {
         let text = self
             .command(&[
@@ -148,27 +154,40 @@ impl Manager {
             .await
             .ok()?;
         let (flag, instance) = text.trim_end_matches('\n').split_once('\u{1f}')?;
-        let instance = instance.to_owned();
         match flag {
-            "on" if !instance.is_empty() => Some(instance),
-            "" => {
-                let socket = self.native.socket.clone();
-                let enabled = tokio::task::spawn_blocking(move || Store::inbox_flag(&socket))
-                    .await
-                    .unwrap_or(false);
-                // -o leaves a value another process set meanwhile.
-                let _ = self
-                    .command(&[
-                        "set-option",
-                        "-gqo",
-                        "@masil-inbox",
-                        if enabled { "on" } else { "off" },
-                    ])
-                    .await;
-                (enabled && !instance.is_empty()).then_some(instance)
-            }
-            _ => None,
+            "on" if !instance.is_empty() => return Some(instance.to_owned()),
+            "on" | "" => {}
+            _ => return None,
         }
+        let socket = self.native.socket.clone();
+        let probe = tokio::task::spawn_blocking(move || Store::inbox_probe(&socket))
+            .await
+            .ok()
+            .flatten();
+        let enabled = probe.as_ref().is_some_and(|(enabled, _)| *enabled);
+        // -o leaves a value another process set meanwhile.
+        if flag.is_empty() {
+            let _ = self
+                .command(&[
+                    "set-option",
+                    "-gqo",
+                    "@masil-inbox",
+                    if enabled { "on" } else { "off" },
+                ])
+                .await;
+        }
+        let (true, stored) = probe? else {
+            return None;
+        };
+        if instance.is_empty() {
+            // As `operation_store` does on first use: the server adopts the
+            // store that exists. Opening it checks the instance again.
+            let _ = self
+                .command(&["set-option", "-gqo", super::STORE_OPTION, &stored])
+                .await;
+            return Some(stored);
+        }
+        Some(instance.to_owned())
     }
 
     /// Writes the effects to the inbox if it is on, then nudges a running
@@ -307,7 +326,22 @@ pub(super) async fn command(manager: &Manager, args: &[String]) -> Result<Value,
                     .command(&["set-option", "-gq", "@masil-inbox", wanted])
                     .await?;
             }
-            Ok(json!({"enabled": stored, "cache": cached, "repaired": repaired}))
+            // Also records the store in the server if nothing did yet. A
+            // server that names a replaced store records nothing.
+            let recording = match manager.inbox_instance().await {
+                Some(instance) => {
+                    let socket = manager.native.socket.clone();
+                    tokio::task::spawn_blocking(move || Store::inbox_probe(&socket))
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|(enabled, stored)| enabled && stored == instance)
+                }
+                None => false,
+            };
+            Ok(
+                json!({"enabled": stored, "cache": cached, "repaired": repaired, "recording": recording}),
+            )
         }
         _ => Err(usage()),
     }
