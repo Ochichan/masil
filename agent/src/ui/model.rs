@@ -109,6 +109,10 @@ pub enum Effect {
     InterruptAgent,
     ReadScreen,
     CloseAgent,
+    /// Open the request dialog for this agent's pending requests.
+    Answer {
+        id: String,
+    },
     Quit,
     Preferences {
         language: Language,
@@ -126,6 +130,11 @@ pub enum Effect {
     /// Mark every event through this sequence read.
     InboxReadAll {
         through: i64,
+    },
+    /// Open the request dialog for an inbox event's run.
+    InboxAnswer {
+        pane: String,
+        run: String,
     },
 }
 
@@ -176,6 +185,8 @@ pub(crate) enum Action {
     InterruptAgent,
     ReadScreen,
     CloseAgent,
+    /// Answer the agent's pending requests through masil.
+    Answer,
     /// Open or close the inbox view.
     Inbox,
     /// Focus the oldest unseen inbox event's pane.
@@ -398,6 +409,8 @@ pub struct App {
     pub(crate) last_click: Option<ClickRecord>,
     pub(crate) ack_in_flight: Option<(String, String)>,
     pub(crate) prompt_in_flight: bool,
+    /// The latest `y` press: only its request list may open a dialog.
+    pub(crate) answer_request: u64,
     pub(crate) toast: Option<String>,
     /// Server status line on the last footer row, and whether one is offline.
     pub(crate) endpoint_line: Option<(String, bool)>,
@@ -452,6 +465,7 @@ impl App {
             last_click: None,
             ack_in_flight: None,
             prompt_in_flight: false,
+            answer_request: 0,
             toast: None,
             endpoint_line: None,
             last_area: Rect::default(),
@@ -682,7 +696,9 @@ impl App {
                             && row.binding != "managed_conflict"
                     })
             }
-            Action::PrepareDraft | Action::InterruptAgent => {
+            // Any running agent: the dialog says why one without an answer
+            // channel is answered in its pane.
+            Action::PrepareDraft | Action::InterruptAgent | Action::Answer => {
                 self.managed
                     && self.connected
                     && self.selected().is_some_and(|row| {
@@ -749,6 +765,9 @@ impl App {
             Action::InterruptAgent => Effect::InterruptAgent,
             Action::ReadScreen => Effect::ReadScreen,
             Action::CloseAgent => Effect::CloseAgent,
+            Action::Answer => Effect::Answer {
+                id: self.selected_id.clone()?,
+            },
             Action::Inbox => {
                 self.toggle_inbox();
                 return None;

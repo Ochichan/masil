@@ -480,6 +480,7 @@ impl Manager {
 
     /// Start with an optional client key pinned to the server boot.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_with_operation(
         &self,
         name: &str,
@@ -489,7 +490,16 @@ impl Manager {
         session: Option<&str>,
         split: Option<&str>,
         key: Option<ClientKey<'_>>,
+        answers: bool,
     ) -> Result<Value, String> {
+        if answers {
+            // docs/agent-answers.md: only OpenCode's TUI can take the
+            // listening options safely.
+            if crate::providers::find(provider).map(|provider| provider.id) != Some("opencode") {
+                return Err("invalid_argument: --answers is for OpenCode only".into());
+            }
+            super::answer::check_start_args(args)?;
+        }
         let _lock = self.lock()?;
         let identity = self
             .command(&[
@@ -528,7 +538,10 @@ impl Manager {
         let canonical = cwd
             .canonicalize()
             .map_err(|e| format!("working directory: {e}"))?;
-        let digest = launch_digest(name, provider_id, &canonical, args, session, split);
+        let mut digest = launch_digest(name, provider_id, &canonical, args, session, split);
+        if answers {
+            digest = super::prompt::sha256(&format!("{digest}\nanswers"));
+        }
         // A retry of a finished launch answers from its record: the agent it
         // started now owns the name, so launch checks would reject it.
         // An expired attempt is resolved first for the same reason.
@@ -552,9 +565,10 @@ impl Manager {
                 return Ok(start_receipt(&record));
             }
         }
-        let prepared = self
+        let mut prepared = self
             .prepare_launch(name, provider, cwd, args, session, split)
             .await?;
+        prepared.answers = answers;
         let mut reconciled = false;
         let ticket = loop {
             let request = NewOperation {
@@ -731,6 +745,9 @@ impl Manager {
                     }
                     let record = if record.action == "prompt" {
                         self.resolve_prompt(&mut store, &record, delivered).await?
+                    } else if record.action == "answer" && !delivered {
+                        // The same request can then be answered again.
+                        store.settle_unknown(&record, "not_applied", "user", None, now_ms())?
                     } else {
                         let state = if delivered {
                             "user_confirmed_delivered"

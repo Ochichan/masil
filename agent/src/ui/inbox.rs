@@ -151,6 +151,7 @@ pub(crate) fn kind_label(language: Language, kind: &str) -> &'static str {
 fn resolution_label(language: Language, resolution: &str) -> &'static str {
     match resolution {
         "replied" => word(language, "answered", "응답함"),
+        "answered" => word(language, "answered in masil", "masil에서 응답함"),
         "rejected" => word(language, "rejected", "거절함"),
         "decided" => word(language, "decided", "결정됨"),
         "left_blocked" => word(language, "no longer waiting", "대기 끝"),
@@ -265,6 +266,17 @@ impl App {
                     .inbox
                     .selected_item()
                     .map(|event| Effect::InboxFocus {
+                        pane: event.pane.clone(),
+                        run: event.run.clone(),
+                    })
+                    .into_iter()
+                    .collect();
+            }
+            KeyCode::Char('y') => {
+                return self
+                    .inbox
+                    .selected_item()
+                    .map(|event| Effect::InboxAnswer {
                         pane: event.pane.clone(),
                         run: event.run.clone(),
                     })
@@ -524,8 +536,8 @@ impl App {
     pub(crate) fn inbox_hint(&self) -> &'static str {
         word(
             self.language,
-            "Enter/g focus · a read · A all read · o all/unseen · u next unseen · i close",
-            "Enter/g 이동 · a 읽음 · A 모두 읽음 · o 전체/안 읽음 · u 다음 · i 닫기",
+            "Enter/g focus · y answer · a read · A all read · o all/unseen · u next unseen · i close",
+            "Enter/g 이동 · y 응답 · a 읽음 · A 모두 읽음 · o 전체/안 읽음 · u 다음 · i 닫기",
         )
     }
 }

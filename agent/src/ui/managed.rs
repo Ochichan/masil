@@ -1,6 +1,7 @@
 //! Native agent-management desk. The native server is queried only while this view is open.
 
 use super::{
+    answer::{AnswerDialog, Outcome},
     i18n::action_label,
     model::{Action, App, Effect, Language, Theme},
     palette::{self, Palette, PaletteResult},
@@ -690,7 +691,19 @@ struct TargetIdentity {
 }
 enum ActionResult {
     Receipt(String),
-    Details { id: String, value: Value },
+    Details {
+        id: String,
+        value: Value,
+    },
+    /// The agent's pending requests, to answer in a dialog: `press` is the
+    /// `y` press it answers, and `event` the inbox event's pane and run when
+    /// it was pressed there.
+    Requests {
+        agent: Box<Agent>,
+        value: Value,
+        press: u64,
+        event: Option<(String, String)>,
+    },
 }
 
 impl TargetIdentity {
@@ -781,6 +794,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut dialog: Option<Dialog> = None;
+    let mut answering: Option<AnswerDialog> = None;
     let mut palette: Option<Palette> = None;
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -797,6 +811,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 terminal.terminal().draw(|frame| {
                     app.draw(frame);
                     if let Some(dialog) = &mut dialog { dialog.draw(frame, app.theme); }
+                    if let Some(answering) = &mut answering { answering.draw(frame, app.theme); }
                     if let Some(palette) = &mut palette { palette.draw(frame, app.theme); }
                 }).map_err(|error| error.to_string())?;
                 app.dirty = false;
@@ -828,6 +843,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             }
                         } else if matches!(&event, Event::Key(key) if key.code == KeyCode::Char(':') && key.modifiers.difference(KeyModifiers::SHIFT).is_empty())
                             && dialog.is_none()
+                            && answering.is_none()
                             && app.overlay.is_none()
                             && app.focus != super::model::Focus::Search
                         {
@@ -836,6 +852,18 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             let fleet = fleet.clone();
                             tasks.spawn(async move { Work::Panes(fleet.local.pane_targets().await) });
                             app.dirty = true;
+                            Vec::new()
+                        } else if let Some(active) = &mut answering {
+                            let outcome = active.handle(event);
+                            app.dirty = true;
+                            match outcome {
+                                Outcome::None => {}
+                                Outcome::Cancel => answering = None,
+                                Outcome::Submit { request, reply } => {
+                                    let agent = answering.take().expect("active answer dialog").agent;
+                                    submit_answer(agent, request, reply, fleet.clone(), &mut tasks, app.language, &current_epoch);
+                                }
+                            }
                             Vec::new()
                         } else if let Some(active) = &mut dialog {
                             let outcome = active.handle(event);
@@ -904,6 +932,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     }
                                     if identity_changed {
                                         dialog = None;
+                                        answering = None;
                                         palette = None;
                                         app.cancel_interactions();
                                         app.overlay = None;
@@ -934,6 +963,32 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                         Ok(Work::Action(message)) if message.target.as_ref().is_some_and(|target| target.same_run(&agents)) || (message.target.is_none() && message.boot == current_epoch) => match message.result {
                             Ok(ActionResult::Receipt(receipt)) => { app.finish_action(); app.notify(receipt); app.inbox.refresh = true; },
                             Ok(ActionResult::Details { id, value }) => app.set_details(&id, value),
+                            Ok(ActionResult::Requests { agent, value, press, event }) => {
+                                app.dirty = true;
+                                // Only the latest press opens, and only onto the view it was
+                                // pressed in: a late list must not take a key meant elsewhere.
+                                let same_view = if let Some((pane, run)) = &event {
+                                    app.inbox.open
+                                        && app.inbox.selected_item().is_some_and(|item| &item.pane == pane && &item.run == run)
+                                } else {
+                                    !app.inbox.open && app.selected_id.as_ref() == Some(&agent.id)
+                                };
+                                let free = answering.is_none()
+                                    && dialog.is_none()
+                                    && palette.is_none()
+                                    && app.overlay.is_none()
+                                    && app.focus != super::model::Focus::Search;
+                                if press != app.answer_request {
+                                } else if !(same_view && free) {
+                                    app.notify(self::message(
+                                        app.language,
+                                        "The view changed before the requests arrived; press y again".into(),
+                                        "요청 목록이 오기 전에 화면이 바뀌었습니다. y를 다시 누르세요".into(),
+                                    ));
+                                } else if let Some(opened) = open_answers(*agent, value, &mut app) {
+                                    answering = Some(opened);
+                                }
+                            }
                             Err(error) => { app.finish_action(); app.notify(format!("Action failed: {}", crate::managed::failure::human(&error))); app.inbox.refresh = true; },
                         },
                         Ok(Work::Action(_)) => {},
@@ -1444,9 +1499,132 @@ fn dispatch_effect(
                 });
             }
         }
+        Effect::Answer { id } => {
+            if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {
+                let boot = expected_boot.to_owned();
+                let target = TargetIdentity::for_agent(&agent);
+                app.answer_request += 1;
+                let press = app.answer_request;
+                tasks.spawn(async move {
+                    let result = fleet
+                        .requests(&agent)
+                        .await
+                        .map(|value| ActionResult::Requests {
+                            agent: Box::new(agent),
+                            value,
+                            press,
+                            event: None,
+                        });
+                    action_message(boot, Some(target), result)
+                });
+            }
+        }
+        Effect::InboxAnswer { pane, run } => {
+            let listed = agents
+                .values()
+                .find(|agent| {
+                    (agent.endpoint_id.is_empty() || agent.endpoint_id == "local")
+                        && !agent.stale
+                        && agent.pane_id == pane
+                        && agent.run == run
+                })
+                .cloned();
+            let boot = expected_boot.to_owned();
+            app.answer_request += 1;
+            let press = app.answer_request;
+            tasks.spawn(async move {
+                let result = async {
+                    // An agent the saved view hides is still a local agent.
+                    let agent = match listed {
+                        Some(agent) => agent,
+                        None => fleet
+                            .local_agents()
+                            .await?
+                            .into_iter()
+                            .find(|agent| agent.pane_id == pane && agent.run == run)
+                            .ok_or_else(|| {
+                                "target_absent: the event's pane is closed or runs another agent now"
+                                    .to_owned()
+                            })?,
+                    };
+                    let value = fleet.requests(&agent).await?;
+                    Ok(ActionResult::Requests {
+                        agent: Box::new(agent),
+                        value,
+                        press,
+                        event: Some((pane, run)),
+                    })
+                }
+                .await;
+                action_message(boot, None, result)
+            });
+        }
         Effect::Retry => {}
         Effect::CopyId { .. } | Effect::Preferences { .. } | Effect::Quit => {}
     }
+}
+
+/// The answer dialog for these requests, or a note when there is nothing
+/// masil can answer.
+fn open_answers(agent: Agent, value: Value, app: &mut App) -> Option<AnswerDialog> {
+    let language = app.language;
+    if value["channel"] != crate::managed::answer::CHANNEL {
+        let reason = value["reason"].as_str().unwrap_or("no answer channel");
+        app.notify(message(
+            language,
+            format!("{}: {reason}. Press g to go to its pane.", agent.name),
+            format!("{}: 창에서 답하세요 (g로 이동). {reason}", agent.name),
+        ));
+        return None;
+    }
+    let requests = value["requests"].as_array().cloned().unwrap_or_default();
+    if requests.is_empty() {
+        app.notify(message(
+            language,
+            format!("{} has no pending request", agent.name),
+            format!("{}에 대기 중인 요청이 없습니다", agent.name),
+        ));
+        return None;
+    }
+    Some(AnswerDialog::new(language, agent, requests))
+}
+
+fn submit_answer(
+    agent: Agent,
+    request: String,
+    reply: crate::managed::answer::Reply,
+    fleet: Arc<Fleet>,
+    tasks: &mut JoinSet<Work>,
+    language: super::model::Language,
+    current_epoch: &str,
+) {
+    let epoch = current_epoch.to_owned();
+    let target = TargetIdentity::for_agent(&agent);
+    tasks.spawn(async move {
+        let result = fleet.answer(&agent, &request, reply).await.map(|value| {
+            let accepted = value["provider_accepted"] == true;
+            let also = value["also_answered"].as_array().map_or(0, Vec::len);
+            let stage = value["stage"].as_str().unwrap_or("unknown");
+            let mut english = if accepted {
+                format!("Answered {request}; OpenCode accepted it")
+            } else {
+                format!("Answered {request}: {stage}")
+            };
+            let mut korean = if accepted {
+                format!("{request}에 답했습니다. OpenCode가 받았습니다")
+            } else {
+                format!("{request}에 답했습니다: {stage}")
+            };
+            if also > 0 {
+                english.push_str(&format!(
+                    "; it also closed {also} other request(s) of the session"
+                ));
+                korean.push_str(&format!(". 같은 session의 요청 {also}개도 함께 닫혔습니다"));
+            }
+            ActionResult::Receipt(message(language, english, korean))
+        });
+        action_message(epoch, Some(target), result)
+    });
 }
 
 fn submit_dialog(

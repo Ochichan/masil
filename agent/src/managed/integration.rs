@@ -520,6 +520,13 @@ export const MasilAgentStatePlugin = async () => ({
     if (!rootSessionID || !sessionID || childSessions.has(sessionID) || sessionID !== rootSessionID) return;
     send({ event });
   },
+  // Under `agent start --answers` the server password is masil's; the
+  // agent's shell gets the one the user had (or none). MCP and LSP servers
+  // still inherit it.
+  "shell.env": async (_input, output) => {
+    if (process.env.MASIL_OPENCODE_ANSWERS !== "1") return;
+    output.env.OPENCODE_SERVER_PASSWORD = process.env.MASIL_OPENCODE_ORIGINAL_PASSWORD ?? "";
+  },
 });
 __DEFAULT__
 "#

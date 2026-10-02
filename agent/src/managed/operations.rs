@@ -91,7 +91,26 @@ INSERT INTO meta VALUES ('min_reader', 2);
 
 /// Additive schema per feature, applied once each in any order. Later
 /// phases add entries; names are never reused.
-const FEATURES: &[(&str, &str)] = &[("inbox", INBOX_SCHEMA)];
+const FEATURES: &[(&str, &str)] = &[
+    ("inbox", INBOX_SCHEMA),
+    ("provider_secrets", PROVIDER_SECRETS_SCHEMA),
+];
+
+/// Per-run secrets a provider's local server checks (OpenCode's server
+/// password, docs/agent-answers.md). The store is 0600 and doctor bundles
+/// leave it out.
+const PROVIDER_SECRETS_SCHEMA: &str = "
+CREATE TABLE provider_secrets (
+  run TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  secret TEXT NOT NULL,
+  created_ms INTEGER NOT NULL
+);
+";
+/// Secrets of runs that are gone are kept this long against a run that is
+/// registering while the cleanup lists live runs.
+const SECRET_GRACE_MS: u64 = 60_000;
+const SECRET_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Durable attention events (docs/inbox.md). AUTOINCREMENT keeps public IDs
 /// unique after pruning; a resolution may arrive before its request.
@@ -1626,6 +1645,73 @@ impl Store {
         Ok(changed)
     }
 
+    /// Records the secret a provider started with for `run`.
+    pub fn put_secret(
+        &mut self,
+        run: &str,
+        provider: &str,
+        secret: &str,
+        now: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        tx.execute(
+            "INSERT INTO provider_secrets VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (run) DO UPDATE SET provider = ?2, secret = ?3, created_ms = ?4",
+            params![run, provider, secret, now as i64],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
+    /// The secret `run`'s provider started with, if any.
+    pub fn secret(&self, run: &str, provider: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT secret FROM provider_secrets WHERE run = ?1 AND provider = ?2",
+                params![run, provider],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    /// Forgets secrets of runs that are no longer live, after a grace for a
+    /// run registering meanwhile, and every secret past the retention.
+    pub fn prune_secrets(&mut self, live: &HashSet<String>, now: u64) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let rows = {
+            let mut statement = tx
+                .prepare("SELECT run, created_ms FROM provider_secrets")
+                .map_err(sql)?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql)?
+        };
+        let mut removed = 0;
+        for (run, created) in rows {
+            let age = now.saturating_sub(created.max(0) as u64);
+            if age >= SECRET_RETENTION_MS || (!live.contains(&run) && age >= SECRET_GRACE_MS) {
+                removed += tx
+                    .execute("DELETE FROM provider_secrets WHERE run = ?1", [&run])
+                    .map_err(sql)?;
+            }
+        }
+        tx.commit().map_err(sql)?;
+        Ok(removed)
+    }
+
     /// Runs with open attention events, for the coordinator's check of runs
     /// whose pane is gone.
     pub fn open_runs(&self) -> Result<Vec<String>, String> {
@@ -2216,7 +2302,7 @@ mod tests {
         assert!(!backup_path(&path).exists());
         let status = store.status().unwrap();
         assert_eq!(status["min_reader"], 2);
-        assert_eq!(status["features"], json!(["inbox"]));
+        assert_eq!(status["features"], json!(["inbox", "provider_secrets"]));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2330,7 +2416,7 @@ mod tests {
         let store = Store::open_path(&path).unwrap();
         assert_eq!(
             store.status().unwrap()["features"],
-            json!(["inbox", "later"])
+            json!(["inbox", "later", "provider_secrets"])
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2354,7 +2440,7 @@ mod tests {
         apply_features(&mut store.conn, &second, 3).unwrap();
         assert_eq!(
             store.status().unwrap()["features"],
-            json!(["alpha", "beta", "gamma", "inbox"])
+            json!(["alpha", "beta", "gamma", "inbox", "provider_secrets"])
         );
         fs::remove_dir_all(dir).unwrap();
     }

@@ -87,6 +87,8 @@ pub(crate) struct Info {
     /// Start time in microseconds (macOS) or clock ticks since boot (Linux);
     /// only compared between processes of the same machine.
     pub(crate) started: u64,
+    /// Whether the process has a controlling terminal.
+    pub(crate) tty: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -108,7 +110,64 @@ pub(crate) fn info(pid: i32) -> Option<Info> {
         parent: bsd.pbi_ppid as i32,
         group: bsd.pbi_pgid as i32,
         started: bsd.pbi_start_tvsec * 1_000_000 + bsd.pbi_start_tvusec,
+        // NODEV (all bits set) when there is no controlling terminal.
+        tty: bsd.e_tdev != u32::MAX && bsd.e_tdev != 0,
     })
+}
+
+/// The parent of `pid` when another user owns it; macOS gives only short
+/// information on such a process. None for this user's processes.
+#[cfg(target_os = "macos")]
+pub(crate) fn other_users_parent(pid: i32) -> Option<i32> {
+    // SAFETY: a zeroed proc_bsdshortinfo is valid; proc_pidinfo writes at
+    // most its size.
+    let mut short: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&mut short as *mut libc::proc_bsdshortinfo).cast(),
+            size,
+        )
+    };
+    // SAFETY: geteuid has no preconditions.
+    (written == size && short.pbsi_uid != unsafe { libc::geteuid() })
+        .then_some(short.pbsi_ppid as i32)
+}
+
+/// Linux shows every process's parent, so this is never needed there.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn other_users_parent(_pid: i32) -> Option<i32> {
+    None
+}
+
+/// The direct children of `pid`.
+#[cfg(target_os = "macos")]
+pub(crate) fn children(pid: i32) -> Vec<i32> {
+    let mut buffer = vec![0 as libc::pid_t; 256];
+    let bytes = (buffer.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: the buffer holds `bytes` bytes; the call writes at most that.
+    let written = unsafe { libc::proc_listchildpids(pid, buffer.as_mut_ptr().cast(), bytes) };
+    if written <= 0 {
+        return Vec::new();
+    }
+    // The return value is a count of PIDs on macOS.
+    buffer.truncate((written as usize).min(buffer.len()));
+    buffer.into_iter().filter(|child| *child > 0).collect()
+}
+
+/// The direct children of `pid`, from every process's parent field.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn children(pid: i32) -> Vec<i32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|child| info(*child).is_some_and(|info| info.parent == pid))
+        .collect()
 }
 
 /// Fields 4, 5 and 22 of /proc/PID/stat. The command name in field 2 may
@@ -122,6 +181,7 @@ pub(crate) fn info(pid: i32) -> Option<Info> {
         parent: fields.get(1)?.parse().ok()?,
         group: fields.get(2)?.parse().ok()?,
         started: fields.get(19)?.parse().ok()?,
+        tty: fields.get(4)?.parse::<i64>().ok()? != 0,
     })
 }
 
@@ -138,6 +198,31 @@ mod tests {
             parse_procargs(&buffer),
             Some(vec!["vim".to_string(), "a b".to_string()])
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn another_users_process_still_has_a_parent() {
+        // launchd is root's; a user process gets no full information on it.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(info(1).is_none());
+            assert_eq!(other_users_parent(1), Some(0));
+        }
+        assert_eq!(other_users_parent(std::process::id() as i32), None);
+    }
+
+    #[test]
+    fn a_spawned_child_is_listed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let listed = children(std::process::id() as i32);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(listed.contains(&pid), "{pid} not in {listed:?}");
     }
 
     #[test]

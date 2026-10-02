@@ -1,4 +1,5 @@
 //! Native agent management. Nothing runs until a management command or view is opened.
+pub(crate) mod answer;
 mod cli;
 mod commands;
 mod durable;
@@ -95,6 +96,8 @@ struct PreparedLaunch {
     cwd: PathBuf,
     argv: Vec<String>,
     args: Vec<String>,
+    /// `--answers`: exec-managed decides the listening options in the pane.
+    answers: bool,
 }
 
 enum PreparedEvidence {
@@ -153,6 +156,9 @@ struct RunEvidence {
     /// Origin of the metadata report with the same sequence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     report: Option<ReportSource>,
+    /// A start asked for masil's answer channel (`answer::CHANNEL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answer_channel: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1166,7 +1172,7 @@ impl Manager {
         session: Option<&str>,
         split: Option<&str>,
     ) -> Result<Value, String> {
-        self.start_with_operation(name, provider, cwd, args, session, split, None)
+        self.start_with_operation(name, provider, cwd, args, session, split, None, false)
             .await
     }
 
@@ -1214,6 +1220,7 @@ impl Manager {
             cwd,
             argv,
             args: args.to_vec(),
+            answers: false,
         })
     }
 
@@ -1231,6 +1238,7 @@ impl Manager {
             cwd,
             argv,
             args,
+            answers,
         } = prepared;
         let mut command: Vec<OsString> = if let Some(target) = split {
             vec![
@@ -1277,13 +1285,16 @@ impl Manager {
             self.native.socket.as_os_str().to_owned(),
             "exec-managed".into(),
         ]);
+        if answers {
+            command.push(answer::EXEC_FLAG.into());
+        }
         command.extend(argv.iter().map(OsString::from));
         let result = self
             .native
             .tmux(command, None)
             .await
             .map_err(server_unreachable)?;
-        self.finish_launch(result, provider, name, run, session, argv, args)
+        self.finish_launch(result, provider, name, run, session, argv, args, answers)
             .await
             .map_err(String::from)
     }
@@ -1298,6 +1309,7 @@ impl Manager {
         session: Option<&str>,
         argv: Vec<String>,
         args: Vec<String>,
+        answers: bool,
     ) -> Result<Value, failure::AfterEffect> {
         let line = String::from_utf8(result.stdout)
             .map_err(|_| failure::AfterEffect::new("invalid launch result"))?;
@@ -1324,24 +1336,27 @@ impl Manager {
         };
         let encoded = encode(&metadata).map_err(failure::AfterEffect::new)?;
         let mut registration = vec!["set-option", "-p", "-t", fields[0], META, &encoded];
-        let evidence = match session {
-            Some(session) => Some(
+        let binding = session.map(|session| Binding {
+            session: session.into(),
+            source: BindingSource::Requested,
+            sequence: 0,
+            at: now_ms(),
+            event: None,
+            requested: None,
+            conflict: None,
+        });
+        let evidence = if binding.is_some() || answers {
+            Some(
                 encode(&RunEvidence {
                     run: run.into(),
-                    binding: Some(Binding {
-                        session: session.into(),
-                        source: BindingSource::Requested,
-                        sequence: 0,
-                        at: now_ms(),
-                        event: None,
-                        requested: None,
-                        conflict: None,
-                    }),
+                    binding,
+                    answer_channel: answers.then(|| answer::CHANNEL.to_owned()),
                     ..RunEvidence::default()
                 })
                 .map_err(failure::AfterEffect::new)?,
-            ),
-            None => None,
+            )
+        } else {
+            None
         };
         if let Some(evidence) = &evidence {
             registration.extend([";", "set-option", "-p", "-t", fields[0], EVIDENCE, evidence]);
@@ -1992,6 +2007,12 @@ fn capability_view(
         (None, Some(_)) => "unverified",
         (None, None) => "none",
     };
+    // `agent start --answers`: masil may answer through the provider's own
+    // server once it has checked it (docs/agent-answers.md).
+    let answers = running
+        && provider == "opencode"
+        && evidence.and_then(|evidence| evidence.answer_channel.as_deref())
+            == Some(answer::CHANNEL);
     CapabilityView {
         contract: 1,
         state_authority: state_authority.into(),
@@ -2009,8 +2030,8 @@ fn capability_view(
             "unavailable"
         }
         .into(),
-        approval_response: false,
-        question_response: false,
+        approval_response: answers,
+        question_response: answers,
         turn_identity: false,
         resume: binding.session_id.is_some()
             && binding.state != "conflict"

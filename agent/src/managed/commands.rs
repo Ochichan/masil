@@ -96,7 +96,7 @@ pub(crate) const VERBS: &[Verb] = &[
     },
     Verb {
         name: "start",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER --cwd DIR [--split %N] [--session ID] [--boot BOOT --operation ID] [-- ARGS...]",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER --cwd DIR [--split %N] [--session ID] [--answers] [--boot BOOT --operation ID] [-- ARGS...]",
         mutating: true,
         target_stage: Some("process_started"),
         remote: true,
@@ -177,6 +177,20 @@ pub(crate) const VERBS: &[Verb] = &[
         mutating: true,
         target_stage: Some("process_started"),
         remote: true,
+    },
+    Verb {
+        name: "requests",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] requests TARGET",
+        mutating: false,
+        target_stage: None,
+        remote: false,
+    },
+    Verb {
+        name: "answer",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] answer TARGET REQUEST --choice once|reject [--message TEXT] | --answer TEXT... | --reject",
+        mutating: true,
+        target_stage: None,
+        remote: false,
     },
     Verb {
         name: "inbox",

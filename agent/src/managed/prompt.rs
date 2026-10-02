@@ -93,7 +93,7 @@ fn explicit_key(run: &str, operation: u64) -> String {
     operations::key(&format!("run:{run}"), "prompt", &operation.to_string())
 }
 
-fn sha256(text: &str) -> String {
+pub(super) fn sha256(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 

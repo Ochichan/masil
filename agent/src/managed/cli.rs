@@ -146,6 +146,12 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
 /// with the original provider process. No second provider or terminal parser.
 fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
+    // `agent start --answers`: the listening options and password are
+    // decided here, in the pane, after registration.
+    let (answers, args) = match args.split_first() {
+        Some((flag, rest)) if flag == super::answer::EXEC_FLAG => (true, rest),
+        _ => (false, args),
+    };
     validate_args(args)?;
     let program = args
         .first()
@@ -159,7 +165,8 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
         socket: socket.into(),
         client: None,
     };
-    tokio::runtime::Builder::new_current_thread()
+    let mut argv = args.to_vec();
+    let environment = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
@@ -191,9 +198,19 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
                 }
             })
             .await
-            .map_err(|_| "wait_timeout: managed launch registration timed out".to_string())?
+            .map_err(|_| "wait_timeout: managed launch registration timed out".to_string())??;
+            if !answers {
+                return Ok(Vec::new());
+            }
+            Ok::<_, String>(
+                super::answer::prepare_exec(&native, std::path::Path::new(socket), &run, &mut argv)
+                    .await,
+            )
         })?;
-    let error = std::process::Command::new(program).args(&args[1..]).exec();
+    let error = std::process::Command::new(program)
+        .args(&argv[1..])
+        .envs(environment)
+        .exec();
     Err(format!("provider could not start: {error}"))
 }
 
@@ -339,9 +356,15 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             let mut boot = None;
             let mut operation = None;
             let mut extra = Vec::new();
+            let mut answers = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
+                    "--answers" if !answers => {
+                        answers = true;
+                        i += 1;
+                        continue;
+                    }
                     "--cwd" if cwd.is_none() => cwd = Some(PathBuf::from(value(args, i)?)),
                     "--split" if split.is_none() => split = Some(value(args, i)?),
                     "--session" if session.is_none() => session = Some(value(args, i)?),
@@ -357,7 +380,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                 }
                 i += 2;
             }
-            let outcome = manager
+            let mut outcome = manager
                 .start_with_operation(
                     &args[0],
                     &args[1],
@@ -366,8 +389,15 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     session,
                     split,
                     client_key(boot, operation, "--boot BOOT")?,
+                    answers,
                 )
                 .await?;
+            // The channel is only used once the server refuses requests
+            // without its password; one that does not is stopped.
+            if answers && let Some(pane) = outcome["pane_id"].as_str() {
+                let agent = manager.get(pane).await?;
+                outcome["answer_channel"] = json!(manager.verify_answers(&agent).await?);
+            }
             // A new agent needs watching: start a coordinator that should be
             // running and is not, without waiting for it (D1).
             let socket = manager.native.socket.clone();
@@ -420,6 +450,50 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         "find" => print(&manager.find(args).await?)?,
         "operations" => print(&manager.operations_command(false, args).await?)?,
         "inbox" => print(&super::inbox::command(&manager, args).await?)?,
+        "requests" if args.len() == 1 => {
+            let agent = manager.get(&args[0]).await?;
+            print(&manager.requests(&agent).await?)?;
+        }
+        "answer" if args.len() >= 3 => {
+            let mut choice = None;
+            let mut message = None;
+            let mut answers = Vec::new();
+            let mut reject = false;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--choice" if choice.is_none() => choice = Some(value(args, i)?),
+                    "--message" if message.is_none() => message = Some(value(args, i)?.to_owned()),
+                    "--answer" => answers.push(value(args, i)?.to_owned()),
+                    "--reject" if !reject => {
+                        reject = true;
+                        i += 1;
+                        continue;
+                    }
+                    other => {
+                        return Err(format!("usage: unknown or repeated answer option: {other}"));
+                    }
+                }
+                i += 2;
+            }
+            let reply = match (choice, answers.is_empty(), reject) {
+                (Some("once"), true, false) => super::answer::Reply::Once,
+                (Some("reject"), true, false) => super::answer::Reply::Reject { message },
+                (None, false, false) if message.is_none() => super::answer::Reply::Answers(answers),
+                (None, true, true) if message.is_none() => super::answer::Reply::RejectQuestion,
+                (Some(other), _, _) if other != "once" && other != "reject" => {
+                    return Err(
+                        "invalid_argument: --choice is once or reject; always is not offered yet"
+                            .into(),
+                    );
+                }
+                _ => {
+                    return Err("usage: answer TARGET REQUEST --choice once|reject [--message TEXT] | --answer TEXT... | --reject".into());
+                }
+            };
+            let agent = manager.get(&args[0]).await?;
+            print(&manager.answer(&agent, &args[1], reply).await?)?;
+        }
         "operation" if !args.is_empty() => {
             let record = manager.operations_command(true, args).await?;
             return print_record(&manager, &record, args.len() == 1).await;
@@ -541,6 +615,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     Some(manager.resume_session(&agent)?),
                     split,
                     client_key(boot, operation, "--boot BOOT")?,
+                    false,
                 )
                 .await?;
             // The new run has only a request; the source run's evidence stays separate.

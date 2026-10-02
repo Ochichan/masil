@@ -334,6 +334,37 @@ impl Fleet {
         self.local.inbox_mark_read(ids, through_seq).await
     }
 
+    /// The pending requests masil can answer for this agent (local only).
+    pub async fn requests(&self, agent: &Agent) -> Result<Value, String> {
+        let agent = self.answering(agent).await?;
+        self.local.requests(&agent).await
+    }
+
+    pub async fn answer(
+        &self,
+        agent: &Agent,
+        request: &str,
+        reply: super::answer::Reply,
+    ) -> Result<Value, String> {
+        let agent = self.answering(agent).await?;
+        self.local.answer(&agent, request, reply).await
+    }
+
+    /// The agent as its pane runs it now: answers find the provider's server
+    /// through the pane's current processes, not a listed copy.
+    async fn answering(&self, agent: &Agent) -> Result<Agent, String> {
+        if self.remote(agent)?.is_some() {
+            return Err(
+                "answer_channel_none: answers to a remote agent are not offered yet".into(),
+            );
+        }
+        let current = self.local.get(&agent.pane_id).await?;
+        if current.run != agent.run || current.generation != agent.generation {
+            return Err("target_absent: the pane runs another agent now".into());
+        }
+        Ok(current)
+    }
+
     /// Every local agent, whatever the saved view hides.
     pub async fn local_agents(&self) -> Result<Vec<Agent>, String> {
         self.local.list().await
