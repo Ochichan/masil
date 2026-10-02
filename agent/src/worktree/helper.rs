@@ -105,6 +105,7 @@ pub(super) fn run(id: i64) -> Result<i32, String> {
     let log = registry.open_job_log(id)?;
     let end = match job.kind.as_str() {
         "create" => create::run(&mut registry, &job, &log),
+        "remove" => super::remove::run(&mut registry, &job, &log),
         kind => End::Failed(format!("this masil-agent cannot run {kind} jobs")),
     };
     let tail = output_tail(&registry, id);
@@ -146,6 +147,11 @@ pub(super) fn settle_orphan(registry: &mut Registry, id: i64) -> Result<(), Stri
     }
     stop_orphan_child(&job);
     let settled = serde_json::json!({"reconciled": true});
+    if job.kind == "remove" {
+        let (state, error) = super::remove::settle(registry, &job);
+        registry.end_orphan(&job, state, &error, Some(&settled), now)?;
+        return Ok(());
+    }
     let Some(worktree) = job.worktree_id.filter(|_| job.kind == "create") else {
         let error = if job.kind == "create" {
             "its helper ended before it reserved a worktree"

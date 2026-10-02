@@ -104,6 +104,8 @@ struct PreparedLaunch {
     args: Vec<String>,
     /// `--answers`: exec-managed decides the listening options in the pane.
     answers: bool,
+    /// The masil worktree the directory is in; its start takes a lease.
+    worktree: Option<crate::worktree::Found>,
 }
 
 enum PreparedEvidence {
@@ -1313,6 +1315,7 @@ impl Manager {
                 std::fs::metadata(&cwd).map_err(|error| format!("working directory: {error}"))?;
             (metadata.dev(), metadata.ino())
         };
+        let worktree = crate::worktree::detect(&cwd)?;
         Ok(PreparedLaunch {
             cwd_identity,
             provider,
@@ -1320,6 +1323,7 @@ impl Manager {
             argv,
             args: args.to_vec(),
             answers: false,
+            worktree,
         })
     }
 
@@ -1339,6 +1343,7 @@ impl Manager {
             argv,
             args,
             answers,
+            worktree: _,
         } = prepared;
         let mut command: Vec<OsString> = if let Some(target) = split {
             vec![
@@ -2556,6 +2561,35 @@ fn decode<T: for<'a> Deserialize<'a>>(value: &str) -> Option<T> {
 }
 
 /// Decode tmux's `q:` escaping without interpreting any text as shell code.
+/// `list-panes -a` format for [`pane_runs`].
+pub(crate) const PANE_RUNS: &str = "#{q:pane_id}\t#{q:masil_core_boot_id}\t#{q:pane_dead}\t#{q:@masil-managed-agent}\t#{q:pane_current_path}";
+
+/// One pane as worktree checks see it.
+pub(crate) struct PaneRun {
+    pub(crate) pane: String,
+    pub(crate) boot: String,
+    pub(crate) dead: bool,
+    /// The managed run in this pane, if masil started an agent there.
+    pub(crate) run: Option<String>,
+    pub(crate) path: String,
+}
+
+pub(crate) fn pane_runs(output: &str) -> Result<Vec<PaneRun>, String> {
+    records(output)?
+        .into_iter()
+        .map(|fields| match fields.as_slice() {
+            [pane, boot, dead, meta, path] => Ok(PaneRun {
+                pane: pane.clone(),
+                boot: boot.clone(),
+                dead: dead == "1",
+                run: decode::<Metadata>(meta).map(|meta| meta.run),
+                path: path.clone(),
+            }),
+            _ => Err("invalid pane record".to_owned()),
+        })
+        .collect()
+}
+
 fn records(text: &str) -> Result<Vec<Vec<String>>, String> {
     let mut rows = Vec::new();
     let mut row = Vec::new();

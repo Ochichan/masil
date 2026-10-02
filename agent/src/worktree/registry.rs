@@ -204,6 +204,19 @@ impl Worktree {
     }
 }
 
+/// A run that uses a worktree.
+#[derive(Clone, Debug)]
+pub(super) struct LeaseRow {
+    pub(super) id: i64,
+    pub(super) worktree: i64,
+    pub(super) socket: String,
+    pub(super) boot: String,
+    pub(super) run: String,
+    pub(super) pane: Option<String>,
+    pub(super) state: String,
+    pub(super) until_ms: u64,
+}
+
 /// A new worktree row, before its directory exists.
 pub(super) struct Reservation<'a> {
     pub(super) repo_common_dir: &'a str,
@@ -237,6 +250,8 @@ pub(super) enum CancelStep {
 pub(super) enum End {
     Succeeded(Value),
     Failed(String),
+    /// Refused before any effect, with what the person needs to decide.
+    Refused(String, Value),
     /// Stopped before its effect.
     Cancelled(String),
 }
@@ -424,8 +439,12 @@ impl Registry {
     /// Waits for `registry.lock`, which groups checks and changes that span
     /// git or tmux calls. SQLite transactions stay short and never hold it.
     pub(super) fn lock(&self) -> Result<Lock, String> {
+        self.lock_within(LOCK_WAIT)
+    }
+
+    pub(super) fn lock_within(&self, wait: Duration) -> Result<Lock, String> {
         let file = private_file(&self.dir.join("registry.lock"), "worktree registry lock")?;
-        let deadline = Instant::now() + LOCK_WAIT;
+        let deadline = Instant::now() + wait;
         loop {
             // SAFETY: flock on an open descriptor this function owns.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -436,10 +455,10 @@ impl Registry {
                 return Err(format!("worktree registry lock: {error}"));
             }
             if Instant::now() >= deadline {
-                return Err(
-                    "registry_busy: another worktree command has held the registry lock for 60 s"
-                        .into(),
-                );
+                return Err(format!(
+                    "registry_busy: another worktree command has held the registry lock for {} s",
+                    wait.as_secs()
+                ));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -518,6 +537,16 @@ impl Registry {
             .map_err(sql)?;
         tx.commit().map_err(sql)?;
         Ok((job, true))
+    }
+
+    pub(super) fn set_job_worktree(&self, job: i64, worktree: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE jobs SET worktree_id = ?2 WHERE id = ?1",
+                params![job, worktree],
+            )
+            .map(drop)
+            .map_err(sql)
     }
 
     pub(super) fn job(&self, id: i64) -> Result<Option<Job>, String> {
@@ -731,6 +760,7 @@ impl Registry {
                 }
                 End::Succeeded(result) => ("succeeded", Some(result), None),
                 End::Failed(error) => ("failed", None, Some(error)),
+                End::Refused(error, result) => ("failed", Some(result), Some(error)),
                 End::Cancelled(error) => ("cancelled", None, Some(error)),
             };
             tx.execute(
@@ -957,6 +987,205 @@ impl Registry {
                 params![id, to, gone, now as i64],
             )
             .map(|changed| changed == 1)
+            .map_err(sql)
+    }
+
+    // Leases.
+
+    /// Records that `run` on `socket` is starting in a worktree, with its
+    /// run history row.
+    pub(super) fn insert_lease(
+        &mut self,
+        worktree: i64,
+        socket: &str,
+        boot: &str,
+        run: &str,
+        until_ms: u64,
+        now: u64,
+    ) -> Result<i64, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        tx.execute(
+            "INSERT INTO leases(worktree_id, socket, boot, run, state, until_ms, created_ms)
+             VALUES (?1, ?2, ?3, ?4, 'launching', ?5, ?6)",
+            params![worktree, socket, boot, run, until_ms as i64, now as i64],
+        )
+        .map_err(sql)?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT OR IGNORE INTO runs(worktree_id, socket, boot, run, started_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![worktree, socket, boot, run, now as i64],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(id)
+    }
+
+    pub(super) fn leases(&self, worktree: Option<i64>) -> Result<Vec<LeaseRow>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, worktree_id, socket, boot, run, pane, state, until_ms FROM leases
+                 WHERE ?1 IS NULL OR worktree_id = ?1 ORDER BY id",
+            )
+            .map_err(sql)?;
+        statement
+            .query_map([worktree], |row| {
+                Ok(LeaseRow {
+                    id: row.get(0)?,
+                    worktree: row.get(1)?,
+                    socket: row.get(2)?,
+                    boot: row.get(3)?,
+                    run: row.get(4)?,
+                    pane: row.get(5)?,
+                    state: row.get(6)?,
+                    until_ms: row.get::<_, i64>(7)? as u64,
+                })
+            })
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)
+    }
+
+    /// The run is registered in its pane.
+    pub(super) fn set_lease_live(&mut self, id: i64, pane: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE leases SET state = 'live', pane = ?2 WHERE id = ?1",
+                params![id, pane],
+            )
+            .map(drop)
+            .map_err(sql)
+    }
+
+    /// Drops a lease whose run ended or never started; its run history row
+    /// records the end.
+    pub(super) fn end_lease(&mut self, lease: &LeaseRow, now: u64) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        tx.execute("DELETE FROM leases WHERE id = ?1", [lease.id])
+            .map_err(sql)?;
+        tx.execute(
+            "UPDATE runs SET ended_ms = ?4 WHERE socket = ?1 AND boot = ?2 AND run = ?3
+               AND ended_ms IS NULL",
+            params![lease.socket, lease.boot, lease.run, now as i64],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
+    /// Sockets any run in this worktree used, from leases and history.
+    pub(super) fn run_sockets(&self, worktree: i64) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT socket FROM leases WHERE worktree_id = ?1
+                 UNION SELECT socket FROM runs WHERE worktree_id = ?1",
+            )
+            .map_err(sql)?;
+        statement
+            .query_map([worktree], |row| row.get(0))
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)
+    }
+
+    /// Worktrees of a repository that are not gone, matching a name or else
+    /// a branch.
+    pub(super) fn find(&self, repo_key: &str, spec: &str) -> Result<Vec<Worktree>, String> {
+        let by = |column: &str| -> Result<Vec<Worktree>, String> {
+            let mut statement = self
+                .conn
+                .prepare(&format!(
+                    "SELECT {WORKTREE_COLUMNS} FROM worktrees
+                     WHERE repo_key = ?1 AND {column} = ?2 AND state IN {ACTIVE} ORDER BY id"
+                ))
+                .map_err(sql)?;
+            statement
+                .query_map(params![repo_key, spec], worktree_row)
+                .map_err(sql)?
+                .collect::<Result<_, _>>()
+                .map_err(sql)
+        };
+        let named = by("name")?;
+        if !named.is_empty() {
+            return Ok(named);
+        }
+        by("branch")
+    }
+
+    /// Marks a ready (or half-deleted) worktree as being removed by `job`.
+    pub(super) fn begin_removing(&mut self, id: i64, job: i64) -> Result<Option<String>, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let state: Option<String> = tx
+            .query_row("SELECT state FROM worktrees WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(sql)?;
+        let Some(state) = state else {
+            return Ok(None);
+        };
+        if state == "ready" {
+            tx.execute(
+                "UPDATE worktrees SET state = 'removing', removing_job = ?2 WHERE id = ?1",
+                params![id, job],
+            )
+            .map_err(sql)?;
+        } else if state == "deleting" {
+            tx.execute(
+                "UPDATE worktrees SET removing_job = ?2 WHERE id = ?1",
+                params![id, job],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(Some(state))
+    }
+
+    /// The job removing this worktree, if any.
+    pub(super) fn removing_job(&self, id: i64) -> Result<Option<i64>, String> {
+        self.conn
+            .query_row(
+                "SELECT removing_job FROM worktrees WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(sql)
+    }
+
+    /// Ends a removal that did not delete anything: back to ready.
+    pub(super) fn stop_removing(&mut self, id: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE worktrees SET state = CASE WHEN state = 'removing' THEN 'ready' ELSE state END,
+                   removing_job = NULL WHERE id = ?1",
+                [id],
+            )
+            .map(drop)
+            .map_err(sql)
+    }
+
+    /// Paths setup put in a worktree, which removal does not ask about.
+    pub(super) fn setup_paths(&self, worktree: i64) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path FROM setup_paths WHERE worktree_id = ?1 ORDER BY path")
+            .map_err(sql)?;
+        statement
+            .query_map([worktree], |row| row.get(0))
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
             .map_err(sql)
     }
 

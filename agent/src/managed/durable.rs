@@ -613,13 +613,56 @@ impl Manager {
                 }
             }
         };
+        // A start in a masil worktree leases it before anything launches,
+        // so a removal cannot begin in between (docs/worktrees.md).
+        let lease = match &prepared.worktree {
+            None => None,
+            Some(found) => {
+                match crate::worktree::begin(found, &self.native.socket, &boot, &ticket.ticket) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        let _ = store.finish(
+                            &ticket,
+                            "rejected_before_effect",
+                            "worktree",
+                            Some(&json!({"error": error})),
+                            now_ms(),
+                        );
+                        return Err(format!(
+                            "{error} (operation {} is rejected_before_effect)",
+                            ticket.key
+                        ));
+                    }
+                }
+            }
+        };
         // The ticket is the new run's identity, so reconcile can find the pane.
-        match self
+        let launched = self
             .launch(prepared, name, &ticket.ticket, session, split)
-            .await
-        {
+            .await;
+        if let Some(lease) = &lease {
+            match &launched {
+                Ok(outcome) => {
+                    if let Some(pane) = outcome["pane_id"].as_str() {
+                        crate::worktree::launched(lease, pane);
+                    }
+                }
+                Err(error)
+                    if error.starts_with("cwd_rejected")
+                        || (transport_rejected(error) && !error.contains("was launched")) =>
+                {
+                    crate::worktree::abandon(lease);
+                }
+                // Unknown: lease cleanup finds out from the server.
+                Err(_) => {}
+            }
+        }
+        match launched {
             Ok(mut outcome) => {
                 outcome["operation_key"] = json!(ticket.key);
+                if let Some(lease) = &lease {
+                    outcome["worktree"] = json!({"id": lease.worktree, "name": lease.name});
+                }
                 store
                     .finish(&ticket, "process_started", "registration", Some(&outcome), now_ms())
                     .map_err(|error| {

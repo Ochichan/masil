@@ -45,6 +45,9 @@ struct PaneFile {
     #[serde(default)]
     focus: bool,
     agent: Option<AgentFile>,
+    /// An agent pane runs in this masil worktree; `cwd` is then a relative
+    /// path inside it.
+    worktree: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,6 +80,10 @@ struct Pane {
     command: Option<Vec<String>>,
     focus: bool,
     agent: Option<AgentFile>,
+    /// The worktree name or path, and the directory inside it, until it is
+    /// resolved against the registry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree: Option<(String, Option<String>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -379,7 +386,27 @@ fn normalize(parsed: TemplateFile) -> Result<Template, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute());
-    normalize_from(parsed, &cwd, home.as_deref())
+    let mut template = normalize_from(parsed, &cwd, home.as_deref())?;
+    resolve_worktrees(&mut template)?;
+    Ok(template)
+}
+
+/// Agent panes with `worktree` run in that masil worktree, found by name in
+/// the repository of the template root. One that does not exist fails the
+/// plan; layout never makes one.
+fn resolve_worktrees(template: &mut Template) -> Result<(), String> {
+    let root = PathBuf::from(&template.root);
+    for (window_index, window) in template.windows.iter_mut().enumerate() {
+        for (pane_index, pane) in window.panes.iter_mut().enumerate() {
+            let Some((spec, cwd)) = pane.worktree.take() else {
+                continue;
+            };
+            let dir = crate::worktree::start_dir(&spec, &root, cwd.as_deref().map(Path::new))
+                .map_err(|error| format!("window {window_index} pane {pane_index}: {error}"))?;
+            pane.cwd = path_text(&dir, "pane cwd")?;
+        }
+    }
+    Ok(())
 }
 
 fn normalize_from(
@@ -455,6 +482,31 @@ fn normalize_from(
                     return Err("at most one pane may set focus = true".into());
                 }
             }
+            if let Some(spec) = pane.worktree {
+                if pane.agent.is_none() {
+                    return Err(format!(
+                        "window {window_index} pane {pane_index} sets worktree but is not an agent pane"
+                    ));
+                }
+                if pane
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.starts_with('/') || cwd.starts_with('~'))
+                {
+                    return Err(format!(
+                        "window {window_index} pane {pane_index} cwd must be relative inside its worktree"
+                    ));
+                }
+                panes.push(Pane {
+                    // Replaced by the worktree's directory before the plan.
+                    cwd: root_text.clone(),
+                    command: pane.command,
+                    focus: pane.focus,
+                    agent: pane.agent,
+                    worktree: Some((spec, pane.cwd)),
+                });
+                continue;
+            }
             let pane_cwd =
                 resolve_path(pane.cwd.as_deref().unwrap_or("."), &root, home, "pane cwd")?;
             panes.push(Pane {
@@ -462,6 +514,7 @@ fn normalize_from(
                 command: pane.command,
                 focus: pane.focus,
                 agent: pane.agent,
+                worktree: None,
             });
         }
         windows.push(Window {

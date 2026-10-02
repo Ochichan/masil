@@ -5,7 +5,12 @@
 mod create;
 mod git;
 mod helper;
+mod lease;
 mod registry;
+mod remove;
+mod servers;
+
+pub(crate) use lease::{Found, abandon, begin, detect, launched, start_dir};
 
 use registry::{Job, Registry, now_ms};
 use serde_json::{Value, json};
@@ -14,6 +19,9 @@ use std::path::{Path, PathBuf};
 const HELP: &str = "\
 usage: masil-agent worktree create REPO BRANCH [--from REF] [--name NAME] [--key KEY] [--no-wait]
        masil-agent worktree list [REPO] [--all]
+       masil-agent worktree remove WORKTREE [--repo DIR] [--force] [--confirm TOKEN] [--delete-branch]
+                                   [--key KEY] [--no-wait]
+       masil-agent worktree forget PATH
        masil-agent worktree jobs [JOB]
        masil-agent worktree cancel JOB [--no-wait]";
 /// Jobs `worktree jobs` shows.
@@ -31,6 +39,8 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
         Some("list") => list(&args[1..]),
         Some("jobs") => jobs(&args[1..]),
         Some("cancel") => cancel(&args[1..]),
+        Some("remove") => remove(&args[1..]),
+        Some("forget") => forget(&args[1..]),
         Some("job-run") => match &args[1..] {
             [id] => helper::run(job_id(id)?),
             _ => Err(format!("usage: {HELP}")),
@@ -249,6 +259,9 @@ fn create(args: &[String]) -> Result<i32, String> {
     let mut registry = Registry::open()?;
     helper::sweep(&mut registry)?;
     registry.prune(now_ms())?;
+    // Ended runs release their worktrees; a server that does not answer
+    // only delays that.
+    let _ = lease::prune(&mut registry, None);
     let (job, new) = registry.insert_job(
         "create",
         &format!("repo:{}", repo.key),
@@ -292,7 +305,17 @@ fn report(job: &Job) -> Result<i32, String> {
         text
     };
     match job.state.as_str() {
-        "failed" => Err(format!("job_failed: worktree job {}: {}", job.id, error())),
+        "failed" => {
+            let text = job.error.clone().unwrap_or_default();
+            // A refusal names its reason; its result says what to decide.
+            if crate::managed::failure::has_registered_code(&text) {
+                if job.result.is_some() {
+                    print(&job.to_json(false))?;
+                }
+                return Err(format!("{text} (worktree job {})", job.id));
+            }
+            Err(format!("job_failed: worktree job {}: {}", job.id, error()))
+        }
         "cancelled" => Err(format!(
             "job_cancelled: worktree job {}: {}",
             job.id,
@@ -324,6 +347,14 @@ fn list(args: &[String]) -> Result<i32, String> {
         if let Some(job) = registry.last_job(worktree.id)? {
             value["last_job"] = json!({"id": job.id, "kind": job.kind, "state": job.state});
         }
+        let runs: Vec<Value> = registry
+            .leases(Some(worktree.id))?
+            .iter()
+            .map(|lease| {
+                json!({"socket": lease.socket, "run": lease.run, "pane": lease.pane, "state": lease.state})
+            })
+            .collect();
+        value["runs"] = json!(runs);
         worktrees.push(value);
     }
     print(&json!({"worktrees": worktrees}))?;
@@ -370,10 +401,120 @@ fn cancel(args: &[String]) -> Result<i32, String> {
     };
     let id = job_id(id)?;
     let mut registry = Registry::open()?;
+    let _ = lease::prune(&mut registry, None);
     let mut job = helper::cancel(&mut registry, id)?;
     if job.open() && !parsed.flag("--no-wait") {
         job = helper::wait(&mut registry, id, None)?;
     }
     print(&job.to_json(false))?;
+    Ok(0)
+}
+
+fn remove(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(
+        args,
+        &["--repo", "--confirm", "--key"],
+        &["--force", "--delete-branch", "--no-wait"],
+    )?;
+    let [target] = parsed.positional.as_slice() else {
+        return Err(format!("usage: {HELP}"));
+    };
+    let key = parsed.value("--key");
+    if let Some(key) = &key
+        && !valid_key(key)
+    {
+        return Err(format!("invalid_argument: {key} is not a valid key"));
+    }
+    let hint = match parsed.value("--repo") {
+        Some(repo) => PathBuf::from(repo),
+        None => std::env::current_dir().map_err(|error| error.to_string())?,
+    };
+    let mut registry = Registry::open()?;
+    let row = lease::resolve(&registry, target, &hint)?;
+    let request = remove::Request {
+        worktree: row.id,
+        force: parsed.flag("--force"),
+        confirm: parsed.value("--confirm"),
+        delete_branch: parsed.flag("--delete-branch"),
+        socket_dir: Some(
+            servers::socket_dir()
+                .and_then(|dir| dir.to_str().map(str::to_owned))
+                .ok_or(
+                    "server_unanswered: the default socket directory cannot be resolved, so its \
+                     servers cannot be checked",
+                )?,
+        ),
+    };
+    let request = serde_json::to_value(&request).map_err(|error| error.to_string())?;
+    helper::sweep(&mut registry)?;
+    registry.prune(now_ms())?;
+    let (job, new) = registry.insert_job(
+        "remove",
+        &format!("repo:{}", row.repo_key),
+        key.as_deref(),
+        &request,
+        now_ms(),
+    )?;
+    let child = if new {
+        registry.set_job_worktree(job.id, row.id)?;
+        match helper::spawn(&registry, job.id) {
+            Ok(child) => Some(child),
+            Err(error) => {
+                registry.end_orphan(&job, "failed", &error, None, now_ms())?;
+                return Err(format!("job_failed: {error} (worktree job {})", job.id));
+            }
+        }
+    } else {
+        None
+    };
+    if parsed.flag("--no-wait") {
+        print(&job.to_json(false))?;
+        return Ok(0);
+    }
+    let job = helper::wait(&mut registry, job.id, child)?;
+    report(&job)
+}
+
+/// Drops masil's marker and git lock from a worktree this registry does not
+/// know (made with another state directory, or before it was lost). Files
+/// stay.
+fn forget(args: &[String]) -> Result<i32, String> {
+    let [path] = args else {
+        return Err(format!("usage: {HELP}"));
+    };
+    let path = Path::new(path)
+        .canonicalize()
+        .map_err(|error| format!("invalid_argument: {}: {error}", path))?;
+    let found = lease::detect(&path)?.ok_or_else(|| {
+        format!(
+            "invalid_argument: {} is not in a worktree masil made",
+            path.display()
+        )
+    })?;
+    let registry = Registry::open()?;
+    if registry.registry_id()? == found.registry
+        && registry
+            .worktree(found.worktree)?
+            .is_some_and(|row| !matches!(row.state.as_str(), "removed" | "failed"))
+    {
+        return Err(
+            "worktree_unavailable: masil still tracks this worktree; use `worktree remove`".into(),
+        );
+    }
+    std::fs::remove_file(&found.marker)
+        .map_err(|error| format!("{}: {error}", found.marker.display()))?;
+    let root = found
+        .root
+        .to_str()
+        .ok_or("invalid_argument: the worktree path is not UTF-8")?;
+    let locked = create::entries(&found.root)?
+        .into_iter()
+        .find(|entry| entry.path == root)
+        .and_then(|entry| entry.locked)
+        .is_some_and(|reason| reason.starts_with("masil worktree "));
+    if locked {
+        git::query(&found.root, &["worktree", "unlock", "--", root])?;
+    }
+    print(&json!({"forgotten": root, "unlocked": locked}))?;
     Ok(0)
 }

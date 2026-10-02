@@ -96,7 +96,7 @@ pub(crate) const VERBS: &[Verb] = &[
     },
     Verb {
         name: "start",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER --cwd DIR [--split %N] [--session ID] [--answers] [--boot BOOT --operation ID] [-- ARGS...]",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER [--cwd DIR] [--worktree NAME|PATH (local only)] [--split %N] [--session ID] [--answers] [--boot BOOT --operation ID] [-- ARGS...]",
         mutating: true,
         target_stage: Some("process_started"),
         remote: true,

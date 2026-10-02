@@ -395,13 +395,13 @@ fn write_marker(registry: &Registry, worktree: i64, path: &Path) -> Result<(), S
 }
 
 /// One worktree as `git worktree list --porcelain` shows it.
-struct Entry {
-    path: String,
-    branch: Option<String>,
-    locked: Option<String>,
+pub(super) struct Entry {
+    pub(super) path: String,
+    pub(super) branch: Option<String>,
+    pub(super) locked: Option<String>,
 }
 
-fn entries(root: &Path) -> Result<Vec<Entry>, String> {
+pub(super) fn entries(root: &Path) -> Result<Vec<Entry>, String> {
     let list = git::query(root, &["worktree", "list", "--porcelain", "-z"])?;
     let mut entries: Vec<Entry> = Vec::new();
     for field in list.split('\0') {

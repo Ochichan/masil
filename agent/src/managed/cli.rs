@@ -511,9 +511,11 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             let mut operation = None;
             let mut extra = Vec::new();
             let mut answers = false;
+            let mut worktree = None;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
+                    "--worktree" if worktree.is_none() => worktree = Some(value(args, i)?),
                     "--answers" if !answers => {
                         answers = true;
                         i += 1;
@@ -534,11 +536,18 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                 }
                 i += 2;
             }
+            let here = std::env::current_dir().map_err(|e| e.to_string())?;
+            // With a worktree, the directory is that worktree, or --cwd
+            // inside it; the start then leases it like any start there.
+            let cwd = match worktree {
+                Some(spec) => crate::worktree::start_dir(spec, &here, cwd.as_deref())?,
+                None => cwd.unwrap_or(here),
+            };
             let mut outcome = manager
                 .start_with_operation(
                     &args[0],
                     &args[1],
-                    &cwd.unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?),
+                    &cwd,
                     &extra,
                     session,
                     split,
