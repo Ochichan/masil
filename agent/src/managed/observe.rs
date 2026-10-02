@@ -30,6 +30,8 @@ const FIRST_LOOK_BACK_MS: u64 = 120_000;
 /// Turn ends and errors read from the server; requests keep the plugin's
 /// key (`hook:opencode`) so one request is one event.
 const SOURCE: &str = "api:opencode";
+/// A user message older than this is no prompt masil can still accept.
+const PROMPT_RECENT_MS: u64 = 122_000;
 /// Frames read only for their type.
 const SKIPPED: &[&str] = &[
     "message.part.delta",
@@ -62,6 +64,21 @@ pub(super) enum Update {
     Restored {
         run: String,
     },
+    /// A user message the server recorded, to match with a prompt masil
+    /// delivered (`prompt::accept_prompt`).
+    Prompted {
+        run: String,
+        message: Prompted,
+    },
+}
+
+#[derive(Clone)]
+pub(super) struct Prompted {
+    pub session: String,
+    pub message: String,
+    pub digest: String,
+    /// When OpenCode recorded it (ms).
+    pub created_ms: u64,
 }
 
 /// The runs the coordinator observes, by run.
@@ -197,6 +214,8 @@ struct Memory {
     lost: bool,
     /// No connection worked yet in this task.
     first: bool,
+    /// User messages read since the last send.
+    prompted: Vec<Prompted>,
 }
 
 struct Turn {
@@ -204,6 +223,8 @@ struct Turn {
     /// The turn failed or the person stopped it: it does not end as done.
     errored: bool,
     ended: bool,
+    /// Its text was read and reported (Update::Prompted).
+    read: bool,
 }
 
 async fn observe(
@@ -221,6 +242,7 @@ async fn observe(
         attempt: 0,
         lost: false,
         first: true,
+        prompted: Vec::new(),
     };
     let mut endpoint = None;
     loop {
@@ -309,6 +331,7 @@ async fn follow(
     });
     effects.extend(catch_up(endpoint, target, &view, memory).await);
     let _ = updates.send(Update::Effects(effects));
+    send_prompted(target, memory, updates);
     let mut last = view.state(true);
     let _ = updates.send(Update::State {
         run: target.run.clone(),
@@ -345,6 +368,7 @@ async fn follow(
         if !effects.is_empty() {
             let _ = updates.send(Update::Effects(effects));
         }
+        send_prompted(target, memory, updates);
         let state = view.state(true);
         if state != last {
             last = state;
@@ -456,6 +480,8 @@ impl View {
         match kind {
             "server.instance.disposed" => return Err("OpenCode's instance closed".into()),
             "session.status" => {
+                // A turn's message and parts are saved before it is busy.
+                read_prompt(endpoint, memory, &session).await;
                 if properties["status"]["type"] == "idle" {
                     if self.busy.remove(&session) {
                         effects.extend(turn_end(endpoint, target, memory, &session).await);
@@ -516,6 +542,7 @@ impl View {
                             message: id.to_owned(),
                             errored: false,
                             ended: false,
+                            read: false,
                         },
                     );
                 }
@@ -562,6 +589,50 @@ impl View {
         }
         Ok(effects)
     }
+}
+
+/// Sends the user messages read so far.
+fn send_prompted(target: &Target, memory: &mut Memory, updates: &mpsc::UnboundedSender<Update>) {
+    for message in memory.prompted.drain(..) {
+        let _ = updates.send(Update::Prompted {
+            run: target.run.clone(),
+            message,
+        });
+    }
+}
+
+/// Reads the session's latest user message once, for its text.
+async fn read_prompt(endpoint: &answer::Endpoint, memory: &mut Memory, session: &str) {
+    let Some(turn) = memory.turns.get_mut(session).filter(|turn| !turn.read) else {
+        return;
+    };
+    let Ok(message) = endpoint
+        .get_json(&format!("/session/{session}/message/{}", turn.message))
+        .await
+    else {
+        return;
+    };
+    turn.read = true;
+    memory.prompted.push(Prompted {
+        session: session.to_owned(),
+        message: turn.message.clone(),
+        digest: prompt_digest(&message["parts"]),
+        created_ms: message["info"]["time"]["created"].as_u64().unwrap_or(0),
+    });
+}
+
+/// The accept digest of a user message's own text: its text parts, without
+/// what OpenCode added (editor context, file reads).
+fn prompt_digest(parts: &Value) -> String {
+    let text = parts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|part| part["type"] == "text" && part["synthetic"] != true)
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    super::prompt::accept_digest("opencode", &text).unwrap_or_default()
 }
 
 /// A root session that went idle ended its turn; one that failed or was
@@ -687,10 +758,29 @@ async fn catch_up(
         let Some(user) = messages[start]["info"]["id"].as_str() else {
             continue;
         };
+        // A user message since the last look may be a prompt masil
+        // delivered, if it is recent enough to be matched.
+        let recent = now_ms().saturating_sub(PROMPT_RECENT_MS);
+        for message in &messages {
+            let info = &message["info"];
+            let created = info["time"]["created"].as_u64().unwrap_or(0);
+            if info["role"] == "user"
+                && created >= since.max(recent)
+                && let Some(message_id) = info["id"].as_str()
+            {
+                memory.prompted.push(Prompted {
+                    session: id.to_owned(),
+                    message: message_id.to_owned(),
+                    digest: prompt_digest(&message["parts"]),
+                    created_ms: created,
+                });
+            }
+        }
         let mut turn = Turn {
             message: user.to_owned(),
             errored: false,
             ended: false,
+            read: true,
         };
         let mut completed = false;
         for message in &messages[start + 1..] {

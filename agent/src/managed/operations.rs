@@ -1651,6 +1651,85 @@ impl Store {
     }
 
     /// Resolves a run's open attention events of the given kinds.
+    /// Prompts of `run` delivered at or after `since` and not yet taken in
+    /// by the provider, the latest delivery first.
+    pub fn delivered_prompts(&self, run: &str, since: u64) -> Result<Vec<Record>, String> {
+        let keys: Vec<String> = {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT key FROM operations
+                     WHERE namespace = ?1 AND action = 'prompt' AND state = 'delivered'
+                       AND updated_ms >= ?2
+                     ORDER BY updated_ms DESC LIMIT 16",
+                )
+                .map_err(sql)?;
+            statement
+                .query_map(params![format!("run:{run}"), since as i64], |row| {
+                    row.get(0)
+                })
+                .map_err(sql)?
+                .collect::<Result<_, _>>()
+                .map_err(sql)?
+        };
+        let mut records = Vec::new();
+        for key in keys {
+            if let Some(record) = Self::record_in(&self.conn, &key)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Whether a prompt of `run` admitted (or retried) at or after `since` is
+    /// still being delivered.
+    pub fn prompt_dispatching(&self, run: &str, since: u64) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM operations
+                   WHERE namespace = ?1 AND action = 'prompt' AND state = ?2 AND updated_ms >= ?3)",
+                params![format!("run:{run}"), DISPATCHING, since as i64],
+                |row| row.get(0),
+            )
+            .map_err(sql)
+    }
+
+    /// Records that the provider took a delivered prompt in as a turn of
+    /// its own. False when the record is no longer `delivered`.
+    pub fn accept_prompt(
+        &mut self,
+        record: &Record,
+        source: &str,
+        evidence: &Value,
+        now: u64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let seq = Self::next_seq(&tx)?;
+        let changed = tx
+            .execute(
+                "UPDATE operations SET state = 'native_accepted', updated_ms = ?3, store_seq = ?4
+                 WHERE id = ?1 AND ticket = ?2 AND state = 'delivered'",
+                params![record.op, record.ticket, now as i64, seq],
+            )
+            .map_err(sql)?;
+        if changed == 1 {
+            Self::append(
+                &tx,
+                record.op,
+                "native_accepted",
+                source,
+                Some(evidence),
+                now,
+            )?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(changed == 1)
+    }
+
     /// Resolves the run's open request events from `source` whose native
     /// request is not in `present`.
     pub fn resolve_absent(
@@ -2105,6 +2184,47 @@ mod tests {
             Admission::Dispatch(ticket) => ticket,
             other => panic!("expected dispatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_delivered_prompt_is_accepted_once_and_only_from_delivered() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let ticket = dispatch(
+            store
+                .admit(&request("d1"), json!({"accept_digest": "a1"}), 100)
+                .unwrap(),
+        );
+        assert!(store.prompt_dispatching("r1", 0).unwrap());
+        assert!(store.delivered_prompts("r1", 0).unwrap().is_empty());
+        store
+            .finish(&ticket, "delivered", "pane_ledger", None, 110)
+            .unwrap();
+        assert!(!store.prompt_dispatching("r1", 0).unwrap());
+        let delivered = store.delivered_prompts("r1", 0).unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].intent().unwrap()["accept_digest"], "a1");
+        // Outside the window, or another run, lists nothing.
+        assert!(store.delivered_prompts("r1", 111).unwrap().is_empty());
+        assert!(store.delivered_prompts("r2", 0).unwrap().is_empty());
+        let turn = json!({"turn": "msg_1"});
+        assert!(
+            store
+                .accept_prompt(&delivered[0], "provider_api", &turn, 120)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .accept_prompt(&delivered[0], "provider_api", &turn, 130)
+                .unwrap()
+        );
+        let record = store.get("run:r1/prompt/1").unwrap().unwrap();
+        assert_eq!(record.state, "native_accepted");
+        assert_eq!(
+            record.receipts.last().unwrap().evidence.as_ref().unwrap()["turn"],
+            "msg_1"
+        );
+        assert!(store.delivered_prompts("r1", 0).unwrap().is_empty());
     }
 
     #[test]

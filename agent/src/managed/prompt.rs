@@ -19,6 +19,10 @@ const OPTION: &str = "@masil-agent-prompt-receipts";
 const TICKETS: &str = "@masil-agent-prompt-tickets";
 const FENCE: &str = "@masil-agent-prompt-fence";
 const MAX_RETAINED: usize = 16;
+/// How long after delivery a provider's report can still accept a prompt.
+const ACCEPT_WINDOW_MS: u64 = 120_000;
+/// Clock difference allowed between masil and the provider.
+const CLOCK_SKEW_MS: u64 = 2_000;
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +93,87 @@ impl PaneLedger {
     }
 }
 
+/// A receipt shows what the provider reported: `native_accepted` and the
+/// turn it started.
+fn with_acceptance(mut value: Value, record: &Record) -> Value {
+    if record.state != "native_accepted" {
+        return value;
+    }
+    let evidence = record
+        .receipts
+        .iter()
+        .rev()
+        .find(|receipt| receipt.stage == "native_accepted")
+        .and_then(|receipt| receipt.evidence.clone())
+        .unwrap_or(Value::Null);
+    value["stage"] = json!("native_accepted");
+    value["provider_accepted"] = json!(true);
+    value["turn"] = evidence["turn"].clone();
+    value
+}
+
+/// The digest a provider's report of a delivered prompt is compared by,
+/// over text both sides reduce the same way. None for providers that
+/// report no prompt text.
+///
+/// OpenCode trims a long paste and turns CR into LF. Claude Code wraps a
+/// multi-line or long paste in `<pasted_content id="…">`, turns a tab into
+/// four spaces and drops trailing spaces (2.1.287).
+pub(super) fn accept_digest(provider: &str, text: &str) -> Option<String> {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = match provider {
+        "opencode" => text,
+        "claude" => unwrap_pasted(&text).replace('\t', "    "),
+        _ => return None,
+    };
+    Some(sha256(text.trim()))
+}
+
+/// Replaces each `<pasted_content id="X">` block with its content.
+fn unwrap_pasted(text: &str) -> String {
+    const OPEN: &str = "<pasted_content id=\"";
+    let mut output = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        let after = &rest[start + OPEN.len()..];
+        let Some(id_end) = after.find("\">") else {
+            break;
+        };
+        let id = &after[..id_end];
+        let body = &after[id_end + 2..];
+        let close = format!("</pasted_content id=\"{id}\">");
+        let Some(body_end) = body.find(&close) else {
+            break;
+        };
+        output.push_str(&rest[..start]);
+        let inner = &body[..body_end];
+        let inner = inner.strip_prefix('\n').unwrap_or(inner);
+        output.push_str(inner.strip_suffix('\n').unwrap_or(inner));
+        rest = &body[body_end + close.len()..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// A provider's report of a prompt it took in.
+#[derive(Clone)]
+pub(super) struct Reported {
+    pub digest: String,
+    /// When the provider recorded it; a prompt delivered later is not it.
+    pub created_ms: Option<u64>,
+    pub evidence: Value,
+}
+
+/// What accepting a provider's report of a prompt found.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Acceptance {
+    /// This delivered prompt is now `native_accepted`.
+    Accepted(String),
+    /// A prompt of the run is still being delivered; look again shortly.
+    Dispatching,
+    None,
+}
+
 fn explicit_key(run: &str, operation: u64) -> String {
     operations::key(&format!("run:{run}"), "prompt", &operation.to_string())
 }
@@ -100,12 +185,15 @@ pub(super) fn sha256(text: &str) -> String {
 /// A durable record for a slot the pane ledger no longer holds.
 fn public_record(run: &str, operation: u64, record: &Record) -> Value {
     let stage = match record.state.as_str() {
-        "delivered" | "user_confirmed_delivered" => "delivered",
+        "delivered" | "user_confirmed_delivered" | "native_accepted" => "delivered",
         "user_confirmed_not_delivered" => "not_delivered",
         _ => "pending",
     };
-    json!({"operation":operation,"run":run,"stage":stage,"provider_accepted":false,"task_success":null,
-        "operation_key":record.operation_key})
+    with_acceptance(
+        json!({"operation":operation,"run":run,"stage":stage,"provider_accepted":false,"task_success":null,
+            "operation_key":record.operation_key}),
+        record,
+    )
 }
 
 impl Manager {
@@ -126,9 +214,131 @@ impl Manager {
             .iter()
             .find(|e| e.operation == operation)
         {
-            return Ok(pane.public(entry));
+            let public = pane.public(entry);
+            // The provider's report lives in the store, not the ledger.
+            if entry.stage == "delivered"
+                && !pane.store.is_empty()
+                && let Some(record) = self.stored(&pane.store, &pane.key(operation)).await
+            {
+                return Ok(with_acceptance(public, &record));
+            }
+            return Ok(public);
         }
         self.retained_prompt(agent, operation).await
+    }
+
+    /// A record of the server's store, read without creating or
+    /// maintaining it; None when it cannot be read.
+    async fn stored(&self, instance: &str, key: &str) -> Option<Record> {
+        let socket = self.native.socket.clone();
+        let (instance, key) = (instance.to_owned(), key.to_owned());
+        tokio::task::spawn_blocking(move || {
+            Store::open_existing(&socket, &instance)
+                .ok()
+                .flatten()?
+                .get(&key)
+                .ok()
+                .flatten()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Marks the run's delivered prompt whose accept digest is `digest` as
+    /// taken in by the provider, the latest delivery first. `created_ms` is
+    /// when the provider recorded it; a prompt pasted after that is not it.
+    pub(super) async fn accept_prompt(
+        &self,
+        run: &str,
+        digest: &str,
+        created_ms: Option<u64>,
+        source: &str,
+        evidence: Value,
+    ) -> Result<Acceptance, String> {
+        let reports = [Reported {
+            digest: digest.to_owned(),
+            created_ms,
+            evidence,
+        }];
+        Ok(self
+            .accept_prompts(run, &reports, source)
+            .await?
+            .pop()
+            .unwrap_or(Acceptance::None))
+    }
+
+    /// As `accept_prompt` for several reports of one run, with one store
+    /// read; one result per report, in order.
+    pub(super) async fn accept_prompts(
+        &self,
+        run: &str,
+        reports: &[Reported],
+        source: &str,
+    ) -> Result<Vec<Acceptance>, String> {
+        let none = || reports.iter().map(|_| Acceptance::None).collect();
+        let instance = self
+            .command(&["show-options", "-gqv", super::STORE_OPTION])
+            .await?
+            .trim()
+            .to_owned();
+        // No store: masil never delivered a prompt on this server.
+        if instance.is_empty() {
+            return Ok(none());
+        }
+        let socket = self.native.socket.clone();
+        let (run, reports, source) = (run.to_owned(), reports.to_vec(), source.to_owned());
+        tokio::task::spawn_blocking(move || {
+            let Some(mut store) = Store::open_existing(&socket, &instance)? else {
+                return Ok(reports.iter().map(|_| Acceptance::None).collect());
+            };
+            let now = now_ms();
+            let since = now.saturating_sub(ACCEPT_WINDOW_MS);
+            // Newest first: a resend of text the provider never took in is
+            // the one it reports now.
+            let mut delivered = store.delivered_prompts(&run, since)?;
+            let dispatching = store.prompt_dispatching(&run, since)?;
+            let mut results = Vec::new();
+            for report in &reports {
+                let eligible = |record: &Record, before_only: bool| {
+                    let intent = record.intent();
+                    let pasted = intent
+                        .and_then(|intent| intent["paste_ms"].as_u64())
+                        .unwrap_or(record.created_ms);
+                    intent.and_then(|intent| intent["accept_digest"].as_str())
+                        == Some(report.digest.as_str())
+                        && report.created_ms.is_none_or(|created| {
+                            if before_only {
+                                pasted <= created
+                            } else {
+                                created + CLOCK_SKEW_MS >= pasted
+                            }
+                        })
+                };
+                // On one host a prompt is pasted before its message exists;
+                // the clock allowance is a fallback.
+                let found = delivered
+                    .iter()
+                    .position(|record| eligible(record, true))
+                    .or_else(|| delivered.iter().position(|record| eligible(record, false)));
+                let result = match found {
+                    Some(index) => {
+                        let record = delivered.remove(index);
+                        if store.accept_prompt(&record, &source, &report.evidence, now)? {
+                            Acceptance::Accepted(record.operation_key)
+                        } else {
+                            Acceptance::None
+                        }
+                    }
+                    None if dispatching => Acceptance::Dispatching,
+                    None => Acceptance::None,
+                };
+                results.push(result);
+            }
+            Ok(results)
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
 
     /// Durable receipts outlive the 16 pane-ledger entries for explicit keys.
@@ -238,7 +448,8 @@ impl Manager {
                 if receipt.digest != digest {
                     return Err("prompt operation was already used with different content".into());
                 }
-                return Ok(pane.public(receipt));
+                // As `prompt-receipt` shows it, with the provider's report.
+                return self.prompt_receipt(agent, Some(operation)).await;
             }
             if pane.ledger.entries.iter().any(|r| r.stage == "pending") {
                 return Err("a prompt delivery is unresolved; inspect its receipt and the native TUI before any new submission".into());
@@ -298,8 +509,11 @@ impl Manager {
                 digest: &digest,
                 payload_bytes: text.len() as u64,
             };
-            let intent =
-                json!({"slot": operation, "ledger_sha256": sha256(&pane.raw), "fence": pane.fence});
+            // The provider's report of the prompt is matched by this digest
+            // (accept_prompt); the text itself is not kept.
+            let intent = json!({"slot": operation, "ledger_sha256": sha256(&pane.raw),
+                "fence": pane.fence, "accept_digest": accept_digest(&agent.provider, text),
+                "paste_ms": now_ms()});
             let ticket = match store.admit(&request, intent, now_ms())? {
                 Admission::Dispatch(ticket) => ticket,
                 Admission::Recorded(record) => {
@@ -429,6 +643,10 @@ impl Manager {
                 Ok(Guarded::Applied) => {
                     finish(&mut store, &ticket, "delivered", "pane_ledger", None)
                         .map_err(String::from)?;
+                    // The coordinator matches the server's new message to it.
+                    if super::observe::observable(agent) {
+                        crate::coordinator::poke(&self.native.socket);
+                    }
                     // Delivery is committed; a failed read of the pane's
                     // receipt does not make it unknown.
                     Ok(self
@@ -636,6 +854,34 @@ fn format_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_and_opencode_reports_compare_equal_to_what_was_sent() {
+        // As Claude Code 2.1.287 reported masil's pastes (D16 probe).
+        let sent = "first line\nsecond line\n  indented third\n";
+        let got = "\n\n<pasted_content id=\"9cb8\">\nfirst line\nsecond line\n  indented third\n</pasted_content id=\"9cb8\">\n";
+        assert_eq!(accept_digest("claude", sent), accept_digest("claude", got));
+        assert_eq!(
+            accept_digest("claude", "col1\tcol2\nabc\tdef"),
+            accept_digest("claude", "col1    col2\nabc    def")
+        );
+        assert_eq!(
+            accept_digest("claude", "  leading spaces and trailing  "),
+            accept_digest("claude", "  leading spaces and trailing")
+        );
+        let unwrapped = "a\n<pasted_content id=\"x\">\nb\n</pasted_content id=\"x\">\nc";
+        assert_eq!(unwrap_pasted(unwrapped), "a\nb\nc");
+        assert_ne!(
+            accept_digest("claude", "one"),
+            accept_digest("claude", "two")
+        );
+        // OpenCode trims a long paste.
+        assert_eq!(
+            accept_digest("opencode", "a\nb\nc\n"),
+            accept_digest("opencode", "a\nb\nc")
+        );
+        assert_eq!(accept_digest("codex", "x"), None);
+    }
 
     fn pane(raw: &str, tickets: Tickets) -> PaneLedger {
         PaneLedger {

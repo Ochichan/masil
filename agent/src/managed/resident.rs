@@ -14,6 +14,7 @@ use super::operations::{STORE_NEWER, Store};
 use super::{Agent, Manager};
 use crate::observation::now_ms;
 use serde::Serialize;
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -344,6 +345,8 @@ pub(crate) async fn watch(
             reports.flush(&manager, observer).await;
         }
         woken |= control.poked.swap(false, Ordering::SeqCst);
+        // `agent prompt` pokes once it has delivered.
+        reports.accept(&manager, woken).await;
         if control.reload.swap(false, Ordering::SeqCst) {
             if let Err(error) = manager.reload() {
                 errors.note(&error, &log, &control);
@@ -561,9 +564,17 @@ struct Reports {
     /// Writes refused in a row; a run is given up after a few, until its
     /// next state.
     failures: HashMap<String, u32>,
+    /// User messages the servers recorded, kept while a delivered prompt
+    /// may still be matched to them, with when they arrived.
+    prompted: HashMap<String, Vec<(super::observe::Prompted, u64)>>,
+    /// A message came since the last match.
+    recheck: bool,
+    matched_at: u64,
 }
 
 const REPORT_TRIES: u32 = 5;
+/// How long a user message waits for the prompt masil delivered.
+const PROMPT_KEEP_MS: u64 = 120_000;
 
 #[derive(Clone, Copy)]
 enum Wanted {
@@ -606,6 +617,17 @@ impl Reports {
                 self.failures.remove(&run);
                 self.waiting.insert(run, Wanted::Clear);
             }
+            Update::Prompted { run, message } => {
+                // A reconnect's catch-up can report a message again.
+                let messages = self.prompted.entry(run).or_default();
+                if !messages
+                    .iter()
+                    .any(|(kept, _)| kept.message == message.message)
+                {
+                    messages.push((message, now_ms()));
+                    self.recheck = true;
+                }
+            }
             Update::Restored { run } => {
                 manager
                     .inbox_apply(vec![super::inbox::Effect::ResolveRun {
@@ -617,6 +639,40 @@ impl Reports {
             }
         }
         self.flush(manager, observer).await;
+    }
+
+    /// Matches the kept user messages with delivered prompts: a match is
+    /// `native_accepted`, with the message as its turn. At most twice a
+    /// second; a message that matches nothing waits for the next delivery.
+    async fn accept(&mut self, manager: &Manager, woken: bool) {
+        let now = now_ms();
+        let panes = &self.panes;
+        self.prompted.retain(|run, messages| {
+            messages.retain(|(_, at)| now < at + PROMPT_KEEP_MS);
+            !messages.is_empty() && panes.contains_key(run)
+        });
+        if self.prompted.is_empty() || !(self.recheck || woken) || now < self.matched_at + 500 {
+            return;
+        }
+        self.recheck = false;
+        self.matched_at = now;
+        for (run, messages) in &mut self.prompted {
+            let reports: Vec<_> = messages
+                .iter()
+                .map(|(message, _)| super::prompt::Reported {
+                    digest: message.digest.clone(),
+                    created_ms: Some(message.created_ms),
+                    evidence: json!({"turn": message.message, "session": message.session}),
+                })
+                .collect();
+            let Ok(results) = manager.accept_prompts(run, &reports, "provider_api").await else {
+                continue;
+            };
+            let mut results = results.into_iter();
+            messages.retain(|_| {
+                !matches!(results.next(), Some(super::prompt::Acceptance::Accepted(_)))
+            });
+        }
     }
 
     fn retry_in(&self, now: u64) -> Option<Duration> {

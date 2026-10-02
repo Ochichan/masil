@@ -293,6 +293,10 @@ struct IntegrationSeen {
     sequence: u64,
     event: String,
     at: u64,
+    /// A hook reported a prompt the provider is taking in (Claude
+    /// `UserPromptSubmit`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    prompt: bool,
 }
 
 /// Where a report came from. Only integration hooks are provider-native.
@@ -1816,6 +1820,29 @@ impl Manager {
         Ok(true)
     }
 
+    /// Records once per run that its prompt hook works (capability
+    /// `provider_ack`). Best effort.
+    pub(super) async fn note_prompt_hook(&self, agent: &Agent) {
+        let mut evidence = agent
+            .run_evidence
+            .clone()
+            .filter(|e| e.run == agent.run)
+            .unwrap_or_else(|| RunEvidence {
+                run: agent.run.clone(),
+                ..RunEvidence::default()
+            });
+        let seen = evidence.integration.get_or_insert_with(Default::default);
+        if seen.prompt {
+            return;
+        }
+        seen.prompt = true;
+        if let Ok(encoded) = encode(&evidence) {
+            let _ = self
+                .guarded_input_outcome(agent, vec![Self::option(agent, EVIDENCE, encoded)], None)
+                .await;
+        }
+    }
+
     pub async fn close(&self, agent: &Agent) -> Result<(), String> {
         match self.close_with_operation(agent, None).await {
             // A report written meanwhile (a hook, the coordinator) changes
@@ -2243,6 +2270,18 @@ fn capability_view(
         && provider == "opencode"
         && evidence.and_then(|evidence| evidence.answer_channel.as_deref())
             == Some(answer::CHANNEL);
+    // Prompt acceptance and its turn: a coordinator that observes the
+    // `--answers` server (and has not lost it); Claude's prompt hook
+    // reports them. Whether its report decides the state right now (the
+    // pane may just have drawn) does not matter here.
+    let observed = evidence
+        .and_then(|evidence| evidence.report.as_ref())
+        .is_some_and(|source| {
+            source.source == REPORT_SOURCE_API && source.generation.is_some() && source.observed()
+        });
+    let prompts = running
+        && ((answers && observed)
+            || (provider == "claude" && seen.is_some_and(|seen| seen.prompt)));
     CapabilityView {
         contract: 1,
         state_authority: state_authority.into(),
@@ -2253,7 +2292,7 @@ fn capability_view(
             "unavailable"
         }
         .into(),
-        provider_ack: false,
+        provider_ack: prompts,
         interrupt: if running {
             "key_delivery"
         } else {
@@ -2262,7 +2301,7 @@ fn capability_view(
         .into(),
         approval_response: answers,
         question_response: answers,
-        turn_identity: false,
+        turn_identity: prompts,
         resume: binding.session_id.is_some()
             && binding.state != "conflict"
             && providers::resume(provider, "example").is_ok(),
@@ -3015,6 +3054,7 @@ mod tests {
             sequence: 2,
             event: "agent_start".into(),
             at: 10,
+            prompt: false,
         });
         let binding = view(&metadata, &evidence);
         let native = capability_view(

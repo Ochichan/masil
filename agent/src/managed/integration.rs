@@ -56,7 +56,13 @@ const TARGETS: &[Target] = &[
     Target {
         id: "claude",
         capability: Capability::SessionOnly,
-        events: &["SessionStart", "PermissionRequest", "Notification", "Stop"],
+        events: &[
+            "SessionStart",
+            "UserPromptSubmit",
+            "PermissionRequest",
+            "Notification",
+            "Stop",
+        ],
     },
     Target {
         id: "codex",
@@ -587,6 +593,8 @@ fn registration_fragment(target: &Target, hook_path: &std::path::Path) -> Value 
         "claude" => {
             json!({"format":"settings.json fragment","hooks":{
                 "SessionStart":[{"matcher":"^(startup|resume|clear|compact|fork)$","hooks":[{"type":"command","command":command("session"),"timeout":10}]}],
+                // Exit 2 would block the prompt: a missing bridge must not.
+                "UserPromptSubmit":[{"hooks":[{"type":"command","command":format!("{} || true", command("")),"timeout":10}]}],
                 "PermissionRequest":[{"hooks":[{"type":"command","command":command(""),"timeout":10}]}],
                 "Notification":[{"matcher":"elicitation_dialog","hooks":[{"type":"command","command":command(""),"timeout":10}]}],
                 "Stop":[{"hooks":[{"type":"command","command":command(""),"timeout":10}]}],
@@ -866,6 +874,9 @@ async fn hook(
                 target.id, &pane, &run, sequence, &mapped, payload,
             ))
             .await;
+        if target.id == "claude" && normalize_event(&mapped.event) == "userpromptsubmit" {
+            accept_claude_prompt(manager, &agent, payload).await;
+        }
         return Ok(None);
     }
     if matches!(target.id, "opencode" | "kilo") {
@@ -1349,6 +1360,43 @@ fn callback_ref(kind: &str, run: &str, sequence: u64) -> String {
     format!("{kind}:{run}:{sequence}")
 }
 
+/// Claude Code reports the prompt it is about to send: a prompt masil
+/// delivered with the same text becomes `native_accepted`, with Claude's
+/// `prompt_id` as its turn. Nothing is printed, since Claude adds this
+/// hook's output to the model's context, and nothing fails the hook.
+async fn accept_claude_prompt(
+    manager: &Manager,
+    agent: &super::Agent,
+    payload: &Map<String, Value>,
+) {
+    let Some(text) = payload.get("prompt").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(digest) = super::prompt::accept_digest("claude", text) else {
+        return;
+    };
+    let turn = first_text(payload, &["prompt_id", "promptId"])
+        .filter(|id| valid_text(id))
+        .map(str::to_owned);
+    manager.note_prompt_hook(agent).await;
+    let evidence = json!({"turn": turn, "session": agent.session_id});
+    for attempt in 0..2 {
+        match manager
+            .accept_prompt(&agent.run, &digest, None, REPORT_SOURCE, evidence.clone())
+            .await
+        {
+            // masil may still be finishing the delivery this hook reports.
+            Ok(super::prompt::Acceptance::Dispatching) if attempt == 0 => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            _ => return,
+        }
+    }
+}
+
+/// The source recorded for an acceptance a hook reported.
+const REPORT_SOURCE: &str = "native_callback";
+
 /// Inbox effects of an OpenCode event the coordinator read from the pane's
 /// own server (`observe.rs`). They share the plugin's key, `hook:opencode`
 /// and `request:<id>`, so a request seen both ways is one event.
@@ -1782,7 +1830,7 @@ fn session_event_allowed(provider: &str, event: &str) -> bool {
     match provider {
         "claude" => matches!(
             normalized.as_str(),
-            "sessionstart" | "permissionrequest" | "notification" | "stop"
+            "sessionstart" | "userpromptsubmit" | "permissionrequest" | "notification" | "stop"
         ),
         "codex" => matches!(normalized.as_str(), "sessionstart" | "stop"),
         "copilot" | "droid" | "qodercli" | "qwen" => normalized == "sessionstart",
@@ -1809,7 +1857,10 @@ fn session_event_allowed(provider: &str, event: &str) -> bool {
 fn event_only_callback(provider: &str, event: &str) -> bool {
     matches!(
         (provider, normalize_event(event).as_str()),
-        ("claude", "permissionrequest" | "notification" | "stop") | ("codex", "stop")
+        (
+            "claude",
+            "userpromptsubmit" | "permissionrequest" | "notification" | "stop"
+        ) | ("codex", "stop")
     )
 }
 
