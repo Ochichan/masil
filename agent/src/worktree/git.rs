@@ -23,7 +23,7 @@ const GRACE: Duration = Duration::from_secs(2);
 /// Error text kept from a failed query.
 const ERROR_TAIL: usize = 2048;
 
-pub(super) fn command(dir: &Path) -> Command {
+pub(crate) fn command(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir);
     for name in SCRUBBED {
@@ -37,19 +37,19 @@ pub(super) fn command(dir: &Path) -> Command {
     command
 }
 
-pub(super) fn tail(bytes: &[u8], limit: usize) -> String {
+pub(crate) fn tail(bytes: &[u8], limit: usize) -> String {
     let start = bytes.len().saturating_sub(limit);
     String::from_utf8_lossy(&bytes[start..]).trim().to_owned()
 }
 
 /// A read-only git query: its stdout, or its stderr's end as the error.
-pub(super) fn query(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn query(dir: &Path, args: &[&str]) -> Result<String, String> {
     probe(dir, args)?.ok_or_else(|| format!("git {} found nothing", args.join(" ")))
 }
 
 /// Like [`query`], but `None` when git exits 1, which `rev-parse --verify
 /// --quiet` and `show-ref` use for "no such ref".
-pub(super) fn probe(dir: &Path, args: &[&str]) -> Result<Option<String>, String> {
+pub(crate) fn probe(dir: &Path, args: &[&str]) -> Result<Option<String>, String> {
     let output = command(dir)
         .args(args)
         .output()
@@ -115,7 +115,7 @@ pub(super) fn run_logged(
 /// SIGTERM to the child's group, then SIGKILL to whatever is left of it
 /// once the leader has exited or [`GRACE`] has passed. The leader is reaped
 /// only after that, so the group ID cannot name another group meanwhile.
-pub(super) fn stop(child: &mut Child) {
+pub(crate) fn stop(child: &mut Child) {
     let group = child.id() as i32;
     // SAFETY: signals to a group led by an unreaped child of this process.
     unsafe { libc::killpg(group, libc::SIGTERM) };
@@ -129,7 +129,7 @@ pub(super) fn stop(child: &mut Child) {
 }
 
 /// Whether the child `pid` has exited, without reaping it.
-pub(super) fn exited(pid: i32) -> bool {
+pub(crate) fn exited(pid: i32) -> bool {
     // SAFETY: a zeroed siginfo_t is valid for waitid to fill.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: waits on this process's own child; WNOWAIT leaves it unreaped.
@@ -153,4 +153,102 @@ fn signal_pid(info: &libc::siginfo_t) -> libc::pid_t {
 #[cfg(not(target_os = "linux"))]
 fn signal_pid(info: &libc::siginfo_t) -> libc::pid_t {
     info.si_pid
+}
+
+/// What [`output_within`] read.
+pub(crate) struct Output {
+    pub(crate) stdout: Vec<u8>,
+    /// Output stopped at the byte limit; git was stopped there.
+    pub(crate) truncated: bool,
+}
+
+/// Runs git in its own process group and returns its standard output, at
+/// most `limit` bytes. Exit codes in `ok` count as success. A git still
+/// running at `deadline` is stopped and `timeout` is the error; output past
+/// `limit` stops git too.
+pub(crate) fn output_within(
+    dir: &Path,
+    args: &[&str],
+    ok: &[i32],
+    deadline: Instant,
+    limit: usize,
+    timeout: &str,
+) -> Result<Output, String> {
+    use std::io::Read;
+    use std::sync::Arc;
+    let mut child = command(dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("git: {error}"))?;
+    let full = Arc::new(AtomicBool::new(false));
+    let mut stdout = child.stdout.take().ok_or("git output unavailable")?;
+    let mut stderr = child.stderr.take().ok_or("git output unavailable")?;
+    let reader = {
+        let full = Arc::clone(&full);
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = (&mut stdout).take(limit as u64 + 1).read_to_end(&mut bytes);
+            if bytes.len() > limit {
+                bytes.truncate(limit);
+                full.store(true, Ordering::SeqCst);
+            }
+            bytes
+        })
+    };
+    let errors = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut bytes);
+        bytes
+    });
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break Some(status);
+        }
+        if full.load(Ordering::SeqCst) {
+            stop(&mut child);
+            break None;
+        }
+        if Instant::now() >= deadline {
+            stop(&mut child);
+            let _ = reader.join();
+            return Err(timeout.to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let stdout = reader.join().unwrap_or_default();
+    let stderr = errors.join().unwrap_or_default();
+    // Past the limit git may also have died of SIGPIPE; what was read stands.
+    let Some(status) = status.filter(|_| !full.load(Ordering::SeqCst)) else {
+        return Ok(Output {
+            stdout,
+            truncated: true,
+        });
+    };
+    if status.code().is_some_and(|code| ok.contains(&code)) {
+        return Ok(Output {
+            stdout,
+            truncated: false,
+        });
+    }
+    Err(format!(
+        "git {} failed ({status}): {}",
+        subcommand(args),
+        tail(&stderr, ERROR_TAIL)
+    ))
+}
+
+/// The git subcommand in `args`, past any `-c NAME=VALUE`.
+fn subcommand<'a>(args: &[&'a str]) -> &'a str {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if *arg == "-c" {
+            args.next();
+        } else if !arg.starts_with('-') {
+            return arg;
+        }
+    }
+    ""
 }

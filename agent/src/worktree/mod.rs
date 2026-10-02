@@ -3,7 +3,7 @@
 //! server and survive the command that asked for them.
 
 mod create;
-mod git;
+pub(crate) mod git;
 mod helper;
 mod lease;
 mod registry;

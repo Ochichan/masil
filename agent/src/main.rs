@@ -2,6 +2,7 @@
 //! `agent coordinator start` and later mutating commands start the coordinator.
 mod agent_stream;
 mod attention;
+mod changes;
 mod coordinator;
 mod daemon;
 mod detection;

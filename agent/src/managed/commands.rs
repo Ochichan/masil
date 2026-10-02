@@ -200,6 +200,13 @@ pub(crate) const VERBS: &[Verb] = &[
         remote: false,
     },
     Verb {
+        name: "changes",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] changes TARGET [--file PATH | --handoff REVIEWER]",
+        mutating: true,
+        target_stage: None,
+        remote: false,
+    },
+    Verb {
         name: "inbox",
         usage: "masil-agent agent [--socket MASIL_SOCKET] inbox [list] [--all] [--limit N] | ack ID... | read-all [--through SEQ] | enable | disable | status",
         mutating: true,

@@ -419,6 +419,55 @@ fn value(args: &[String], index: usize) -> Result<&str, String> {
         .ok_or_else(|| format!("usage: missing value for {}", args[index]))
 }
 
+/// `changes TARGET [--file PATH] [--handoff REVIEWER]`: the agent's working
+/// tree changes, one file's diff, or a review request queued for another
+/// agent (never sent by itself).
+async fn changes_command(manager: &Manager, args: &[String]) -> Result<i32, String> {
+    let mut file = None;
+    let mut handoff = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" if file.is_none() => file = Some(value(args, i)?.to_owned()),
+            "--handoff" if handoff.is_none() => handoff = Some(value(args, i)?.to_owned()),
+            other => {
+                return Err(format!(
+                    "usage: unknown or repeated changes option: {other}"
+                ));
+            }
+        }
+        i += 2;
+    }
+    if file.is_some() && handoff.is_some() {
+        return Err("usage: --file and --handoff do not go together".into());
+    }
+    let agent = manager.get(&args[0]).await?;
+    let cwd = PathBuf::from(&agent.cwd);
+    let (root, value) = tokio::task::spawn_blocking(move || -> Result<(PathBuf, Value), String> {
+        let root = crate::changes::root_of(&cwd)?;
+        let value = match &file {
+            Some(path) => crate::changes::diff(&root, path)?,
+            None => crate::changes::list(&root)?,
+        };
+        Ok((root, value))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    let Some(reviewer) = handoff else {
+        print(&value)?;
+        return Ok(0);
+    };
+    let reviewer = manager.get(&reviewer).await?;
+    // The item limit counts the attached path too.
+    let text = crate::changes::handoff_text(&value, 30 * 1024);
+    let root_text = root.to_string_lossy().into_owned();
+    let item = manager
+        .queue_add(&reviewer, &text, &[root_text], &root)
+        .await?;
+    print(&json!({"stage": "queued", "reviewer": reviewer.name, "item": item}))?;
+    Ok(0)
+}
+
 fn print<T: Serialize + ?Sized>(value: &T) -> Result<(), String> {
     println!(
         "{}",
@@ -638,6 +687,9 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "queue" if !args.is_empty() => {
             return queue_command(&manager, args).await;
+        }
+        "changes" if !args.is_empty() => {
+            return changes_command(&manager, args).await;
         }
         "answer" if args.len() >= 3 => {
             let mut choice = None;
