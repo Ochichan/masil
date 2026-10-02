@@ -22,7 +22,7 @@ mod view;
 use crate::{detection::Engine, native_ui, observation::now_ms, providers};
 pub(crate) use cli::run;
 use evidence::Evidence;
-pub(crate) use operations::Through;
+pub(crate) use operations::{Through, private_directory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -31,6 +31,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+pub(crate) use store::validate_private_metadata;
 
 const META: &str = "@masil-managed-agent";
 const TRACKED: &str = "@masil-managed-observation";
@@ -2521,7 +2522,7 @@ fn executable(command: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("agent executable is not installed: {command}"))
 }
 
-fn nonce() -> Result<String, String> {
+pub(crate) fn nonce() -> Result<String, String> {
     use std::io::Read;
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom")

@@ -17,6 +17,7 @@ mod process;
 mod providers;
 mod session;
 mod ui;
+mod worktree;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
@@ -705,6 +706,16 @@ fn execute() -> Result<i32, String> {
     }
     if args[0] == "agent" {
         return match managed::run(&args[1..]) {
+            Ok(code) => Ok(code),
+            Err(message) => {
+                let (class, code) = managed::failure::classify(&message);
+                eprintln!("masil-agent: error[{code}]: {message}");
+                Ok(class.exit_code())
+            }
+        };
+    }
+    if args[0] == "worktree" {
+        return match worktree::run(&args[1..]) {
             Ok(code) => Ok(code),
             Err(message) => {
                 let (class, code) = managed::failure::classify(&message);

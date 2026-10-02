@@ -569,7 +569,7 @@ fn canonical_snapshot_path(path: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(name))
 }
 
-pub(super) fn validate_private_metadata(
+pub(crate) fn validate_private_metadata(
     metadata: &fs::Metadata,
     label: &str,
 ) -> Result<(), String> {

@@ -439,9 +439,14 @@ fn store_name(socket: &Path) -> String {
 }
 
 fn state_directory() -> Result<PathBuf, String> {
+    private_directory(&state_base()?.join("masil/operations"))
+}
+
+/// Creates `directory` if needed and returns its canonical path, owned by
+/// this user and closed to group and other.
+pub(crate) fn private_directory(directory: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let directory = state_base()?.join("masil/operations");
-    fs::create_dir_all(&directory).map_err(|error| format!("{}: {error}", directory.display()))?;
+    fs::create_dir_all(directory).map_err(|error| format!("{}: {error}", directory.display()))?;
     let directory = directory
         .canonicalize()
         .map_err(|error| format!("{}: {error}", directory.display()))?;
