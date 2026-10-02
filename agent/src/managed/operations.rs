@@ -94,7 +94,52 @@ INSERT INTO meta VALUES ('min_reader', 2);
 const FEATURES: &[(&str, &str)] = &[
     ("inbox", INBOX_SCHEMA),
     ("provider_secrets", PROVIDER_SECRETS_SCHEMA),
+    ("prompt_queue", PROMPT_QUEUE_SCHEMA),
 ];
+
+/// The prompt queue (docs/prompt-queue.md). A row's prompt is the operation
+/// `operation_key`; the trigger copies that operation's state to the row in
+/// the same transaction, whoever changes it, so the row keeps it after the
+/// operation is pruned. Bodies stay until the person removes them (D8); a
+/// sent body goes 24 h after `sent_ms`.
+const PROMPT_QUEUE_SCHEMA: &str = "
+CREATE TABLE prompt_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run TEXT NOT NULL,
+  pane TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  body TEXT,
+  attachments TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  operation_key TEXT,
+  op_state TEXT,
+  op_updated_ms INTEGER,
+  note TEXT,
+  created_ms INTEGER NOT NULL,
+  updated_ms INTEGER NOT NULL,
+  sent_ms INTEGER
+);
+CREATE INDEX prompt_queue_run ON prompt_queue (run, position, id);
+CREATE INDEX prompt_queue_operation ON prompt_queue (operation_key);
+CREATE TRIGGER prompt_queue_follow AFTER UPDATE OF state ON operations
+WHEN NEW.action = 'prompt'
+BEGIN
+  UPDATE prompt_queue SET op_state = NEW.state, op_updated_ms = NEW.updated_ms,
+    sent_ms = CASE
+      WHEN sent_ms IS NULL
+        AND NEW.state IN ('delivered', 'native_accepted', 'user_confirmed_delivered')
+      THEN NEW.updated_ms ELSE sent_ms END
+  WHERE operation_key = NEW.key;
+END;
+";
+/// A sent body is kept this long, the row a week (to read its receipt).
+const QUEUE_SENT_BODY_MS: u64 = 24 * 60 * 60 * 1000;
+const QUEUE_SENT_ROW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Queue quota: items and bytes of kept bodies and attachments.
+const QUEUE_ITEMS: i64 = 256;
+const QUEUE_BYTES: i64 = 2 << 20;
+const QUEUE_RUN_ITEMS: i64 = 64;
 
 /// Per-run secrets a provider's local server checks (OpenCode's server
 /// password, docs/agent-answers.md). The store is 0600 and doctor bundles
@@ -170,6 +215,109 @@ pub(super) struct Store {
     path: PathBuf,
 }
 
+const QUEUE_COLUMNS: &str = "id, run, pane, provider, position, body, attachments, revision,
+  operation_key, op_state, note, created_ms, updated_ms, sent_ms";
+
+/// One queued prompt (docs/prompt-queue.md).
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct QueueItem {
+    pub id: i64,
+    pub run: String,
+    pub pane: String,
+    pub provider: String,
+    pub position: i64,
+    /// None once a sent body's day is over.
+    pub body: Option<String>,
+    pub attachments: Value,
+    pub revision: i64,
+    pub operation_key: Option<String>,
+    pub op_state: Option<String>,
+    pub note: Option<String>,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+    pub sent_ms: Option<u64>,
+}
+
+/// A change of a staged queued prompt.
+pub(super) enum QueueChange {
+    Body(String),
+    Attachments(Value),
+    /// 1-based place among the run's items.
+    Position(i64),
+}
+
+impl QueueItem {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let attachments: String = row.get(6)?;
+        Ok(Self {
+            id: row.get(0)?,
+            run: row.get(1)?,
+            pane: row.get(2)?,
+            provider: row.get(3)?,
+            position: row.get(4)?,
+            body: row.get(5)?,
+            attachments: serde_json::from_str(&attachments).unwrap_or(Value::Array(Vec::new())),
+            revision: row.get(7)?,
+            operation_key: row.get(8)?,
+            op_state: row.get(9)?,
+            note: row.get(10)?,
+            created_ms: row.get::<_, i64>(11)?.max(0) as u64,
+            updated_ms: row.get::<_, i64>(12)?.max(0) as u64,
+            sent_ms: row.get::<_, Option<i64>>(13)?.map(|at| at.max(0) as u64),
+        })
+    }
+
+    fn hidden_after(mut self, now: u64) -> Self {
+        if self
+            .sent_ms
+            .is_some_and(|sent| now.saturating_sub(sent) >= QUEUE_SENT_BODY_MS)
+        {
+            self.body = None;
+        }
+        self
+    }
+
+    /// staged, sending, sent, unknown or not_sent, from its operation.
+    pub fn state(&self) -> &'static str {
+        match self.op_state.as_deref() {
+            None | Some("rejected_before_effect" | "not_applied") => "staged",
+            Some(DISPATCHING) => "sending",
+            Some("delivered" | "native_accepted" | "user_confirmed_delivered") => "sent",
+            Some(UNKNOWN) => "unknown",
+            Some("user_confirmed_not_delivered") => "not_sent",
+            Some(_) => "unknown",
+        }
+    }
+
+    fn stale() -> String {
+        "queue_stale: the queued prompt changed since it was shown; look at it again".into()
+    }
+
+    /// Whether this item of `current_run` may change now.
+    fn changeable(&self, revision: Option<i64>, current_run: &str) -> Result<(), String> {
+        if self.run != current_run {
+            return Err("queue_held: this prompt was queued for an earlier run of the agent; it can be removed or added again".into());
+        }
+        match self.state() {
+            "staged" => {}
+            "sending" => {
+                return Err(
+                    "queue_sending: this prompt is being sent; look at it again shortly".into(),
+                );
+            }
+            state => {
+                return Err(format!(
+                    "queue_not_staged: this prompt is {state}; settle an unknown one with `agent operation resolve`, or queue a sent one again with `add --from`"
+                ));
+            }
+        }
+        if revision.is_some_and(|revision| revision != self.revision) {
+            return Err(Self::stale());
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct NewOperation<'a> {
     pub namespace: &'a str,
     pub action: &'a str,
@@ -180,6 +328,13 @@ pub(super) struct NewOperation<'a> {
     pub boot: &'a str,
     pub digest: &'a str,
     pub payload_bytes: u64,
+}
+
+/// The queue row a prompt admission marks (`admit_with`).
+pub(super) struct QueuedPrompt<'a> {
+    pub item: i64,
+    pub revision: i64,
+    pub run: &'a str,
 }
 
 /// Permission to attempt the effect once, identified by `ticket`.
@@ -654,7 +809,7 @@ impl Store {
         // prevent any duplicate; `operations status` reports this profile.
         conn.execute_batch(&format!(
             "PRAGMA synchronous=FULL; PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=OFF;
-             PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;
+             PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA secure_delete=ON;
              PRAGMA journal_size_limit={JOURNAL_LIMIT_BYTES}; PRAGMA wal_autocheckpoint={AUTOCHECKPOINT_PAGES};"
         ))
         .map_err(sql)?;
@@ -786,6 +941,19 @@ impl Store {
         intent: Value,
         now: u64,
     ) -> Result<Admission, String> {
+        self.admit_with(new, intent, now, None)
+    }
+
+    /// As `admit`; a dispatch of a queued prompt also marks its queue row in
+    /// the same transaction, which commits only if the row still has the
+    /// revision the text was made from.
+    pub fn admit_with(
+        &mut self,
+        new: &NewOperation<'_>,
+        intent: Value,
+        now: u64,
+        queued: Option<&QueuedPrompt<'_>>,
+    ) -> Result<Admission, String> {
         let key = key(new.namespace, new.action, new.id);
         self.check_wal_pressure()?;
         let tx = self
@@ -884,6 +1052,30 @@ impl Store {
         }
         Self::append(&tx, op, "accepted_durable", "masil", None, now)?;
         Self::append(&tx, op, "dispatch_intent", "masil", Some(&intent), now)?;
+        if let Some(queued) = queued {
+            let marked = tx
+                .execute(
+                    "UPDATE prompt_queue SET operation_key = ?1, op_state = ?2, op_updated_ms = ?3,
+                       revision = revision + 1, note = NULL, updated_ms = ?3
+                     WHERE id = ?4 AND revision = ?5 AND run = ?6",
+                    params![
+                        key,
+                        DISPATCHING,
+                        now as i64,
+                        queued.item,
+                        queued.revision,
+                        queued.run
+                    ],
+                )
+                .map_err(sql)?;
+            // Dropping the transaction undoes the admission.
+            if marked != 1 {
+                return Err(
+                    "queue_stale: the queued prompt changed before it was sent; look at it again"
+                        .into(),
+                );
+            }
+        }
         tx.commit().map_err(sql)?;
         Ok(Admission::Dispatch(Ticket { op, key, ticket }))
     }
@@ -1650,7 +1842,252 @@ impl Store {
         tx.commit().map_err(sql)
     }
 
-    /// Resolves a run's open attention events of the given kinds.
+    /// Clears sent bodies after a day and sent rows after a week. Writes
+    /// only when something is due.
+    fn queue_retention_in(tx: &Connection, now: u64) -> Result<(), String> {
+        let body_before = now.saturating_sub(QUEUE_SENT_BODY_MS) as i64;
+        let row_before = now.saturating_sub(QUEUE_SENT_ROW_MS) as i64;
+        let due: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM prompt_queue WHERE sent_ms IS NOT NULL
+                   AND (sent_ms <= ?2 OR (body IS NOT NULL AND sent_ms <= ?1)))",
+                params![body_before, row_before],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if due {
+            tx.execute(
+                "DELETE FROM prompt_queue WHERE sent_ms IS NOT NULL AND sent_ms <= ?1",
+                [row_before],
+            )
+            .map_err(sql)?;
+            tx.execute(
+                "UPDATE prompt_queue SET body = NULL WHERE body IS NOT NULL AND sent_ms <= ?1",
+                [body_before],
+            )
+            .map_err(sql)?;
+        }
+        Ok(())
+    }
+
+    /// Refuses a change that would pass the queue's quota: kept bodies and
+    /// attachments, counted in bytes.
+    fn queue_quota_in(
+        tx: &Connection,
+        run: &str,
+        added_items: i64,
+        added_bytes: i64,
+    ) -> Result<(), String> {
+        let (items, bytes, run_items): (i64, i64, i64) = tx
+            .query_row(
+                "SELECT COUNT(*),
+                   COALESCE(SUM(length(CAST(body AS BLOB)) + length(CAST(attachments AS BLOB))), 0),
+                   COALESCE(SUM(run = ?1), 0)
+                 FROM prompt_queue WHERE body IS NOT NULL",
+                [run],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(sql)?;
+        if items + added_items > QUEUE_ITEMS
+            || run_items + added_items > QUEUE_RUN_ITEMS
+            || bytes + added_bytes > QUEUE_BYTES
+        {
+            return Err(format!(
+                "queue_full: the prompt queue holds at most {QUEUE_ITEMS} items ({QUEUE_RUN_ITEMS} per agent run) and 2 MiB; remove some first"
+            ));
+        }
+        Ok(())
+    }
+
+    fn queue_item_in(tx: &Connection, id: i64, now: u64) -> Result<Option<QueueItem>, String> {
+        tx.query_row(
+            &format!("SELECT {QUEUE_COLUMNS} FROM prompt_queue WHERE id = ?1"),
+            [id],
+            QueueItem::from_row,
+        )
+        .optional()
+        .map_err(sql)
+        .map(|item| item.map(|item| item.hidden_after(now)))
+    }
+
+    /// Adds a staged prompt at the end of the run's queue.
+    pub fn queue_add(
+        &mut self,
+        run: &str,
+        pane: &str,
+        provider: &str,
+        body: &str,
+        attachments: &Value,
+        now: u64,
+    ) -> Result<QueueItem, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        Self::queue_retention_in(&tx, now)?;
+        let attachments = attachments.to_string();
+        Self::queue_quota_in(&tx, run, 1, (body.len() + attachments.len()) as i64)?;
+        let position: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(position), 0) + 1 FROM prompt_queue WHERE run = ?1",
+                [run],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        tx.execute(
+            "INSERT INTO prompt_queue (run, pane, provider, position, body, attachments, revision,
+               created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
+            params![run, pane, provider, position, body, attachments, now as i64],
+        )
+        .map_err(sql)?;
+        let id = tx.last_insert_rowid();
+        let item = Self::queue_item_in(&tx, id, now)?.ok_or("queue item disappeared")?;
+        tx.commit().map_err(sql)?;
+        Ok(item)
+    }
+
+    /// Every queued prompt, by run and position. A sent body past its day
+    /// reads as gone even before the next change clears it.
+    pub fn queue_items(&self, now: u64) -> Result<Vec<QueueItem>, String> {
+        let mut statement = self
+            .conn
+            .prepare(&format!(
+                "SELECT {QUEUE_COLUMNS} FROM prompt_queue ORDER BY run, position, id"
+            ))
+            .map_err(sql)?;
+        statement
+            .query_map([], QueueItem::from_row)
+            .map_err(sql)?
+            .map(|item| item.map(|item| item.hidden_after(now)))
+            .collect::<Result<_, _>>()
+            .map_err(sql)
+    }
+
+    pub fn queue_item(&self, id: i64, now: u64) -> Result<Option<QueueItem>, String> {
+        Self::queue_item_in(&self.conn, id, now)
+    }
+
+    /// Changes a staged prompt of the agent's current run. `revision`, when
+    /// given, must be the one the caller showed.
+    pub fn queue_change(
+        &mut self,
+        id: i64,
+        revision: Option<i64>,
+        current_run: &str,
+        change: QueueChange,
+        now: u64,
+    ) -> Result<QueueItem, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        Self::queue_retention_in(&tx, now)?;
+        let item = Self::queue_item_in(&tx, id, now)?
+            .ok_or_else(|| format!("target_absent: queued prompt {id} does not exist"))?;
+        item.changeable(revision, current_run)?;
+        match change {
+            QueueChange::Body(body) => {
+                let grown = body.len() as i64 - item.body.as_deref().map_or(0, str::len) as i64;
+                Self::queue_quota_in(&tx, &item.run, 0, grown.max(0))?;
+                tx.execute(
+                    "UPDATE prompt_queue SET body = ?2, revision = revision + 1, updated_ms = ?3
+                     WHERE id = ?1",
+                    params![id, body, now as i64],
+                )
+                .map_err(sql)?;
+            }
+            QueueChange::Attachments(attachments) => {
+                let attachments = attachments.to_string();
+                let grown = attachments.len() as i64 - item.attachments.to_string().len() as i64;
+                Self::queue_quota_in(&tx, &item.run, 0, grown.max(0))?;
+                tx.execute(
+                    "UPDATE prompt_queue SET attachments = ?2, revision = revision + 1, updated_ms = ?3
+                     WHERE id = ?1",
+                    params![id, attachments, now as i64],
+                )
+                .map_err(sql)?;
+            }
+            QueueChange::Position(position) => {
+                let ids: Vec<i64> = {
+                    let mut statement = tx
+                        .prepare(
+                            "SELECT id FROM prompt_queue WHERE run = ?1 AND id != ?2 ORDER BY position, id",
+                        )
+                        .map_err(sql)?;
+                    statement
+                        .query_map(params![item.run, id], |row| row.get(0))
+                        .map_err(sql)?
+                        .collect::<Result<_, _>>()
+                        .map_err(sql)?
+                };
+                let at = (position.max(1) as usize - 1).min(ids.len());
+                let mut order = ids;
+                order.insert(at, id);
+                for (index, other) in order.iter().enumerate() {
+                    tx.execute(
+                        "UPDATE prompt_queue SET position = ?2 WHERE id = ?1",
+                        params![other, index as i64 + 1],
+                    )
+                    .map_err(sql)?;
+                }
+                tx.execute(
+                    "UPDATE prompt_queue SET revision = revision + 1, updated_ms = ?2 WHERE id = ?1",
+                    params![id, now as i64],
+                )
+                .map_err(sql)?;
+            }
+        }
+        let item = Self::queue_item_in(&tx, id, now)?.ok_or("queue item disappeared")?;
+        tx.commit().map_err(sql)?;
+        Ok(item)
+    }
+
+    /// Removes a queued prompt. One of a run that is not live any more goes
+    /// in any state; one of a live run unless it is being sent or its
+    /// outcome is unknown (which a person settles first).
+    pub fn queue_remove(
+        &mut self,
+        id: i64,
+        revision: Option<i64>,
+        live_runs: &HashSet<String>,
+        now: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        Self::queue_retention_in(&tx, now)?;
+        let item = Self::queue_item_in(&tx, id, now)?
+            .ok_or_else(|| format!("target_absent: queued prompt {id} does not exist"))?;
+        if live_runs.contains(&item.run) && matches!(item.state(), "sending" | "unknown") {
+            item.changeable(revision, &item.run)?;
+        } else if revision.is_some_and(|revision| revision != item.revision) {
+            return Err(QueueItem::stale());
+        }
+        tx.execute("DELETE FROM prompt_queue WHERE id = ?1", [id])
+            .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
+    /// The reason the last send of an item did not go out; not a change of
+    /// its content, so the revision stays.
+    pub fn queue_note(&mut self, id: i64, note: &str, now: u64) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        tx.execute(
+            "UPDATE prompt_queue SET note = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![id, note.chars().take(512).collect::<String>(), now as i64],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
     /// Prompts of `run` delivered at or after `since` and not yet taken in
     /// by the provider, the latest delivery first.
     pub fn delivered_prompts(&self, run: &str, since: u64) -> Result<Vec<Record>, String> {
@@ -1778,6 +2215,7 @@ impl Store {
         Ok(changed)
     }
 
+    /// Resolves a run's open attention events of the given kinds.
     pub fn resolve_run(
         &mut self,
         run: &str,
@@ -2186,6 +2624,196 @@ mod tests {
         }
     }
 
+    fn queued_request<'a>(id: &'a str, digest: &'a str) -> NewOperation<'a> {
+        NewOperation {
+            namespace: "run:r1",
+            action: "prompt",
+            id,
+            explicit: false,
+            target: "%1",
+            run: Some("r1"),
+            boot: "b1",
+            digest,
+            payload_bytes: 5,
+        }
+    }
+
+    #[test]
+    fn a_queued_prompt_follows_its_operation_and_admission_needs_its_revision() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let item = store
+            .queue_add("r1", "%1", "codex", "hello", &json!([]), 100)
+            .unwrap();
+        assert_eq!(
+            (item.state(), item.revision, item.position),
+            ("staged", 1, 1)
+        );
+        // A stale revision admits nothing.
+        let stale = QueuedPrompt {
+            item: item.id,
+            revision: 7,
+            run: "r1",
+        };
+        let id = format!("q{}", item.id);
+        assert!(
+            store
+                .admit_with(&queued_request(&id, "d1"), json!({}), 110, Some(&stale))
+                .unwrap_err()
+                .starts_with("queue_stale")
+        );
+        assert!(store.get(&key("run:r1", "prompt", &id)).unwrap().is_none());
+        let current = QueuedPrompt {
+            item: item.id,
+            revision: 1,
+            run: "r1",
+        };
+        let ticket = dispatch(
+            store
+                .admit_with(&queued_request(&id, "d1"), json!({}), 120, Some(&current))
+                .unwrap(),
+        );
+        let sending = store.queue_item(item.id, 120).unwrap().unwrap();
+        assert_eq!((sending.state(), sending.revision), ("sending", 2));
+        assert!(
+            store
+                .queue_change(item.id, None, "r1", QueueChange::Body("x".into()), 125)
+                .unwrap_err()
+                .starts_with("queue_sending")
+        );
+        // A no-op attempt leaves it staged; the trigger follows the operation.
+        store
+            .finish(&ticket, "not_applied", "test", None, 130)
+            .unwrap();
+        assert_eq!(
+            store.queue_item(item.id, 130).unwrap().unwrap().state(),
+            "staged"
+        );
+        let edited = store
+            .queue_change(
+                item.id,
+                Some(2),
+                "r1",
+                QueueChange::Body("hello again".into()),
+                140,
+            )
+            .unwrap();
+        let again = QueuedPrompt {
+            item: item.id,
+            revision: edited.revision,
+            run: "r1",
+        };
+        let ticket = dispatch(
+            store
+                .admit_with(&queued_request(&id, "d2"), json!({}), 150, Some(&again))
+                .unwrap(),
+        );
+        store
+            .finish(&ticket, "delivered", "test", None, 160)
+            .unwrap();
+        let sent = store.queue_item(item.id, 160).unwrap().unwrap();
+        assert_eq!((sent.state(), sent.sent_ms), ("sent", Some(160)));
+        assert!(
+            store
+                .queue_change(item.id, None, "r1", QueueChange::Body("x".into()), 170)
+                .unwrap_err()
+                .starts_with("queue_not_staged")
+        );
+        // The sent body reads as gone after a day and is cleared at the next change.
+        let day = 160 + QUEUE_SENT_BODY_MS;
+        assert!(
+            store
+                .queue_item(item.id, day)
+                .unwrap()
+                .unwrap()
+                .body
+                .is_none()
+        );
+        store
+            .queue_add("r1", "%1", "codex", "next", &json!([]), day)
+            .unwrap();
+        let raw: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT body FROM prompt_queue WHERE id = ?1",
+                [item.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(raw.is_none());
+    }
+
+    #[test]
+    fn queue_items_of_an_ended_run_are_held_and_removable_in_any_state() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let first = store
+            .queue_add("r1", "%1", "codex", "a", &json!([]), 100)
+            .unwrap();
+        let second = store
+            .queue_add("r1", "%1", "codex", "b", &json!([]), 100)
+            .unwrap();
+        let moved = store
+            .queue_change(second.id, Some(1), "r1", QueueChange::Position(1), 110)
+            .unwrap();
+        assert_eq!(moved.position, 1);
+        assert_eq!(
+            store.queue_item(first.id, 110).unwrap().unwrap().position,
+            2
+        );
+        // The agent now runs r2: r1's items are held.
+        assert!(
+            store
+                .queue_change(first.id, None, "r2", QueueChange::Body("c".into()), 120)
+                .unwrap_err()
+                .starts_with("queue_held")
+        );
+        let live: HashSet<String> = ["r2".to_owned()].into();
+        store.queue_remove(first.id, None, &live, 130).unwrap();
+        assert!(store.queue_item(first.id, 130).unwrap().is_none());
+        assert!(
+            store
+                .queue_remove(second.id, Some(9), &live, 140)
+                .unwrap_err()
+                .starts_with("queue_stale")
+        );
+    }
+
+    #[test]
+    fn the_queue_quota_counts_bytes_not_characters() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let korean = "가".repeat(10_000);
+        for _ in 0..QUEUE_RUN_ITEMS {
+            store
+                .queue_add("r1", "%1", "codex", "x", &json!([]), 100)
+                .unwrap();
+        }
+        assert!(
+            store
+                .queue_add("r1", "%1", "codex", "x", &json!([]), 100)
+                .unwrap_err()
+                .starts_with("queue_full")
+        );
+        // 30 KB of Korean text, 70 times, passes 2 MiB in bytes.
+        let mut full = false;
+        for index in 0..80 {
+            if let Err(error) = store.queue_add(
+                &format!("run{index}"),
+                "%2",
+                "codex",
+                &korean,
+                &json!([]),
+                100,
+            ) {
+                assert!(error.starts_with("queue_full"));
+                full = true;
+                break;
+            }
+        }
+        assert!(full);
+    }
+
     #[test]
     fn a_delivered_prompt_is_accepted_once_and_only_from_delivered() {
         let dir = temp();
@@ -2502,7 +3130,10 @@ mod tests {
         assert!(!backup_path(&path).exists());
         let status = store.status().unwrap();
         assert_eq!(status["min_reader"], 2);
-        assert_eq!(status["features"], json!(["inbox", "provider_secrets"]));
+        assert_eq!(
+            status["features"],
+            json!(["inbox", "prompt_queue", "provider_secrets"])
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2616,7 +3247,7 @@ mod tests {
         let store = Store::open_path(&path).unwrap();
         assert_eq!(
             store.status().unwrap()["features"],
-            json!(["inbox", "later", "provider_secrets"])
+            json!(["inbox", "later", "prompt_queue", "provider_secrets"])
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2640,7 +3271,14 @@ mod tests {
         apply_features(&mut store.conn, &second, 3).unwrap();
         assert_eq!(
             store.status().unwrap()["features"],
-            json!(["alpha", "beta", "gamma", "inbox", "provider_secrets"])
+            json!([
+                "alpha",
+                "beta",
+                "gamma",
+                "inbox",
+                "prompt_queue",
+                "provider_secrets"
+            ])
         );
         fs::remove_dir_all(dir).unwrap();
     }

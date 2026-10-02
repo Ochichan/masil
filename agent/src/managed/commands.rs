@@ -193,6 +193,13 @@ pub(crate) const VERBS: &[Verb] = &[
         remote: false,
     },
     Verb {
+        name: "queue",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] queue TARGET [show ID | add TEXT [--attach PATH]... | add --from ID | edit ID TEXT | attach ID PATH | detach ID N | move ID POSITION | remove ID | send [ID]] [--revision N] | queue --held [remove ID]",
+        mutating: true,
+        target_stage: Some("delivered"),
+        remote: false,
+    },
+    Verb {
         name: "inbox",
         usage: "masil-agent agent [--socket MASIL_SOCKET] inbox [list] [--all] [--limit N] | ack ID... | read-all [--through SEQ] | enable | disable | status",
         mutating: true,

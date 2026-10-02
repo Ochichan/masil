@@ -5,7 +5,9 @@ use super::{
     i18n::action_label,
     model::{Action, App, Effect, Language, Theme},
     palette::{self, Palette, PaletteResult},
-    preferences, terminal,
+    preferences,
+    queue::{QueueOutcome, QueueWindow},
+    terminal,
     view::{action_shortcut, cell_width, ellipsize, wrap_rows},
 };
 use crate::managed::{
@@ -675,6 +677,16 @@ enum Work {
     Action(ActionMessage),
     Panes(Result<(Vec<crate::managed::find::PaneTarget>, bool), String>),
     Inbox(Result<crate::managed::inbox::InboxView, String>),
+    /// A queue window's list, after a change when there was one.
+    Queue(QueueMessage),
+}
+
+struct QueueMessage {
+    agent: Box<Agent>,
+    /// The `e` press that asked to open the window.
+    press: Option<u64>,
+    done: Option<(&'static str, Result<Value, String>)>,
+    view: Result<Value, String>,
 }
 struct ActionMessage {
     boot: String,
@@ -795,6 +807,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut dialog: Option<Dialog> = None;
     let mut answering: Option<AnswerDialog> = None;
+    let mut queueing: Option<QueueWindow> = None;
     let mut palette: Option<Palette> = None;
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -812,6 +825,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                     app.draw(frame);
                     if let Some(dialog) = &mut dialog { dialog.draw(frame, app.theme); }
                     if let Some(answering) = &mut answering { answering.draw(frame, app.theme); }
+                    if let Some(queueing) = &mut queueing { queueing.draw(frame, app.theme); }
                     if let Some(palette) = &mut palette { palette.draw(frame, app.theme); }
                 }).map_err(|error| error.to_string())?;
                 app.dirty = false;
@@ -844,6 +858,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                         } else if matches!(&event, Event::Key(key) if key.code == KeyCode::Char(':') && key.modifiers.difference(KeyModifiers::SHIFT).is_empty())
                             && dialog.is_none()
                             && answering.is_none()
+                            && queueing.is_none()
                             && app.overlay.is_none()
                             && app.focus != super::model::Focus::Search
                         {
@@ -852,6 +867,18 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             let fleet = fleet.clone();
                             tasks.spawn(async move { Work::Panes(fleet.local.pane_targets().await) });
                             app.dirty = true;
+                            Vec::new()
+                        } else if let Some(active) = &mut queueing {
+                            let outcome = active.handle(event);
+                            app.dirty = true;
+                            match outcome {
+                                QueueOutcome::None => {}
+                                QueueOutcome::Close => queueing = None,
+                                QueueOutcome::Op(op) => {
+                                    let agent = active.agent.clone();
+                                    queue_task(&mut tasks, fleet.clone(), agent, Some(op), None);
+                                }
+                            }
                             Vec::new()
                         } else if let Some(active) = &mut answering {
                             let outcome = active.handle(event);
@@ -931,6 +958,12 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         app.dirty = true;
                                     }
                                     if identity_changed {
+                                        // The queue window stays: it shows the agent's new run
+                                        // and keeps typed text from reaching the desk's keys.
+                                        if let Some(window) = &queueing {
+                                            let agent = window.agent.clone();
+                                            queue_task(&mut tasks, fleet.clone(), agent, None, None);
+                                        }
                                         dialog = None;
                                         answering = None;
                                         palette = None;
@@ -974,6 +1007,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     !app.inbox.open && app.selected_id.as_ref() == Some(&agent.id)
                                 };
                                 let free = answering.is_none()
+                                    && queueing.is_none()
                                     && dialog.is_none()
                                     && palette.is_none()
                                     && app.overlay.is_none()
@@ -992,6 +1026,48 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             Err(error) => { app.finish_action(); app.notify(format!("Action failed: {}", crate::managed::failure::human(&error))); app.inbox.refresh = true; },
                         },
                         Ok(Work::Action(_)) => {},
+                        Ok(Work::Queue(message)) => {
+                            app.dirty = true;
+                            let QueueMessage { agent, press, done, view } = message;
+                            let window = queueing.as_mut().filter(|window| window.pane() == agent.pane_id);
+                            // Shown in the window whatever the agent runs now.
+                            if let Some((kind, result)) = done {
+                                match (&result, window) {
+                                    (Ok(value), Some(window)) if kind == "show" => window.edit_body(value),
+                                    (_, Some(window)) => window.finished(result.as_ref().map(|_| ()).map_err(String::as_str), queue_done(app.language, kind, &result)),
+                                    (_, None) => app.notify(queue_done(app.language, kind, &result)),
+                                }
+                            }
+                            match view {
+                                Ok(view) => {
+                                    if let Some(window) = queueing.as_mut().filter(|window| window.pane() == agent.pane_id) {
+                                        window.refresh(view);
+                                    } else if press.is_some_and(|press| press == app.queue_request) {
+                                        let free = answering.is_none()
+                                            && queueing.is_none()
+                                            && dialog.is_none()
+                                            && palette.is_none()
+                                            && app.overlay.is_none()
+                                            && app.focus != super::model::Focus::Search
+                                            && !app.inbox.open
+                                            && app.selected_id.as_ref() == Some(&agent.id);
+                                        if free {
+                                            queueing = Some(QueueWindow::new(app.language, *agent, view));
+                                        } else {
+                                            app.notify(self::message(
+                                                app.language,
+                                                "The view changed before the queue arrived; press e again".into(),
+                                                "대기열이 오기 전에 화면이 바뀌었습니다. e를 다시 누르세요".into(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(error) if press.is_some() => {
+                                    app.notify(format!("Action failed: {}", crate::managed::failure::human(&error)));
+                                }
+                                Err(_) => {}
+                            }
+                        }
                         Ok(Work::Panes(result)) => {
                             if let Some(active) = &mut palette {
                                 active.set_panes(result);
@@ -1499,6 +1575,12 @@ fn dispatch_effect(
                 });
             }
         }
+        Effect::Queue { id } => {
+            if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {
+                app.queue_request += 1;
+                queue_task(tasks, fleet, agent, None, Some(app.queue_request));
+            }
+        }
         Effect::Answer { id } => {
             if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {
                 let boot = expected_boot.to_owned();
@@ -1562,6 +1644,88 @@ fn dispatch_effect(
         Effect::Retry => {}
         Effect::CopyId { .. } | Effect::Preferences { .. } | Effect::Quit => {}
     }
+}
+
+/// One queue change (when given), then the agent's queue again.
+fn queue_task(
+    tasks: &mut JoinSet<Work>,
+    fleet: Arc<Fleet>,
+    agent: Agent,
+    op: Option<crate::managed::queue::QueueOp>,
+    press: Option<u64>,
+) {
+    use crate::managed::queue::QueueOp;
+    tasks.spawn(async move {
+        let done = match op {
+            Some(op) => {
+                let kind = match &op {
+                    QueueOp::Add { .. } | QueueOp::AddFrom { .. } => "added",
+                    QueueOp::Show { .. } => "show",
+                    QueueOp::Edit { .. } => "saved",
+                    QueueOp::Attach { .. } => "attached",
+                    QueueOp::Move { .. } => "moved",
+                    QueueOp::Remove { .. } => "removed",
+                    QueueOp::Send { .. } => "sent",
+                };
+                Some((kind, fleet.queue_op(&agent, op).await))
+            }
+            None => None,
+        };
+        let view = fleet.queue_view(&agent).await;
+        Work::Queue(QueueMessage {
+            agent: Box::new(agent),
+            press,
+            done,
+            view,
+        })
+    });
+}
+
+/// What a queue change did, in a line.
+fn queue_done(
+    language: super::model::Language,
+    kind: &str,
+    result: &Result<Value, String>,
+) -> String {
+    let error = match result {
+        Ok(value) if kind == "sent" => {
+            let stage = value["stage"].as_str().unwrap_or("delivered");
+            let key = value["operation_key"].as_str().unwrap_or_default();
+            return match stage {
+                "delivered" | "native_accepted" | "user_confirmed_delivered" => message(
+                    language,
+                    format!("Sent: {stage}; provider acceptance shows in its receipt"),
+                    format!("보냄: {stage}. provider 수락은 receipt에 보입니다"),
+                ),
+                _ => message(
+                    language,
+                    format!(
+                        "Outcome unknown; check the pane, then `agent operation resolve {key}`"
+                    ),
+                    format!(
+                        "결과를 모릅니다. 창을 본 뒤 `agent operation resolve {key}`로 정하세요"
+                    ),
+                ),
+            };
+        }
+        Ok(_) => {
+            return match (language, kind) {
+                (super::model::Language::Korean, "added") => "넣었습니다".into(),
+                (super::model::Language::Korean, "saved") => "저장했습니다".into(),
+                (super::model::Language::Korean, "attached") => "경로를 확인해 붙였습니다".into(),
+                (super::model::Language::Korean, "moved") => "옮겼습니다".into(),
+                (super::model::Language::Korean, "removed") => "지웠습니다".into(),
+                (_, "added") => "Queued".into(),
+                (_, "saved") => "Saved".into(),
+                (_, "attached") => "Path checked and attached".into(),
+                (_, "moved") => "Moved".into(),
+                (_, "removed") => "Removed".into(),
+                _ => String::new(),
+            };
+        }
+        Err(error) => error,
+    };
+    crate::managed::failure::human(error).to_owned()
 }
 
 /// The answer dialog for these requests, or a note when there is nothing

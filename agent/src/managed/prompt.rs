@@ -411,6 +411,29 @@ impl Manager {
         text: &str,
         operation: Option<u64>,
     ) -> Result<Value, String> {
+        self.deliver(agent, text, operation, None).await
+    }
+
+    /// A queued prompt (queue.rs): its operation is `q<item>`, and admission
+    /// commits only while the item still has `revision`.
+    pub(super) async fn prompt_queued(
+        &self,
+        agent: &Agent,
+        text: &str,
+        item: i64,
+        revision: i64,
+    ) -> Result<Value, String> {
+        self.deliver(agent, text, None, Some((item, revision)))
+            .await
+    }
+
+    async fn deliver(
+        &self,
+        agent: &Agent,
+        text: &str,
+        operation: Option<u64>,
+        queued: Option<(i64, i64)>,
+    ) -> Result<Value, String> {
         if text.is_empty()
             || text.len() > 32768
             || text
@@ -494,6 +517,8 @@ impl Manager {
             let mut store = self.operation_store_recorded(&pane.store).await?;
             let id = if explicit {
                 operation.to_string()
+            } else if let Some((item, _)) = queued {
+                format!("q{item}")
             } else {
                 format!("auto-{}", nonce()?)
             };
@@ -513,8 +538,13 @@ impl Manager {
             // (accept_prompt); the text itself is not kept.
             let intent = json!({"slot": operation, "ledger_sha256": sha256(&pane.raw),
                 "fence": pane.fence, "accept_digest": accept_digest(&agent.provider, text),
-                "paste_ms": now_ms()});
-            let ticket = match store.admit(&request, intent, now_ms())? {
+                "paste_ms": now_ms(), "queue_item": queued.map(|(item, _)| item)});
+            let marked = queued.map(|(item, revision)| operations::QueuedPrompt {
+                item,
+                revision,
+                run: &agent.run,
+            });
+            let ticket = match store.admit_with(&request, intent, now_ms(), marked.as_ref())? {
                 Admission::Dispatch(ticket) => ticket,
                 Admission::Recorded(record) => {
                     return Ok(public_record(&agent.run, operation, &record));

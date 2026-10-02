@@ -113,6 +113,10 @@ pub enum Effect {
     Answer {
         id: String,
     },
+    /// Open this agent's prompt queue.
+    Queue {
+        id: String,
+    },
     Quit,
     Preferences {
         language: Language,
@@ -187,6 +191,8 @@ pub(crate) enum Action {
     CloseAgent,
     /// Answer the agent's pending requests through masil.
     Answer,
+    /// The agent's prompt queue.
+    Queue,
     /// Open or close the inbox view.
     Inbox,
     /// Focus the oldest unseen inbox event's pane.
@@ -411,6 +417,8 @@ pub struct App {
     pub(crate) prompt_in_flight: bool,
     /// The latest `y` press: only its request list may open a dialog.
     pub(crate) answer_request: u64,
+    /// The latest `e` press: only its list may open the queue window.
+    pub(crate) queue_request: u64,
     pub(crate) toast: Option<String>,
     /// Server status line on the last footer row, and whether one is offline.
     pub(crate) endpoint_line: Option<(String, bool)>,
@@ -466,6 +474,7 @@ impl App {
             ack_in_flight: None,
             prompt_in_flight: false,
             answer_request: 0,
+            queue_request: 0,
             toast: None,
             endpoint_line: None,
             last_area: Rect::default(),
@@ -698,7 +707,7 @@ impl App {
             }
             // Any running agent: the dialog says why one without an answer
             // channel is answered in its pane.
-            Action::PrepareDraft | Action::InterruptAgent | Action::Answer => {
+            Action::PrepareDraft | Action::InterruptAgent | Action::Answer | Action::Queue => {
                 self.managed
                     && self.connected
                     && self.selected().is_some_and(|row| {
@@ -766,6 +775,9 @@ impl App {
             Action::ReadScreen => Effect::ReadScreen,
             Action::CloseAgent => Effect::CloseAgent,
             Action::Answer => Effect::Answer {
+                id: self.selected_id.clone()?,
+            },
+            Action::Queue => Effect::Queue {
                 id: self.selected_id.clone()?,
             },
             Action::Inbox => {

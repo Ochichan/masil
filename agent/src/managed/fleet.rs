@@ -350,6 +350,30 @@ impl Fleet {
         self.local.answer(&agent, request, reply).await
     }
 
+    /// The agent's prompt queue (local agents only, until P8).
+    pub async fn queue_view(&self, agent: &Agent) -> Result<Value, String> {
+        if self.remote(agent)?.is_some() {
+            return Err(
+                "queue_remote_unsupported: a remote agent's prompt queue is not offered yet".into(),
+            );
+        }
+        let agent = self.local.get(&agent.pane_id).await?;
+        self.local.queue_view(&agent).await
+    }
+
+    pub async fn queue_op(
+        &self,
+        agent: &Agent,
+        op: super::queue::QueueOp,
+    ) -> Result<Value, String> {
+        if self.remote(agent)?.is_some() {
+            return Err(
+                "queue_remote_unsupported: a remote agent's prompt queue is not offered yet".into(),
+            );
+        }
+        self.local.queue_op(agent, op).await
+    }
+
     /// The agent as its pane runs it now: answers find the provider's server
     /// through the pane's current processes, not a listed copy.
     async fn answering(&self, agent: &Agent) -> Result<Agent, String> {

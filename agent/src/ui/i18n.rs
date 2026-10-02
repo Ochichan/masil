@@ -388,6 +388,7 @@ pub(crate) fn action_label(
         Action::ReadScreen => Text::ReadScreen,
         Action::CloseAgent => Text::CloseAgent,
         Action::Answer => return word(language, "Answer requests", "요청에 답하기"),
+        Action::Queue => return word(language, "Prompt queue", "prompt 대기열"),
         Action::Inbox => return word(language, "Inbox", "인박스"),
         Action::NextUnseen => return word(language, "Next unseen event", "다음 안 읽은 사건"),
     };
@@ -435,6 +436,8 @@ pub(crate) fn compact_action_label(
         (Language::Korean, Action::CloseAgent, _, _) => "닫기",
         (Language::English, Action::Answer, _, _) => "Answer",
         (Language::Korean, Action::Answer, _, _) => "응답",
+        (Language::English, Action::Queue, _, _) => "Queue",
+        (Language::Korean, Action::Queue, _, _) => "대기열",
         (Language::English, Action::Inbox, _, _) => "Inbox",
         (Language::Korean, Action::Inbox, _, _) => "인박스",
         (Language::English, Action::NextUnseen, _, _) => "Next",
@@ -571,6 +574,10 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                     "y",
                     "Answer an OpenCode permission or question (started with --answers)",
                 ),
+                Key(
+                    "e",
+                    "Prompt queue: write prompts ahead, send each with s when the agent is idle",
+                ),
                 Key("z", "Expand or restore an owned side panel"),
                 Gap,
                 Group("INBOX"),
@@ -615,6 +622,10 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                 Key(
                     "y",
                     "OpenCode 권한 요청이나 질문에 답하기 (--answers로 시작한 경우)",
+                ),
+                Key(
+                    "e",
+                    "prompt 대기열: 미리 써 두고 agent가 대기일 때 s로 하나씩 보내기",
                 ),
                 Key("z", "소유한 사이드패널 확대 또는 복원"),
                 Gap,

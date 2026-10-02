@@ -101,6 +101,7 @@ impl App {
             KeyCode::Char('v') if self.managed => self.one_effect(Action::ReadScreen),
             KeyCode::Char('X') if self.managed => self.one_effect(Action::CloseAgent),
             KeyCode::Char('y') if self.managed => self.one_effect(Action::Answer),
+            KeyCode::Char('e') if self.managed => self.one_effect(Action::Queue),
             KeyCode::Char('i') if self.managed => {
                 self.toggle_inbox();
                 Vec::new()
@@ -321,6 +322,10 @@ impl App {
                     KeyCode::Char('y') if self.managed => {
                         self.overlay = None;
                         self.one_effect(Action::Answer)
+                    }
+                    KeyCode::Char('e') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::Queue)
                     }
                     _ => Vec::new(),
                 }
@@ -1004,6 +1009,7 @@ impl App {
                 Action::PrepareDraft,
                 Action::SendPrompt,
                 Action::Answer,
+                Action::Queue,
                 Action::InterruptAgent,
                 Action::ReadScreen,
                 Action::CloseAgent,

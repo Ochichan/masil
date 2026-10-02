@@ -13,6 +13,7 @@ mod integration;
 mod observe;
 mod operations;
 mod prompt;
+pub(crate) mod queue;
 mod remote_cli;
 pub(crate) mod resident;
 mod store;

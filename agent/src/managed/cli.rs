@@ -259,6 +259,102 @@ pub(super) fn capability_report(agent: &Agent) -> serde_json::Value {
     json!({"pane_id":agent.pane_id,"run":agent.run,"provider":agent.provider,"process":agent.process,"state":agent.state,"binding":agent.binding,"capabilities":agent.capabilities})
 }
 
+/// `agent queue ...` (queue.rs).
+async fn queue_command(manager: &Manager, args: &[String]) -> Result<i32, String> {
+    let usage = || {
+        "usage: queue TARGET [show ID | add TEXT [--attach PATH]... | add --from ID | edit ID TEXT | attach ID PATH | detach ID N | move ID POSITION | remove ID | send [ID]] [--revision N] | queue --held [remove ID]".to_owned()
+    };
+    // --revision N may come anywhere after the target.
+    let mut revision = None;
+    let mut words = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--revision" {
+            let value = value(args, index)?;
+            revision = Some(value.parse::<i64>().map_err(|_| usage())?);
+            index += 2;
+        } else {
+            words.push(args[index].as_str());
+            index += 1;
+        }
+    }
+    let number = |text: &str| text.parse::<i64>().map_err(|_| usage());
+    let here = std::env::current_dir().map_err(|error| error.to_string())?;
+    if words.first() == Some(&"--held") {
+        return match words[1..] {
+            [] => print(&manager.queue_held().await?).map(|()| 0),
+            ["remove", id] => {
+                print(&manager.queue_remove(number(id)?, revision).await?).map(|()| 0)
+            }
+            _ => Err(usage()),
+        };
+    }
+    let Some(target) = words.first() else {
+        return Err(usage());
+    };
+    let agent = manager.get(target).await?;
+    let value = match words[1..] {
+        [] => manager.queue_view(&agent).await?,
+        ["show", id] => manager.queue_show(number(id)?).await?,
+        ["add", "--from", id] => manager.queue_add_from(&agent, number(id)?).await?,
+        ["add", ref rest @ ..] if !rest.is_empty() => {
+            let mut body = None;
+            let mut paths = Vec::new();
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index] {
+                    "--attach" => {
+                        paths.push(rest.get(index + 1).ok_or_else(usage)?.to_string());
+                        index += 2;
+                    }
+                    text if body.is_none() => {
+                        body = Some(text);
+                        index += 1;
+                    }
+                    _ => return Err(usage()),
+                }
+            }
+            manager
+                .queue_add(&agent, body.ok_or_else(usage)?, &paths, &here)
+                .await?
+        }
+        ["edit", id, text] => {
+            manager
+                .queue_edit(&agent, number(id)?, text, revision)
+                .await?
+        }
+        ["attach", id, path] => {
+            manager
+                .queue_attach(&agent, number(id)?, path, revision, &here)
+                .await?
+        }
+        ["detach", id, at] => {
+            let at = at.parse::<usize>().map_err(|_| usage())?;
+            manager
+                .queue_detach(&agent, number(id)?, at, revision)
+                .await?
+        }
+        ["move", id, position] => {
+            manager
+                .queue_move(&agent, number(id)?, number(position)?, revision)
+                .await?
+        }
+        ["remove", id] => manager.queue_remove(number(id)?, revision).await?,
+        ["send"] => {
+            let outcome = manager.queue_send(&agent, None, revision).await?;
+            return print_record(manager, &outcome, false).await;
+        }
+        ["send", id] => {
+            let outcome = manager
+                .queue_send(&agent, Some(number(id)?), revision)
+                .await?;
+            return print_record(manager, &outcome, false).await;
+        }
+        _ => return Err(usage()),
+    };
+    print(&value).map(|()| 0)
+}
+
 fn value(args: &[String], index: usize) -> Result<&str, String> {
     args.get(index + 1)
         .map(String::as_str)
@@ -472,6 +568,9 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         "requests" if args.len() == 1 => {
             let agent = manager.get(&args[0]).await?;
             print(&manager.requests(&agent).await?)?;
+        }
+        "queue" if !args.is_empty() => {
+            return queue_command(&manager, args).await;
         }
         "answer" if args.len() >= 3 => {
             let mut choice = None;
