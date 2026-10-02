@@ -1,5 +1,6 @@
 //! Native agent management. Nothing runs until a management command or view is opened.
 pub(crate) mod answer;
+pub(crate) mod changes;
 mod cli;
 mod commands;
 mod durable;

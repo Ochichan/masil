@@ -442,30 +442,43 @@ async fn changes_command(manager: &Manager, args: &[String]) -> Result<i32, Stri
         return Err("usage: --file and --handoff do not go together".into());
     }
     let agent = manager.get(&args[0]).await?;
-    let cwd = PathBuf::from(&agent.cwd);
-    let (root, value) = tokio::task::spawn_blocking(move || -> Result<(PathBuf, Value), String> {
-        let root = crate::changes::root_of(&cwd)?;
-        let value = match &file {
-            Some(path) => crate::changes::diff(&root, path)?,
-            None => crate::changes::list(&root)?,
-        };
-        Ok((root, value))
-    })
-    .await
-    .map_err(|error| error.to_string())??;
-    let Some(reviewer) = handoff else {
-        print(&value)?;
-        return Ok(0);
+    let op = match (file, handoff) {
+        (Some(path), _) => super::changes::ChangesOp::Diff { path },
+        (None, Some(reviewer)) => super::changes::ChangesOp::Handoff { reviewer },
+        (None, None) => super::changes::ChangesOp::List,
     };
-    let reviewer = manager.get(&reviewer).await?;
-    // The item limit counts the attached path too.
-    let text = crate::changes::handoff_text(&value, 30 * 1024);
-    let root_text = root.to_string_lossy().into_owned();
-    let item = manager
-        .queue_add(&reviewer, &text, &[root_text], &root)
-        .await?;
-    print(&json!({"stage": "queued", "reviewer": reviewer.name, "item": item}))?;
+    print(&manager.changes_op(&agent, op).await?)?;
     Ok(0)
+}
+
+/// `restore ID PATH... [--confirm TOKEN]`.
+fn restore_op(args: &[String]) -> Result<super::changes::ChangesOp, String> {
+    let usage = "usage: checkpoint TARGET restore ID PATH... [--confirm TOKEN]";
+    let (id, rest) = args.split_first().ok_or(usage)?;
+    let id = id
+        .parse::<u64>()
+        .map_err(|_| format!("invalid_argument: {id} is not a checkpoint number"))?;
+    let mut paths = Vec::new();
+    let mut token = None;
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == "--confirm" && token.is_none() {
+            token = Some(value(rest, i)?.to_owned());
+            i += 2;
+        } else {
+            paths.push(rest[i].clone());
+            i += 1;
+        }
+    }
+    if paths.is_empty() {
+        return Err(usage.into());
+    }
+    Ok(super::changes::ChangesOp::Restore {
+        id,
+        paths,
+        token,
+        run: None,
+    })
 }
 
 fn print<T: Serialize + ?Sized>(value: &T) -> Result<(), String> {
@@ -690,6 +703,29 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "changes" if !args.is_empty() => {
             return changes_command(&manager, args).await;
+        }
+        "checkpoint" if args.len() >= 2 => {
+            let agent = manager.get(&args[0]).await?;
+            let op = match args[1].as_str() {
+                "restore" => restore_op(&args[2..])?,
+                _ => match crate::checkpoint::Command::parse(&args[1..])? {
+                    crate::checkpoint::Command::List => super::changes::ChangesOp::Checkpoints,
+                    crate::checkpoint::Command::Make { reason } => {
+                        super::changes::ChangesOp::Make { reason }
+                    }
+                    crate::checkpoint::Command::Show { id, path } => {
+                        super::changes::ChangesOp::Show { id, path }
+                    }
+                },
+            };
+            let value = manager.changes_op(&agent, op).await?;
+            print(&value)?;
+            if value["stage"] == "partly_restored" {
+                return Err(format!(
+                    "checkpoint_partial: some files were not restored; checkpoint {} holds them as they were before",
+                    value["before"]
+                ));
+            }
         }
         "answer" if args.len() >= 3 => {
             let mut choice = None;

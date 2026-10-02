@@ -815,9 +815,7 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
                 Action::Keys { keys } => manager.keys(&agent, &keys).await,
                 Action::Draft { text } => manager.draft(&agent, &text).await,
                 Action::Prompt { text, operation } => {
-                    manager
-                        .prompt_with_operation(&agent, &text, operation)
-                        .await
+                    manager.prompt_served(&agent, &text, operation).await
                 }
                 Action::Receipt { operation } => manager.prompt_receipt(&agent, operation).await,
                 Action::ConnectionStatus { lease } => {

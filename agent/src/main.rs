@@ -3,6 +3,7 @@
 mod agent_stream;
 mod attention;
 mod changes;
+mod checkpoint;
 mod coordinator;
 mod daemon;
 mod detection;
@@ -714,6 +715,9 @@ fn execute() -> Result<i32, String> {
                 Ok(class.exit_code())
             }
         };
+    }
+    if args[0] == "checkpoint-auto" {
+        return checkpoint::auto(&args[1..]);
     }
     if args[0] == "worktree" {
         return match worktree::run(&args[1..]) {

@@ -160,6 +160,8 @@ pub(crate) struct Output {
     pub(crate) stdout: Vec<u8>,
     /// Output stopped at the byte limit; git was stopped there.
     pub(crate) truncated: bool,
+    /// git's exit status, when it ended by itself.
+    pub(crate) code: Option<i32>,
 }
 
 /// Runs git in its own process group and returns its standard output, at
@@ -174,15 +176,98 @@ pub(crate) fn output_within(
     limit: usize,
     timeout: &str,
 ) -> Result<Output, String> {
-    use std::io::Read;
+    let mut command = command(dir);
+    command.args(args);
+    run_within(command, None, ok, deadline, limit, timeout)
+}
+
+/// Like [`output_within`] for a prepared git command, writing `input` to
+/// its standard input.
+pub(crate) fn run_within(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+    ok: &[i32],
+    deadline: Instant,
+    limit: usize,
+    timeout: &str,
+) -> Result<Output, String> {
+    command.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    run_prepared(command, input, ok, deadline, limit, timeout)
+}
+
+/// Like [`run_within`], reading standard input from `stdin` (a descriptor
+/// git reads without resolving any path).
+pub(crate) fn run_with_stdin(
+    mut command: Command,
+    stdin: Stdio,
+    ok: &[i32],
+    deadline: Instant,
+    limit: usize,
+    timeout: &str,
+) -> Result<Output, String> {
+    command.stdin(stdin);
+    run_prepared(command, None, ok, deadline, limit, timeout)
+}
+
+/// Runs git with its standard output going straight into `file`.
+pub(crate) fn run_into(
+    mut command: Command,
+    file: std::fs::File,
+    deadline: Instant,
+    timeout: &str,
+) -> Result<(), String> {
+    command.stdin(Stdio::null()).stdout(file);
+    let mut child = command
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("git: {error}"))?;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!("git failed ({status})"))
+            };
+        }
+        if Instant::now() >= deadline {
+            stop(&mut child);
+            return Err(timeout.to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn run_prepared(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+    ok: &[i32],
+    deadline: Instant,
+    limit: usize,
+    timeout: &str,
+) -> Result<Output, String> {
+    use std::io::{Read, Write};
     use std::sync::Arc;
-    let mut child = command(dir)
-        .args(args)
+    let name = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let name = subcommand(&name.iter().map(String::as_str).collect::<Vec<_>>()).to_owned();
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .map_err(|error| format!("git: {error}"))?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
     let full = Arc::new(AtomicBool::new(false));
     let mut stdout = child.stdout.take().ok_or("git output unavailable")?;
     let mut stderr = child.stderr.take().ok_or("git output unavailable")?;
@@ -198,10 +283,21 @@ pub(crate) fn output_within(
             bytes
         })
     };
+    // Read to the end, keeping the tail: a pipe closed early would kill a
+    // chatty git (warnings per file) with SIGPIPE.
     let errors = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut bytes);
-        bytes
+        let mut kept = Vec::new();
+        let mut buffer = [0u8; 8192];
+        while let Ok(read) = stderr.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            kept.extend_from_slice(&buffer[..read]);
+            if kept.len() > 2 * ERROR_TAIL {
+                kept.drain(..kept.len() - ERROR_TAIL);
+            }
+        }
+        kept
     });
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
@@ -225,26 +321,27 @@ pub(crate) fn output_within(
         return Ok(Output {
             stdout,
             truncated: true,
+            code: None,
         });
     };
     if status.code().is_some_and(|code| ok.contains(&code)) {
         return Ok(Output {
             stdout,
             truncated: false,
+            code: status.code(),
         });
     }
     Err(format!(
-        "git {} failed ({status}): {}",
-        subcommand(args),
+        "git {name} failed ({status}): {}",
         tail(&stderr, ERROR_TAIL)
     ))
 }
 
-/// The git subcommand in `args`, past any `-c NAME=VALUE`.
+/// The git subcommand in `args`, past any `-C DIR` and `-c NAME=VALUE`.
 fn subcommand<'a>(args: &[&'a str]) -> &'a str {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
-        if *arg == "-c" {
+        if *arg == "-c" || *arg == "-C" {
             args.next();
         } else if !arg.starts_with('-') {
             return arg;

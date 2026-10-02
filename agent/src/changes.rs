@@ -17,6 +17,8 @@ pub(crate) const DIFF_LIMIT: usize = 256 * 1024;
 const COUNT_LIMIT: u64 = 1024 * 1024;
 const LIST_LIMIT: usize = 64 * 1024 * 1024;
 const TIME: Duration = Duration::from_secs(10);
+const TOO_LARGE: &str =
+    "changes_too_large: git listed more than masil reads; the working tree has too many changes";
 const TIMEOUT: &str =
     "changes_timeout: git did not finish within 10 s; the repository may be very large";
 
@@ -117,6 +119,9 @@ pub(crate) struct Entry {
     pub(crate) insertions: Option<u64>,
     pub(crate) deletions: Option<u64>,
     pub(crate) binary: bool,
+    /// The name is not UTF-8 and is shown approximately; it cannot be
+    /// named in `--file`.
+    pub(crate) lossy: bool,
 }
 
 impl Entry {
@@ -133,6 +138,9 @@ impl Entry {
         if let Some(from) = &self.from {
             value["from"] = json!(from);
         }
+        if self.lossy {
+            value["name_not_utf8"] = json!(true);
+        }
         value
     }
 }
@@ -148,6 +156,7 @@ fn status_entries(output: &[u8]) -> Vec<Entry> {
         .split(|byte| *byte == 0)
         .filter(|field| !field.is_empty());
     while let Some(field) = fields.next() {
+        let lossy = std::str::from_utf8(field).is_err();
         let line = text(field);
         let kind_of = |xy: &str, sub: &str| -> &'static str {
             if sub.starts_with('S') {
@@ -187,6 +196,7 @@ fn status_entries(output: &[u8]) -> Vec<Entry> {
                     insertions: None,
                     deletions: None,
                     binary: false,
+                    lossy,
                 }
             }
             Some("2") => {
@@ -211,6 +221,7 @@ fn status_entries(output: &[u8]) -> Vec<Entry> {
                     insertions: None,
                     deletions: None,
                     binary: false,
+                    lossy,
                 }
             }
             Some("u") => {
@@ -227,6 +238,7 @@ fn status_entries(output: &[u8]) -> Vec<Entry> {
                     insertions: None,
                     deletions: None,
                     binary: false,
+                    lossy,
                 }
             }
             Some("?") => Entry {
@@ -238,6 +250,7 @@ fn status_entries(output: &[u8]) -> Vec<Entry> {
                 insertions: None,
                 deletions: None,
                 binary: false,
+                lossy,
             },
             _ => continue,
         };
@@ -272,6 +285,40 @@ fn numstat(output: &[u8]) -> HashMap<String, (Option<u64>, Option<u64>, bool)> {
         counts.insert(path, (added.parse().ok(), deleted.parse().ok(), binary));
     }
     counts
+}
+
+/// Rename records of a paired numstat: destination, then its source and
+/// counts.
+type Counts = (Option<u64>, Option<u64>, bool);
+
+fn renamed_counts(output: &[u8]) -> HashMap<String, (String, Counts)> {
+    let mut renames = HashMap::new();
+    let mut fields = output.split(|byte| *byte == 0);
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let line = text(field);
+        let mut parts = line.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if !path.is_empty() {
+            continue;
+        }
+        let (Some(from), Some(to)) = (fields.next(), fields.next()) else {
+            break;
+        };
+        renames.insert(
+            text(to),
+            (
+                text(from),
+                (added.parse().ok(), deleted.parse().ok(), added == "-"),
+            ),
+        );
+    }
+    renames
 }
 
 /// Lines in an untracked file, read without following a symlink or
@@ -326,30 +373,58 @@ fn entries(
         deadline,
         LIST_LIMIT,
     )?;
+    if status.truncated {
+        return Err(TOO_LARGE.into());
+    }
     let mut entries = status_entries(&status.stdout);
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    if shown == 0 {
+        return Ok(entries);
+    }
+    // Plumbing: porcelain `git diff` refreshes, and so locks, the user's
+    // index. Without rename pairing, every path gets its own counts.
     let counts = run(
         root,
-        &[
-            "diff",
-            "--numstat",
-            "-z",
-            "-M",
-            "--no-ext-diff",
-            "--no-textconv",
-            &base.tree,
-        ],
+        &["diff-index", "--numstat", "-z", "--no-renames", &base.tree],
         &[0],
         deadline,
         LIST_LIMIT,
     )?;
+    if counts.truncated {
+        return Err(TOO_LARGE.into());
+    }
     let counts = numstat(&counts.stdout);
+    let renames = if entries.iter().take(shown).any(|entry| entry.from.is_some()) {
+        let paired = run(
+            root,
+            &["diff-index", "--numstat", "-z", "-M", &base.tree],
+            &[0],
+            deadline,
+            LIST_LIMIT,
+        )?;
+        renamed_counts(&paired.stdout)
+    } else {
+        HashMap::new()
+    };
     for entry in entries.iter_mut().take(shown) {
         if entry.kind == "untracked" {
-            let (lines, binary) = count_lines(root, &entry.path);
-            entry.insertions = lines;
-            entry.deletions = lines.map(|_| 0);
-            entry.binary = binary;
+            if Instant::now() < deadline {
+                let (lines, binary) = count_lines(root, &entry.path);
+                entry.insertions = lines;
+                entry.deletions = lines.map(|_| 0);
+                entry.binary = binary;
+            }
+        } else if let Some(from) = &entry.from {
+            // A rename's counts are of the pair, as one paired numstat says.
+            if let Some((added, deleted, binary)) = renames
+                .get(&entry.path)
+                .filter(|(source, _)| source == from)
+                .map(|(_, counts)| *counts)
+            {
+                entry.insertions = added;
+                entry.deletions = deleted;
+                entry.binary = binary;
+            }
         } else if let Some((added, deleted, binary)) = counts.get(&entry.path) {
             entry.insertions = *added;
             entry.deletions = *deleted;
@@ -376,6 +451,10 @@ pub(crate) fn list(root: &Path) -> Result<Value, String> {
 }
 
 /// A path inside the working tree, as given: relative, no `.` or `..`.
+pub(crate) fn check_relative(path: &str) -> Result<(), String> {
+    inside(path)
+}
+
 fn inside(path: &str) -> Result<(), String> {
     let normal = !path.is_empty()
         && Path::new(path)
@@ -400,6 +479,11 @@ pub(crate) fn diff(root: &Path, path: &str) -> Result<Value, String> {
         .into_iter()
         .find(|entry| entry.path == path)
         .ok_or_else(|| format!("invalid_argument: {path} is not among the changed files"))?;
+    if path.ends_with('/') {
+        return Err(format!(
+            "invalid_argument: {path} is a directory (a repository inside this one), not a file"
+        ));
+    }
     let output = if entry.kind == "untracked" {
         // `--no-index` differs from /dev/null with status 1.
         run(
@@ -419,8 +503,10 @@ pub(crate) fn diff(root: &Path, path: &str) -> Result<Value, String> {
             DIFF_LIMIT,
         )?
     } else {
+        // Plumbing, so the user's index is neither refreshed nor locked.
         let mut rest = vec![
-            "diff",
+            "diff-index",
+            "-p",
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
@@ -464,11 +550,17 @@ pub(crate) fn handoff_text(list: &Value, limit: usize) -> String {
             (Some(added), Some(deleted)) => format!("+{added} -{deleted}"),
             _ => "?".to_owned(),
         };
+        // A file name may hold control characters a prompt cannot carry.
+        let path: String = file["path"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect();
         let line = format!(
-            "{} {} {}\n",
+            "{} {} {path}\n",
             file["kind"].as_str().unwrap_or_default(),
             counts,
-            file["path"].as_str().unwrap_or_default()
         );
         // Room for the closing note.
         if text.len() + line.len() + 80 > limit {

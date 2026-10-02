@@ -207,6 +207,13 @@ pub(crate) const VERBS: &[Verb] = &[
         remote: false,
     },
     Verb {
+        name: "checkpoint",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] checkpoint TARGET make [--reason TEXT] | list | show ID [--file PATH] | restore ID PATH... [--confirm TOKEN]",
+        mutating: true,
+        target_stage: None,
+        remote: false,
+    },
+    Verb {
         name: "inbox",
         usage: "masil-agent agent [--socket MASIL_SOCKET] inbox [list] [--all] [--limit N] | ack ID... | read-all [--through SEQ] | enable | disable | status",
         mutating: true,

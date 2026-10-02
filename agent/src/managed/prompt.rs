@@ -411,7 +411,19 @@ impl Manager {
         text: &str,
         operation: Option<u64>,
     ) -> Result<Value, String> {
-        self.deliver(agent, text, operation, None).await
+        self.deliver(agent, text, operation, None, true).await
+    }
+
+    /// A prompt this machine sends for a remote client (endpoint serve).
+    /// It takes no automatic checkpoint: that client cannot reach this
+    /// machine's checkpoints yet (P8).
+    pub async fn prompt_served(
+        &self,
+        agent: &Agent,
+        text: &str,
+        operation: Option<u64>,
+    ) -> Result<Value, String> {
+        self.deliver(agent, text, operation, None, false).await
     }
 
     /// A queued prompt (queue.rs): its operation is `q<item>`, and admission
@@ -423,7 +435,7 @@ impl Manager {
         item: i64,
         revision: i64,
     ) -> Result<Value, String> {
-        self.deliver(agent, text, None, Some((item, revision)))
+        self.deliver(agent, text, None, Some((item, revision)), true)
             .await
     }
 
@@ -433,6 +445,7 @@ impl Manager {
         text: &str,
         operation: Option<u64>,
         queued: Option<(i64, i64)>,
+        checkpoint: bool,
     ) -> Result<Value, String> {
         if text.is_empty()
             || text.len() > 32768
@@ -545,7 +558,14 @@ impl Manager {
                 run: &agent.run,
             });
             let ticket = match store.admit_with(&request, intent, now_ms(), marked.as_ref())? {
-                Admission::Dispatch(ticket) => ticket,
+                Admission::Dispatch(ticket) => {
+                    // A new delivery only, never a replay; started and left
+                    // to run, so the prompt does not wait (docs/checkpoints.md).
+                    if checkpoint {
+                        crate::checkpoint::before_prompt(&agent.cwd, &agent.name, &agent.run);
+                    }
+                    ticket
+                }
                 Admission::Recorded(record) => {
                     return Ok(public_record(&agent.run, operation, &record));
                 }
