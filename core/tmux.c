@@ -432,13 +432,51 @@ getversion(void)
 	return (TMUX_VERSION);
 }
 
+/* Populate the defaults used only by the server, after it has forked. */
+void
+set_default_options(void)
+{
+	const struct options_table_entry	*oe;
+	const char			*s;
+	int				 keys;
+
+	for (oe = options_table; oe->name != NULL; oe++) {
+		/* Command aliases are also needed by the client parser. */
+		if (strcmp(oe->name, "command-alias") == 0)
+			continue;
+		if (oe->scope & OPTIONS_TABLE_SERVER)
+			options_default(global_options, oe);
+		if (oe->scope & OPTIONS_TABLE_SESSION)
+			options_default(global_s_options, oe);
+		if (oe->scope & OPTIONS_TABLE_WINDOW)
+			options_default(global_w_options, oe);
+	}
+
+	/* The shell comes from SHELL or from the user's passwd entry. */
+	options_set_string(global_s_options, "default-shell", 0, "%s",
+	    getshell());
+
+	/* Override keys to vi if VISUAL or EDITOR are set. */
+	if ((s = getenv("VISUAL")) != NULL || (s = getenv("EDITOR")) != NULL) {
+		options_set_string(global_options, "editor", 0, "%s", s);
+		if (strrchr(s, '/') != NULL)
+			s = strrchr(s, '/') + 1;
+		if (strstr(s, "vi") != NULL)
+			keys = MODEKEY_VI;
+		else
+			keys = MODEKEY_EMACS;
+		options_set_number(global_s_options, "status-keys", keys);
+		options_set_number(global_w_options, "mode-keys", keys);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
 	char					*path = NULL, *label = NULL;
 	char					*cause, **var;
 	const char				*s, *cwd;
-	int					 opt, keys, feat = 0, fflag = 0;
+	int					 opt, feat = 0, fflag = 0;
 	uint64_t				 flags = 0;
 	const struct options_table_entry	*oe;
 	u_int					 i;
@@ -570,32 +608,10 @@ main(int argc, char **argv)
 	global_s_options = options_create(NULL);
 	global_w_options = options_create(NULL);
 	for (oe = options_table; oe->name != NULL; oe++) {
-		if (oe->scope & OPTIONS_TABLE_SERVER)
+		if (strcmp(oe->name, "command-alias") == 0) {
 			options_default(global_options, oe);
-		if (oe->scope & OPTIONS_TABLE_SESSION)
-			options_default(global_s_options, oe);
-		if (oe->scope & OPTIONS_TABLE_WINDOW)
-			options_default(global_w_options, oe);
-	}
-
-	/*
-	 * The default shell comes from SHELL or from the user's passwd entry
-	 * if available.
-	 */
-	options_set_string(global_s_options, "default-shell", 0, "%s",
-	    getshell());
-
-	/* Override keys to vi if VISUAL or EDITOR are set. */
-	if ((s = getenv("VISUAL")) != NULL || (s = getenv("EDITOR")) != NULL) {
-		options_set_string(global_options, "editor", 0, "%s", s);
-		if (strrchr(s, '/') != NULL)
-			s = strrchr(s, '/') + 1;
-		if (strstr(s, "vi") != NULL)
-			keys = MODEKEY_VI;
-		else
-			keys = MODEKEY_EMACS;
-		options_set_number(global_s_options, "status-keys", keys);
-		options_set_number(global_w_options, "mode-keys", keys);
+			break;
+		}
 	}
 
 	/*
