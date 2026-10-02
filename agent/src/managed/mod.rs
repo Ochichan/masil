@@ -7,7 +7,7 @@ mod evidence;
 pub(crate) mod failure;
 pub(crate) mod find;
 pub(crate) mod fleet;
-mod inbox;
+pub(crate) mod inbox;
 mod integration;
 mod operations;
 mod prompt;
@@ -19,6 +19,7 @@ mod view;
 use crate::{detection::Engine, native_ui, observation::now_ms, providers};
 pub(crate) use cli::run;
 use evidence::Evidence;
+pub(crate) use operations::Through;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -1356,7 +1357,10 @@ impl Manager {
         )
     }
 
-    pub async fn acknowledge(&self, agent: &Agent) -> Result<(), String> {
+    /// Marks the agent's attention seen, and its inbox events read as far as
+    /// `through`: what the caller displayed, or what existed when it read
+    /// the agent.
+    pub async fn acknowledge(&self, agent: &Agent, through: Through) -> Result<(), String> {
         if agent.state != "blocked" && !agent.returned_idle {
             return Err("agent has no observed attention request".into());
         }
@@ -1366,10 +1370,43 @@ impl Manager {
             .await?;
         self.inbox_apply(vec![inbox::Effect::AckRun {
             run: agent.run.clone(),
-            revision: i64::try_from(agent.tracked.revision).unwrap_or(i64::MAX),
+            through,
         }])
         .await;
         Ok(())
+    }
+
+    /// Marks many agents' attention seen in one native command, so all
+    /// clients redraw once. An agent that changed meanwhile is left alone.
+    /// Their inbox events are read by the caller's fence. Returns how many
+    /// were marked.
+    pub(crate) async fn acknowledge_many(&self, agents: &[Agent]) -> Result<usize, String> {
+        let mut agents: Vec<Agent> = agents
+            .iter()
+            .filter(|agent| agent.state == "blocked" || agent.returned_idle)
+            .cloned()
+            .collect();
+        let mut groups = Vec::new();
+        let mut updates = Vec::new();
+        for (index, agent) in agents.iter().enumerate() {
+            let mut tracked = agent.tracked.clone();
+            tracked.seen = true;
+            let encoded = encode(&tracked)?;
+            groups.push((
+                agent.pane_id.clone(),
+                identity_guard(agent),
+                vec![Self::option(agent, TRACKED, encoded.clone())],
+                format!("{TRACKED_REJECTED} {index}"),
+            ));
+            updates.push((index, encoded));
+        }
+        if groups.is_empty() {
+            return Ok(0);
+        }
+        let uncommitted = self
+            .write_tracked_updates(&mut agents, &groups, &updates)
+            .await?;
+        Ok(groups.len() - uncommitted.len())
     }
 
     pub async fn focus(&self, agent: &Agent) -> Result<(), String> {
@@ -1661,6 +1698,14 @@ fn screen_effects(
             run: run.clone(),
             kinds: inbox::WAITING,
             resolution: "left_blocked",
+        });
+    }
+    // A new turn answers the last one's end: the person is at the agent.
+    if previous.run == run && previous.state != "working" && tracked.state == "working" {
+        effects.push(inbox::Effect::ResolveRun {
+            run: run.clone(),
+            kinds: inbox::TURN_ENDS,
+            resolution: "next_turn",
         });
     }
     let event = |kind: &'static str| inbox::Effect::Event {
@@ -2390,6 +2435,43 @@ async fn identify_foreground(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_new_turn_resolves_the_last_turn_end() {
+        let tracked = |state: &str, revision| Tracked {
+            run: "r1".into(),
+            state: state.into(),
+            report_sequence: 0,
+            revision,
+            seen: false,
+            returned_idle: false,
+        };
+        let effects = screen_effects(
+            "codex",
+            "%1",
+            &tracked("idle", 3),
+            &tracked("working", 4),
+            false,
+        );
+        assert!(effects.iter().any(|effect| matches!(effect,
+            inbox::Effect::ResolveRun { run, kinds, resolution: "next_turn" }
+                if run == "r1" && *kinds == inbox::TURN_ENDS)));
+        // Working again after working is no new turn; another run is a run end.
+        let again = screen_effects(
+            "codex",
+            "%1",
+            &tracked("working", 4),
+            &tracked("working", 5),
+            false,
+        );
+        assert!(!again.iter().any(|effect| matches!(
+            effect,
+            inbox::Effect::ResolveRun {
+                resolution: "next_turn",
+                ..
+            }
+        )));
+    }
+
     #[test]
     fn tracked_rejections_name_their_groups() {
         let stdout = format!("{TRACKED_REJECTED} 4\nother\n{TRACKED_REJECTED} 6\n");

@@ -196,6 +196,10 @@ pub(crate) struct WatchControl {
     pub wake: Notify,
     /// Re-read detection manifests before the next pass.
     pub reload: AtomicBool,
+    /// A report or inbox write happened: look at the panes.
+    pub poked: AtomicBool,
+    /// Events were read: count again for the badge.
+    pub recount: AtomicBool,
     /// The coordinator is ending: finish the current pass and return.
     pub stopping: AtomicBool,
     pub report: Mutex<WatchReport>,
@@ -283,6 +287,7 @@ pub(crate) async fn watch(
     let mut busy = false;
     let mut absent: HashMap<String, u64> = HashMap::new();
     let mut stood_back = 0;
+    let mut badge = Badge::read(&manager).await;
     let mut first = true;
     loop {
         let interval = if busy || now_ms() < hot_until {
@@ -290,12 +295,16 @@ pub(crate) async fn watch(
         } else {
             base
         };
+        // A badge value held back by the once-a-second limit is written as
+        // soon as the second is over.
+        let interval = badge
+            .retry_in(now_ms())
+            .map_or(interval, |retry| interval.min(retry));
         let mut woken = first || retry;
         if !first {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = control.wake.notified() => {
-                    woken = true;
                     // Several pokes in a burst make one pass.
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
@@ -303,8 +312,10 @@ pub(crate) async fn watch(
         }
         first = false;
         if control.stopping.load(Ordering::SeqCst) {
+            badge.clear(&manager).await;
             return;
         }
+        woken |= control.poked.swap(false, Ordering::SeqCst);
         if control.reload.swap(false, Ordering::SeqCst) {
             if let Err(error) = manager.reload() {
                 errors.note(&error, &log, &control);
@@ -312,6 +323,20 @@ pub(crate) async fn watch(
             woken = true;
         }
         let started = now_ms();
+        // Its own clock: passes count often while agents work, and the
+        // shown value must still be read back now and then.
+        let periodic = started.saturating_sub(badge.reread_at) >= timing.ended_after;
+        if periodic {
+            badge.reread_at = started;
+            badge.reread(&manager).await;
+        }
+        if control.recount.swap(false, Ordering::SeqCst)
+            || woken
+            || periodic
+            || badge.retry_in(started).is_some_and(|retry| retry.is_zero())
+        {
+            badge.count(&manager, started).await;
+        }
         if started.saturating_sub(last_reopen) >= timing.reopen {
             if let Some(resident) = &manager.resident
                 && let Ok(mut store) = resident.store.lock()
@@ -422,6 +447,8 @@ pub(crate) async fn watch(
             if changed {
                 hot_until = now_ms() + timing.hot;
             }
+            // A pass can record or resolve events.
+            badge.count(&manager, now_ms()).await;
         }
         let panes: HashSet<String> = signature
             .lines()
@@ -473,6 +500,107 @@ pub(crate) async fn watch(
             report.last_tick_ms = started;
             report.stood_back = count;
             report.last_stood_back = last;
+        }
+    }
+}
+
+/// The status-line badge: the unseen count in a server option, written
+/// only when it changes and at most once a second, since every option write
+/// redraws every client.
+struct Badge {
+    /// The value the server shows; None when unknown.
+    shown: Option<i64>,
+    /// A value waiting for the once-a-second limit.
+    pending: Option<i64>,
+    last_write: u64,
+    counted: u64,
+    reread_at: u64,
+}
+
+const BADGE_GAP_MS: u64 = 1_000;
+
+impl Badge {
+    async fn read(manager: &Manager) -> Self {
+        let shown = manager
+            .command(&["show-options", "-gqv", crate::coordinator::BADGE_OPTION])
+            .await
+            .ok()
+            .map(|text| text.trim().parse::<i64>().unwrap_or(0));
+        Self {
+            shown,
+            pending: None,
+            last_write: 0,
+            counted: 0,
+            reread_at: 0,
+        }
+    }
+
+    fn retry_in(&self, now: u64) -> Option<Duration> {
+        self.pending?;
+        Some(Duration::from_millis(
+            (self.last_write + BADGE_GAP_MS).saturating_sub(now),
+        ))
+    }
+
+    async fn count(&mut self, manager: &Manager, now: u64) {
+        self.counted = now;
+        let Ok(count) = manager
+            .with_resident_store(|store| store.inbox_unseen_count())
+            .await
+        else {
+            // Wait a gap before trying again, never in a tight loop.
+            self.last_write = now;
+            return;
+        };
+        self.update(manager, count.unwrap_or(0), now).await;
+    }
+
+    /// Reads the shown value again: another process (`inbox status`, a
+    /// stale coordinator) may have changed it.
+    async fn reread(&mut self, manager: &Manager) {
+        if let Ok(text) = manager
+            .command(&["show-options", "-gqv", crate::coordinator::BADGE_OPTION])
+            .await
+        {
+            self.shown = Some(text.trim().parse::<i64>().unwrap_or(0));
+        }
+    }
+
+    async fn update(&mut self, manager: &Manager, count: i64, now: u64) {
+        if self.shown == Some(count) {
+            self.pending = None;
+            return;
+        }
+        if now.saturating_sub(self.last_write) < BADGE_GAP_MS {
+            self.pending = Some(count);
+            return;
+        }
+        let value = count.to_string();
+        let args: &[&str] = if count == 0 {
+            &["set-option", "-gqu", crate::coordinator::BADGE_OPTION]
+        } else {
+            &[
+                "set-option",
+                "-gq",
+                crate::coordinator::BADGE_OPTION,
+                &value,
+            ]
+        };
+        // A failed write is retried after a gap, never in a tight loop.
+        self.last_write = now;
+        if manager.command(args).await.is_ok() {
+            self.shown = Some(count);
+            self.pending = None;
+        } else {
+            self.pending = Some(count);
+        }
+    }
+
+    async fn clear(&mut self, manager: &Manager) {
+        if self.shown != Some(0) {
+            let _ = manager
+                .command(&["set-option", "-gqu", crate::coordinator::BADGE_OPTION])
+                .await;
         }
     }
 }

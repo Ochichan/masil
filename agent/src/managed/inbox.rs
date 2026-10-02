@@ -6,7 +6,7 @@
 //! opens the store.
 
 use super::Manager;
-use super::operations::{InboxEvent, Store};
+use super::operations::{InboxEvent, Store, Through};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -30,8 +30,9 @@ pub(super) enum Effect {
         source_ref: String,
         resolution: &'static str,
     },
-    /// The person acknowledged the run at this tracked revision.
-    AckRun { run: String, revision: i64 },
+    /// The person acknowledged the run; events they cannot have seen yet
+    /// stay unread.
+    AckRun { run: String, through: Through },
     /// The run's open events of these kinds no longer need attention.
     ResolveRun {
         run: String,
@@ -42,6 +43,8 @@ pub(super) enum Effect {
 
 /// Kinds that wait for the person until resolved.
 pub(super) const WAITING: &[&str] = &["blocked", "approval_requested", "question_asked"];
+/// Kinds that report a finished turn; the next turn resolves them.
+pub(super) const TURN_ENDS: &[&str] = &["turn_completed", "returned_idle"];
 pub(super) const ALL: &[&str] = &[
     "blocked",
     "approval_requested",
@@ -148,7 +151,7 @@ fn apply(store: &mut Store, effects: &[Effect]) -> Result<(), String> {
                 kinds,
                 resolution,
             } => store.resolve_run(run, kinds, resolution, now).map(drop),
-            Effect::AckRun { run, revision } => store.ack_run(run, *revision, now).map(drop),
+            Effect::AckRun { run, through } => store.ack_run(run, *through, now).map(drop),
         };
         if let Err(error) = applied {
             first_error.get_or_insert(error);
@@ -241,6 +244,120 @@ impl Manager {
     }
 }
 
+/// One inbox event as the management window lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct InboxItem {
+    pub id: i64,
+    pub seq: i64,
+    pub source: String,
+    pub pane: String,
+    pub run: String,
+    pub revision: Option<i64>,
+    pub kind: String,
+    pub summary: Option<Value>,
+    pub observed_ms: u64,
+    pub read: bool,
+    pub resolution: Option<String>,
+}
+
+/// The inbox as the management window shows it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct InboxView {
+    pub enabled: bool,
+    pub unseen: i64,
+    pub events: Vec<InboxItem>,
+}
+
+impl InboxView {
+    fn from_value(value: &Value) -> Self {
+        let events = value["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|event| {
+                Some(InboxItem {
+                    id: event["id"].as_i64()?,
+                    seq: event["seq"].as_i64()?,
+                    source: event["source"].as_str()?.to_owned(),
+                    pane: event["pane"].as_str()?.to_owned(),
+                    run: event["run"].as_str()?.to_owned(),
+                    revision: event["revision"].as_i64(),
+                    kind: event["kind"].as_str()?.to_owned(),
+                    summary: event
+                        .get("summary")
+                        .filter(|value| !value.is_null())
+                        .cloned(),
+                    observed_ms: event["observed_ms"].as_u64()?,
+                    read: event["read"].as_bool().unwrap_or(false),
+                    resolution: event["resolution"].as_str().map(str::to_owned),
+                })
+            })
+            .collect();
+        Self {
+            enabled: value["enabled"].as_bool().unwrap_or(false),
+            unseen: value["unseen"].as_i64().unwrap_or(0),
+            events,
+        }
+    }
+}
+
+impl Manager {
+    /// The server's cached inbox switch; one native command, no store.
+    pub(crate) async fn inbox_switch(&self) -> bool {
+        match self
+            .command(&["display-message", "-p", "#{@masil-inbox}"])
+            .await
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("on") => true,
+            // Unknown after a server start: the store decides and fills it.
+            Ok("") => self.inbox_instance().await.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The inbox read-only, for the management window: unseen events, or
+    /// the most recent ones when `all`.
+    pub(crate) async fn inbox_view(&self, all: bool, limit: usize) -> Result<InboxView, String> {
+        let socket = self.native.socket.clone();
+        let value = tokio::task::spawn_blocking(move || read(&socket, all, limit))
+            .await
+            .map_err(|error| error.to_string())??;
+        Ok(InboxView::from_value(&value))
+    }
+
+    /// Marks events read, or everything through `through_seq`, in the store
+    /// the server recorded. Never creates a store; nudges a running
+    /// coordinator to recount its badge.
+    pub(crate) async fn inbox_mark_read(
+        &self,
+        ids: Vec<i64>,
+        through_seq: Option<i64>,
+    ) -> Result<(), String> {
+        let instance = self
+            .inbox_instance()
+            .await
+            .ok_or("inbox_off: the inbox is off or has no store")?;
+        let socket = self.native.socket.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = Store::open_existing(&socket, &instance)?
+                .ok_or("store_replaced: the operation store is missing or replaced")?;
+            if !ids.is_empty() {
+                store.ack_events(&ids, now_ms())?;
+            }
+            if let Some(through) = through_seq {
+                store.read_all(Some(through))?;
+            }
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        crate::coordinator::recount(&self.native.socket);
+        Ok(())
+    }
+}
+
 /// Switches the inbox on or off. Enable sets the cached switch first and
 /// disable clears the store's switch first, so a failure part way leaves
 /// the cache on, which only costs a store open per event.
@@ -263,8 +380,19 @@ pub(super) async fn set_enabled(manager: &Manager, enabled: bool) -> Result<Valu
     let mut store = manager.operation_store().await?;
     store.set_inbox_enabled(enabled)?;
     if !enabled {
+        // The badge goes with the switch, even with no coordinator to clear
+        // it.
         manager
-            .command(&["set-option", "-gq", "@masil-inbox", "off"])
+            .command(&[
+                "set-option",
+                "-gq",
+                "@masil-inbox",
+                "off",
+                ";",
+                "set-option",
+                "-gqu",
+                crate::coordinator::BADGE_OPTION,
+            ])
             .await?;
     }
     let socket = manager.native.socket.clone();
@@ -346,6 +474,7 @@ pub(super) async fn command(manager: &Manager, args: &[String]) -> Result<Value,
                 .map_err(|_| "invalid_argument: event IDs are integers")?;
             let mut store = manager.operation_store().await?;
             let missing = store.ack_events(&ids, now_ms())?;
+            crate::coordinator::recount(&manager.native.socket);
             if !missing.is_empty() {
                 return Err(format!("target_absent: no inbox event {missing:?}"));
             }
@@ -361,15 +490,21 @@ pub(super) async fn command(manager: &Manager, args: &[String]) -> Result<Value,
                 _ => None,
             };
             let mut store = manager.operation_store().await?;
-            Ok(json!({"fence": store.read_all(through)?}))
+            let fence = store.read_all(through)?;
+            crate::coordinator::recount(&manager.native.socket);
+            Ok(json!({"fence": fence}))
         }
         ["enable"] => set_enabled(manager, true).await,
         ["disable"] => set_enabled(manager, false).await,
         ["status"] => {
             let socket = manager.native.socket.clone();
-            let stored = tokio::task::spawn_blocking(move || Store::inbox_flag(&socket))
+            let checked = tokio::task::spawn_blocking(move || Store::inbox_flag_checked(&socket))
                 .await
-                .unwrap_or(false);
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            // A store that cannot be read now repairs nothing.
+            let readable = checked.is_ok();
+            let stored = checked.unwrap_or(false);
             let cached = manager
                 .command(&["show-options", "-gqv", "@masil-inbox"])
                 .await?
@@ -377,7 +512,7 @@ pub(super) async fn command(manager: &Manager, args: &[String]) -> Result<Value,
                 .to_owned();
             let wanted = if stored { "on" } else { "off" };
             // The store decides; a stale cache is corrected here.
-            let repaired = cached != wanted;
+            let repaired = readable && cached != wanted;
             if repaired {
                 manager
                     .command(&["set-option", "-gq", "@masil-inbox", wanted])
@@ -396,6 +531,40 @@ pub(super) async fn command(manager: &Manager, args: &[String]) -> Result<Value,
                 }
                 None => false,
             };
+            // The badge shows the store's unseen count, or nothing. A failed
+            // read repairs nothing.
+            let unseen = if !readable {
+                None
+            } else if stored {
+                manager
+                    .inbox_view(false, 1)
+                    .await
+                    .ok()
+                    .map(|view| view.unseen)
+            } else {
+                Some(0)
+            };
+            let badge = manager
+                .command(&["show-options", "-gqv", crate::coordinator::BADGE_OPTION])
+                .await?
+                .trim()
+                .parse::<i64>()
+                .unwrap_or(0);
+            let repair = unseen.filter(|unseen| *unseen != badge);
+            if let Some(unseen) = repair {
+                let value = unseen.to_string();
+                let args: &[&str] = if unseen == 0 {
+                    &["set-option", "-gqu", crate::coordinator::BADGE_OPTION]
+                } else {
+                    &[
+                        "set-option",
+                        "-gq",
+                        crate::coordinator::BADGE_OPTION,
+                        &value,
+                    ]
+                };
+                manager.command(args).await?;
+            }
             let socket = manager.native.socket.clone();
             let coordinator =
                 tokio::task::spawn_blocking(move || crate::coordinator::status(&socket))
@@ -415,6 +584,8 @@ pub(super) async fn command(manager: &Manager, args: &[String]) -> Result<Value,
                 "cache": cached,
                 "repaired": repaired,
                 "recording": recording,
+                "unseen": unseen,
+                "badge_repaired": repair.is_some(),
                 "coordinator": coordinator,
             }))
         }

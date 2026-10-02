@@ -425,11 +425,15 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             return print_record(&manager, &record, args.len() == 1).await;
         }
         "ack" if args.len() == 5 && args[1] == "--run" && args[3] == "--revision" => {
+            // Events recorded after this read were not shown to the caller.
+            let read_at = crate::observation::now_ms();
             let agent = manager.get(&args[0]).await?;
             if agent.run != args[2] || agent.revision != args[4] {
                 return Err("identity_mismatch: attention changed since it was displayed".into());
             }
-            manager.acknowledge(&agent).await?;
+            manager
+                .acknowledge(&agent, super::Through::Before(read_at))
+                .await?;
             print(&json!({"stage":"seen","revision":agent.revision}))?;
         }
         "send-keys" if args.len() >= 2 => {

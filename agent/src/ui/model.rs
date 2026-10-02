@@ -114,6 +114,19 @@ pub enum Effect {
         language: Language,
         theme: Theme,
     },
+    /// Focus the pane of an inbox event's run, without reading it.
+    InboxFocus {
+        pane: String,
+        run: String,
+    },
+    /// Mark one inbox event read.
+    InboxRead {
+        id: i64,
+    },
+    /// Mark every event through this sequence read.
+    InboxReadAll {
+        through: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -163,6 +176,10 @@ pub(crate) enum Action {
     InterruptAgent,
     ReadScreen,
     CloseAgent,
+    /// Open or close the inbox view.
+    Inbox,
+    /// Focus the oldest unseen inbox event's pane.
+    NextUnseen,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,6 +205,7 @@ pub(crate) enum HitTarget {
     ContextItem(Action),
     DismissOverlay,
     OverlaySurface,
+    InboxRow(i64),
 }
 
 #[derive(Clone, Debug)]
@@ -384,6 +402,8 @@ pub struct App {
     /// Server status line on the last footer row, and whether one is offline.
     pub(crate) endpoint_line: Option<(String, bool)>,
     pub(crate) last_area: Rect,
+    /// The inbox view of the management window.
+    pub(crate) inbox: super::inbox::InboxState,
 }
 
 impl App {
@@ -435,6 +455,7 @@ impl App {
             toast: None,
             endpoint_line: None,
             last_area: Rect::default(),
+            inbox: Default::default(),
         }
     }
 
@@ -678,6 +699,8 @@ impl App {
                             && row.activity == "idle"
                     })
             }
+            Action::Inbox => self.managed,
+            Action::NextUnseen => self.managed && self.inbox.oldest_unseen().is_some(),
         }
     }
 
@@ -726,6 +749,15 @@ impl App {
             Action::InterruptAgent => Effect::InterruptAgent,
             Action::ReadScreen => Effect::ReadScreen,
             Action::CloseAgent => Effect::CloseAgent,
+            Action::Inbox => {
+                self.toggle_inbox();
+                return None;
+            }
+            Action::NextUnseen => {
+                let effect = self.next_unseen().into_iter().next();
+                self.dirty = true;
+                return effect;
+            }
         };
         self.toast = None;
         self.dirty = true;

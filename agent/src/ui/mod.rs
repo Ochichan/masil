@@ -8,6 +8,7 @@ FORM: User-pinned persistent sidebar and full management view, seed e2f9e8dc.
 FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
 */
 mod i18n;
+mod inbox;
 mod input;
 mod managed;
 pub(crate) mod model;

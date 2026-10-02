@@ -317,11 +317,39 @@ impl Fleet {
             self.local.interrupt(agent, None).await
         }
     }
-    pub async fn acknowledge(&self, agent: &Agent) -> Result<(), String> {
+    /// This server's inbox for the management window; empty without a store
+    /// read while the inbox is off.
+    pub async fn inbox_view(&self, all: bool) -> Result<super::inbox::InboxView, String> {
+        if !self.local.inbox_switch().await {
+            return Ok(super::inbox::InboxView::default());
+        }
+        self.local.inbox_view(all, 100).await
+    }
+
+    pub async fn inbox_mark_read(
+        &self,
+        ids: Vec<i64>,
+        through_seq: Option<i64>,
+    ) -> Result<(), String> {
+        self.local.inbox_mark_read(ids, through_seq).await
+    }
+
+    /// Every local agent, whatever the saved view hides.
+    pub async fn local_agents(&self) -> Result<Vec<Agent>, String> {
+        self.local.list().await
+    }
+
+    pub async fn acknowledge_many(&self, agents: &[Agent]) -> Result<usize, String> {
+        self.local.acknowledge_many(agents).await
+    }
+
+    /// `through` bounds the local inbox read to what the caller displayed; a
+    /// remote server bounds it by when it read the agent.
+    pub async fn acknowledge(&self, agent: &Agent, through: super::Through) -> Result<(), String> {
         if let Some(e) = self.remote(agent)? {
             self.action(e, agent, Action::Ack).await.map(|_| ())
         } else {
-            self.local.acknowledge(agent).await
+            self.local.acknowledge(agent, through).await
         }
     }
     pub async fn close(&self, agent: &Agent) -> Result<(), String> {

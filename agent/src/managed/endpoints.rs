@@ -793,6 +793,8 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
                 .await
         }
         Request::Action { expected, action } => {
+            // Events recorded after this read were not shown to the caller.
+            let read_at = crate::observation::now_ms();
             let agent = manager.get(&expected.pane_id).await?;
             let allow_revision_change = matches!(
                 action,
@@ -822,7 +824,9 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
                     super::remote_cli::connection_status(manager, &agent, &lease).await
                 }
                 Action::Ack => {
-                    manager.acknowledge(&agent).await?;
+                    manager
+                        .acknowledge(&agent, super::Through::Before(read_at))
+                        .await?;
                     Ok(json!({"stage":"seen", "revision":agent.revision}))
                 }
                 Action::Close => {

@@ -198,6 +198,29 @@ impl App {
             2
         };
         let footer_height = if dense { 1 } else { 2 };
+        // The inbox view replaces filters, search, list and actions: they all
+        // act on agents, which this view does not select.
+        if self.managed && self.inbox.open {
+            let body_height = area
+                .height
+                .saturating_sub(header_height + footer_height)
+                .max(1);
+            let header = Rect::new(area.x, area.y, area.width, header_height);
+            let body = Rect::new(area.x, area.y + header_height, area.width, body_height);
+            let footer_y = body.bottom();
+            let footer = Rect::new(
+                area.x,
+                footer_y,
+                area.width,
+                footer_height.min(area.bottom().saturating_sub(footer_y)),
+            );
+            self.draw_header(frame, header, palette, dense, gutter);
+            self.draw_inbox(frame, body, palette);
+            self.draw_footer(frame, footer, palette, gutter);
+            self.draw_overlay(frame, area, palette);
+            self.dirty = false;
+            return;
+        }
         let fixed = header_height + filters_height + search_height + actions_height + footer_height;
         let body_height = area.height.saturating_sub(fixed).max(1);
         let mut y = area.y;
@@ -423,6 +446,7 @@ impl App {
                         format!(" {}", tr(self.language, Text::Agents)),
                         Style::default().fg(palette.text),
                     ),
+                    self.inbox_span(palette),
                 ],
                 title_width as usize,
             );
@@ -486,14 +510,21 @@ impl App {
         let (short, _) = self.connection_label(true, palette);
         let view = Span::styled(format!("  {view}"), Style::default().fg(palette.text));
         let status = |text: String| Span::styled(text, Style::default().fg(connection_color));
+        let inbox = self.inbox_span(palette);
         let titles = [
             vec![
                 product.clone(),
                 view.clone(),
+                inbox.clone(),
                 status(format!("  {connection}")),
             ],
-            vec![product.clone(), view, status(format!("  {short}"))],
-            vec![product, status(format!("  {short}"))],
+            vec![
+                product.clone(),
+                view,
+                inbox.clone(),
+                status(format!("  {short}")),
+            ],
+            vec![product, inbox, status(format!("  {short}"))],
             vec![status(short.to_owned())],
         ];
         // Title and control labels shorten in turns until both fit.
@@ -1603,7 +1634,27 @@ impl App {
     }
 
     /// The hint for the hovered target or focus: full, short, then minimal.
+    /// "  Inbox N" in the header while the inbox is on, warning-coloured
+    /// when something is unseen.
+    fn inbox_span(&self, palette: Palette) -> Span<'static> {
+        match self.inbox_label() {
+            Some(label) => {
+                let color = if self.inbox.view.unseen > 0 || self.inbox.mismatch {
+                    palette.warning
+                } else {
+                    palette.muted
+                };
+                Span::styled(format!("  {label}"), Style::default().fg(color))
+            }
+            None => Span::raw(""),
+        }
+    }
+
     fn current_hint(&self) -> [&'static str; 3] {
+        if self.managed && self.inbox.open {
+            let hint = self.inbox_hint();
+            return [hint, hint, tr(self.language, Text::HelpHintShort)];
+        }
         let hint = |full, short| {
             [
                 tr(self.language, full),
@@ -2173,10 +2224,12 @@ pub(super) fn action_shortcut(action: Action) -> &'static str {
         Action::InterruptAgent => "x",
         Action::ReadScreen => "v",
         Action::CloseAgent => "X",
+        Action::Inbox => "i",
+        Action::NextUnseen => "u",
     }
 }
 
-fn utc_timestamp(milliseconds: u64) -> String {
+pub(super) fn utc_timestamp(milliseconds: u64) -> String {
     let seconds = milliseconds / 1_000;
     let millis = milliseconds % 1_000;
     let days = (seconds / 86_400) as i64;
@@ -2368,6 +2421,73 @@ mod tests {
         app.set_native_available(true);
         terminal.draw(|frame| app.draw(frame)).unwrap();
         app
+    }
+
+    #[test]
+    fn the_inbox_view_replaces_the_agent_controls() {
+        use crate::managed::inbox::{InboxItem, InboxView};
+        let width = 110;
+        let height = 24;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        app.managed = true;
+        app.apply_snapshot(snapshot());
+        app.set_connection(true, None);
+        app.set_native_available(true);
+        app.inbox.apply(InboxView {
+            enabled: true,
+            unseen: 1,
+            events: vec![InboxItem {
+                id: 7,
+                seq: 40,
+                source: "hook:claude".into(),
+                pane: "%3".into(),
+                run: "r".into(),
+                revision: None,
+                kind: "approval_requested".into(),
+                summary: Some(serde_json::json!({"tool": "Bash", "command": "cargo test"})),
+                observed_ms: 0,
+                read: false,
+                resolution: None,
+            }],
+        });
+        app.inbox
+            .set_names(vec![("%3".into(), "r".into(), "builder".into())]);
+        app.toggle_inbox();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        for wanted in [
+            "Inbox 1",
+            "Approval",
+            "builder",
+            "hook:claude",
+            "Bash: cargo test",
+            "00:00:00",
+        ] {
+            assert!(text.contains(wanted), "{wanted} missing in\n{text}");
+        }
+        assert!(
+            app.hits
+                .iter()
+                .any(|hit| hit.target == HitTarget::InboxRow(7))
+        );
+        assert!(
+            !app.hits
+                .iter()
+                .any(|hit| matches!(hit.target, HitTarget::Filter(_) | HitTarget::Action(_)))
+        );
+        // The same inbox again changes nothing to draw.
+        assert!(!app.dirty);
+        assert!(!app.inbox.apply(app.inbox.view.clone()));
     }
 
     #[test]

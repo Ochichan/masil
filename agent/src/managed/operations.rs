@@ -295,6 +295,15 @@ fn now_ms() -> u64 {
 
 pub(super) const STORE_NEWER: &str = "store_newer";
 
+/// How far a run-wide read reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Through {
+    /// Up to this store sequence, the newest a client displayed.
+    Seq(i64),
+    /// Events recorded at or before this time, when a command read the agent.
+    Before(u64),
+}
+
 fn reader_allowed(minimum: Option<i64>) -> Result<(), String> {
     match minimum {
         Some(minimum) if minimum > READER_GENERATION => Err(format!(
@@ -1266,12 +1275,12 @@ impl Store {
         Some((store.inbox_enabled().unwrap_or(false), instance))
     }
 
-    /// The store's inbox switch, read without creating or changing anything.
-    pub fn inbox_flag(socket: &Path) -> bool {
-        Self::readonly(socket)
-            .ok()
-            .flatten()
-            .is_some_and(|store| store.inbox_enabled().unwrap_or(false))
+    /// The store's inbox switch, or why it could not be read.
+    pub fn inbox_flag_checked(socket: &Path) -> Result<bool, String> {
+        match Self::readonly(socket)? {
+            Some(store) => store.inbox_enabled(),
+            None => Ok(false),
+        }
     }
 
     /// The inbox read without creating or changing anything; None when there
@@ -1293,6 +1302,7 @@ impl Store {
         }
         let mut value = store.inbox(all, limit)?;
         value["enabled"] = json!(store.inbox_enabled()?);
+        value["unseen"] = json!(store.inbox_unseen_count()?);
         Ok(Some(value))
     }
 
@@ -1421,7 +1431,30 @@ impl Store {
                 ],
             )
             .map_err(sql)?;
-        let id = (inserted != 0).then(|| tx.last_insert_rowid());
+        let mut id = (inserted != 0).then(|| tx.last_insert_rowid());
+        if id.is_none() && event.source.starts_with("hook:") && event.kind == "turn_completed" {
+            // The same turn ends again after another Stop hook made it go
+            // on, and the first end was resolved by the work in between or
+            // already read: this end is new to the person. Hooks are not
+            // redelivered, so a repeat is a real second end.
+            id = tx
+                .query_row(
+                    "UPDATE inbox_events SET store_seq = ?3, observed_ms = ?4, acked_ms = NULL,
+                       resolved_ms = NULL, resolution = NULL
+                     WHERE source = ?1 AND source_ref = ?2
+                       AND (resolution = 'next_turn' OR (resolved_ms IS NULL AND acked_ms IS NOT NULL))
+                     RETURNING id",
+                    params![
+                        event.source,
+                        event.source_ref,
+                        seq,
+                        event.observed_ms as i64
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql)?;
+        }
         // Also for a repeated callback: a turn can end twice with one ID
         // when another Stop hook made it continue.
         if event.source.starts_with("hook:") {
@@ -1662,35 +1695,42 @@ impl Store {
         Ok(missing)
     }
 
-    /// Marks a run's events read up to the screen event of `revision`, or
-    /// up to the run's newest event when that revision left no event.
-    pub fn ack_run(&mut self, run: &str, revision: i64, now: u64) -> Result<usize, String> {
+    /// Marks a run's events read, but only those the person can have seen:
+    /// up to a sequence a client displayed, or recorded before the moment a
+    /// command read the agent. Unknown outcomes are read one by one.
+    pub fn ack_run(&mut self, run: &str, through: Through, now: u64) -> Result<usize, String> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
         Self::check_reader_in(&tx)?;
-        let through: Option<i64> = tx
-            .query_row(
-                "SELECT COALESCE(
-                   (SELECT store_seq FROM inbox_events WHERE run = ?1 AND source = 'screen' AND revision = ?2),
-                   (SELECT MAX(store_seq) FROM inbox_events WHERE run = ?1))",
-                params![run, revision],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        let Some(through) = through else {
-            return Ok(0);
+        let (seq, before) = match through {
+            Through::Seq(seq) => (seq, i64::MAX),
+            Through::Before(at) => (i64::MAX, at as i64),
         };
         let changed = tx
             .execute(
-                "UPDATE inbox_events SET acked_ms = ?3
-                 WHERE run = ?1 AND store_seq <= ?2 AND acked_ms IS NULL",
-                params![run, through, now as i64],
+                "UPDATE inbox_events SET acked_ms = ?4
+                 WHERE run = ?1 AND source != 'operation' AND acked_ms IS NULL
+                   AND store_seq <= ?2 AND observed_ms <= ?3",
+                params![run, seq, before, now as i64],
             )
             .map_err(sql)?;
         tx.commit().map_err(sql)?;
         Ok(changed)
+    }
+
+    /// The events a client lists as unseen, counted the same way.
+    pub fn inbox_unseen_count(&self) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM inbox_events
+                 WHERE acked_ms IS NULL AND resolved_ms IS NULL
+                   AND store_seq > (SELECT value FROM meta WHERE name = 'inbox_fence')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)
     }
 
     /// Marks everything up to `through` (default: now) read; events written
@@ -2420,7 +2460,7 @@ mod tests {
         };
         store.record_event(&screen("r2:9", 9, 3)).unwrap();
         store.record_event(&screen("r2:10", 10, 4)).unwrap();
-        assert_eq!(store.ack_run("r2", 9, 5).unwrap(), 1);
+        assert_eq!(store.ack_run("r2", Through::Before(3), 5).unwrap(), 1);
         assert_eq!(unread(&store), ["b", "r2:10"]);
         let missing = store.ack_events(&[999], 6).unwrap();
         assert_eq!(missing, [999]);
@@ -2593,6 +2633,64 @@ mod tests {
         assert_eq!(runs, ["r1", "r2"]);
         assert_eq!(store.resolve_ended_run("r1", 20, 40).unwrap(), 1);
         assert_eq!(unread(&store), ["b", "c", "run:r1/prompt/1"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn run_reads_stop_at_what_was_shown_and_skip_unknown_outcomes() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        store
+            .record_event(&event("p1", "r1", "approval_requested", 10))
+            .unwrap();
+        store
+            .record_event(&event("p2", "r1", "approval_requested", 20))
+            .unwrap();
+        let ticket = dispatch(store.admit(&request("d1"), json!({}), 5).unwrap());
+        store.finish(&ticket, UNKNOWN, "test", None, 6).unwrap();
+        assert_eq!(store.inbox_unseen_count().unwrap(), 3);
+        // A client that showed only p1 (seq 1) reads only p1.
+        let p1_seq: i64 = store
+            .conn
+            .query_row(
+                "SELECT store_seq FROM inbox_events WHERE source_ref = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(store.ack_run("r1", Through::Seq(p1_seq), 30).unwrap(), 1);
+        assert_eq!(unread(&store), ["p2", "run:r1/prompt/1"]);
+        // A command that read the agent at 15 leaves p2 (recorded at 20).
+        assert_eq!(store.ack_run("r1", Through::Before(15), 31).unwrap(), 0);
+        assert_eq!(store.ack_run("r1", Through::Before(25), 32).unwrap(), 1);
+        // The unknown outcome stays for its own read.
+        assert_eq!(unread(&store), ["run:r1/prompt/1"]);
+        assert_eq!(store.inbox_unseen_count().unwrap(), 1);
+        store.read_all(None).unwrap();
+        assert_eq!(store.inbox_unseen_count().unwrap(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_turn_that_ends_again_after_going_on_is_unseen_again() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        let end = |at| InboxEvent {
+            source: "hook:claude",
+            ..event("turn_completed:r1:p1", "r1", "turn_completed", at)
+        };
+        store.record_event(&end(10)).unwrap();
+        store
+            .resolve_run("r1", &["turn_completed"], "next_turn", 20)
+            .unwrap();
+        assert!(unread(&store).is_empty());
+        // Another Stop hook made the turn go on; it ends again, same key.
+        assert!(store.record_event(&end(30)).unwrap().is_some());
+        assert_eq!(unread(&store), ["turn_completed:r1:p1"]);
+        // A plain duplicate stays one event.
+        assert_eq!(store.record_event(&end(31)).unwrap(), None);
         fs::remove_dir_all(dir).unwrap();
     }
 

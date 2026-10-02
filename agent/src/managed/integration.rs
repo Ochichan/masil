@@ -2551,6 +2551,15 @@ mod tests {
     }
 
     #[test]
+    fn a_subagent_stop_is_not_a_turn_end() {
+        // Claude reports a subagent's end separately; it must not resolve
+        // the parent's waiting events or count as its turn end.
+        let payload =
+            object(r#"{"hook_event_name":"SubagentStop","session_id":"s1","agent_id":"a1"}"#);
+        assert!(map_callback(target("claude").unwrap(), None, &payload).is_err());
+    }
+
+    #[test]
     fn summaries_redact_before_they_are_truncated() {
         let redacted = redact_text("API_TOKEN=first --password=third --token fourth");
         assert_eq!(redacted, "API_TOKEN=*** --password=*** --token ***");

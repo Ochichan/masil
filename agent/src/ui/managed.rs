@@ -8,7 +8,7 @@ use super::{
     view::{action_shortcut, cell_width, ellipsize, wrap_rows},
 };
 use crate::managed::{
-    Agent, Manager,
+    Agent, Manager, Through,
     fleet::{EndpointStatus, Fleet, FleetSnapshot},
 };
 use crossterm::event::{
@@ -673,6 +673,7 @@ enum Work {
     Poll(Result<FleetSnapshot, String>),
     Action(ActionMessage),
     Panes(Result<(Vec<crate::managed::find::PaneTarget>, bool), String>),
+    Inbox(Result<crate::managed::inbox::InboxView, String>),
 }
 struct ActionMessage {
     boot: String,
@@ -753,6 +754,20 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
         app.notify(warning.clone());
     }
     let fleet = Arc::new(Fleet::new(Manager::new(socket.clone(), options.client)?)?);
+    // An inbox in another state directory is not the one the server writes.
+    {
+        let socket = socket.clone();
+        app.inbox.mismatch = tokio::task::spawn_blocking(move || {
+            crate::coordinator::check_state(&socket)
+                .is_err_and(|error| error.starts_with("coordinator_state_mismatch"))
+        })
+        .await
+        .unwrap_or(false);
+    }
+    let mut inbox_pending = false;
+    let mut inbox_due = false;
+    let mut inbox_checked: Option<Instant> = None;
+    let mut last_poll_ms = 0u64;
     let mut current_epoch = String::new();
     let owned_pane = options
         .compact
@@ -834,7 +849,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     Vec::new()
                                 }
                             }
-                        } else if matches!(&event, Event::Key(key) if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+                        } else if !app.inbox.open && matches!(&event, Event::Key(key) if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
                             if let Some(agent) = selected_agent(&app, &agents).filter(|agent| !agent.stale) {
                                 dialog = Some(Dialog::confirm(app.language, DialogKind::Interrupt(agent.clone()), word(app.language, "Interrupt agent?", "에이전트를 중단할까요?"), word(app.language, "Delivers C-c to the verified foreground process. Provider handling is not asserted.", "검증된 포그라운드 프로세스에 C-c를 전달합니다. 제공자의 처리 여부는 확인되지 않습니다."), word(app.language, "Interrupt", "중단")));
                                 app.dirty = true;
@@ -871,6 +886,17 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         .clone()
                                         .unwrap_or_else(|| "managed-fleet-empty".into());
                                     agents = next_agents;
+                                    last_poll_ms = crate::observation::now_ms();
+                                    inbox_due = true;
+                                    let mut names = agents
+                                        .values()
+                                        .filter(|agent| agent.endpoint_id.is_empty() || agent.endpoint_id == "local")
+                                        .map(|agent| (agent.pane_id.clone(), agent.run.clone(), agent.name.clone()))
+                                        .collect::<Vec<_>>();
+                                    names.sort();
+                                    if app.inbox.set_names(names) && app.inbox.open {
+                                        app.dirty = true;
+                                    }
                                     let next_endpoint_line = endpoint_status_line(&endpoints, app.language);
                                     if app.endpoint_line.as_ref() != Some(&next_endpoint_line) {
                                         app.endpoint_line = Some(next_endpoint_line);
@@ -899,10 +925,16 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 }
                             }
                         }
+                        Ok(Work::Inbox(result)) => {
+                            inbox_pending = false;
+                            if let Ok(view) = result && app.inbox.apply(view) {
+                                app.dirty = true;
+                            }
+                        }
                         Ok(Work::Action(message)) if message.target.as_ref().is_some_and(|target| target.same_run(&agents)) || (message.target.is_none() && message.boot == current_epoch) => match message.result {
-                            Ok(ActionResult::Receipt(receipt)) => { app.finish_action(); app.notify(receipt); },
+                            Ok(ActionResult::Receipt(receipt)) => { app.finish_action(); app.notify(receipt); app.inbox.refresh = true; },
                             Ok(ActionResult::Details { id, value }) => app.set_details(&id, value),
-                            Err(error) => { app.finish_action(); app.notify(format!("Action failed: {}", crate::managed::failure::human(&error))); },
+                            Err(error) => { app.finish_action(); app.notify(format!("Action failed: {}", crate::managed::failure::human(&error))); app.inbox.refresh = true; },
                         },
                         Ok(Work::Action(_)) => {},
                         Ok(Work::Panes(result)) => {
@@ -920,6 +952,22 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 _ = hangup.recv() => break,
             };
 
+            // The inbox is read after each poll while it is on, and its switch
+            // checked every 5 s while it is off; the store is not opened then.
+            if !inbox_pending && !app.inbox.mismatch && (app.inbox.refresh || inbox_due) {
+                let check = app.inbox.refresh
+                    || app.inbox.view.enabled
+                    || inbox_checked.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5));
+                if check {
+                    inbox_pending = true;
+                    inbox_checked = Some(Instant::now());
+                    let fleet = fleet.clone();
+                    let all = app.inbox.all;
+                    tasks.spawn(async move { Work::Inbox(fleet.inbox_view(all).await) });
+                }
+                app.inbox.refresh = false;
+                inbox_due = false;
+            }
             for effect in effects {
                 if matches!(effect, Effect::Quit) { return Ok(0); }
                 if let Effect::Preferences { language, theme } = effect {
@@ -931,7 +979,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                     app.notify("An action is pending; try again shortly".into());
                     continue;
                 }
-                dispatch_effect(effect, &mut dialog, &mut app, &agents, fleet.clone(), &mut tasks, owned_pane.as_deref(), &current_epoch);
+                dispatch_effect(effect, &mut dialog, &mut app, &agents, fleet.clone(), &mut tasks, owned_pane.as_deref(), &current_epoch, last_poll_ms);
                 app.dirty = true;
             }
         }
@@ -946,6 +994,21 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
 /// Agents in desk order, then the desk actions for the current selection.
 /// Panes of this server are added once the background query returns.
 fn palette_items(app: &App, agents: &HashMap<String, Agent>) -> Vec<palette::Item> {
+    // The inbox view selects events, not agents: only its own actions.
+    if app.managed && app.inbox.open {
+        return [Action::Inbox, Action::NextUnseen]
+            .into_iter()
+            .map(|action| palette::Item {
+                kind: palette::Kind::Action,
+                label: action_label(app.language, action, false, false).to_owned(),
+                detail: String::new(),
+                hint: action_shortcut(action).to_owned(),
+                target: palette::Target::Action(action),
+                enabled: app.action_enabled(action),
+                pane: None,
+            })
+            .collect();
+    }
     let mut items: Vec<palette::Item> = app
         .rows
         .iter()
@@ -960,9 +1023,15 @@ fn palette_items(app: &App, agents: &HashMap<String, Agent>) -> Vec<palette::Ite
             pane: agent.endpoint_id.is_empty().then(|| agent.pane_id.clone()),
         })
         .collect();
+    let inbox_actions = if app.managed {
+        vec![Action::Inbox, Action::NextUnseen]
+    } else {
+        Vec::new()
+    };
     items.extend(
         app.context_actions()
             .into_iter()
+            .chain(inbox_actions)
             .map(|action| palette::Item {
                 kind: palette::Kind::Action,
                 label: action_label(app.language, action, app.ack_in_flight.is_some(), false)
@@ -1055,6 +1124,7 @@ fn dispatch_effect(
     tasks: &mut JoinSet<Work>,
     owned_pane: Option<&str>,
     expected_boot: &str,
+    last_poll_ms: u64,
 ) {
     let language = app.language;
     match effect {
@@ -1129,8 +1199,14 @@ fn dispatch_effect(
             if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {
                 let boot = expected_boot.to_owned();
                 let target = TargetIdentity::for_agent(&agent);
+                // Read inbox events only as far as this window showed them.
+                let through = if app.inbox.view.enabled {
+                    Through::Seq(app.inbox.newest_seq_of(&agent.run).unwrap_or(0))
+                } else {
+                    Through::Before(last_poll_ms)
+                };
                 tasks.spawn(async move {
-                    let result = fleet.acknowledge(&agent).await.map(|()| {
+                    let result = fleet.acknowledge(&agent, through).await.map(|()| {
                         ActionResult::Receipt(message(
                             language,
                             format!("Marked {id} as seen"),
@@ -1140,6 +1216,167 @@ fn dispatch_effect(
                     action_message(boot, Some(target), result)
                 });
             }
+        }
+        Effect::InboxFocus { pane, run } => {
+            let local = |agent: &&Agent| {
+                (agent.endpoint_id.is_empty() || agent.endpoint_id == "local") && !agent.stale
+            };
+            let listed = agents
+                .values()
+                .filter(local)
+                .find(|agent| agent.pane_id == pane && agent.run == run)
+                .cloned();
+            let origin = owned_pane.map(str::to_owned);
+            let boot = expected_boot.to_owned();
+            tasks.spawn(async move {
+                let result = async {
+                    // An agent the saved view hides is still a local agent.
+                    let agent = match listed {
+                        Some(agent) => agent,
+                        None => fleet
+                            .local_agents()
+                            .await?
+                            .into_iter()
+                            .find(|agent| agent.pane_id == pane && agent.run == run)
+                            .ok_or_else(|| {
+                                "target_absent: the event's pane is closed or runs another agent now"
+                                    .to_owned()
+                            })?,
+                    };
+                    fleet.focus_from(&agent, origin.as_deref()).await?;
+                    Ok(ActionResult::Receipt(message(
+                        language,
+                        format!("Selected pane {}", agent.pane_id),
+                        format!("창 {} 선택 완료", agent.pane_id),
+                    )))
+                }
+                .await;
+                action_message(boot, None, result)
+            });
+        }
+        Effect::InboxRead { id } => {
+            let Some(event) = app
+                .inbox
+                .view
+                .events
+                .iter()
+                .find(|event| event.id == id)
+                .cloned()
+            else {
+                return;
+            };
+            // The listed copy of the agent: its guard refuses a revision
+            // newer than the one this window showed.
+            let listed = agents
+                .values()
+                .find(|agent| {
+                    (agent.endpoint_id.is_empty() || agent.endpoint_id == "local")
+                        && agent.pane_id == event.pane
+                        && agent.run == event.run
+                })
+                .cloned();
+            let boot = expected_boot.to_owned();
+            tasks.spawn(async move {
+                let result = async {
+                    fleet.inbox_mark_read(vec![id], None).await?;
+                    // The agent first: listing it can record a newer event,
+                    // which the store read below then sees.
+                    let agent =
+                        match listed {
+                            Some(agent) => Some(agent),
+                            None => fleet.local_agents().await?.into_iter().find(|agent| {
+                                agent.pane_id == event.pane && agent.run == event.run
+                            }),
+                        };
+                    // The row is seen once its run has no unseen event left
+                    // in the store. A full list may hide older ones: then
+                    // the row stays as it is.
+                    let unseen = fleet.inbox_view(false).await?;
+                    let waiting = unseen.events.len() >= 100
+                        || unseen.events.iter().any(|other| {
+                            other.run == event.run && other.source != "operation" && !other.read
+                        });
+                    let mut changed = false;
+                    if !waiting
+                        && let Some(agent) = agent
+                        && (agent.state == "blocked" || agent.returned_idle)
+                        && !agent.seen
+                        && let Err(error) = fleet.acknowledge(&agent, Through::Seq(event.seq)).await
+                    {
+                        // The row changed since this window showed it: the
+                        // event is read, the newer attention stays unseen.
+                        if !error.starts_with("identity_mismatch") {
+                            return Err(error);
+                        }
+                        changed = true;
+                    }
+                    Ok(ActionResult::Receipt(if changed {
+                        message(
+                            language,
+                            "Marked the event read; the agent changed, so its row stays unseen"
+                                .to_owned(),
+                            "사건을 읽음으로 표시했습니다. agent가 바뀌어 행은 그대로 둡니다"
+                                .to_owned(),
+                        )
+                    } else {
+                        message(
+                            language,
+                            "Marked the event read".to_owned(),
+                            "사건을 읽음으로 표시했습니다".to_owned(),
+                        )
+                    }))
+                }
+                .await;
+                action_message(boot, None, result)
+            });
+        }
+        Effect::InboxReadAll { through } => {
+            // Only runs this window showed an event of, up to the fence.
+            let shown = app
+                .inbox
+                .view
+                .events
+                .iter()
+                .filter(|event| event.seq <= through && event.source != "operation")
+                .map(|event| event.run.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let boot = expected_boot.to_owned();
+            tasks.spawn(async move {
+                let result = async {
+                    fleet.inbox_mark_read(Vec::new(), Some(through)).await?;
+                    // The agents first: listing them can record newer
+                    // events, which the store read below then sees. Their
+                    // copies guard the writes, so a later change is refused.
+                    let agents = fleet.local_agents().await?;
+                    // Runs with an unseen event after the fence keep their
+                    // rows unseen, whether or not this window showed it.
+                    let waiting = fleet
+                        .inbox_view(false)
+                        .await?
+                        .events
+                        .into_iter()
+                        .filter(|event| event.source != "operation" && !event.read)
+                        .map(|event| event.run)
+                        .collect::<std::collections::HashSet<_>>();
+                    let unseen = agents
+                        .into_iter()
+                        .filter(|agent| {
+                            (agent.state == "blocked" || agent.returned_idle)
+                                && !agent.seen
+                                && shown.contains(&agent.run)
+                                && !waiting.contains(&agent.run)
+                        })
+                        .collect::<Vec<_>>();
+                    fleet.acknowledge_many(&unseen).await?;
+                    Ok(ActionResult::Receipt(message(
+                        language,
+                        "Marked every listed event read".to_owned(),
+                        "보이는 사건을 모두 읽음으로 표시했습니다".to_owned(),
+                    )))
+                }
+                .await;
+                action_message(boot, None, result)
+            });
         }
         Effect::Navigate { id, .. } => {
             if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {

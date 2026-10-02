@@ -34,6 +34,8 @@ const CLIENT_LIMIT: usize = 32;
 const DEADLINE: Duration = Duration::from_secs(3);
 const DEFAULT_IDLE: Duration = Duration::from_secs(600);
 const DEFAULT_WATCH: Duration = Duration::from_secs(2);
+/// The server option the status line shows the unseen inbox count from.
+pub(crate) const BADGE_OPTION: &str = "@masil-inbox-unseen";
 /// Features, the executable and the store are checked this often.
 const SUPERVISE_EVERY: Duration = Duration::from_secs(30);
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
@@ -673,6 +675,16 @@ pub(crate) fn reload(socket: &Path) {
 /// Tells a running coordinator that the inbox changed. Never starts one,
 /// waits at most 50 ms and ignores every failure.
 pub(crate) fn poke(socket: &Path) {
+    signal(socket, "poke");
+}
+
+/// Tells a running coordinator that events were read, so only its badge
+/// count can have changed. As `poke`, never starts one.
+pub(crate) fn recount(socket: &Path) {
+    signal(socket, "recount");
+}
+
+fn signal(socket: &Path, method: &str) {
     let Ok(state) = crate::managed::state_base() else {
         return;
     };
@@ -686,7 +698,7 @@ pub(crate) fn poke(socket: &Path) {
     if stream.set_write_timeout(timeout).is_err() || stream.set_read_timeout(timeout).is_err() {
         return;
     }
-    let body = json!({"v": 1, "id": "poke", "method": "poke"}).to_string();
+    let body = json!({"v": 1, "id": method, "method": method}).to_string();
     let _ = stream
         .write_all(&(body.len() as u32).to_be_bytes())
         .and_then(|()| stream.write_all(body.as_bytes()));
@@ -1038,28 +1050,45 @@ async fn supervise(
             *current = features;
         }
         let wanted = shared.features().iter().any(|feature| feature == "inbox");
-        if let Ok(mut watcher) = shared.watch.lock() {
-            if wanted
-                && watcher
-                    .as_ref()
-                    .is_none_or(tokio::task::JoinHandle::is_finished)
-            {
-                match crate::managed::Manager::resident(socket.clone(), watch) {
-                    Ok(manager) => {
-                        let path = log_path.clone();
-                        *watcher = Some(tokio::spawn(crate::managed::resident::watch(
-                            manager,
-                            shared.control.clone(),
-                            watch,
-                            move |message: &str| log(&path, message),
-                            shared.stop.clone(),
-                        )));
+        let stopped = match shared.watch.lock() {
+            Ok(mut watcher) => {
+                if wanted
+                    && watcher
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                {
+                    match crate::managed::Manager::resident(socket.clone(), watch) {
+                        Ok(manager) => {
+                            let path = log_path.clone();
+                            *watcher = Some(tokio::spawn(crate::managed::resident::watch(
+                                manager,
+                                shared.control.clone(),
+                                watch,
+                                move |message: &str| log(&path, message),
+                                shared.stop.clone(),
+                            )));
+                        }
+                        Err(error) => log(&log_path, &format!("watch: {error}")),
                     }
-                    Err(error) => log(&log_path, &format!("watch: {error}")),
+                    None
+                } else if wanted {
+                    None
+                } else {
+                    watcher.take()
                 }
-            } else if !wanted && let Some(handle) = watcher.take() {
-                handle.abort();
             }
+            Err(_) => None,
+        };
+        if let Some(handle) = stopped {
+            handle.abort();
+            // A badge write in flight lands before the clear below.
+            let _ = handle.await;
+            // The inbox went off: no badge for it.
+            let socket = socket.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                masil(&socket, &["set-option", "-gqu", BADGE_OPTION])
+            })
+            .await;
         }
         if !exe_unchanged(&shared.identity["exe"]) {
             log(&log_path, "the masil-agent executable changed; exiting");
@@ -1387,6 +1416,13 @@ fn respond(
         // A report or inbox write: the watch looks at the panes now.
         Some("poke") => {
             POKES.fetch_add(1, Ordering::SeqCst);
+            shared.control.poked.store(true, Ordering::SeqCst);
+            shared.control.wake.notify_one();
+            (ok(json!({})), false)
+        }
+        // Events were read: only the badge count can have changed.
+        Some("recount") => {
+            shared.control.recount.store(true, Ordering::SeqCst);
             shared.control.wake.notify_one();
             (ok(json!({})), false)
         }

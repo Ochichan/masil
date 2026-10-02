@@ -64,6 +64,9 @@ impl App {
         if self.focus == Focus::Search {
             return self.handle_search_key(key);
         }
+        if self.managed && self.inbox.open {
+            return self.handle_inbox_key(key);
+        }
         if key.code == KeyCode::F(10) && key.modifiers.contains(KeyModifiers::SHIFT) {
             self.open_context_for_selection();
             return Vec::new();
@@ -97,6 +100,11 @@ impl App {
             KeyCode::Char('x') if self.managed => self.one_effect(Action::InterruptAgent),
             KeyCode::Char('v') if self.managed => self.one_effect(Action::ReadScreen),
             KeyCode::Char('X') if self.managed => self.one_effect(Action::CloseAgent),
+            KeyCode::Char('i') if self.managed => {
+                self.toggle_inbox();
+                Vec::new()
+            }
+            KeyCode::Char('u') if self.managed => self.next_unseen(),
             KeyCode::Esc => {
                 if self.details_open {
                     self.details_open = false;
@@ -399,6 +407,18 @@ impl App {
                 self.dirty = true;
                 Vec::new()
             }
+            MouseEventKind::ScrollUp
+                if self.managed && self.inbox.open && self.overlay.is_none() =>
+            {
+                self.scroll_inbox(-1);
+                Vec::new()
+            }
+            MouseEventKind::ScrollDown
+                if self.managed && self.inbox.open && self.overlay.is_none() =>
+            {
+                self.scroll_inbox(1);
+                Vec::new()
+            }
             MouseEventKind::ScrollUp => {
                 self.wheel(mouse.column, mouse.row, -3);
                 Vec::new()
@@ -428,13 +448,31 @@ impl App {
             return Vec::new();
         };
         let related_double = matches!(&hit.target, HitTarget::Row { id, .. }
-            if self.last_click.as_ref().is_some_and(|click| click.id == *id));
+            if self.last_click.as_ref().is_some_and(|click| click.id == *id))
+            || matches!(&hit.target, HitTarget::InboxRow(event)
+                if self.last_click.as_ref().is_some_and(|click| click.id == format!("inbox:{event}")));
         self.pressed = None;
         self.drag = None;
         if !related_double {
             self.last_click = None;
         }
         match &hit.target {
+            HitTarget::InboxRow(event) => {
+                let key = format!("inbox:{event}");
+                let double = self.last_click.as_ref().is_some_and(|click| {
+                    click.id == key
+                        && now.saturating_duration_since(click.at) <= DOUBLE_CLICK
+                        && click.column.abs_diff(column) <= 1
+                        && click.row.abs_diff(row) <= 1
+                });
+                self.last_click = (!double).then_some(ClickRecord {
+                    id: key,
+                    column,
+                    row,
+                    at: now,
+                });
+                return self.click_inbox_row(*event, double);
+            }
             HitTarget::Row { id, .. } => {
                 self.selected_id = Some(id.clone());
                 self.focus = Focus::List;
@@ -888,7 +926,7 @@ impl App {
         self.dirty = true;
     }
 
-    fn change_language(&mut self) -> Vec<Effect> {
+    pub(crate) fn change_language(&mut self) -> Vec<Effect> {
         self.language = self.language.next();
         self.toast = None;
         self.dirty = true;
@@ -898,7 +936,7 @@ impl App {
         }]
     }
 
-    fn change_theme(&mut self) -> Vec<Effect> {
+    pub(crate) fn change_theme(&mut self) -> Vec<Effect> {
         self.theme = self.theme.next();
         self.toast = None;
         self.dirty = true;

@@ -387,6 +387,8 @@ pub(crate) fn action_label(
         Action::InterruptAgent => Text::InterruptAgent,
         Action::ReadScreen => Text::ReadScreen,
         Action::CloseAgent => Text::CloseAgent,
+        Action::Inbox => return word(language, "Inbox", "인박스"),
+        Action::NextUnseen => return word(language, "Next unseen event", "다음 안 읽은 사건"),
     };
     tr(language, key)
 }
@@ -430,6 +432,17 @@ pub(crate) fn compact_action_label(
         (Language::Korean, Action::InterruptAgent, _, _) => "중단",
         (Language::Korean, Action::ReadScreen, _, _) => "화면",
         (Language::Korean, Action::CloseAgent, _, _) => "닫기",
+        (Language::English, Action::Inbox, _, _) => "Inbox",
+        (Language::Korean, Action::Inbox, _, _) => "인박스",
+        (Language::English, Action::NextUnseen, _, _) => "Next",
+        (Language::Korean, Action::NextUnseen, _, _) => "다음",
+    }
+}
+
+fn word(language: Language, english: &'static str, korean: &'static str) -> &'static str {
+    match language {
+        Language::English => english,
+        Language::Korean => korean,
     }
 }
 
@@ -553,6 +566,16 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                 Key("X", "Confirm closing the selected pane"),
                 Key("z", "Expand or restore an owned side panel"),
                 Gap,
+                Group("INBOX"),
+                Key("i", "Open or close this server's inbox"),
+                Key("u", "Focus the oldest unseen event's pane"),
+                Key("Enter / g", "In the inbox: focus the event's pane"),
+                Key(
+                    "a / A A",
+                    "In the inbox: mark one / every listed event read",
+                ),
+                Key("o", "In the inbox: switch between unseen and recent events"),
+                Gap,
                 Group("TRUTH AND OWNERSHIP"),
                 Note("Needs input is generic unless evidence identifies a question or approval."),
                 Note("Drafts are never pasted or submitted by the management screen."),
@@ -582,6 +605,13 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                 Key("x / Ctrl-C", "확인 후 에이전트에 C-c 전달"),
                 Key("X", "확인 후 선택한 창 닫기"),
                 Key("z", "소유한 사이드패널 확대 또는 복원"),
+                Gap,
+                Group("인박스"),
+                Key("i", "이 서버의 인박스 열기와 닫기"),
+                Key("u", "가장 오래된 안 읽은 사건의 창으로 이동"),
+                Key("Enter / g", "인박스에서: 사건의 창으로 이동"),
+                Key("a / A A", "인박스에서: 하나 / 보이는 사건 모두 읽음"),
+                Key("o", "인박스에서: 안 읽은 사건과 최근 사건 전환"),
                 Gap,
                 Group("상태와 소유권"),
                 Note("근거가 질문 또는 승인을 식별하지 않으면 입력 필요로 표시합니다."),
