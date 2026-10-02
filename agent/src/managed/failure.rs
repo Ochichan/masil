@@ -46,6 +46,7 @@ const CODES: &[(&str, Class)] = &[
     ("queue_not_staged", Class::Refused),
     ("queue_remote_unsupported", Class::Refused),
     ("attachment_missing", Class::Refused),
+    ("cwd_rejected", Class::Refused),
     ("lock_busy", Class::Transient),
     ("store_unavailable", Class::Transient),
     ("store_full", Class::Transient),
@@ -147,7 +148,7 @@ pub(crate) fn recorded_exit_code(stage: &str, query: bool) -> i32 {
         | "interrupt_key_delivered"
         | "native_accepted"
         | "pane_closed" => 0,
-        "expired" => Class::Refused.exit_code(),
+        "expired" | "cwd_rejected" => Class::Refused.exit_code(),
         // An attempt still in flight has no known outcome yet.
         "outcome_unknown" | "dispatching" | "pending" => Class::Unknown.exit_code(),
         "rejected_before_effect"

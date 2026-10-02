@@ -166,20 +166,48 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
         client: None,
     };
     let mut argv = args.to_vec();
+    // The directory the start checked; None from a launch without it.
+    let checked = match std::env::var(super::LAUNCH_CWD) {
+        Ok(value) => Some(enter_launch_directory(&value)),
+        Err(_) => None,
+    };
+    let verdict = match &checked {
+        Some(Err(reason)) => format!("{run} cwd_rejected {reason}"),
+        _ => format!("{run} ok"),
+    };
     let environment = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
         .block_on(async {
+            // A rejection keeps the pane until the start has read why.
+            if let Some(Err(reason)) = &checked {
+                native
+                    .tmux(
+                        [
+                            "set-option", "-p", "-t", &pane, "remain-on-exit", "on", ";",
+                            "set-option", "-p", "-t", &pane, super::LAUNCH_VERDICT, &verdict,
+                        ]
+                        .iter()
+                        .map(std::ffi::OsString::from),
+                        None,
+                    )
+                    .await
+                    .map_err(super::server_unreachable)?;
+                return Err(format!("cwd_rejected: {reason}; the agent was not started"));
+            }
+            let mut first = true;
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
+                    // The verdict goes with the first read of the registration.
+                    let mut read: Vec<&str> = Vec::new();
+                    if first && checked.is_some() {
+                        read.extend(["set-option", "-p", "-t", &pane, super::LAUNCH_VERDICT, &verdict, ";"]);
+                    }
+                    first = false;
+                    read.extend(["show-options", "-pqv", "-t", &pane, super::META]);
                     let output = native
-                        .tmux(
-                            ["show-options", "-pqv", "-t", &pane, super::META]
-                                .iter()
-                                .map(std::ffi::OsString::from),
-                            None,
-                        )
+                        .tmux(read.iter().map(std::ffi::OsString::from), None)
                         .await
                         .map_err(super::server_unreachable)?;
                     let encoded = String::from_utf8(output.stdout)
@@ -207,11 +235,41 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
                     .await,
             )
         })?;
-    let error = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(&argv[1..])
         .envs(environment)
-        .exec();
+        .env_remove(super::LAUNCH_CWD);
+    if let Some(Ok(path)) = &checked {
+        command.env("PWD", path);
+    }
+    let error = command.exec();
     Err(format!("provider could not start: {error}"))
+}
+
+/// Opens the directory the start checked and moves into it, if it is still
+/// that directory (`<dev>:<ino>:<path>`). tmux starts a pane in the home
+/// directory when its directory is gone; the provider never runs there.
+fn enter_launch_directory(value: &str) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut parts = value.splitn(3, ':');
+    let (Some(dev), Some(ino), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("the start's directory record is unreadable".into());
+    };
+    let (Ok(dev), Ok(ino)) = (dev.parse::<u64>(), ino.parse::<u64>()) else {
+        return Err("the start's directory record is unreadable".into());
+    };
+    // chdir needs only search permission, as tmux's own does; the identity
+    // of "." is then the directory this process is in.
+    std::env::set_current_dir(path)
+        .map_err(|error| format!("{path} cannot be entered: {error}"))?;
+    let metadata = std::fs::metadata(".").map_err(|error| format!("{path}: {error}"))?;
+    if (metadata.dev(), metadata.ino()) != (dev, ino) {
+        return Err(format!(
+            "{path} is not the directory the start checked (replaced or recreated)"
+        ));
+    }
+    Ok(path.to_owned())
 }
 
 /// A client operation key needs the namespace the client observed.

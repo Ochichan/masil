@@ -39,7 +39,10 @@ const MAX_EVIDENCE: usize = 2048;
 
 /// States from which a new attempt may start: the previous attempt is proven
 /// to have had no effect.
-const RETRYABLE: [&str; 2] = ["rejected_before_effect", "not_applied"];
+/// States after which the same key may run again: nothing took effect.
+/// `cwd_rejected`: the launched child refused its directory and never
+/// started the agent.
+const RETRYABLE: [&str; 3] = ["rejected_before_effect", "not_applied", "cwd_rejected"];
 pub(super) const DISPATCHING: &str = "dispatching";
 pub(super) const UNKNOWN: &str = "outcome_unknown";
 

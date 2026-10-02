@@ -96,6 +96,9 @@ enum Guarded {
 struct PreparedLaunch {
     provider: &'static providers::Provider,
     cwd: PathBuf,
+    /// The directory's identity when it was checked; `exec-managed` runs
+    /// the provider only in that same directory (docs/managed-agents.md).
+    cwd_identity: (u64, u64),
     argv: Vec<String>,
     args: Vec<String>,
     /// `--answers`: exec-managed decides the listening options in the pane.
@@ -1303,7 +1306,14 @@ impl Manager {
         {
             argv.insert(1, "--no-daemon".into());
         }
+        let cwd_identity = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata =
+                std::fs::metadata(&cwd).map_err(|error| format!("working directory: {error}"))?;
+            (metadata.dev(), metadata.ino())
+        };
         Ok(PreparedLaunch {
+            cwd_identity,
             provider,
             cwd,
             argv,
@@ -1324,6 +1334,7 @@ impl Manager {
         let PreparedLaunch {
             provider,
             cwd,
+            cwd_identity,
             argv,
             args,
             answers,
@@ -1359,6 +1370,15 @@ impl Manager {
                     .to_string_lossy()
                     .into_owned(),
             ),
+            (
+                LAUNCH_CWD,
+                format!(
+                    "{}:{}:{}",
+                    cwd_identity.0,
+                    cwd_identity.1,
+                    cwd.to_string_lossy()
+                ),
+            ),
         ] {
             command.extend(["-e".into(), format!("{key}={value}").into()]);
         }
@@ -1382,9 +1402,75 @@ impl Manager {
             .tmux(command, None)
             .await
             .map_err(server_unreachable)?;
-        self.finish_launch(result, provider, name, run, session, argv, args, answers)
+        let (mut outcome, verdict) = self
+            .finish_launch(result, provider, name, run, session, argv, args, answers)
             .await
-            .map_err(String::from)
+            .map_err(String::from)?;
+        let pane = outcome["pane_id"].as_str().unwrap_or_default().to_owned();
+        match self.launch_verdict(&pane, run, verdict).await {
+            LaunchVerdict::Ok => {}
+            LaunchVerdict::Rejected(reason) => {
+                // The child kept its pane open to report; it never ran the
+                // provider. It may not have exited yet, so no dead-pane guard.
+                if let Err(error) = self.command(&["kill-pane", "-t", &pane]).await {
+                    // Not `cwd_rejected`: the pane still holds the name, so
+                    // the start is settled from the pane.
+                    return Err(format!(
+                        "the agent was not started ({reason}), but its pane {pane} could not be removed: {error}"
+                    ));
+                }
+                return Err(format!("cwd_rejected: the agent was not started: {reason}"));
+            }
+            // Started, and already ended: the stage stays the start's.
+            LaunchVerdict::Exited => outcome["process"] = json!("exited"),
+            LaunchVerdict::Unanswered => outcome["cwd_check"] = json!("unanswered"),
+        }
+        Ok(outcome)
+    }
+
+    /// Kills `pane` only while it is still dead, so a pane respawned since
+    /// it was read dead (a `pane-died` hook) keeps running.
+    pub(super) async fn remove_dead_pane(&self, pane: &str) -> Result<String, String> {
+        self.command(&[
+            "if-shell",
+            "-F",
+            "-t",
+            pane,
+            "#{pane_dead}",
+            &format!("kill-pane -t {pane}"),
+        ])
+        .await
+    }
+
+    /// What the launched `exec-managed` found of its directory: read with
+    /// the registration, then for up to 3 s more.
+    async fn launch_verdict(&self, pane: &str, run: &str, first: Option<String>) -> LaunchVerdict {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut seen = first;
+        loop {
+            if let Some(verdict) = seen.as_deref().and_then(|text| parse_verdict(text, run)) {
+                return verdict;
+            }
+            if std::time::Instant::now() >= deadline {
+                return LaunchVerdict::Unanswered;
+            }
+            // The child writes it within milliseconds of starting.
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            // `show-options -q` answers an absent pane with nothing; the
+            // pane id says whether it is still there.
+            let format = format!("#{{pane_id}}\t#{{{LAUNCH_VERDICT}}}");
+            seen = match self
+                .command(&["display-message", "-p", "-t", pane, &format])
+                .await
+            {
+                Ok(text) => match text.trim_end_matches('\n').split_once('\t') {
+                    Some((id, verdict)) if id == pane => Some(verdict.to_owned()),
+                    // The provider started, and its pane already ended.
+                    _ => return LaunchVerdict::Exited,
+                },
+                Err(_) => return LaunchVerdict::Unanswered,
+            };
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1398,7 +1484,7 @@ impl Manager {
         argv: Vec<String>,
         args: Vec<String>,
         answers: bool,
-    ) -> Result<Value, failure::AfterEffect> {
+    ) -> Result<(Value, Option<String>), failure::AfterEffect> {
         let line = String::from_utf8(result.stdout)
             .map_err(|_| failure::AfterEffect::new("invalid launch result"))?;
         let fields: Vec<_> = line.trim().split('\t').collect();
@@ -1449,15 +1535,18 @@ impl Manager {
         if let Some(evidence) = &evidence {
             registration.extend([";", "set-option", "-p", "-t", fields[0], EVIDENCE, evidence]);
         }
-        self.command(&registration).await.map_err(|e| {
+        // The child's verdict on its directory, usually written already.
+        registration.extend([";", "show-options", "-pqv", "-t", fields[0], LAUNCH_VERDICT]);
+        let verdict = self.command(&registration).await.map_err(|e| {
             failure::AfterEffect::new(format!(
                 "pane {} was launched, but registration failed: {e}; do not blindly retry",
                 fields[0]
             ))
         })?;
-        Ok(
+        Ok((
             json!({"stage":"process_started","pane_id":fields[0],"run":run,"name":name,"provider":provider.id,"native_session_requested":session,"native_session_verified":false,"provider_accepted":false}),
-        )
+            Some(verdict),
+        ))
     }
 
     /// Marks the agent's attention seen, and its inbox events read as far as
@@ -2085,6 +2174,30 @@ fn provider_contract(engine: &Engine, id: &str) -> Result<Value, String> {
         "question_response": false,
         "turn_identity": false,
     }))
+}
+
+/// `exec-managed` reads the directory it must run in from this variable
+/// (`<dev>:<ino>:<path>`) and writes its verdict to this pane option.
+pub(super) const LAUNCH_CWD: &str = "MASIL_AGENT_CWD";
+pub(super) const LAUNCH_VERDICT: &str = "@masil-agent-launch";
+
+pub(super) enum LaunchVerdict {
+    Ok,
+    Rejected(String),
+    /// The pane ended before a verdict was read, usually because the
+    /// provider ran and ended.
+    Exited,
+    Unanswered,
+}
+
+/// `<run> ok` or `<run> cwd_rejected <reason>` of this run.
+fn parse_verdict(text: &str, run: &str) -> Option<LaunchVerdict> {
+    let rest = text.trim().strip_prefix(run)?.strip_prefix(' ')?;
+    if rest == "ok" {
+        return Some(LaunchVerdict::Ok);
+    }
+    rest.strip_prefix("cwd_rejected")
+        .map(|reason| LaunchVerdict::Rejected(reason.trim().to_owned()))
 }
 
 const REPORT_SOURCE_RUN: &str = "run_report";
@@ -2774,6 +2887,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_launch_verdict_belongs_to_its_run() {
+        assert!(matches!(
+            parse_verdict("r1 ok\n", "r1"),
+            Some(LaunchVerdict::Ok)
+        ));
+        match parse_verdict("r1 cwd_rejected /x is gone", "r1") {
+            Some(LaunchVerdict::Rejected(reason)) => assert_eq!(reason, "/x is gone"),
+            _ => panic!("expected a rejection"),
+        }
+        assert!(parse_verdict("r2 ok", "r1").is_none());
+        assert!(parse_verdict("r10 ok", "r1").is_none());
+        assert!(parse_verdict("", "r1").is_none());
+    }
     #[test]
     fn native_escaping_preserves_delimiters_and_never_executes() {
         assert_eq!(

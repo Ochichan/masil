@@ -299,6 +299,26 @@ impl Manager {
                     }
                     results.push(outcome);
                 }
+                // The child refused its directory and never started the agent.
+                Err(error) if error.starts_with("cwd_rejected") => {
+                    let error = bounded_error(error);
+                    journal.insert(
+                        index,
+                        ReceiptEntry {
+                            index,
+                            state: ReceiptState::FailedNotStarted,
+                            pane_id: None,
+                            run: None,
+                            error: Some(error.clone()),
+                        },
+                    );
+                    receipt.entries = journal.values().cloned().collect();
+                    write_json_atomic(&receipt_path, &receipt)?;
+                    results.push(json!({
+                        "index": index, "name": entry.name, "stage": "failed_not_started",
+                        "action": "not_launched", "error": error, "can_retry": true,
+                    }));
+                }
                 Err(error) => {
                     // Manager::start may have reached tmux before returning an
                     // error. Keep the durable pending marker and fail closed.

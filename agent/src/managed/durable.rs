@@ -464,18 +464,34 @@ impl Manager {
     async fn settle_start_after_effect(&self, run: &str) -> Result<&'static str, AfterEffect> {
         let inventory = self.inventory().await.map_err(AfterEffect::new)?;
         super::validate_inventory(&inventory).map_err(AfterEffect::new)?;
-        Ok(inventory
-            .iter()
-            .find(|fields| {
-                decode::<super::Metadata>(&fields[11]).is_some_and(|meta| meta.run == run)
-            })
-            .map_or("outcome_unknown", |fields| {
-                if fields[4] == "1" {
-                    "process_exited"
-                } else {
-                    "process_started"
-                }
-            }))
+        let Some(fields) = inventory.iter().find(|fields| {
+            decode::<super::Metadata>(&fields[11]).is_some_and(|meta| meta.run == run)
+        }) else {
+            return Ok("outcome_unknown");
+        };
+        if fields[4] != "1" {
+            return Ok("process_started");
+        }
+        // A child that refused its directory kept the pane to say so.
+        let verdict = self
+            .command(&[
+                "show-options",
+                "-pqv",
+                "-t",
+                &fields[0],
+                super::LAUNCH_VERDICT,
+            ])
+            .await
+            .unwrap_or_default();
+        if verdict.trim().starts_with(&format!("{run} cwd_rejected")) {
+            // Its child kept the pane only to report; the agent never ran.
+            // Gone, the name is free for a retry.
+            self.remove_dead_pane(&fields[0])
+                .await
+                .map_err(AfterEffect::new)?;
+            return Ok("cwd_rejected");
+        }
+        Ok("process_exited")
     }
 
     /// Start with an optional client key pinned to the server boot.
@@ -560,7 +576,7 @@ impl Manager {
             }
             if !matches!(
                 record.state.as_str(),
-                "rejected_before_effect" | "not_applied"
+                "rejected_before_effect" | "not_applied" | "cwd_rejected"
             ) {
                 return Ok(start_receipt(&record));
             }
@@ -613,6 +629,20 @@ impl Manager {
                         )))
                     })?;
                 Ok(outcome)
+            }
+            // The child checked its directory and did not start the agent.
+            Err(error) if error.starts_with("cwd_rejected") => {
+                let _ = store.finish(
+                    &ticket,
+                    "cwd_rejected",
+                    "exec_managed",
+                    Some(&json!({"error": error})),
+                    now_ms(),
+                );
+                Err(format!(
+                    "{error} (operation {} is cwd_rejected)",
+                    ticket.key
+                ))
             }
             Err(error) => {
                 if transport_rejected(&error) && !error.contains("was launched") {
