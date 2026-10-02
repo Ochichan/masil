@@ -112,20 +112,45 @@ pub(super) fn run_logged(
     ran
 }
 
-/// SIGTERM to the child's group, SIGKILL after [`GRACE`]. The child is not
-/// reaped before the signals, so its group ID cannot name another group.
+/// SIGTERM to the child's group, then SIGKILL to whatever is left of it
+/// once the leader has exited or [`GRACE`] has passed. The leader is reaped
+/// only after that, so the group ID cannot name another group meanwhile.
 pub(super) fn stop(child: &mut Child) {
     let group = child.id() as i32;
     // SAFETY: signals to a group led by an unreaped child of this process.
     unsafe { libc::killpg(group, libc::SIGTERM) };
     let deadline = Instant::now() + GRACE;
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            return;
-        }
+    while Instant::now() < deadline && !exited(group) {
         std::thread::sleep(Duration::from_millis(20));
     }
     // SAFETY: as above; the leader is still unreaped.
     unsafe { libc::killpg(group, libc::SIGKILL) };
     let _ = child.wait();
+}
+
+/// Whether the child `pid` has exited, without reaping it.
+pub(super) fn exited(pid: i32) -> bool {
+    // SAFETY: a zeroed siginfo_t is valid for waitid to fill.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waits on this process's own child; WNOWAIT leaves it unreaped.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    result == 0 && signal_pid(&info) != 0
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    // SAFETY: waitid filled the child fields.
+    unsafe { info.si_pid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    info.si_pid
 }

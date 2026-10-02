@@ -9,6 +9,7 @@ mod lease;
 mod registry;
 mod remove;
 mod servers;
+mod setup;
 
 pub(crate) use lease::{Found, abandon, begin, detect, launched, start_dir};
 
@@ -17,11 +18,13 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 const HELP: &str = "\
-usage: masil-agent worktree create REPO BRANCH [--from REF] [--name NAME] [--key KEY] [--no-wait]
+usage: masil-agent worktree create REPO BRANCH [--from REF] [--name NAME] [--setup] [--key KEY] [--no-wait]
        masil-agent worktree list [REPO] [--all]
        masil-agent worktree remove WORKTREE [--repo DIR] [--force] [--confirm TOKEN] [--delete-branch]
                                    [--key KEY] [--no-wait]
        masil-agent worktree forget PATH
+       masil-agent worktree setup WORKTREE [--repo DIR] [--key KEY] [--no-wait]
+       masil-agent worktree trust REPO [--confirm SHA256] | untrust REPO
        masil-agent worktree jobs [JOB]
        masil-agent worktree cancel JOB [--no-wait]";
 /// Jobs `worktree jobs` shows.
@@ -41,6 +44,9 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
         Some("cancel") => cancel(&args[1..]),
         Some("remove") => remove(&args[1..]),
         Some("forget") => forget(&args[1..]),
+        Some("setup") => setup_command(&args[1..]),
+        Some("trust") => trust(&args[1..]),
+        Some("untrust") => untrust(&args[1..]),
         Some("job-run") => match &args[1..] {
             [id] => helper::run(job_id(id)?),
             _ => Err(format!("usage: {HELP}")),
@@ -206,7 +212,11 @@ fn check_branch(repo: &Repo, branch: &str) -> Result<(), String> {
 }
 
 fn create(args: &[String]) -> Result<i32, String> {
-    let parsed = parse(args, &["--from", "--name", "--key"], &["--no-wait"])?;
+    let parsed = parse(
+        args,
+        &["--from", "--name", "--key"],
+        &["--no-wait", "--setup"],
+    )?;
     let [repo, branch] = parsed.positional.as_slice() else {
         return Err(format!("usage: {HELP}"));
     };
@@ -246,6 +256,13 @@ fn create(args: &[String]) -> Result<i32, String> {
             return Err(format!("invalid_argument: --from {from} is not a commit"));
         }
     }
+    let with_setup = parsed.flag("--setup");
+    let mut registry = Registry::open()?;
+    if with_setup {
+        // Refused here, before anything is made, if there is nothing to
+        // run or it is not trusted.
+        setup::plan(&registry, &repo.common_dir, Path::new(&repo.root))?;
+    }
     let request = create::Request {
         repo_root: repo.root,
         common_dir: repo.common_dir,
@@ -254,9 +271,9 @@ fn create(args: &[String]) -> Result<i32, String> {
         from,
         name,
         data_root: data_root()?,
+        setup: with_setup,
     };
     let request = serde_json::to_value(&request).map_err(|error| error.to_string())?;
-    let mut registry = Registry::open()?;
     helper::sweep(&mut registry)?;
     registry.prune(now_ms())?;
     // Ended runs release their worktrees; a server that does not answer
@@ -287,7 +304,32 @@ fn create(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
     let job = helper::wait(&mut registry, job.id, child)?;
-    report(&job)
+    let made = matches!(job.state.as_str(), "succeeded" | "too_late");
+    let queued = job.result.as_ref().map(|result| &result["setup_job"]);
+    let Some(setup) = queued.and_then(Value::as_i64).filter(|_| made) else {
+        if made && with_setup {
+            let why = queued
+                .and_then(|value| value["error"].as_str())
+                .unwrap_or("the create job ended without starting it");
+            print(&job.to_json(false))?;
+            return Err(format!(
+                "job_failed: setup did not start ({why}); the worktree itself is ready, run \
+                 `worktree setup` to set it up"
+            ));
+        }
+        return report(&job);
+    };
+    // The worktree is ready; its setup is a job of its own.
+    let setup = helper::wait(&mut registry, setup, None)?;
+    if setup.state != "succeeded" {
+        return report(&setup).map_err(|error| {
+            format!("{error}; the worktree itself is ready, run `worktree setup` to try again")
+        });
+    }
+    let mut value = job.to_json(false);
+    value["setup"] = setup.to_json(false);
+    print(&value)?;
+    Ok(0)
 }
 
 /// Prints a finished job; failures become the error of the command.
@@ -516,5 +558,101 @@ fn forget(args: &[String]) -> Result<i32, String> {
         git::query(&found.root, &["worktree", "unlock", "--", root])?;
     }
     print(&json!({"forgotten": root, "unlocked": locked}))?;
+    Ok(0)
+}
+
+fn setup_command(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(args, &["--repo", "--key"], &["--no-wait"])?;
+    let [target] = parsed.positional.as_slice() else {
+        return Err(format!("usage: {HELP}"));
+    };
+    let key = parsed.value("--key");
+    if let Some(key) = &key
+        && !valid_key(key)
+    {
+        return Err(format!("invalid_argument: {key} is not a valid key"));
+    }
+    let hint = match parsed.value("--repo") {
+        Some(repo) => PathBuf::from(repo),
+        None => std::env::current_dir().map_err(|error| error.to_string())?,
+    };
+    let mut registry = Registry::open()?;
+    let row = lease::resolve(&registry, target, &hint)?;
+    if row.state != "ready" {
+        return Err(format!(
+            "worktree_unavailable: worktree {} is {}",
+            row.name, row.state
+        ));
+    }
+    setup::plan(&registry, &row.repo_common_dir, Path::new(&row.repo_root))?;
+    helper::sweep(&mut registry)?;
+    let (id, child) = helper::queue_setup(&mut registry, row.id, key.as_deref())?;
+    let job = registry
+        .job(id)?
+        .ok_or_else(|| format!("target_absent: worktree job {id} is not in the registry"))?;
+    if parsed.flag("--no-wait") {
+        print(&job.to_json(false))?;
+        return Ok(0);
+    }
+    let job = helper::wait(&mut registry, id, child)?;
+    report(&job)
+}
+
+/// Shows a repository's own setup and, given back the digest it showed,
+/// trusts exactly those bytes. A file changed in between is refused.
+fn trust(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(args, &["--confirm"], &[])?;
+    let [repo] = parsed.positional.as_slice() else {
+        return Err(format!("usage: {HELP}"));
+    };
+    let repo = repository(repo)?;
+    let (file, setup, digest) = setup::repo_setup(Path::new(&repo.root))?
+        .ok_or_else(|| format!("setup_missing: {} has no {}", repo.root, setup::REPO_FILE))?;
+    let mut shown = json!({
+        "repo": repo.root,
+        "file": file,
+        "sha256": digest,
+        "commands": setup.commands,
+        "copy": setup.copy,
+        "timeout_s": setup.timeout_s,
+        "trusted": false,
+    });
+    match parsed.value("--confirm") {
+        None => {
+            shown["next"] = json!(format!(
+                "after reading the commands, run `masil-agent worktree trust {} --confirm {digest}`",
+                repo.root
+            ));
+        }
+        Some(confirm) if confirm == digest => {
+            let mut registry = Registry::open()?;
+            registry.trust(
+                &repo.common_dir,
+                setup::identity(&repo.common_dir)?,
+                &digest,
+                now_ms(),
+            )?;
+            shown["trusted"] = json!(true);
+        }
+        Some(_) => {
+            print(&shown)?;
+            return Err(format!(
+                "setup_untrusted: {} changed since its digest was shown; read it again",
+                file.display()
+            ));
+        }
+    }
+    print(&shown)?;
+    Ok(0)
+}
+
+fn untrust(args: &[String]) -> Result<i32, String> {
+    let [repo] = args else {
+        return Err(format!("usage: {HELP}"));
+    };
+    let repo = repository(repo)?;
+    let mut registry = Registry::open()?;
+    let removed = registry.untrust(&repo.common_dir)?;
+    print(&json!({"untrusted": repo.root, "was_trusted": removed}))?;
     Ok(0)
 }

@@ -69,6 +69,33 @@ pub(super) fn spawn(registry: &Registry, id: i64) -> Result<Child, String> {
     Ok(child)
 }
 
+/// Queues a setup job for a worktree and starts its helper; the helper of a
+/// key's earlier job is not started again.
+pub(super) fn queue_setup(
+    registry: &mut Registry,
+    worktree: i64,
+    key: Option<&str>,
+) -> Result<(i64, Option<Child>), String> {
+    let (job, new) = registry.insert_job(
+        "setup",
+        &format!("worktree:{worktree}"),
+        key,
+        &serde_json::json!({"worktree": worktree}),
+        now_ms(),
+    )?;
+    if !new {
+        return Ok((job.id, None));
+    }
+    registry.set_job_worktree(job.id, worktree)?;
+    match spawn(registry, job.id) {
+        Ok(child) => Ok((job.id, Some(child))),
+        Err(error) => {
+            registry.end_orphan(&job, "failed", &error, None, now_ms())?;
+            Err(error)
+        }
+    }
+}
+
 /// The helper's main: claim the job, run it, record how it ended.
 pub(super) fn run(id: i64) -> Result<i32, String> {
     // SAFETY: the handler only stores to an atomic. Installed before the
@@ -106,6 +133,7 @@ pub(super) fn run(id: i64) -> Result<i32, String> {
     let end = match job.kind.as_str() {
         "create" => create::run(&mut registry, &job, &log),
         "remove" => super::remove::run(&mut registry, &job, &log),
+        "setup" => super::setup::run(&mut registry, &job, &log),
         kind => End::Failed(format!("this masil-agent cannot run {kind} jobs")),
     };
     let tail = output_tail(&registry, id);

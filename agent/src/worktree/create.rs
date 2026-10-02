@@ -26,6 +26,9 @@ pub(super) struct Request {
     pub(super) from: Option<String>,
     pub(super) name: Option<String>,
     pub(super) data_root: String,
+    /// Run setup once the worktree is ready.
+    #[serde(default)]
+    pub(super) setup: bool,
 }
 
 enum Stop {
@@ -86,7 +89,19 @@ pub(super) fn run(registry: &mut Registry, job: &Job, log: &File) -> End {
         Err(error) => return End::Failed(format!("the job request is not readable: {error}")),
     };
     match create(registry, job, &request, log) {
-        Ok(result) => End::Succeeded(result),
+        Ok(mut result) => {
+            // A create cancelled too late keeps its worktree, without setup.
+            if request.setup
+                && !CANCEL.load(Ordering::SeqCst)
+                && let Some(worktree) = result["id"].as_i64()
+            {
+                result["setup_job"] = match super::helper::queue_setup(registry, worktree, None) {
+                    Ok((id, _)) => json!(id),
+                    Err(error) => json!({"error": error}),
+                };
+            }
+            End::Succeeded(result)
+        }
         Err(Stop::Failed(error)) => End::Failed(error),
         Err(Stop::Cancelled(error)) => End::Cancelled(error),
     }

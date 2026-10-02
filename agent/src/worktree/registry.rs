@@ -204,6 +204,10 @@ impl Worktree {
     }
 }
 
+/// A trusted repository setup file: the git directory's identity and the
+/// file's sha256.
+pub(super) type Trust = ((u64, u64), String);
+
 /// A run that uses a worktree.
 #[derive(Clone, Debug)]
 pub(super) struct LeaseRow {
@@ -666,7 +670,10 @@ impl Registry {
         if !dead.is_empty() {
             return Ok(Claim::Reconcile(dead));
         }
-        if busy.len() >= MAX_RUNNING
+        // Setup can run for hours; it neither counts toward nor waits for
+        // the limit, and one worktree's setups still run one at a time.
+        let counted = busy.iter().filter(|other| other.kind != "setup").count();
+        if (job.kind != "setup" && counted >= MAX_RUNNING)
             || busy
                 .iter()
                 .any(|other| other.resource_key == job.resource_key)
@@ -1176,14 +1183,105 @@ impl Registry {
             .map_err(sql)
     }
 
+    /// Records paths setup put in a worktree.
+    pub(super) fn add_setup_paths(
+        &mut self,
+        worktree: i64,
+        paths: &[String],
+        kind: &str,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        for path in paths {
+            tx.execute(
+                "INSERT OR IGNORE INTO setup_paths(worktree_id, path, kind) VALUES (?1, ?2, ?3)",
+                params![worktree, path, kind],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)
+    }
+
+    /// An open setup job of this worktree, if any.
+    pub(super) fn open_setup(&self, worktree: i64) -> Result<Option<i64>, String> {
+        self.conn
+            .query_row(
+                "SELECT id FROM jobs WHERE kind = 'setup' AND worktree_id = ?1
+                   AND state IN ('queued','running','cancel_requested') LIMIT 1",
+                [worktree],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    /// Trusts a repository's own setup file: these bytes, in this git
+    /// directory.
+    pub(super) fn trust(
+        &mut self,
+        common_dir: &str,
+        identity: (u64, u64),
+        sha256: &str,
+        now: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO trusted_repos(common_dir, dev, ino, file_sha256, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(common_dir) DO UPDATE SET dev = ?2, ino = ?3, file_sha256 = ?4,
+                   created_ms = ?5",
+                params![
+                    common_dir,
+                    identity.0 as i64,
+                    identity.1 as i64,
+                    sha256,
+                    now as i64
+                ],
+            )
+            .map(drop)
+            .map_err(sql)
+    }
+
+    pub(super) fn untrust(&mut self, common_dir: &str) -> Result<bool, String> {
+        self.conn
+            .execute(
+                "DELETE FROM trusted_repos WHERE common_dir = ?1",
+                [common_dir],
+            )
+            .map(|changed| changed == 1)
+            .map_err(sql)
+    }
+
+    /// The git directory identity and file digest a repository is trusted
+    /// with.
+    pub(super) fn trusted(&self, common_dir: &str) -> Result<Option<Trust>, String> {
+        self.conn
+            .query_row(
+                "SELECT dev, ino, file_sha256 FROM trusted_repos WHERE common_dir = ?1",
+                [common_dir],
+                |row| {
+                    Ok((
+                        (row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64),
+                        row.get(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql)
+    }
+
     /// Paths setup put in a worktree, which removal does not ask about.
-    pub(super) fn setup_paths(&self, worktree: i64) -> Result<Vec<String>, String> {
+    /// With their kind: `ignored` for a directory, `copy:<sha256>` for a
+    /// copied file.
+    pub(super) fn setup_paths(&self, worktree: i64) -> Result<Vec<(String, String)>, String> {
         let mut statement = self
             .conn
-            .prepare("SELECT path FROM setup_paths WHERE worktree_id = ?1 ORDER BY path")
+            .prepare("SELECT path, kind FROM setup_paths WHERE worktree_id = ?1 ORDER BY path")
             .map_err(sql)?;
         statement
-            .query_map([worktree], |row| row.get(0))
+            .query_map([worktree], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(sql)?
             .collect::<Result<_, _>>()
             .map_err(sql)

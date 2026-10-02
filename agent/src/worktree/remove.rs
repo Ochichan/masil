@@ -58,6 +58,14 @@ fn start(registry: &mut Registry, job: i64, id: i64) -> Result<Option<Worktree>,
     match registry.begin_removing(id, job).map_err(End::Failed)? {
         None => Ok(None),
         Some(state) if state == "ready" || state == "deleting" => {
+            // Setup works in the directory; a setup that starts from now on
+            // finds it no longer ready.
+            if let Some(setup) = registry.open_setup(id).map_err(End::Failed)? {
+                registry.stop_removing(id).map_err(End::Failed)?;
+                return Err(End::Failed(format!(
+                    "worktree_in_use: setup job {setup} works in it"
+                )));
+            }
             registry.worktree(id).map_err(End::Failed)
         }
         Some(state) => Err(End::Failed(format!(
@@ -353,7 +361,7 @@ impl Files {
 
 /// Entries of `git status --porcelain=v2 -z`, shown as `XY path`, `?? path`
 /// or `!! path`; a rename or copy carries its source.
-fn status_entries(output: &str) -> Vec<String> {
+pub(super) fn status_entries(output: &str) -> Vec<String> {
     let mut entries = Vec::new();
     let mut fields = output.split('\0').filter(|field| !field.is_empty());
     while let Some(field) = fields.next() {
@@ -397,7 +405,19 @@ fn files(registry: &Registry, row: &Worktree) -> Result<Files, String> {
         ],
     )?);
     changes.sort();
-    let setup: BTreeSet<String> = registry.setup_paths(row.id)?.into_iter().collect();
+    let setup: std::collections::HashMap<String, String> =
+        registry.setup_paths(row.id)?.into_iter().collect();
+    // Setup's directories, and its copies while unedited, are not asked about.
+    let from_setup = |ignored: &str| match setup.get(ignored.trim_end_matches('/')) {
+        Some(kind) if kind == "ignored" => true,
+        Some(kind) => kind.strip_prefix("copy:").is_some_and(|digest| {
+            super::setup::copied_digest(&path.join(ignored)).as_deref() == Some(digest)
+        }),
+        // A directory setup's copies made: setup's only while every file in
+        // it is one of them, unedited.
+        None if ignored.ends_with('/') => only_copies(path, ignored.trim_end_matches('/'), &setup),
+        None => false,
+    };
     let mut ignored: Vec<String> = status_entries(&git::query(
         path,
         &[
@@ -411,7 +431,7 @@ fn files(registry: &Registry, row: &Worktree) -> Result<Files, String> {
     )?)
     .into_iter()
     .filter_map(|entry| entry.strip_prefix("!! ").map(str::to_owned))
-    .filter(|ignored| !setup.contains(ignored.trim_end_matches('/')))
+    .filter(|ignored| !from_setup(ignored))
     .collect();
     ignored.sort();
     let head = git::query(path, &["rev-parse", "--verify", "HEAD"]).unwrap_or_default();
@@ -442,6 +462,54 @@ fn files(registry: &Registry, row: &Worktree) -> Result<Files, String> {
         ignored,
         token,
     })
+}
+
+/// Whether every file under `dir` (relative to the worktree) is a copy
+/// setup made and nobody edited. Symlinks and anything else count as a
+/// person's; a large tree is not walked.
+fn only_copies(
+    worktree: &Path,
+    dir: &str,
+    setup: &std::collections::HashMap<String, String>,
+) -> bool {
+    const LIMIT: usize = 1000;
+    let mut pending = vec![dir.to_owned()];
+    let mut seen = 0;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(worktree.join(&dir)) else {
+            return false;
+        };
+        for entry in entries {
+            seen += 1;
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return false;
+            };
+            let rel = format!("{dir}/{name}");
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(rel),
+                Ok(kind) if kind.is_file() => {
+                    let unedited = setup
+                        .get(&rel)
+                        .and_then(|kind| kind.strip_prefix("copy:"))
+                        .is_some_and(|digest| {
+                            super::setup::copied_digest(&worktree.join(&rel)).as_deref()
+                                == Some(digest)
+                        });
+                    if !unedited {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            if seen > LIMIT {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Settles a remove job whose helper died. Before step 6 nothing was

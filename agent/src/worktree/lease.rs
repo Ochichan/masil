@@ -184,6 +184,12 @@ pub(crate) fn begin(found: &Found, socket: &Path, boot: &str, run: &str) -> Resu
             row.name, row.state
         ));
     }
+    if let Some(setup) = registry.open_setup(row.id)? {
+        return Err(format!(
+            "worktree_in_use: setup job {setup} is still working in worktree {}; start after it ends",
+            row.name
+        ));
+    }
     if row.identity != Some(found.identity) {
         return Err(format!(
             "worktree_unavailable: this directory is not the worktree {} masil made (a copy?)",
