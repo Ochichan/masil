@@ -187,7 +187,7 @@ pub(crate) const VERBS: &[Verb] = &[
     },
     Verb {
         name: "answer",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] answer TARGET REQUEST --choice once|reject [--message TEXT] | --answer TEXT... | --reject",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] answer TARGET REQUEST --choice once|always|reject [--message TEXT] | --answer TEXT... | --reject",
         mutating: true,
         target_stage: None,
         remote: false,

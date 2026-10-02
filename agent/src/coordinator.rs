@@ -1022,7 +1022,7 @@ impl Shared {
 }
 
 /// Keeps the work in step with the store's features: the screen watch runs
-/// while the inbox is on. Also ends the process when its executable was
+/// while the inbox is on or an `--answers` run lives. Also ends the process when its executable was
 /// replaced, so the next start runs the new one.
 async fn supervise(
     shared: Arc<Shared>,
@@ -1049,7 +1049,11 @@ async fn supervise(
             }
             *current = features;
         }
-        let wanted = shared.features().iter().any(|feature| feature == "inbox");
+        // The inbox and `--answers` runs both need the panes watched.
+        let wanted = shared
+            .features()
+            .iter()
+            .any(|feature| feature == "inbox" || feature == "answers");
         let stopped = match shared.watch.lock() {
             Ok(mut watcher) => {
                 if wanted

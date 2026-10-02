@@ -144,6 +144,8 @@ pub(crate) fn kind_label(language: Language, kind: &str) -> &'static str {
         "turn_completed" => word(language, "Turn done", "턴 끝"),
         "returned_idle" => word(language, "Back to idle", "idle 복귀"),
         "operation_unknown" => word(language, "Outcome unknown", "결과 모름"),
+        "error" => word(language, "Error", "오류"),
+        "observation_lost" => word(language, "Not observed", "관찰 끊김"),
         _ => word(language, "Event", "사건"),
     }
 }
@@ -152,6 +154,8 @@ fn resolution_label(language: Language, resolution: &str) -> &'static str {
     match resolution {
         "replied" => word(language, "answered", "응답함"),
         "answered" => word(language, "answered in masil", "masil에서 응답함"),
+        "restored" => word(language, "observed again", "다시 관찰함"),
+        "superseded" => word(language, "answered with another", "함께 처리됨"),
         "rejected" => word(language, "rejected", "거절함"),
         "decided" => word(language, "decided", "결정됨"),
         "left_blocked" => word(language, "no longer waiting", "대기 끝"),

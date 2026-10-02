@@ -59,6 +59,8 @@ enum Stage {
         text: String,
     },
     Reject,
+    /// Confirming an `always` allow.
+    Always,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -125,6 +127,21 @@ impl AnswerDialog {
     fn is_permission(&self) -> bool {
         self.current()
             .is_some_and(|request| request["kind"] == "permission")
+    }
+
+    /// Other permissions of the selected request's session.
+    fn session_peers(&self) -> usize {
+        let Some(request) = self.current() else {
+            return 0;
+        };
+        self.requests
+            .iter()
+            .filter(|other| {
+                other["kind"] == "permission"
+                    && other["session_id"] == request["session_id"]
+                    && other["id"] != request["id"]
+            })
+            .count()
     }
 
     fn questions(&self) -> Vec<Value> {
@@ -209,6 +226,14 @@ impl AnswerDialog {
         self.notice = None;
         match std::mem::replace(&mut self.stage, Stage::List) {
             Stage::List => self.list_key(key.code),
+            Stage::Always => match key.code {
+                KeyCode::Esc => Outcome::None,
+                KeyCode::Enter => self.submit(Reply::Always),
+                _ => {
+                    self.stage = Stage::Always;
+                    Outcome::None
+                }
+            },
             Stage::Reject => match key.code {
                 KeyCode::Esc => Outcome::None,
                 KeyCode::Enter => self.submit(if self.is_permission() {
@@ -242,15 +267,21 @@ impl AnswerDialog {
             KeyCode::Char('1') | KeyCode::Enter if question => self.begin_questions(),
             KeyCode::Enter => {
                 self.notice = Some(self.word(
-                    "Press 1 to allow once or 3 to reject.",
-                    "1은 한 번 허용, 3은 거절입니다.",
+                    "Press 1 to allow once, 2 to always allow or 3 to reject.",
+                    "1은 한 번 허용, 2는 항상 허용, 3은 거절입니다.",
                 ));
             }
+            // What `always` would also allow among the session's other
+            // waiting permissions cannot be known; with none, it may go.
             KeyCode::Char('2') if !question => {
-                self.notice = Some(self.word(
-                    "Always-allow is answered in the pane for now.",
-                    "항상 허용은 아직 창에서 답합니다.",
-                ));
+                if self.session_peers() > 0 {
+                    self.notice = Some(self.word(
+                        "Another permission of this session waits: answer it first, or answer in the pane.",
+                        "같은 session에 다른 권한 요청이 있습니다. 그것을 먼저 처리하거나 창에서 답하세요.",
+                    ));
+                } else {
+                    self.stage = Stage::Always;
+                }
             }
             KeyCode::Char('3') if self.current().is_some() => self.stage = Stage::Reject,
             _ => {}
@@ -493,6 +524,42 @@ impl AnswerDialog {
                     });
                 }
             }
+            Stage::Always => {
+                push(
+                    &mut rows,
+                    &format!(
+                        "{} {}",
+                        self.word("Always allow:", "항상 허용:"),
+                        self.summary(request)
+                    ),
+                    Tone::Text,
+                );
+                let patterns = request["always"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(plain)
+                    .collect::<Vec<_>>();
+                if !patterns.is_empty() {
+                    push(
+                        &mut rows,
+                        &format!(
+                            "{} {}",
+                            self.word("Also allows:", "함께 허용:"),
+                            patterns.join(", ")
+                        ),
+                        Tone::Text,
+                    );
+                }
+                push(
+                    &mut rows,
+                    self.word(
+                        "While this OpenCode runs, its other sessions' matching requests are allowed without asking.",
+                        "이 OpenCode가 떠 있는 동안 다른 session의 같은 요청도 묻지 않고 허용됩니다.",
+                    ),
+                    Tone::Muted,
+                );
+            }
             Stage::Reject if request["kind"] == "permission" => {
                 push(
                     &mut rows,
@@ -591,6 +658,7 @@ impl AnswerDialog {
             Stage::List if self.is_permission() => vec![
                 (label("Esc", self.word("Cancel", "취소")), KeyCode::Esc),
                 (label("3", self.word("Reject", "거절")), KeyCode::Char('3')),
+                (label("2", self.word("Always", "항상")), KeyCode::Char('2')),
                 (
                     label("1", self.word("Allow once", "한 번 허용")),
                     KeyCode::Char('1'),
@@ -615,6 +683,13 @@ impl AnswerDialog {
                             self.word("Next", "다음")
                         },
                     ),
+                    KeyCode::Enter,
+                ),
+            ],
+            Stage::Always => vec![
+                (label("Esc", self.word("Back", "뒤로")), KeyCode::Esc),
+                (
+                    label("Enter", self.word("Always allow", "항상 허용")),
                     KeyCode::Enter,
                 ),
             ],
@@ -869,6 +944,33 @@ mod tests {
             } => assert_eq!(request, "per_2"),
             _ => panic!("expected once"),
         }
+    }
+
+    #[test]
+    fn always_is_confirmed_and_refused_while_the_session_has_another_request() {
+        let mut dialog = AnswerDialog::new(Language::English, agent(), permissions());
+        assert!(matches!(
+            key(&mut dialog, KeyCode::Char('2')),
+            Outcome::None
+        ));
+        assert!(matches!(dialog.stage, Stage::List));
+        assert!(dialog.notice.is_some());
+        let alone = vec![
+            json!({"id": "per_1", "kind": "permission", "session_id": "s",
+            "permission": "bash", "patterns": ["ls"], "always": ["ls *"]}),
+        ];
+        let mut dialog = AnswerDialog::new(Language::English, agent(), alone);
+        key(&mut dialog, KeyCode::Char('2'));
+        assert!(matches!(dialog.stage, Stage::Always));
+        let (rows, _) = dialog.detail(80);
+        assert!(rows.iter().any(|row| row.text.contains("ls *")));
+        assert!(matches!(
+            key(&mut dialog, KeyCode::Enter),
+            Outcome::Submit {
+                reply: Reply::Always,
+                ..
+            }
+        ));
     }
 
     #[test]

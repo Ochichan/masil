@@ -185,6 +185,8 @@ pub(crate) struct WatchReport {
     /// The pane and time of the last stand-back.
     pub last_stood_back: Option<(String, u64)>,
     pub ended_runs: u64,
+    /// `--answers` runs being observed.
+    pub observed: usize,
     pub last_error: Option<String>,
     pub last_error_ms: u64,
 }
@@ -289,6 +291,13 @@ pub(crate) async fn watch(
     let mut stood_back = 0;
     let mut badge = Badge::read(&manager).await;
     let mut first = true;
+    // `--answers` OpenCode runs: their tasks read the servers, this loop
+    // writes what they find (observe.rs).
+    let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut observers = super::observe::Observers::new(base);
+    let mut reports = Reports::default();
+    let observer = super::Observer::current();
+    let mut next_tick: Option<tokio::time::Instant> = None;
     loop {
         let interval = if busy || now_ms() < hot_until {
             (base / 2).max(Duration::from_millis(100))
@@ -300,20 +309,39 @@ pub(crate) async fn watch(
         let interval = badge
             .retry_in(now_ms())
             .map_or(interval, |retry| interval.min(retry));
+        let interval = reports
+            .retry_in(now_ms())
+            .map_or(interval, |retry| interval.min(retry));
         let mut woken = first || retry;
         if !first {
+            // Updates are handled between ticks without moving the next one.
+            let candidate = tokio::time::Instant::now() + interval;
+            let deadline =
+                next_tick.map_or(candidate, |at: tokio::time::Instant| at.min(candidate));
+            next_tick = Some(deadline);
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep_until(deadline) => {}
                 _ = control.wake.notified() => {
                     // Several pokes in a burst make one pass.
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
+                Some(update) = received.recv() => {
+                    if let Some(observer) = observer {
+                        reports.apply(&manager, update, observer).await;
+                    }
+                    continue;
+                }
             }
+            next_tick = None;
         }
         first = false;
         if control.stopping.load(Ordering::SeqCst) {
+            observers.stop();
             badge.clear(&manager).await;
             return;
+        }
+        if let Some(observer) = observer {
+            reports.flush(&manager, observer).await;
         }
         woken |= control.poked.swap(false, Ordering::SeqCst);
         if control.reload.swap(false, Ordering::SeqCst) {
@@ -426,6 +454,20 @@ pub(crate) async fn watch(
             match manager.list().await {
                 Ok(agents) => {
                     retry = false;
+                    reports.panes = agents
+                        .iter()
+                        .filter(|agent| super::observe::observable(agent))
+                        .map(|agent| (agent.run.clone(), agent.pane_id.clone()))
+                        .collect();
+                    reports.agents = agents
+                        .iter()
+                        .filter(|agent| super::observe::observable(agent))
+                        .map(|agent| (agent.run.clone(), agent.clone()))
+                        .collect();
+                    observers.sync(&manager, &agents, &updates).await;
+                    if let Ok(mut report) = control.report.lock() {
+                        report.observed = observers.len();
+                    }
                     // A blocked agent may wait for hours and its event is
                     // already written; only work changes on its own.
                     busy = agents.iter().any(|agent| agent.state == "working");
@@ -501,6 +543,155 @@ pub(crate) async fn watch(
             report.stood_back = count;
             report.last_stood_back = last;
         }
+    }
+}
+
+/// Reports from `--answers` OpenCode servers, written at most once a second
+/// per run since every option write redraws every client. A newer state
+/// replaces one still waiting.
+#[derive(Default)]
+struct Reports {
+    /// Observed runs and their panes, from the last pass.
+    panes: HashMap<String, String>,
+    /// The observed agents as the last pass read them. A write against an
+    /// older copy is refused by its guard and tried again after the next pass.
+    agents: HashMap<String, Agent>,
+    waiting: HashMap<String, Wanted>,
+    written: HashMap<String, u64>,
+    /// Writes refused in a row; a run is given up after a few, until its
+    /// next state.
+    failures: HashMap<String, u32>,
+}
+
+const REPORT_TRIES: u32 = 5;
+
+#[derive(Clone, Copy)]
+enum Wanted {
+    State(super::observe::ApiState),
+    /// The connection is lost: the screen decides again.
+    Clear,
+}
+
+impl Reports {
+    async fn apply(
+        &mut self,
+        manager: &Manager,
+        update: super::observe::Update,
+        observer: super::Observer,
+    ) {
+        use super::observe::Update;
+        match update {
+            Update::State { run, state } => {
+                self.failures.remove(&run);
+                self.waiting.insert(run, Wanted::State(state));
+            }
+            Update::Effects(effects) => manager.inbox_apply(effects).await,
+            // One event per loss: a later loss in the same run is new.
+            Update::Lost { run, since } => {
+                if let Some(pane) = self.panes.get(&run) {
+                    manager
+                        .inbox_apply(vec![super::inbox::Effect::Event {
+                            source: "api:opencode".into(),
+                            source_ref: format!("observation:{run}:{since}"),
+                            provider: "opencode".into(),
+                            pane: pane.clone(),
+                            run: run.clone(),
+                            revision: None,
+                            kind: "observation_lost",
+                            native_ref: None,
+                            summary: None,
+                        }])
+                        .await;
+                }
+                self.failures.remove(&run);
+                self.waiting.insert(run, Wanted::Clear);
+            }
+            Update::Restored { run } => {
+                manager
+                    .inbox_apply(vec![super::inbox::Effect::ResolveRun {
+                        run,
+                        kinds: &["observation_lost"],
+                        resolution: "restored",
+                    }])
+                    .await;
+            }
+        }
+        self.flush(manager, observer).await;
+    }
+
+    fn retry_in(&self, now: u64) -> Option<Duration> {
+        self.waiting
+            .keys()
+            .map(|run| {
+                let at = self.written.get(run).map_or(0, |at| at + 1_000);
+                Duration::from_millis(at.saturating_sub(now))
+            })
+            .min()
+    }
+
+    async fn flush(&mut self, manager: &Manager, observer: super::Observer) {
+        let now = now_ms();
+        self.waiting.retain(|run, _| self.panes.contains_key(run));
+        let due: Vec<String> = self
+            .waiting
+            .keys()
+            .filter(|run| self.written.get(*run).is_none_or(|at| now >= at + 1_000))
+            .cloned()
+            .collect();
+        for run in due {
+            let Some(wanted) = self.waiting.remove(&run) else {
+                continue;
+            };
+            let Some(agent) = self.agents.get_mut(&run) else {
+                continue;
+            };
+            // A closing report holds only while the screen stays as it is
+            // now, so it needs the current output generation.
+            if matches!(wanted, Wanted::State(state) if !state.live)
+                && let Ok(fresh) = manager.get(&agent.pane_id).await
+                && fresh.run == run
+            {
+                *agent = fresh;
+            }
+            let (state, generation) = match wanted {
+                Wanted::State(state) => (state, Some(agent.output_generation)),
+                Wanted::Clear => (
+                    super::observe::ApiState {
+                        state: "unknown",
+                        permissions: 0,
+                        questions: 0,
+                        live: false,
+                    },
+                    None,
+                ),
+            };
+            match manager.report_api(agent, state, observer, generation).await {
+                Ok(written) => {
+                    self.failures.remove(&run);
+                    if written {
+                        self.written.insert(run, now_ms());
+                    }
+                }
+                // Kept for the next second unless a newer state came
+                // meanwhile: a write that lost to a hook's is tried again,
+                // against the pane read again.
+                Err(_) => {
+                    if let Ok(fresh) = manager.get(&agent.pane_id).await
+                        && fresh.run == run
+                    {
+                        *agent = fresh;
+                    }
+                    let failures = self.failures.entry(run.clone()).or_default();
+                    *failures += 1;
+                    if *failures < REPORT_TRIES {
+                        self.waiting.entry(run.clone()).or_insert(wanted);
+                    }
+                    self.written.insert(run, now_ms());
+                }
+            }
+        }
+        self.written.retain(|run, _| self.panes.contains_key(run));
+        self.failures.retain(|run, _| self.panes.contains_key(run));
     }
 }
 
@@ -625,6 +816,10 @@ async fn sweep(
     ended_after: u64,
 ) -> Result<usize, String> {
     let (live, _) = manager.live_runs().await?;
+    // The secret of an `--answers` run that ended goes with it; the last one
+    // gone turns the `answers` feature off. A failure here does not hold up
+    // the inbox's ended runs; the next sweep tries again.
+    let _ = manager.prune_answer_secrets(&live).await;
     let Some(open) = manager
         .with_resident_store(|store| store.open_runs())
         .await?

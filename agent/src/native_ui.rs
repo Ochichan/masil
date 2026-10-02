@@ -14,7 +14,10 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 const COMMAND_DEADLINE: Duration = Duration::from_secs(3);
-const MAX_OUTPUT: usize = 64 * 1024;
+/// A bound on any native command's output. The agent inventory grows with
+/// the panes: up to 64 managed panes, each with its metadata, tracked state
+/// and run evidence (hex-encoded JSON, about 2-4 KiB a pane).
+const MAX_OUTPUT: usize = 256 * 1024;
 pub(crate) const MAX_SCRIPT: usize = 64 * 1024;
 const MAX_COPY: usize = 64 * 1024;
 const SIDEBAR_WIDTH: &str = "34";

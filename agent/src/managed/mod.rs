@@ -10,6 +10,7 @@ pub(crate) mod find;
 pub(crate) mod fleet;
 pub(crate) mod inbox;
 mod integration;
+mod observe;
 mod operations;
 mod prompt;
 mod remote_cli;
@@ -159,12 +160,67 @@ struct RunEvidence {
     /// A start asked for masil's answer channel (`answer::CHANNEL`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     answer_channel: Option<String>,
+    /// What the start's check found: `ready` or `unavailable`. Only a
+    /// ready channel is observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answer_channel_state: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ReportSource {
     sequence: u64,
     source: String,
+    /// `provider_api`: the coordinator that holds the run's connection. Its
+    /// report holds while that process lives, not for a fixed time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observer: Option<Observer>,
+    /// `provider_api`: the pane's output generation when it was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<u64>,
+    /// `provider_api`: the connection was open when it was written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    live: bool,
+    /// `provider_api`: pending permissions and questions of the pane's server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permissions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    questions: Option<u32>,
+}
+
+/// A process by its ID and start time, which together do not repeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Observer {
+    pub pid: i32,
+    pub started: u64,
+}
+
+impl Observer {
+    pub(crate) fn current() -> Option<Self> {
+        let pid = std::process::id() as i32;
+        crate::process::info(pid).map(|info| Self {
+            pid,
+            started: info.started,
+        })
+    }
+
+    fn alive(&self) -> bool {
+        crate::process::info(self.pid).is_some_and(|info| info.started == self.started)
+    }
+}
+
+impl ReportSource {
+    /// A `provider_api` report whose coordinator still runs.
+    fn observed(&self) -> bool {
+        self.source == REPORT_SOURCE_API && self.observer.is_some_and(|observer| observer.alive())
+    }
+
+    /// Whether this source's report still decides the state. A
+    /// `provider_api` report holds while its coordinator runs and keeps the
+    /// connection, and an idle one also while the screen stays as it was.
+    fn holds(&self, state: &str, output_generation: u64) -> bool {
+        self.observed()
+            && (self.live || (state == "idle" && self.generation == Some(output_generation)))
+    }
 }
 
 /// How `Metadata::session` was established for this run.
@@ -354,6 +410,12 @@ pub(crate) struct Agent {
     pub binding: BindingView,
     #[serde(default)]
     pub capabilities: CapabilityView,
+    /// Pending permissions and questions while blocked, when the provider's
+    /// own server told; 0 otherwise.
+    #[serde(default)]
+    pub permission_count: u32,
+    #[serde(default)]
+    pub question_count: u32,
     #[serde(skip)]
     metadata: Option<Metadata>,
     #[serde(skip)]
@@ -669,10 +731,31 @@ impl Manager {
             let run_evidence = metadata
                 .as_ref()
                 .and_then(|m| decode::<RunEvidence>(&fields[16]).filter(|e| e.run == m.run));
+            let output_generation = fields[14]
+                .parse::<u64>()
+                .map_err(|_| "invalid output generation")?;
             let mut report_authority = None;
+            let mut counts = (0, 0);
             if let Some(report) = metadata.as_ref().and_then(|m| m.report.as_ref())
                 && foreground
-                && now_ms().saturating_sub(report.at) <= REPORT_FRESH_MS
+                && match run_evidence
+                    .as_ref()
+                    .and_then(|e| e.report.as_ref())
+                    .filter(|source| {
+                        source.sequence == report.sequence && source.source == REPORT_SOURCE_API
+                    }) {
+                    Some(source) => {
+                        let holds = source.holds(&report.state, output_generation);
+                        if holds && report.state == "blocked" {
+                            counts = (
+                                source.permissions.unwrap_or(0),
+                                source.questions.unwrap_or(0),
+                            );
+                        }
+                        holds
+                    }
+                    None => now_ms().saturating_sub(report.at) <= REPORT_FRESH_MS,
+                }
             {
                 // A visible blocker is stronger than a hook claiming idle/working.
                 if !evidence.visible_blocker() || report.state == "blocked" {
@@ -792,9 +875,9 @@ impl Manager {
                 tracked,
                 tracked_encoded: fields[12].clone(),
                 foreground_group,
-                output_generation: fields[14]
-                    .parse()
-                    .map_err(|_| "invalid output generation")?,
+                output_generation,
+                permission_count: counts.0,
+                question_count: counts.1,
                 title: fields[9].clone(),
                 progress: fields[15].clone(),
             };
@@ -1539,11 +1622,21 @@ impl Manager {
         if metadata.run != agent.run || agent.process != "running" {
             return Err("identity_mismatch: stale agent report".into());
         }
-        if sequence <= metadata.last_sequence
-            || metadata
-                .report
+        // The coordinator numbers its reports by when it writes them; a
+        // callback that started before that still binds its session.
+        let observed = metadata.report.as_ref().is_some_and(|report| {
+            agent
+                .run_evidence
                 .as_ref()
-                .is_some_and(|r| sequence <= r.sequence)
+                .and_then(|e| e.report.as_ref())
+                .is_some_and(|source| source.sequence == report.sequence && source.observed())
+        });
+        if sequence <= metadata.last_sequence
+            || (!observed
+                && metadata
+                    .report
+                    .as_ref()
+                    .is_some_and(|r| sequence <= r.sequence))
         {
             return Err("report sequence did not advance".into());
         }
@@ -1573,6 +1666,20 @@ impl Manager {
         metadata.last_sequence = sequence;
         // State from a report that named another session is not this run's.
         let state = state.filter(|_| binding != Some(BindingOutcome::Contradicted));
+        // While the coordinator reads the provider's own server, that server
+        // decides the state; a callback still binds the session.
+        let state = state.filter(|_| {
+            !evidence
+                .report
+                .as_ref()
+                .filter(|source| {
+                    metadata
+                        .report
+                        .as_ref()
+                        .is_some_and(|r| r.sequence == source.sequence)
+                })
+                .is_some_and(ReportSource::observed)
+        });
         if let Some(state) = state {
             metadata.report = Some(Report {
                 sequence,
@@ -1586,6 +1693,11 @@ impl Manager {
                     ReportOrigin::Callback { .. } => REPORT_SOURCE_CALLBACK,
                 }
                 .into(),
+                observer: None,
+                generation: None,
+                live: false,
+                permissions: None,
+                questions: None,
             });
         }
         if let ReportOrigin::Callback { event, .. } = origin {
@@ -1620,8 +1732,106 @@ impl Manager {
         })
     }
 
+    /// The coordinator's report from the provider's own server
+    /// (`observe.rs`). Written only when something a reader uses differs from
+    /// what the pane holds; Ok(false) when nothing changed. Without
+    /// `generation` the report never holds: the screen decides again.
+    pub(super) async fn report_api(
+        &self,
+        agent: &mut Agent,
+        api: observe::ApiState,
+        observer: Observer,
+        generation: Option<u64>,
+    ) -> Result<bool, String> {
+        let mut metadata = agent.metadata.clone().ok_or("agent is not managed")?;
+        if metadata.run != agent.run || agent.process != "running" {
+            return Err("identity_mismatch: stale agent report".into());
+        }
+        let mut evidence = agent
+            .run_evidence
+            .clone()
+            .filter(|e| e.run == metadata.run)
+            .unwrap_or_else(|| RunEvidence {
+                run: metadata.run.clone(),
+                ..RunEvidence::default()
+            });
+        let source = ReportSource {
+            sequence: 0,
+            source: REPORT_SOURCE_API.into(),
+            observer: Some(observer),
+            generation,
+            live: api.live,
+            permissions: Some(api.permissions),
+            questions: Some(api.questions),
+        };
+        let unchanged = metadata
+            .report
+            .as_ref()
+            .zip(evidence.report.as_ref())
+            .is_some_and(|(report, current)| {
+                current.sequence == report.sequence
+                    && report.state == api.state
+                    && ReportSource {
+                        sequence: 0,
+                        ..current.clone()
+                    } == source
+            });
+        if unchanged {
+            return Ok(false);
+        }
+        // Callbacks number reports by their start time in nanoseconds.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        // `last_sequence` stays the callbacks' own: an earlier-started
+        // callback arriving after this write still binds its session.
+        let sequence = now_ns
+            .max(metadata.last_sequence + 1)
+            .max(metadata.report.as_ref().map_or(0, |r| r.sequence + 1));
+        metadata.report = Some(Report {
+            sequence,
+            state: api.state.into(),
+            at: now_ms(),
+        });
+        evidence.report = Some(ReportSource { sequence, ..source });
+        let encoded = encode(&metadata)?;
+        let outcome = self
+            .guarded_input_outcome(
+                agent,
+                vec![
+                    Self::option(agent, META, encoded.clone()),
+                    Self::option(agent, EVIDENCE, encode(&evidence)?),
+                ],
+                None,
+            )
+            .await?;
+        if matches!(outcome, Guarded::Rejected) {
+            return Err(REPORT_REJECTED.into());
+        }
+        // The caller's copy is what the pane holds now, so its next write
+        // passes the guard.
+        agent.metadata = Some(metadata);
+        agent.run_evidence = Some(evidence);
+        agent.encoded = encoded;
+        Ok(true)
+    }
+
     pub async fn close(&self, agent: &Agent) -> Result<(), String> {
-        self.close_with_operation(agent, None).await.map(|_| ())
+        match self.close_with_operation(agent, None).await {
+            // A report written meanwhile (a hook, the coordinator) changes
+            // what the guard compares: once more, for the same run only.
+            Err(error) if error.starts_with("rejected_before_effect") => {
+                let again = self.get(&agent.pane_id).await?;
+                if again.run != agent.run
+                    || again.generation != agent.generation
+                    || again.state != agent.state
+                {
+                    return Err(error);
+                }
+                self.close_with_operation(&again, None).await.map(|_| ())
+            }
+            result => result.map(|_| ()),
+        }
     }
 
     fn lock(&self) -> Result<std::fs::File, String> {
@@ -1781,8 +1991,26 @@ impl Agent {
     }
 
     pub fn projection(&self) -> Value {
+        let blocked = self.state == "blocked";
+        // Counts come from the provider's own server; without them a blocked
+        // agent is one pending item of an unknown kind.
+        let (permissions, questions) = if blocked {
+            (self.permission_count, self.question_count)
+        } else {
+            (0, 0)
+        };
+        let attention = match (blocked, permissions, questions) {
+            (true, 1.., _) => "approval",
+            (true, 0, 1..) => "question",
+            (true, ..) => "needs_input",
+            (false, ..) if self.returned_idle => "returned_idle",
+            _ => "none",
+        };
+        let pending = u8::from(
+            (blocked && permissions == 0 && questions == 0) || (!blocked && self.returned_idle),
+        );
         let mut projection = json!({"id":self.id,"source_id":self.provider,"session_id":self.session_id.as_deref().unwrap_or("unverified"),"pane_id":self.pane_id,
-            "native":{"exists":self.process=="running","activity":if ["idle","working"].contains(&self.state.as_str()){self.state.as_str()}else{"unknown"},"attention":if self.state=="blocked"{"needs_input"}else if self.returned_idle{"returned_idle"}else{"none"},"permission_count":0,"question_count":0,"pending_count":u8::from(self.state=="blocked"||self.returned_idle),"freshness":"fresh","observed_at_ms":now_ms()},
+            "native":{"exists":self.process=="running","activity":if ["idle","working"].contains(&self.state.as_str()){self.state.as_str()}else{"unknown"},"attention":attention,"permission_count":permissions,"question_count":questions,"pending_count":pending,"freshness":"fresh","observed_at_ms":now_ms()},
             "core":{"process":self.process,"pty_generation":self.generation,"freshness":"fresh"},"binding":self.binding_label(),"frontend_verified":false,
             "attention":{"revision":self.revision,"acknowledged":self.seen,"pending":self.state=="blocked"||self.returned_idle,"available":self.state=="blocked"||self.returned_idle},
             "capabilities":{"read":true,"input":false,"approval":false,"completion":false,"child_aggregation":false}});
@@ -1833,6 +2061,8 @@ fn provider_contract(engine: &Engine, id: &str) -> Result<Value, String> {
 
 const REPORT_SOURCE_RUN: &str = "run_report";
 const REPORT_SOURCE_CALLBACK: &str = "native_callback";
+/// The coordinator read the state from the provider's own server.
+const REPORT_SOURCE_API: &str = "provider_api";
 
 /// Result of one accepted report.
 #[derive(Clone, Copy, Debug)]
@@ -2842,6 +3072,11 @@ mod tests {
         evidence.report = Some(ReportSource {
             sequence: u64::MAX,
             source: REPORT_SOURCE_CALLBACK.into(),
+            observer: None,
+            generation: None,
+            live: false,
+            permissions: None,
+            questions: None,
         });
         assert_eq!(
             decode::<RunEvidence>(&encode(&evidence).unwrap()),
@@ -3047,6 +3282,8 @@ mod tests {
             tracked_encoded: String::new(),
             foreground_group: 0,
             output_generation: 0,
+            permission_count: 0,
+            question_count: 0,
             title: String::new(),
             progress: String::new(),
         };

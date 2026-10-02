@@ -396,7 +396,11 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             // without its password; one that does not is stopped.
             if answers && let Some(pane) = outcome["pane_id"].as_str() {
                 let agent = manager.get(pane).await?;
-                outcome["answer_channel"] = json!(manager.verify_answers(&agent).await?);
+                let channel = manager.verify_answers(&agent).await?;
+                // Without the record the coordinator does not observe the
+                // run; answering still works.
+                let _ = manager.record_answer_channel(pane, channel).await;
+                outcome["answer_channel"] = json!(channel);
             }
             // A new agent needs watching: start a coordinator that should be
             // running and is not, without waiting for it (D1).
@@ -443,7 +447,22 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             let outcome = if command == "interrupt" {
                 manager.interrupt(&agent, key).await?
             } else {
-                manager.close_with_operation(&agent, key).await?
+                match manager.close_with_operation(&agent, key).await {
+                    // A report written meanwhile (a hook, the coordinator)
+                    // changes what the guard compares. Once more, for the
+                    // same run only, when masil numbers the operation.
+                    Err(error) if key.is_none() && error.starts_with("rejected_before_effect") => {
+                        let again = manager.get(&args[0]).await?;
+                        if again.run != agent.run
+                            || again.generation != agent.generation
+                            || again.state != agent.state
+                        {
+                            return Err(error);
+                        }
+                        manager.close_with_operation(&again, None).await?
+                    }
+                    result => result?,
+                }
             };
             return print_record(&manager, &outcome, false).await;
         }
@@ -478,17 +497,15 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             }
             let reply = match (choice, answers.is_empty(), reject) {
                 (Some("once"), true, false) => super::answer::Reply::Once,
+                (Some("always"), true, false) if message.is_none() => super::answer::Reply::Always,
                 (Some("reject"), true, false) => super::answer::Reply::Reject { message },
                 (None, false, false) if message.is_none() => super::answer::Reply::Answers(answers),
                 (None, true, true) if message.is_none() => super::answer::Reply::RejectQuestion,
-                (Some(other), _, _) if other != "once" && other != "reject" => {
-                    return Err(
-                        "invalid_argument: --choice is once or reject; always is not offered yet"
-                            .into(),
-                    );
+                (Some(other), _, _) if !["once", "always", "reject"].contains(&other) => {
+                    return Err("invalid_argument: --choice is once, always or reject".into());
                 }
                 _ => {
-                    return Err("usage: answer TARGET REQUEST --choice once|reject [--message TEXT] | --answer TEXT... | --reject".into());
+                    return Err("usage: answer TARGET REQUEST --choice once|always|reject [--message TEXT] | --answer TEXT... | --reject".into());
                 }
             };
             let agent = manager.get(&args[0]).await?;

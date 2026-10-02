@@ -1349,6 +1349,44 @@ fn callback_ref(kind: &str, run: &str, sequence: u64) -> String {
     format!("{kind}:{run}:{sequence}")
 }
 
+/// Inbox effects of an OpenCode event the coordinator read from the pane's
+/// own server (`observe.rs`). They share the plugin's key, `hook:opencode`
+/// and `request:<id>`, so a request seen both ways is one event.
+pub(super) fn api_request_effects(
+    pane: &str,
+    run: &str,
+    frame: &Map<String, Value>,
+) -> Vec<super::inbox::Effect> {
+    let event = normalize_event(&callback_event(frame).unwrap_or_default());
+    let source = "hook:opencode";
+    let request = |kind: &'static str| {
+        open_code_property(frame, &["id"]).map(|id| {
+            callback_event_effect(
+                "opencode",
+                pane,
+                run,
+                kind,
+                request_ref(&id),
+                Some(id),
+                callback_summary("opencode", &event, frame),
+            )
+        })
+    };
+    let answered = |resolution: &'static str| {
+        open_code_property(frame, &["requestID", "requestId", "request_id"])
+            .map(|id| resolve_effect(source, &id, resolution))
+    };
+    match event.as_str() {
+        "permissionasked" => request("approval_requested"),
+        "questionasked" => request("question_asked"),
+        "permissionreplied" | "questionreplied" => answered("replied"),
+        "questionrejected" => answered("rejected"),
+        _ => None,
+    }
+    .into_iter()
+    .collect()
+}
+
 fn request_ref(id: &str) -> String {
     format!("request:{id}")
 }
@@ -1601,7 +1639,7 @@ fn redact_text(value: &str) -> String {
     redactors.token.replace_all(&value, "***").into_owned()
 }
 
-fn summary_text(value: &str, max_chars: usize, max_bytes: usize) -> String {
+pub(super) fn summary_text(value: &str, max_chars: usize, max_bytes: usize) -> String {
     let value: String = redact_text(value).chars().take(max_chars).collect();
     if value.len() <= max_bytes {
         return value;

@@ -569,8 +569,28 @@ impl Store {
             .map_err(sql)?;
         if Self::inbox_enabled_in(&conn)? && !features.iter().any(|name| name == "inbox") {
             features.push("inbox".into());
-            features.sort();
         }
+        // An `--answers` run keeps its secret until the coordinator sees it end.
+        let secrets: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_secrets')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if secrets
+            && conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM provider_secrets)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql)?
+            && !features.iter().any(|name| name == "answers")
+        {
+            features.push("answers".into());
+        }
+        features.sort();
         Ok(features)
     }
 
@@ -1400,7 +1420,7 @@ impl Store {
             let covered: bool = tx
                 .query_row(
                     "SELECT EXISTS (SELECT 1 FROM inbox_events
-                       WHERE run = ?1 AND source LIKE 'hook:%' AND (
+                       WHERE run = ?1 AND (source LIKE 'hook:%' OR source LIKE 'api:%') AND (
                          (?2 = 'blocked' AND kind IN ('blocked', 'approval_requested', 'question_asked')
                             AND resolved_ms IS NULL)
                          OR (?2 = 'returned_idle' AND kind = 'turn_completed')))",
@@ -1508,6 +1528,18 @@ impl Store {
                 }
                 _ => {}
             }
+        }
+        // A turn end read from the provider's own server is this turn's
+        // screen return to idle. Requests of other sessions still wait, and
+        // a read again after a restart is not a new turn end.
+        if event.source.starts_with("api:") && event.kind == "turn_completed" {
+            tx.execute(
+                "UPDATE inbox_events SET resolved_ms = ?2, resolution = 'covered'
+                 WHERE run = ?1 AND source = 'screen' AND kind = 'returned_idle'
+                   AND resolved_ms IS NULL",
+                params![event.run, event.observed_ms as i64],
+            )
+            .map_err(sql)?;
         }
         if id.is_some() {
             Self::inbox_prune_in(tx, event.observed_ms)?;
@@ -1619,6 +1651,54 @@ impl Store {
     }
 
     /// Resolves a run's open attention events of the given kinds.
+    /// Resolves the run's open request events from `source` whose native
+    /// request is not in `present`.
+    pub fn resolve_absent(
+        &mut self,
+        run: &str,
+        source: &str,
+        present: &[String],
+        before: u64,
+        resolution: &str,
+        now: u64,
+    ) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let open: Vec<(i64, Option<String>)> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, native_ref FROM inbox_events
+                     WHERE run = ?1 AND source = ?2 AND resolved_ms IS NULL AND observed_ms < ?3
+                       AND kind IN ('approval_requested', 'question_asked')",
+                )
+                .map_err(sql)?;
+            statement
+                .query_map(params![run, source, before as i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(sql)?
+                .collect::<Result<_, _>>()
+                .map_err(sql)?
+        };
+        let mut changed = 0;
+        for (id, native) in open {
+            if native.is_some_and(|native| present.contains(&native)) {
+                continue;
+            }
+            changed += tx
+                .execute(
+                    "UPDATE inbox_events SET resolved_ms = ?2, resolution = ?3 WHERE id = ?1",
+                    params![id, now as i64, resolution],
+                )
+                .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(changed)
+    }
+
     pub fn resolve_run(
         &mut self,
         run: &str,

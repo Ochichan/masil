@@ -39,18 +39,30 @@ pub(super) enum Effect {
         kinds: &'static [&'static str],
         resolution: &'static str,
     },
+    /// The run's open request events from `source`, recorded before
+    /// `before`, whose request is not in `present`: the provider no longer
+    /// waits for them.
+    ResolveAbsent {
+        run: String,
+        source: String,
+        present: Vec<String>,
+        before: u64,
+        resolution: &'static str,
+    },
 }
 
 /// Kinds that wait for the person until resolved.
 pub(super) const WAITING: &[&str] = &["blocked", "approval_requested", "question_asked"];
 /// Kinds that report a finished turn; the next turn resolves them.
-pub(super) const TURN_ENDS: &[&str] = &["turn_completed", "returned_idle"];
+pub(super) const TURN_ENDS: &[&str] = &["turn_completed", "returned_idle", "error"];
 pub(super) const ALL: &[&str] = &[
     "blocked",
     "approval_requested",
     "question_asked",
     "turn_completed",
     "returned_idle",
+    "error",
+    "observation_lost",
 ];
 
 fn now_ms() -> u64 {
@@ -152,6 +164,15 @@ fn apply(store: &mut Store, effects: &[Effect]) -> Result<(), String> {
                 resolution,
             } => store.resolve_run(run, kinds, resolution, now).map(drop),
             Effect::AckRun { run, through } => store.ack_run(run, *through, now).map(drop),
+            Effect::ResolveAbsent {
+                run,
+                source,
+                present,
+                before,
+                resolution,
+            } => store
+                .resolve_absent(run, source, present, *before, resolution, now)
+                .map(drop),
         };
         if let Err(error) = applied {
             first_error.get_or_insert(error);

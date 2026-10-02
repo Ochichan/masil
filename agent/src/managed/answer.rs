@@ -331,13 +331,65 @@ fn candidates(pid: i32) -> Vec<i32> {
     candidates
 }
 
-struct Endpoint {
+pub(super) struct Endpoint {
     client: Client,
     port: u16,
     secret: String,
 }
 
 impl Endpoint {
+    /// `GET /event`: the server's event stream, open until either side
+    /// ends it. Only connecting has a time limit.
+    pub(super) async fn events(&self) -> Result<reqwest::Response, String> {
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(HTTP_TIMEOUT)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let response = client
+            .get(format!("http://127.0.0.1:{}/event", self.port))
+            .basic_auth("opencode", Some(&self.secret))
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .map_err(|error| format!("answer_unavailable: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "answer_unavailable: OpenCode answered {} for /event",
+                response.status()
+            ));
+        }
+        Ok(response)
+    }
+
+    /// A JSON page and the cursor OpenCode gives for the next older one.
+    pub(super) async fn get_page(&self, path: &str) -> Result<(Value, Option<String>), String> {
+        let response = self
+            .client
+            .get(format!("http://127.0.0.1:{}{path}", self.port))
+            .basic_auth("opencode", Some(&self.secret))
+            .send()
+            .await
+            .map_err(|error| format!("answer_unavailable: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "answer_unavailable: OpenCode answered {} for {path}",
+                response.status()
+            ));
+        }
+        let cursor = response
+            .headers()
+            .get("x-next-cursor")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 512 && value.bytes().all(|b| b.is_ascii_graphic()))
+            .map(str::to_owned);
+        let (_, body) = read_limited(response).await?;
+        let value = serde_json::from_slice(&body)
+            .map_err(|_| format!("answer_unavailable: OpenCode sent no JSON for {path}"))?;
+        Ok((value, cursor))
+    }
+
     async fn send(
         &self,
         method: Method,
@@ -356,7 +408,7 @@ impl Endpoint {
         .await
     }
 
-    async fn get_json(&self, path: &str) -> Result<Value, String> {
+    pub(super) async fn get_json(&self, path: &str) -> Result<Value, String> {
         let (status, body) = self.send(Method::GET, path, None, true).await?;
         if !status.is_success() {
             return Err(format!(
@@ -385,10 +437,15 @@ async fn call(
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
     }
-    let mut response = request
+    let response = request
         .send()
         .await
         .map_err(|error| format!("answer_unavailable: {error}"))?;
+    read_limited(response).await
+}
+
+/// The status and body, refusing a body over LIST_LIMIT.
+async fn read_limited(mut response: reqwest::Response) -> Result<(StatusCode, Vec<u8>), String> {
     let status = response.status();
     let mut body = Vec::new();
     while let Some(chunk) = response
@@ -409,12 +466,87 @@ fn client() -> Result<Client, String> {
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(HTTP_TIMEOUT)
+        // A local connection is cheap to open; an idle one kept for later
+        // would outlive a quiet observer's stream.
+        .pool_max_idle_per_host(0)
         .build()
         .map_err(|error| error.to_string())
 }
 
+/// The OpenCode server of the process group `pid`: exactly one local
+/// listener of its own processes that refuses every guarded route without
+/// the password and is healthy with it. The password goes only to a port
+/// that asked for it.
+pub(super) async fn discover(secret: String, pid: i32) -> Result<Endpoint, String> {
+    if pid <= 1 {
+        return Err("answer_unavailable: the pane's OpenCode is not running".into());
+    }
+    let ports = tokio::task::spawn_blocking(move || {
+        candidates(pid)
+            .into_iter()
+            .flat_map(listening)
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let client = client()?;
+    let mut usable = Vec::new();
+    let mut unsafe_port = false;
+    for port in ports {
+        let mut refuses = true;
+        let mut answered = false;
+        for path in GUARDED {
+            match call(&client, port, Method::GET, path, None, None).await {
+                Ok((status, _)) if status == StatusCode::UNAUTHORIZED => {}
+                // A server that served the route took the request.
+                Ok((status, _)) if status.is_success() => answered = true,
+                // Another status or no answer proves nothing either way:
+                // the port is not usable now.
+                _ => refuses = false,
+            }
+        }
+        if answered {
+            unsafe_port = true;
+            continue;
+        }
+        if !refuses {
+            continue;
+        }
+        let healthy = call(
+            &client,
+            port,
+            Method::GET,
+            "/global/health",
+            None,
+            Some(&secret),
+        )
+        .await
+        .is_ok_and(|(status, body)| {
+            status.is_success()
+                && serde_json::from_slice::<Value>(&body)
+                    .is_ok_and(|value| value["healthy"] == true)
+        });
+        if healthy {
+            usable.push(port);
+        }
+    }
+    match usable.as_slice() {
+        [port] => Ok(Endpoint {
+            client,
+            port: *port,
+            secret,
+        }),
+        [] if unsafe_port => Err(
+            "answer_unsafe: the pane's OpenCode server answered without its password; masil will not use it"
+                .into(),
+        ),
+        [] => Err("answer_unavailable: the pane's OpenCode server is not listening yet".into()),
+        _ => Err("answer_unavailable: more than one OpenCode server belongs to this pane".into()),
+    }
+}
+
 /// Whether the agent asked for a channel at start.
-fn requested(agent: &Agent) -> bool {
+pub(super) fn requested(agent: &Agent) -> bool {
     agent.provider == PROVIDER
         && agent
             .run_evidence
@@ -449,67 +581,90 @@ impl Manager {
         if agent.process != "running" || agent.foreground_group <= 1 {
             return Err("answer_unavailable: the pane's OpenCode is not running".into());
         }
-        let pid = agent.foreground_group;
-        let ports = tokio::task::spawn_blocking(move || {
-            candidates(pid)
-                .into_iter()
-                .flat_map(listening)
-                .collect::<Vec<_>>()
+        discover(secret, agent.foreground_group).await
+    }
+
+    /// Records what the start's check found: the coordinator observes only
+    /// a ready channel. A ready one also marks the server so that autosave
+    /// brings the coordinator back.
+    pub(super) async fn record_answer_channel(
+        &self,
+        pane: &str,
+        state: &'static str,
+    ) -> Result<(), String> {
+        let agent = self.get(pane).await?;
+        let mut evidence = agent
+            .run_evidence
+            .clone()
+            .filter(|evidence| evidence.run == agent.run)
+            .ok_or("identity_mismatch: the run has no evidence")?;
+        if evidence.answer_channel_state.as_deref() != Some(state) {
+            evidence.answer_channel_state = Some(state.into());
+            let outcome = self
+                .guarded_input_outcome(
+                    &agent,
+                    vec![Self::option(
+                        &agent,
+                        super::EVIDENCE,
+                        super::encode(&evidence)?,
+                    )],
+                    None,
+                )
+                .await?;
+            if matches!(outcome, super::Guarded::Rejected) {
+                return Err("identity_mismatch: the pane changed".into());
+            }
+        }
+        if state == "ready" {
+            self.command(&["set-option", "-gq", "@masil-answers", "on"])
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Drops the secrets of runs not in `live` (after a short grace).
+    pub(super) async fn prune_answer_secrets(
+        &self,
+        live: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        let socket = self.native.socket.clone();
+        let live = live.clone();
+        // A store that was never created holds no secret.
+        tokio::task::spawn_blocking(move || {
+            let Some(base) = super::operations::state_base().ok() else {
+                return Ok(());
+            };
+            if !super::operations::Store::enabled_features(&base, &socket)?
+                .iter()
+                .any(|feature| feature == "answers")
+            {
+                return Ok(());
+            }
+            let mut store = super::operations::Store::open(&socket)?;
+            store.prune_secrets(&live, now_ms()).map(drop)
         })
         .await
-        .map_err(|error| error.to_string())?;
-        let client = client()?;
-        let mut usable = Vec::new();
-        let mut unsafe_port = false;
-        for port in ports {
-            let healthy = call(
-                &client,
-                port,
-                Method::GET,
-                "/global/health",
-                None,
-                Some(&secret),
-            )
+        .map_err(|error| error.to_string())?
+    }
+
+    /// The run's server password, without pruning (the coordinator prunes
+    /// with its ended-run sweep).
+    pub(super) async fn run_secret(&self, run: &str) -> Result<Option<String>, String> {
+        // The coordinator's own connection opens only while the inbox is on.
+        if self.is_resident() {
+            let run = run.to_owned();
+            if let Some(secret) = self
+                .with_resident_store(move |store| store.secret(&run, PROVIDER))
+                .await?
+            {
+                return Ok(secret);
+            }
+        }
+        let run = run.to_owned();
+        let store = self.operation_store().await?;
+        tokio::task::spawn_blocking(move || store.secret(&run, PROVIDER))
             .await
-            .is_ok_and(|(status, body)| {
-                status.is_success()
-                    && serde_json::from_slice::<Value>(&body)
-                        .is_ok_and(|value| value["healthy"] == true)
-            });
-            if !healthy {
-                continue;
-            }
-            let mut refuses = true;
-            let mut answered = false;
-            for path in GUARDED {
-                match call(&client, port, Method::GET, path, None, None).await {
-                    Ok((status, _)) if status == StatusCode::UNAUTHORIZED => {}
-                    // A server that served the route took the request.
-                    Ok((status, _)) if status.is_success() => answered = true,
-                    // Another status or no answer proves nothing either
-                    // way: the port is not usable now.
-                    _ => refuses = false,
-                }
-            }
-            if answered {
-                unsafe_port = true;
-            } else if refuses {
-                usable.push(port);
-            }
-        }
-        match usable.as_slice() {
-            [port] => Ok(Endpoint {
-                client,
-                port: *port,
-                secret,
-            }),
-            [] if unsafe_port => Err(
-                "answer_unsafe: the pane's OpenCode server answered without its password; masil will not use it"
-                    .into(),
-            ),
-            [] => Err("answer_unavailable: the pane's OpenCode server is not listening yet".into()),
-            _ => Err("answer_unavailable: more than one OpenCode server belongs to this pane".into()),
-        }
+            .map_err(|error| error.to_string())?
     }
 
     /// Checks a fresh `--answers` start: the server must refuse requests
@@ -665,6 +820,29 @@ impl Manager {
                     );
                 }
             };
+            // `always` also allows the session's other waiting permissions
+            // that its patterns cover, judged with rules masil cannot see:
+            // with any of them waiting now, it is not sent.
+            let mut checked = None;
+            if matches!(reply, Reply::Always) {
+                let now = pending(&endpoint).await;
+                let others: Result<bool, String> = match &now {
+                    Ok(now) => Ok(now.iter().any(|item| {
+                        item["_kind"] == "permission"
+                            && item["sessionID"] == found["sessionID"]
+                            && item["id"] != request
+                    })),
+                    Err(error) => Err(error.clone()),
+                };
+                checked = now.ok();
+                if !matches!(others, Ok(false)) {
+                    store.finish(&ticket, "not_applied", "masil", None, now_ms())?;
+                    return Err(match others {
+                        Ok(_) => "answer_refused: another permission of this session waits; answer it first, or answer in the pane".into(),
+                        Err(error) => error,
+                    });
+                }
+            }
             let sent = endpoint
                 .send(Method::POST, &path, Some(body.clone()), true)
                 .await;
@@ -700,11 +878,14 @@ impl Manager {
             )?;
             result?;
             // OpenCode rejects the session's other permissions with a
-            // rejected one. Null when the list cannot be read again.
-            let also = if matches!(reply, Reply::Reject { .. }) {
+            // rejected one. `always` is sent only with none waiting at the
+            // check just before it, so a request that arrived after the
+            // check and was allowed with it is not seen. Null when the list
+            // cannot be read again.
+            let also = if matches!(reply, Reply::Reject { .. } | Reply::Always) {
+                let base = checked.as_ref().unwrap_or(&before);
                 pending(&endpoint).await.ok().map(|after| {
-                    before
-                        .iter()
+                    base.iter()
                         .filter(|item| {
                             item["_kind"] == "permission"
                                 && item["sessionID"] == found["sessionID"]
@@ -717,12 +898,21 @@ impl Manager {
             } else {
                 Some(Vec::new())
             };
-            self.inbox_apply(vec![super::inbox::Effect::Resolve {
+            let mut effects = vec![super::inbox::Effect::Resolve {
                 source: format!("hook:{PROVIDER}"),
                 source_ref: format!("request:{request}"),
                 resolution: "answered",
-            }])
-            .await;
+            }];
+            effects.extend(
+                also.iter()
+                    .flatten()
+                    .map(|id| super::inbox::Effect::Resolve {
+                        source: format!("hook:{PROVIDER}"),
+                        source_ref: format!("request:{id}"),
+                        resolution: "superseded",
+                    }),
+            );
+            self.inbox_apply(effects).await;
             return Ok(json!({
                 "stage": "native_accepted",
                 "operation": ticket.key,
@@ -737,7 +927,13 @@ impl Manager {
 /// What a request answer posts.
 pub(crate) enum Reply {
     Once,
-    Reject { message: Option<String> },
+    /// Allow this and, while the OpenCode instance lives, what its
+    /// `always` patterns cover. Sent only when no other permission of the
+    /// session waits (what it would also allow cannot be known).
+    Always,
+    Reject {
+        message: Option<String>,
+    },
     Answers(Vec<String>),
     RejectQuestion,
 }
@@ -747,6 +943,10 @@ impl Reply {
     fn post(&self, id: &str) -> (String, Value) {
         match self {
             Self::Once => (format!("/permission/{id}/reply"), json!({"reply": "once"})),
+            Self::Always => (
+                format!("/permission/{id}/reply"),
+                json!({"reply": "always"}),
+            ),
             Self::Reject { message } => {
                 let mut body = json!({"reply": "reject"});
                 if let Some(message) = message {
@@ -769,7 +969,7 @@ impl Reply {
     fn check(&self, request: &Value) -> Result<(), String> {
         let kind = request["_kind"].as_str().unwrap_or_default();
         match (self, kind) {
-            (Self::Once | Self::Reject { .. }, "permission") => Ok(()),
+            (Self::Once | Self::Always | Self::Reject { .. }, "permission") => Ok(()),
             (Self::RejectQuestion, "question") => Ok(()),
             (Self::Answers(answers), "question") => {
                 let questions = request["questions"].as_array().cloned().unwrap_or_default();
@@ -798,7 +998,7 @@ impl Reply {
                 Ok(())
             }
             (_, "permission") => {
-                Err("invalid_argument: a permission takes --choice once|reject".into())
+                Err("invalid_argument: a permission takes --choice once|always|reject".into())
             }
             _ => Err(
                 "invalid_argument: a question takes --answer TEXT per question, or --reject".into(),
