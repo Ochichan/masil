@@ -2226,6 +2226,7 @@ pub(super) fn action_shortcut(action: Action) -> &'static str {
         Action::CloseAgent => "X",
         Action::Answer => "y",
         Action::Queue => "e",
+        Action::Changes => "f",
         Action::Inbox => "i",
         Action::NextUnseen => "u",
     }

@@ -374,6 +374,22 @@ impl Fleet {
         self.local.queue_op(agent, op).await
     }
 
+    /// Working tree changes, checkpoints and restore (P6): this machine's
+    /// agents only.
+    pub async fn changes_op(
+        &self,
+        agent: &Agent,
+        op: super::changes::ChangesOp,
+    ) -> Result<Value, String> {
+        if self.remote(agent)?.is_some() {
+            return Err(
+                "changes_remote_unsupported: a remote agent's changes and checkpoints are not offered yet".into(),
+            );
+        }
+        let agent = self.local.get(&agent.pane_id).await?;
+        self.local.changes_op(&agent, op).await
+    }
+
     /// The agent as its pane runs it now: answers find the provider's server
     /// through the pane's current processes, not a listed copy.
     async fn answering(&self, agent: &Agent) -> Result<Agent, String> {

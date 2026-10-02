@@ -679,6 +679,20 @@ enum Work {
     Inbox(Result<crate::managed::inbox::InboxView, String>),
     /// A queue window's list, after a change when there was one.
     Queue(QueueMessage),
+    /// A changes window's result.
+    Changes(ChangesMessage),
+    /// A pager popup that could not open.
+    Pager(Result<(), String>),
+}
+
+struct ChangesMessage {
+    agent: Box<Agent>,
+    /// The window opening that asked, if any.
+    window: Option<u64>,
+    /// The `f` press that asked to open the window.
+    press: Option<u64>,
+    op: crate::managed::changes::ChangesOp,
+    result: Result<Value, String>,
 }
 
 struct QueueMessage {
@@ -808,6 +822,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     let mut dialog: Option<Dialog> = None;
     let mut answering: Option<AnswerDialog> = None;
     let mut queueing: Option<QueueWindow> = None;
+    let mut changing: Option<super::changes::ChangesWindow> = None;
     let mut palette: Option<Palette> = None;
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -826,6 +841,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                     if let Some(dialog) = &mut dialog { dialog.draw(frame, app.theme); }
                     if let Some(answering) = &mut answering { answering.draw(frame, app.theme); }
                     if let Some(queueing) = &mut queueing { queueing.draw(frame, app.theme); }
+                    if let Some(changing) = &mut changing { changing.draw(frame, app.theme); }
                     if let Some(palette) = &mut palette { palette.draw(frame, app.theme); }
                 }).map_err(|error| error.to_string())?;
                 app.dirty = false;
@@ -859,6 +875,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             && dialog.is_none()
                             && answering.is_none()
                             && queueing.is_none()
+                            && changing.is_none()
                             && app.overlay.is_none()
                             && app.focus != super::model::Focus::Search
                         {
@@ -867,6 +884,22 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             let fleet = fleet.clone();
                             tasks.spawn(async move { Work::Panes(fleet.local.pane_targets().await) });
                             app.dirty = true;
+                            Vec::new()
+                        } else if let Some(active) = &mut changing {
+                            use super::changes::ChangesOutcome;
+                            let outcome = active.handle(event);
+                            app.dirty = true;
+                            match outcome {
+                                ChangesOutcome::None => {}
+                                ChangesOutcome::Close => changing = None,
+                                ChangesOutcome::Op(op) => {
+                                    changes_task(&mut tasks, fleet.clone(), active.agent.clone(), op, None, Some(active.generation));
+                                }
+                                ChangesOutcome::Pager(text) => {
+                                    let fleet = fleet.clone();
+                                    tasks.spawn(async move { Work::Pager(fleet.local.open_pager(text).await) });
+                                }
+                            }
                             Vec::new()
                         } else if let Some(active) = &mut queueing {
                             let outcome = active.handle(event);
@@ -941,6 +974,11 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         .clone()
                                         .unwrap_or_else(|| "managed-fleet-empty".into());
                                     agents = next_agents;
+                                    if let Some(window) = &mut changing
+                                        && let Some(agent) = agents.values().find(|agent| agent.pane_id == window.pane())
+                                    {
+                                        window.seen_run(&agent.run);
+                                    }
                                     last_poll_ms = crate::observation::now_ms();
                                     inbox_due = true;
                                     let mut names = agents
@@ -1008,6 +1046,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 };
                                 let free = answering.is_none()
                                     && queueing.is_none()
+                                    && changing.is_none()
                                     && dialog.is_none()
                                     && palette.is_none()
                                     && app.overlay.is_none()
@@ -1026,6 +1065,57 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             Err(error) => { app.finish_action(); app.notify(format!("Action failed: {}", crate::managed::failure::human(&error))); app.inbox.refresh = true; },
                         },
                         Ok(Work::Action(_)) => {},
+                        Ok(Work::Pager(Err(error))) => {
+                            let notice = format!("Pager: {}", crate::managed::failure::human(&error));
+                            match &mut changing {
+                                Some(window) => window.tell(notice),
+                                None => app.notify(notice),
+                            }
+                            app.dirty = true;
+                        }
+                        Ok(Work::Pager(Ok(()))) => {}
+                        Ok(Work::Changes(message)) => {
+                            app.dirty = true;
+                            let ChangesMessage { agent, window: opening, press, op, result } = message;
+                            if let Some(window) = changing.as_mut().filter(|window| opening == Some(window.generation)) {
+                                window.receive(&op, result);
+                                if let Some(next) = window.needs() {
+                                    changes_task(&mut tasks, fleet.clone(), window.agent.clone(), next, None, Some(window.generation));
+                                }
+                            } else if press.is_some_and(|press| press == app.changes_request) {
+                                match result {
+                                    Ok(files) => {
+                                        let free = answering.is_none()
+                                            && queueing.is_none()
+                                            && changing.is_none()
+                                            && dialog.is_none()
+                                            && palette.is_none()
+                                            && app.overlay.is_none()
+                                            && app.focus != super::model::Focus::Search
+                                            && !app.inbox.open
+                                            && app.selected_id.as_ref() == Some(&agent.id);
+                                        if free {
+                                            let reviewers = agents
+                                                .values()
+                                                .filter(|other| other.id != agent.id && !other.stale)
+                                                .filter(|other| other.endpoint_id.is_empty() || other.endpoint_id == "local")
+                                                .map(|other| other.name.clone())
+                                                .collect::<std::collections::BTreeSet<_>>()
+                                                .into_iter()
+                                                .collect();
+                                            changing = Some(super::changes::ChangesWindow::new(app.changes_request, app.language, *agent, reviewers, files));
+                                        } else {
+                                            app.notify(self::message(
+                                                app.language,
+                                                "The view changed before the changes arrived; press f again".into(),
+                                                "변경 목록이 오기 전에 화면이 바뀌었습니다. f를 다시 누르세요".into(),
+                                            ));
+                                        }
+                                    }
+                                    Err(error) => app.notify(format!("Action failed: {}", crate::managed::failure::human(&error))),
+                                }
+                            }
+                        }
                         Ok(Work::Queue(message)) => {
                             app.dirty = true;
                             let QueueMessage { agent, press, done, view } = message;
@@ -1045,6 +1135,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     } else if press.is_some_and(|press| press == app.queue_request) {
                                         let free = answering.is_none()
                                             && queueing.is_none()
+                                            && changing.is_none()
                                             && dialog.is_none()
                                             && palette.is_none()
                                             && app.overlay.is_none()
@@ -1575,6 +1666,19 @@ fn dispatch_effect(
                 });
             }
         }
+        Effect::Changes { id } => {
+            if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {
+                app.changes_request += 1;
+                changes_task(
+                    tasks,
+                    fleet,
+                    agent,
+                    crate::managed::changes::ChangesOp::List,
+                    Some(app.changes_request),
+                    None,
+                );
+            }
+        }
         Effect::Queue { id } => {
             if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {
                 app.queue_request += 1;
@@ -1647,6 +1751,26 @@ fn dispatch_effect(
 }
 
 /// One queue change (when given), then the agent's queue again.
+fn changes_task(
+    tasks: &mut JoinSet<Work>,
+    fleet: Arc<Fleet>,
+    agent: Agent,
+    op: crate::managed::changes::ChangesOp,
+    press: Option<u64>,
+    window: Option<u64>,
+) {
+    tasks.spawn(async move {
+        let result = fleet.changes_op(&agent, op.clone()).await;
+        Work::Changes(ChangesMessage {
+            agent: Box::new(agent),
+            window,
+            press,
+            op,
+            result,
+        })
+    });
+}
+
 fn queue_task(
     tasks: &mut JoinSet<Work>,
     fleet: Arc<Fleet>,
