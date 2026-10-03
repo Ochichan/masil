@@ -743,14 +743,15 @@ impl Registry {
     }
 
     /// The owner's last word on its job. A job someone else already ended
-    /// (its owner was taken for dead) keeps that end.
+    /// (its owner was taken for dead) keeps that end. True when this call
+    /// ended it.
     pub(super) fn finish_job(
         &mut self,
         id: i64,
         end: End,
         output_tail: Option<&str>,
         now: u64,
-    ) -> Result<Job, String> {
+    ) -> Result<(Job, bool), String> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -760,7 +761,8 @@ impl Registry {
                 row.get(0)
             })
             .map_err(sql)?;
-        if matches!(state.as_str(), "running" | "cancel_requested") {
+        let ending = matches!(state.as_str(), "running" | "cancel_requested");
+        if ending {
             let (next, result, error) = match end {
                 End::Succeeded(result) if state == "cancel_requested" => {
                     ("too_late", Some(result), None)
@@ -792,7 +794,7 @@ impl Registry {
             )
             .map_err(sql)?;
         tx.commit().map_err(sql)?;
-        Ok(job)
+        Ok((job, ending))
     }
 
     /// Ends an open job whose owner is gone, only if it is still in the
@@ -1459,9 +1461,10 @@ mod tests {
         let a = queued(&mut registry, "repo:a");
         registry.claim(a, (10, 1), &|_| true, 2).unwrap();
         registry.request_cancel(a, 3).unwrap();
-        let job = registry
+        let (job, ended) = registry
             .finish_job(a, End::Succeeded(json!({"ok": 1})), Some("out"), 4)
             .unwrap();
+        assert!(ended);
         assert_eq!(job.state, "too_late");
         assert_eq!(job.result, Some(json!({"ok": 1})));
         let seen = registry.job(a).unwrap().unwrap();
@@ -1489,9 +1492,10 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(registry.job(c).unwrap().unwrap().state, "running");
-        let job = registry
+        let (job, ended) = registry
             .finish_job(b, End::Succeeded(json!({})), None, 4)
             .unwrap();
+        assert!(!ended);
         assert_eq!(job.state, "outcome_unknown");
     }
 

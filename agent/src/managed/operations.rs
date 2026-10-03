@@ -98,7 +98,101 @@ const FEATURES: &[(&str, &str)] = &[
     ("inbox", INBOX_SCHEMA),
     ("provider_secrets", PROVIDER_SECRETS_SCHEMA),
     ("prompt_queue", PROMPT_QUEUE_SCHEMA),
+    ("notify", NOTIFY_SCHEMA),
+    ("schedules", SCHEDULES_SCHEMA),
 ];
+
+/// Schedules (docs/schedules.md). A run row is claimed before its action
+/// starts, so a due time runs at most once; `missed` rows settle the times
+/// that were not run.
+const SCHEDULES_SCHEMA: &str = "
+CREATE TABLE schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  spec TEXT NOT NULL,
+  action TEXT NOT NULL,
+  enabled INTEGER NOT NULL,
+  created_ms INTEGER NOT NULL,
+  changed_ms INTEGER NOT NULL
+);
+CREATE TABLE schedule_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_id INTEGER NOT NULL,
+  due_ms INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  started_ms INTEGER,
+  ended_ms INTEGER,
+  result TEXT,
+  UNIQUE (schedule_id, due_ms)
+);
+";
+/// Run rows kept per schedule.
+const SCHEDULE_RUNS_KEPT: i64 = 200;
+
+/// A schedule as stored, with the latest due time it settled.
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduleRow {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) spec: String,
+    pub(crate) action: Value,
+    pub(crate) enabled: bool,
+    pub(crate) created_ms: i64,
+    pub(crate) changed_ms: i64,
+    pub(crate) last_due: Option<i64>,
+    pub(crate) last_state: Option<String>,
+}
+
+/// What `schedule_record` settled: the due time this caller may run, and
+/// whether a missed-schedule event was written.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScheduleClaim {
+    pub(crate) run: Option<i64>,
+    pub(crate) event: bool,
+}
+
+/// Notifications (docs/notifications.md). A row is written, in the same
+/// transaction that moves the cursor past its event, before anything is
+/// sent: a notification is tried at most once, never twice.
+const NOTIFY_SCHEMA: &str = "
+CREATE TABLE notify_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  store_seq INTEGER NOT NULL,
+  route TEXT NOT NULL,
+  created_ms INTEGER NOT NULL,
+  outcome TEXT NOT NULL,
+  UNIQUE (event_id, store_seq, route)
+);
+CREATE TABLE notify_env (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO meta VALUES ('notify_enabled', 0);
+INSERT INTO meta VALUES ('notify_seq', 0);
+";
+const NOTIFY_KEEP: i64 = 1000;
+const NOTIFY_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Events read per notification batch.
+const NOTIFY_BATCH: i64 = 200;
+
+/// An event a notification pass claimed, with the log rows for its routes.
+#[derive(Clone, Debug)]
+pub(crate) struct NotifyEvent {
+    pub(crate) id: i64,
+    pub(crate) kind: String,
+    pub(crate) provider: String,
+    pub(crate) pane: String,
+    pub(crate) run: String,
+    pub(crate) summary: Option<Value>,
+    pub(crate) observed_ms: u64,
+    /// Log row per route, to record how sending went.
+    pub(crate) rows: Vec<(String, i64)>,
+}
+
+/// What a claim found: events to send, and how many were too old to.
+#[derive(Default, Debug)]
+pub(crate) struct NotifyClaim {
+    pub(crate) events: Vec<NotifyEvent>,
+    pub(crate) stale: usize,
+}
 
 /// The prompt queue (docs/prompt-queue.md). A row's prompt is the operation
 /// `operation_key`; the trigger copies that operation's state to the row in
@@ -732,6 +826,28 @@ impl Store {
             .map_err(sql)?;
         if Self::inbox_enabled_in(&conn)? && !features.iter().any(|name| name == "inbox") {
             features.push("inbox".into());
+        }
+        if Self::notify_enabled_in(&conn)? && !features.iter().any(|name| name == "notify") {
+            features.push("notify".into());
+        }
+        let schedules: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schedules')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if schedules
+            && conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM schedules WHERE enabled = 1)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql)?
+            && !features.iter().any(|name| name == "schedules")
+        {
+            features.push("schedules".into());
         }
         // An `--answers` run keeps its secret until the coordinator sees it end.
         let secrets: bool = conn
@@ -1586,12 +1702,621 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
         Self::check_reader_in(&tx)?;
+        // In the same transaction as `set_notify`'s check, so the two never
+        // end up as notifications on with the inbox off.
+        if !enabled && Self::notify_enabled_in(&tx)? {
+            return Err("inbox_in_use: notifications read the inbox; run `masil-agent agent notify disable` first".into());
+        }
         tx.execute(
             "UPDATE meta SET value = ?1 WHERE name = 'inbox_enabled'",
             [i64::from(enabled)],
         )
         .map_err(sql)?;
         tx.commit().map_err(sql)
+    }
+
+    // Notifications.
+
+    fn notify_enabled_in(conn: &Connection) -> Result<bool, String> {
+        Ok(conn
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'notify_enabled'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(sql)?
+            == Some(1))
+    }
+
+    pub fn notify_enabled(&self) -> Result<bool, String> {
+        Self::notify_enabled_in(&self.conn)
+    }
+
+    /// Turns notifications on or off. Turning them on starts after the
+    /// latest event, so nothing already recorded is notified; turning them
+    /// on again keeps the cursor. Either way `env` replaces the environment
+    /// the routes run in.
+    pub fn set_notify(&mut self, enabled: bool, env: &[(String, String)]) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        if enabled && !Self::inbox_enabled_in(&tx)? {
+            return Err("inbox_in_use: the inbox was switched off meanwhile; run `masil-agent agent notify enable` again".into());
+        }
+        if enabled && !Self::notify_enabled_in(&tx)? {
+            tx.execute(
+                "UPDATE meta SET value = (SELECT value FROM meta WHERE name = 'store_seq')
+                 WHERE name = 'notify_seq'",
+                [],
+            )
+            .map_err(sql)?;
+        }
+        if enabled {
+            tx.execute("DELETE FROM notify_env", []).map_err(sql)?;
+            for (name, value) in env {
+                tx.execute(
+                    "INSERT INTO notify_env (name, value) VALUES (?1, ?2)",
+                    params![name, value],
+                )
+                .map_err(sql)?;
+            }
+        }
+        tx.execute(
+            "UPDATE meta SET value = ?1 WHERE name = 'notify_enabled'",
+            [i64::from(enabled)],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
+    pub fn notify_env(&self) -> Result<Vec<(String, String)>, String> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT name, value FROM notify_env ORDER BY name")
+            .map_err(sql)?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)
+    }
+
+    /// Claims the events recorded since the last claim: the cursor moves
+    /// past every one read, and each event of `kinds` gets a log row per
+    /// route, `sending`, or `skipped_stale` when observed before
+    /// `stale_before`. Acknowledged, resolved and read-all events are
+    /// passed over. Nothing is claimed while notifications are off.
+    pub fn notify_claim(
+        &mut self,
+        kinds: &[String],
+        routes: &[String],
+        stale_before: u64,
+        now: u64,
+    ) -> Result<NotifyClaim, String> {
+        let mut claim = NotifyClaim::default();
+        // Most passes find nothing new; they take no write lock. The cursor
+        // follows `store_seq` (operations move it too), so this stays false
+        // until something is recorded.
+        let pending: bool = self
+            .conn
+            .query_row(
+                "SELECT COALESCE((SELECT value FROM meta WHERE name = 'notify_enabled') = 1
+                   AND (SELECT value FROM meta WHERE name = 'store_seq')
+                     > (SELECT value FROM meta WHERE name = 'notify_seq'), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if !pending {
+            return Ok(claim);
+        }
+        loop {
+            match self.notify_claim_batch(kinds, routes, stale_before, now, &mut claim) {
+                Ok(true) => {}
+                Ok(false) => return Ok(claim),
+                // Batches already committed are claimed: they go out, and
+                // the rest waits for the next pass.
+                Err(_) if !claim.events.is_empty() || claim.stale > 0 => return Ok(claim),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// One batch of [`Store::notify_claim`], committed on its own; true if
+    /// there may be more.
+    fn notify_claim_batch(
+        &mut self,
+        kinds: &[String],
+        routes: &[String],
+        stale_before: u64,
+        now: u64,
+        claim: &mut NotifyClaim,
+    ) -> Result<bool, String> {
+        struct Row {
+            id: i64,
+            seq: i64,
+            kind: String,
+            provider: String,
+            pane: String,
+            run: String,
+            summary: Option<String>,
+            observed: i64,
+            closed: bool,
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        if !Self::notify_enabled_in(&tx)? {
+            return Ok(false);
+        }
+        let meta = |name: &str| -> Result<i64, String> {
+            tx.query_row("SELECT value FROM meta WHERE name = ?1", [name], |row| {
+                row.get(0)
+            })
+            .map_err(sql)
+        };
+        let (cursor, fence, latest) = (
+            meta("notify_seq")?,
+            meta("inbox_fence")?,
+            meta("store_seq")?,
+        );
+        let rows: Vec<Row> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, store_seq, kind, provider, pane, run, summary, observed_ms,
+                       acked_ms IS NOT NULL OR resolved_ms IS NOT NULL
+                     FROM inbox_events WHERE store_seq > ?1 ORDER BY store_seq LIMIT ?2",
+                )
+                .map_err(sql)?;
+            statement
+                .query_map(params![cursor, NOTIFY_BATCH], |row| {
+                    Ok(Row {
+                        id: row.get(0)?,
+                        seq: row.get(1)?,
+                        kind: row.get(2)?,
+                        provider: row.get(3)?,
+                        pane: row.get(4)?,
+                        run: row.get(5)?,
+                        summary: row.get(6)?,
+                        observed: row.get(7)?,
+                        closed: row.get(8)?,
+                    })
+                })
+                .map_err(sql)?
+                .collect::<Result<_, _>>()
+                .map_err(sql)?
+        };
+        for row in &rows {
+            if row.closed || row.seq <= fence || !kinds.contains(&row.kind) {
+                continue;
+            }
+            let stale = (row.observed as u64) < stale_before;
+            let outcome = if stale { "skipped_stale" } else { "sending" };
+            let mut logged = Vec::new();
+            for route in routes {
+                tx.execute(
+                    "INSERT OR IGNORE INTO notify_log (event_id, store_seq, route, created_ms, outcome)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![row.id, row.seq, route, now as i64, outcome],
+                )
+                .map_err(sql)?;
+                if tx.changes() == 1 {
+                    logged.push((route.clone(), tx.last_insert_rowid()));
+                }
+            }
+            if stale {
+                claim.stale += 1;
+            } else if !logged.is_empty() {
+                claim.events.push(NotifyEvent {
+                    id: row.id,
+                    kind: row.kind.clone(),
+                    provider: row.provider.clone(),
+                    pane: row.pane.clone(),
+                    run: row.run.clone(),
+                    summary: row
+                        .summary
+                        .as_deref()
+                        .and_then(|text| serde_json::from_str(text).ok()),
+                    observed_ms: row.observed as u64,
+                    rows: logged,
+                });
+            }
+        }
+        let more = rows.len() as i64 >= NOTIFY_BATCH;
+        // Read to the end: under the write lock nothing can still commit
+        // below `store_seq`, so the cursor goes all the way.
+        let cursor = if more {
+            rows.last().map_or(cursor, |row| row.seq)
+        } else {
+            latest
+        };
+        tx.execute(
+            "UPDATE meta SET value = ?1 WHERE name = 'notify_seq'",
+            [cursor],
+        )
+        .map_err(sql)?;
+        if !more {
+            // Keep the log bounded while here.
+            tx.execute(
+                "DELETE FROM notify_log WHERE created_ms < ?1
+                   OR id <= (SELECT id FROM notify_log ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+                params![now.saturating_sub(NOTIFY_RETENTION_MS) as i64, NOTIFY_KEEP],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(more)
+    }
+
+    /// How sending went for claimed rows.
+    pub fn notify_outcome(&mut self, rows: &[i64], outcome: &str) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(sql)?;
+        for row in rows {
+            tx.execute(
+                "UPDATE notify_log SET outcome = ?2 WHERE id = ?1",
+                params![row, outcome],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)
+    }
+
+    // Schedules.
+
+    const SCHEDULE_COLUMNS: &'static str = "s.id, s.name, s.spec, s.action, s.enabled, s.created_ms, s.changed_ms,
+        (SELECT MAX(due_ms) FROM schedule_runs r WHERE r.schedule_id = s.id),
+        (SELECT state FROM schedule_runs r WHERE r.schedule_id = s.id ORDER BY due_ms DESC LIMIT 1)";
+
+    fn schedule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
+        let action: String = row.get(3)?;
+        Ok(ScheduleRow {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            spec: row.get(2)?,
+            action: serde_json::from_str(&action).unwrap_or(Value::Null),
+            enabled: row.get(4)?,
+            created_ms: row.get(5)?,
+            changed_ms: row.get(6)?,
+            last_due: row.get(7)?,
+            last_state: row.get(8)?,
+        })
+    }
+
+    pub fn schedules(&self) -> Result<Vec<ScheduleRow>, String> {
+        let mut statement = self
+            .conn
+            .prepare(&format!(
+                "SELECT {} FROM schedules s ORDER BY s.name",
+                Self::SCHEDULE_COLUMNS
+            ))
+            .map_err(sql)?;
+        statement
+            .query_map([], Self::schedule_row)
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)
+    }
+
+    fn schedule_named_in(tx: &Connection, name: &str) -> Result<ScheduleRow, String> {
+        tx.query_row(
+            &format!(
+                "SELECT {} FROM schedules s WHERE s.name = ?1",
+                Self::SCHEDULE_COLUMNS
+            ),
+            [name],
+            Self::schedule_row,
+        )
+        .optional()
+        .map_err(sql)?
+        .ok_or_else(|| format!("schedule_absent: no schedule named {name}"))
+    }
+
+    pub fn schedule_add(
+        &mut self,
+        name: &str,
+        spec: &str,
+        action: &Value,
+        now: u64,
+    ) -> Result<ScheduleRow, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM schedules", [], |row| row.get(0))
+            .map_err(sql)?;
+        if count >= crate::schedule::MAX_SCHEDULES {
+            return Err(format!(
+                "schedule_invalid: a server holds at most {} schedules",
+                crate::schedule::MAX_SCHEDULES
+            ));
+        }
+        let inserted = tx
+            .execute(
+                "INSERT INTO schedules (name, spec, action, enabled, created_ms, changed_ms)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?4) ON CONFLICT (name) DO NOTHING",
+                params![name, spec, action.to_string(), now as i64],
+            )
+            .map_err(sql)?;
+        if inserted == 0 {
+            return Err(format!("schedule_exists: a schedule named {name} exists"));
+        }
+        let row = Self::schedule_named_in(&tx, name)?;
+        tx.commit().map_err(sql)?;
+        Ok(row)
+    }
+
+    /// Switches a schedule on or off. Either way its times up to now are
+    /// settled: switching on never makes up for the time it was off.
+    pub fn schedule_set_enabled(
+        &mut self,
+        name: &str,
+        enabled: bool,
+        now: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        Self::schedule_named_in(&tx, name)?;
+        tx.execute(
+            "UPDATE schedules SET enabled = ?2, changed_ms = ?3 WHERE name = ?1",
+            params![name, enabled, now as i64],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
+    pub fn schedule_remove(&mut self, name: &str) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let row = Self::schedule_named_in(&tx, name)?;
+        tx.execute("DELETE FROM schedule_runs WHERE schedule_id = ?1", [row.id])
+            .map_err(sql)?;
+        tx.execute("DELETE FROM schedules WHERE id = ?1", [row.id])
+            .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
+    pub fn schedule_runs(&self, name: &str, limit: usize) -> Result<Vec<Value>, String> {
+        let row = Self::schedule_named_in(&self.conn, name)?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT due_ms, state, started_ms, ended_ms, result FROM schedule_runs
+                 WHERE schedule_id = ?1 ORDER BY due_ms DESC LIMIT ?2",
+            )
+            .map_err(sql)?;
+        statement
+            .query_map(params![row.id, limit as i64], |row| {
+                let result: Option<String> = row.get(4)?;
+                Ok(json!({
+                    "due_ms": row.get::<_, i64>(0)?,
+                    "state": row.get::<_, String>(1)?,
+                    "started_ms": row.get::<_, Option<i64>>(2)?,
+                    "ended_ms": row.get::<_, Option<i64>>(3)?,
+                    "result": result.and_then(|text| serde_json::from_str::<Value>(&text).ok()),
+                }))
+            })
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)
+    }
+
+    /// Settles what the scheduler found for one schedule, if the schedule
+    /// is still on and unchanged since it was read (`changed_ms`): one
+    /// `missed` row for the latest missed time (and an inbox event, when
+    /// the inbox is on), and a `running` row for the time to run, claimed
+    /// only while `now` is within the grace. A row already there means
+    /// another settled it; nothing is claimed twice.
+    pub fn schedule_record(
+        &mut self,
+        id: i64,
+        changed_ms: i64,
+        missed: Option<crate::schedule::Missed>,
+        run: Option<i64>,
+        now: u64,
+    ) -> Result<ScheduleClaim, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let current: Option<(String, bool, i64)> = tx
+            .query_row(
+                "SELECT name, enabled, changed_ms FROM schedules WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sql)?;
+        let mut claim = ScheduleClaim::default();
+        let Some((name, true, current_changed)) = current else {
+            return Ok(claim);
+        };
+        if current_changed != changed_ms {
+            return Ok(claim);
+        }
+        let now = now as i64;
+        // A time to run that is late by now is missed after all.
+        let (run, missed) = match run {
+            Some(due) if now - due > crate::schedule::GRACE_MS => (
+                None,
+                Some(crate::schedule::Missed {
+                    due_ms: due,
+                    count: missed.map_or(0, |missed| missed.count) + 1,
+                    at_least: missed.is_some_and(|missed| missed.at_least),
+                }),
+            ),
+            other => (other, missed),
+        };
+        if let Some(missed) = missed {
+            let result = json!({"missed": missed.count, "at_least": missed.at_least});
+            let inserted = tx
+                .execute(
+                    "INSERT INTO schedule_runs (schedule_id, due_ms, state, ended_ms, result)
+                     VALUES (?1, ?2, 'missed', ?3, ?4) ON CONFLICT DO NOTHING",
+                    params![id, missed.due_ms, now, result.to_string()],
+                )
+                .map_err(sql)?;
+            if inserted == 1 {
+                let source_ref = format!("{id}:{}", missed.due_ms);
+                // The event is a courtesy: a full store keeps the run rows.
+                claim.event = Self::inbox_insert_in(
+                    &tx,
+                    &InboxEvent {
+                        source: "schedule",
+                        source_ref: &source_ref,
+                        provider: "",
+                        pane: "",
+                        run: "",
+                        revision: None,
+                        kind: "missed_schedule",
+                        native_ref: None,
+                        summary: Some(json!({
+                            "schedule": name,
+                            "due_ms": missed.due_ms,
+                            "missed": missed.count,
+                            "at_least": missed.at_least,
+                        })),
+                        observed_ms: now as u64,
+                    },
+                )
+                .is_ok_and(|event| event.is_some());
+            }
+        }
+        if let Some(due) = run {
+            let inserted = tx
+                .execute(
+                    "INSERT INTO schedule_runs (schedule_id, due_ms, state, started_ms)
+                     VALUES (?1, ?2, 'running', ?3) ON CONFLICT DO NOTHING",
+                    params![id, due, now],
+                )
+                .map_err(sql)?;
+            if inserted == 1 {
+                claim.run = Some(due);
+            }
+        }
+        tx.execute(
+            "DELETE FROM schedule_runs WHERE schedule_id = ?1 AND id <=
+               (SELECT id FROM schedule_runs WHERE schedule_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+            params![id, SCHEDULE_RUNS_KEPT],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(claim)
+    }
+
+    /// How a claimed run ended. A row settled otherwise meanwhile (marked
+    /// unknown by a later coordinator) keeps that.
+    pub fn schedule_finish(
+        &mut self,
+        id: i64,
+        due_ms: i64,
+        state: &str,
+        result: &Value,
+        now: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE schedule_runs SET state = ?3, ended_ms = ?4, result = ?5
+                 WHERE schedule_id = ?1 AND due_ms = ?2 AND state = 'running'",
+                params![id, due_ms, state, now as i64, result.to_string()],
+            )
+            .map(drop)
+            .map_err(sql)
+    }
+
+    /// Runs a coordinator that ended left `running`: started before
+    /// `before_ms`, their outcome is unknown. They are never run again.
+    pub fn schedule_settle(&mut self, before_ms: u64, now: u64) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "UPDATE schedule_runs SET state = 'unknown', ended_ms = ?2
+                 WHERE state = 'running' AND started_ms < ?1",
+                params![before_ms as i64, now as i64],
+            )
+            .map_err(sql)
+    }
+
+    /// Notification status read without creating or changing anything;
+    /// None when there is no store or no notification table yet.
+    pub fn notify_readonly(socket: &Path) -> Result<Option<Value>, String> {
+        let Some(store) = Self::readonly(socket)? else {
+            return Ok(None);
+        };
+        let has_table: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'notify_log')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if !has_table {
+            return Ok(None);
+        }
+        store.notify_status().map(Some)
+    }
+
+    /// Whether notifications are on, where the cursor is, and the latest
+    /// log rows.
+    pub fn notify_status(&self) -> Result<Value, String> {
+        let cursor: i64 = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'notify_seq'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT l.event_id, l.route, l.created_ms, l.outcome, e.kind, e.pane
+                 FROM notify_log l LEFT JOIN inbox_events e ON e.id = l.event_id
+                 ORDER BY l.id DESC LIMIT 20",
+            )
+            .map_err(sql)?;
+        let recent: Vec<Value> = statement
+            .query_map([], |row| {
+                Ok(json!({
+                    "event": row.get::<_, i64>(0)?,
+                    "route": row.get::<_, String>(1)?,
+                    "created_ms": row.get::<_, i64>(2)?,
+                    "outcome": row.get::<_, String>(3)?,
+                    "kind": row.get::<_, Option<String>>(4)?,
+                    "pane": row.get::<_, Option<String>>(5)?,
+                }))
+            })
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)?;
+        let unsent: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM notify_log WHERE outcome = 'sending'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        Ok(json!({
+            "enabled": self.notify_enabled()?,
+            "inbox_enabled": self.inbox_enabled()?,
+            "cursor": cursor,
+            "interrupted": unsent,
+            "recent": recent,
+        }))
     }
 
     /// Records one attention event if the inbox is on; an existing event
@@ -1953,6 +2678,69 @@ impl Store {
         let item = Self::queue_item_in(&tx, id, now)?.ok_or("queue item disappeared")?;
         tx.commit().map_err(sql)?;
         Ok(item)
+    }
+
+    /// Adds drafts at the end of the run's queue in one transaction, leaving
+    /// out any the run already waits on (unsent, same text); nothing is
+    /// added if the rest does not fit.
+    pub fn queue_add_drafts(
+        &mut self,
+        run: &str,
+        pane: &str,
+        provider: &str,
+        drafts: &[String],
+        now: u64,
+    ) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        Self::queue_retention_in(&tx, now)?;
+        let mut waiting: std::collections::HashSet<String> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT body FROM prompt_queue
+                     WHERE run = ?1 AND body IS NOT NULL AND sent_ms IS NULL",
+                )
+                .map_err(sql)?;
+            statement
+                .query_map([run], |row| row.get::<_, String>(0))
+                .map_err(sql)?
+                .collect::<Result<_, _>>()
+                .map_err(sql)?
+        };
+        let fresh: Vec<&String> = drafts
+            .iter()
+            .filter(|draft| waiting.insert((*draft).clone()))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(0);
+        }
+        let attachments = "[]";
+        let bytes: usize = fresh
+            .iter()
+            .map(|draft| draft.len() + attachments.len())
+            .sum();
+        Self::queue_quota_in(&tx, run, fresh.len() as i64, bytes as i64)?;
+        let mut position: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(position), 0) FROM prompt_queue WHERE run = ?1",
+                [run],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        for draft in &fresh {
+            position += 1;
+            tx.execute(
+                "INSERT INTO prompt_queue (run, pane, provider, position, body, attachments, revision,
+                   created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
+                params![run, pane, provider, position, draft, attachments, now as i64],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(fresh.len())
     }
 
     /// Every queued prompt, by run and position. A sent body past its day
@@ -3140,7 +3928,13 @@ mod tests {
         assert_eq!(status["min_reader"], 2);
         assert_eq!(
             status["features"],
-            json!(["inbox", "prompt_queue", "provider_secrets"])
+            json!([
+                "inbox",
+                "notify",
+                "prompt_queue",
+                "provider_secrets",
+                "schedules"
+            ])
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -3255,7 +4049,14 @@ mod tests {
         let store = Store::open_path(&path).unwrap();
         assert_eq!(
             store.status().unwrap()["features"],
-            json!(["inbox", "later", "prompt_queue", "provider_secrets"])
+            json!([
+                "inbox",
+                "later",
+                "notify",
+                "prompt_queue",
+                "provider_secrets",
+                "schedules"
+            ])
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -3284,8 +4085,10 @@ mod tests {
                 "beta",
                 "gamma",
                 "inbox",
+                "notify",
                 "prompt_queue",
-                "provider_secrets"
+                "provider_secrets",
+                "schedules"
             ])
         );
         fs::remove_dir_all(dir).unwrap();
@@ -3504,6 +4307,210 @@ mod tests {
                 })
                 .unwrap()
                 .is_some()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn notifications_claim_each_new_event_once_per_route() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let kinds = ["approval_requested".to_owned(), "turn_completed".to_owned()];
+        let routes = ["tmux".to_owned(), "hook".to_owned()];
+        // A run per event: a turn's end resolves what the same run asked.
+        let record = |store: &mut Store, key: &str, kind: &str, at: u64| {
+            store
+                .record_event(&event(key, key, kind, at))
+                .unwrap()
+                .unwrap()
+        };
+        // Notifications need the inbox, and the inbox stays while they are on.
+        assert!(
+            store
+                .set_notify(true, &[])
+                .unwrap_err()
+                .starts_with("inbox_in_use")
+        );
+        store.set_inbox_enabled(true).unwrap();
+        record(&mut store, "before", "approval_requested", 1_000);
+        store
+            .set_notify(true, &[("PATH".into(), "/bin".into())])
+            .unwrap();
+        assert!(
+            store
+                .set_inbox_enabled(false)
+                .unwrap_err()
+                .starts_with("inbox_in_use")
+        );
+        // Nothing recorded before they were switched on is sent.
+        let claim = store.notify_claim(&kinds, &routes, 0, 2_000).unwrap();
+        assert!(claim.events.is_empty() && claim.stale == 0);
+        let fresh = record(&mut store, "fresh", "approval_requested", 10_000);
+        record(&mut store, "other", "error", 10_000);
+        record(&mut store, "old", "turn_completed", 100);
+        let read = record(&mut store, "read", "approval_requested", 10_000);
+        store.ack_events(&[read], 10_001).unwrap();
+        let claim = store.notify_claim(&kinds, &routes, 5_000, 20_000).unwrap();
+        assert_eq!(claim.events.len(), 1);
+        assert_eq!(claim.events[0].id, fresh);
+        let rows: Vec<&str> = claim.events[0]
+            .rows
+            .iter()
+            .map(|(route, _)| route.as_str())
+            .collect();
+        assert_eq!(rows, ["tmux", "hook"]);
+        assert_eq!(claim.stale, 1);
+        // Claimed once: a second pass finds nothing.
+        let again = store.notify_claim(&kinds, &routes, 5_000, 20_000).unwrap();
+        assert!(again.events.is_empty() && again.stale == 0);
+        // The cursor reaches `store_seq`, so the next pass reads only meta.
+        let seqs = |store: &Store| -> (i64, i64) {
+            store
+                .conn
+                .query_row(
+                    "SELECT (SELECT value FROM meta WHERE name = 'notify_seq'),
+                            (SELECT value FROM meta WHERE name = 'store_seq')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let (cursor, latest) = seqs(&store);
+        assert_eq!(cursor, latest);
+        store
+            .notify_outcome(&[claim.events[0].rows[0].1], "sent")
+            .unwrap();
+        let status = store.notify_status().unwrap();
+        assert_eq!(status["interrupted"], 1);
+        assert_eq!(status["recent"].as_array().unwrap().len(), 4);
+        // Switched on again: the cursor stays, the environment is replaced.
+        store
+            .set_notify(true, &[("HOME".into(), "/h".into())])
+            .unwrap();
+        assert_eq!(
+            store.notify_env().unwrap(),
+            [("HOME".to_owned(), "/h".to_owned())]
+        );
+        // Off: nothing is claimed and the cursor does not move.
+        store.set_notify(false, &[]).unwrap();
+        record(&mut store, "while-off", "approval_requested", 30_000);
+        assert!(
+            store
+                .notify_claim(&kinds, &routes, 0, 30_000)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        store.set_notify(true, &[]).unwrap();
+        assert!(
+            store
+                .notify_claim(&kinds, &routes, 0, 30_000)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_due_time_is_claimed_once_and_a_late_one_is_missed() {
+        use crate::schedule::Missed;
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        let action = json!({"kind": "start"});
+        let row = store
+            .schedule_add("nightly", "every:60", &action, 1_000)
+            .unwrap();
+        assert!(
+            store
+                .schedule_add("nightly", "every:60", &action, 1_000)
+                .unwrap_err()
+                .starts_with("schedule_exists")
+        );
+        let claim = store
+            .schedule_record(row.id, row.changed_ms, None, Some(61_000), 61_500)
+            .unwrap();
+        assert_eq!(
+            claim,
+            ScheduleClaim {
+                run: Some(61_000),
+                event: false
+            }
+        );
+        // Another look, or another process, finds it taken.
+        let again = store
+            .schedule_record(row.id, row.changed_ms, None, Some(61_000), 61_600)
+            .unwrap();
+        assert_eq!(again.run, None);
+        store
+            .schedule_finish(row.id, 61_000, "done", &json!({"ok": true}), 62_000)
+            .unwrap();
+        // Past the grace when claimed: missed, with an inbox event.
+        let late = store
+            .schedule_record(
+                row.id,
+                row.changed_ms,
+                Some(Missed {
+                    due_ms: 121_000,
+                    count: 1,
+                    at_least: false,
+                }),
+                Some(181_000),
+                181_000 + 60_001,
+            )
+            .unwrap();
+        assert_eq!(
+            late,
+            ScheduleClaim {
+                run: None,
+                event: true
+            }
+        );
+        let runs = store.schedule_runs("nightly", 10).unwrap();
+        let states: Vec<(i64, &str)> = runs
+            .iter()
+            .map(|run| {
+                (
+                    run["due_ms"].as_i64().unwrap(),
+                    run["state"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(states, [(181_000, "missed"), (61_000, "done")]);
+        assert_eq!(runs[0]["result"]["missed"], 2);
+        let events = store.inbox(false, 10).unwrap();
+        assert_eq!(events["events"][0]["kind"], "missed_schedule");
+        // Switched off and on: what was read before applies to nothing.
+        store
+            .schedule_set_enabled("nightly", false, 200_000)
+            .unwrap();
+        store
+            .schedule_set_enabled("nightly", true, 200_001)
+            .unwrap();
+        let stale = store
+            .schedule_record(row.id, row.changed_ms, None, Some(241_000), 241_000)
+            .unwrap();
+        assert_eq!(stale, ScheduleClaim::default());
+        // A run a coordinator left behind is unknown, never run again.
+        let fresh = store.schedules().unwrap().remove(0);
+        store
+            .schedule_record(fresh.id, fresh.changed_ms, None, Some(241_000), 241_000)
+            .unwrap();
+        assert_eq!(store.schedule_settle(241_001, 250_000).unwrap(), 1);
+        store
+            .schedule_finish(fresh.id, 241_000, "done", &json!({}), 251_000)
+            .unwrap();
+        assert_eq!(
+            store.schedule_runs("nightly", 1).unwrap()[0]["state"],
+            "unknown"
+        );
+        store.schedule_remove("nightly").unwrap();
+        assert!(
+            store
+                .schedule_runs("nightly", 1)
+                .unwrap_err()
+                .starts_with("schedule_absent")
         );
         fs::remove_dir_all(dir).unwrap();
     }

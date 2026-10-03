@@ -205,6 +205,8 @@ pub(crate) struct WatchControl {
     pub recount: AtomicBool,
     /// The coordinator is ending: finish the current pass and return.
     pub stopping: AtomicBool,
+    /// `agent notify test` waits here for the routes' results.
+    pub test: Mutex<Option<tokio::sync::oneshot::Sender<serde_json::Value>>>,
     pub report: Mutex<WatchReport>,
 }
 
@@ -298,6 +300,7 @@ pub(crate) async fn watch(
     let mut observers = super::observe::Observers::new(base);
     let mut reports = Reports::default();
     let observer = super::Observer::current();
+    let mut notifier = crate::notify::Notifier::new(manager.native.clone());
     let mut next_tick: Option<tokio::time::Instant> = None;
     loop {
         let interval = if busy || now_ms() < hot_until {
@@ -332,6 +335,12 @@ pub(crate) async fn watch(
                     }
                     continue;
                 }
+                Some(outcome) = notifier.outcomes.recv() => {
+                    if let Err(error) = record_outcome(&manager, outcome).await {
+                        errors.note(&error, &log, &control);
+                    }
+                    continue;
+                }
             }
             next_tick = None;
         }
@@ -339,7 +348,14 @@ pub(crate) async fn watch(
         if control.stopping.load(Ordering::SeqCst) {
             observers.stop();
             badge.clear(&manager).await;
+            while let Ok(outcome) = notifier.outcomes.try_recv() {
+                let _ = record_outcome(&manager, outcome).await;
+            }
             return;
+        }
+        let test = control.test.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(reply) = test {
+            notify_test(&manager, &mut notifier, reply).await;
         }
         if let Some(observer) = observer {
             reports.flush(&manager, observer).await;
@@ -351,6 +367,7 @@ pub(crate) async fn watch(
             if let Err(error) = manager.reload() {
                 errors.note(&error, &log, &control);
             }
+            notifier.reload();
             woken = true;
         }
         let started = now_ms();
@@ -360,6 +377,11 @@ pub(crate) async fn watch(
         if periodic {
             badge.reread_at = started;
             badge.reread(&manager).await;
+            // An edited notify.toml applies within this period.
+            notifier.recheck();
+            if let Err(error) = notify(&manager, &mut notifier).await {
+                errors.note(&error, &log, &control);
+            }
         }
         if control.recount.swap(false, Ordering::SeqCst)
             || woken
@@ -474,6 +496,10 @@ pub(crate) async fn watch(
                     // A blocked agent may wait for hours and its event is
                     // already written; only work changes on its own.
                     busy = agents.iter().any(|agent| agent.state == "working");
+                    notifier.names = agents
+                        .iter()
+                        .map(|agent| (agent.run.clone(), agent.name.clone()))
+                        .collect();
                     expiry = report_expiry(&agents, now_ms());
                     if let Ok(mut report) = control.report.lock() {
                         report.passes += 1;
@@ -494,6 +520,9 @@ pub(crate) async fn watch(
             }
             // A pass can record or resolve events.
             badge.count(&manager, now_ms()).await;
+            if let Err(error) = notify(&manager, &mut notifier).await {
+                errors.note(&error, &log, &control);
+            }
         }
         let panes: HashSet<String> = signature
             .lines()
@@ -749,6 +778,74 @@ impl Reports {
         self.written.retain(|run, _| self.panes.contains_key(run));
         self.failures.retain(|run, _| self.panes.contains_key(run));
     }
+}
+
+/// Claims the events recorded since the last claim and hands them to the
+/// notification routes (P7a). Costs one read while nothing is new.
+async fn notify(manager: &Manager, notifier: &mut crate::notify::Notifier) -> Result<(), String> {
+    let Some(settings) = notifier.settings()? else {
+        return Ok(());
+    };
+    let (kinds, routes) = (settings.events.clone(), settings.routes());
+    let now = now_ms();
+    let stale_before = now.saturating_sub(crate::notify::STALE_MS);
+    let claimed = manager
+        .with_resident_store(move |store| {
+            let claim = store.notify_claim(&kinds, &routes, stale_before, now)?;
+            // Claimed is committed: without the kept environment the
+            // routes still run, with less.
+            let env = if claim.events.is_empty() && claim.stale == 0 {
+                Vec::new()
+            } else {
+                store.notify_env().unwrap_or_default()
+            };
+            Ok((claim, env))
+        })
+        .await;
+    if let Some((claim, kept)) = claimed?
+        && (!claim.events.is_empty() || claim.stale > 0)
+    {
+        let env = notifier.environment(kept).await;
+        let skipped = notifier.send(claim.events, claim.stale, settings, env);
+        if !skipped.is_empty() {
+            record_outcome(manager, (skipped, "skipped_backlog".into())).await?;
+        }
+    }
+    Ok(())
+}
+
+/// A test through every route, in the environment real notifications use;
+/// the reply comes when all are done. Never blocks the watch.
+async fn notify_test(
+    manager: &Manager,
+    notifier: &mut crate::notify::Notifier,
+    reply: tokio::sync::oneshot::Sender<serde_json::Value>,
+) {
+    let settings = match crate::notify::Settings::load() {
+        Ok(settings) => std::sync::Arc::new(settings),
+        Err(error) => {
+            let _ = reply.send(serde_json::json!({"error": error}));
+            return;
+        }
+    };
+    let kept = manager
+        .with_resident_store(|store| store.notify_env())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let env = notifier.environment(kept).await;
+    notifier.test(settings, env, reply);
+}
+
+async fn record_outcome(
+    manager: &Manager,
+    (rows, outcome): crate::notify::Outcome,
+) -> Result<(), String> {
+    manager
+        .with_resident_store(move |store| store.notify_outcome(&rows, &outcome))
+        .await
+        .map(drop)
 }
 
 /// The status-line badge: the unseen count in a server option, written

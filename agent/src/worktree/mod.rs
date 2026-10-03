@@ -51,6 +51,10 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
             [id] => helper::run(job_id(id)?),
             _ => Err(format!("usage: {HELP}")),
         },
+        Some("job-notify") => match &args[1..] {
+            [id] => helper::send_ended(job_id(id)?),
+            _ => Err(format!("usage: {HELP}")),
+        },
         Some(other) => Err(format!("usage: unknown worktree command {other}\n{HELP}")),
     }
 }

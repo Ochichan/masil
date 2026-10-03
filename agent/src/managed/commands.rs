@@ -221,6 +221,20 @@ pub(crate) const VERBS: &[Verb] = &[
         remote: false,
     },
     Verb {
+        name: "notify",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] notify enable | disable | status | test",
+        mutating: true,
+        target_stage: None,
+        remote: false,
+    },
+    Verb {
+        name: "schedule",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] schedule add NAME (--cron \"M H DOM MON DOW\" | --every 30m) (--layout TEMPLATE [--session S] [--yes] | --start AGENT PROVIDER --cwd DIR [--worktree W] | --queue AGENT --template TEMPLATE) | list | runs NAME [--limit N] | enable NAME | disable NAME | remove NAME",
+        mutating: true,
+        target_stage: None,
+        remote: false,
+    },
+    Verb {
         name: "operations",
         usage: "masil-agent agent [--socket MASIL_SOCKET] operations [list] [--all] [--limit N] | status | reconcile | adopt",
         mutating: true,

@@ -19,7 +19,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Inbox writes reported to this process since it started.
@@ -36,6 +36,9 @@ const DEFAULT_IDLE: Duration = Duration::from_secs(600);
 const DEFAULT_WATCH: Duration = Duration::from_secs(2);
 /// The server option the status line shows the unseen inbox count from.
 pub(crate) const BADGE_OPTION: &str = "@masil-inbox-unseen";
+/// The features the running coordinator serves, for session autosave to
+/// bring one back after it ends; unset when there are none.
+const WANTED_OPTION: &str = "@masil-coordinator-wanted";
 /// Features, the executable and the store are checked this often.
 const SUPERVISE_EVERY: Duration = Duration::from_secs(30);
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
@@ -45,6 +48,9 @@ const NUDGE_WAIT: Duration = Duration::from_secs(1);
 const LOG_LIMIT: u64 = 1 << 20;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_LIMIT: u64 = 256 * 1024;
+/// How long a notification test may take: the hook's 5 s, its stop, and
+/// the other routes alongside.
+const TEST_WAIT: Duration = Duration::from_secs(12);
 /// The environment kept from the job; everything else is dropped, since the
 /// server's job environment is that of the client that started the server.
 const ENV_ALLOW: &[&str] = &[
@@ -356,6 +362,19 @@ fn request(listen: &Path, method: &str, timeout: Duration) -> Result<Value, Stri
                 .unwrap_or("request failed")
         ))
     }
+}
+
+/// `agent notify test`: the coordinator, started if needed, sends a test
+/// through each route and reports how each went.
+pub(crate) fn notify_test(socket: &Path) -> Result<Value, String> {
+    ensure(socket)?;
+    let server = server_info(socket)?;
+    let paths = paths(socket, &server.state)?;
+    request(
+        &paths.listen,
+        "notify_test",
+        TEST_WAIT + Duration::from_secs(2),
+    )
 }
 
 fn hello(listen: &Path) -> Option<Value> {
@@ -961,6 +980,8 @@ fn serve_locked(
             stop: Arc::new(tokio::sync::Notify::new()),
             last_active: Arc::new(std::sync::Mutex::new(Instant::now())),
             watch: std::sync::Mutex::new(None),
+            scheduler: std::sync::Mutex::new(None),
+            schedule_wake: Arc::new(tokio::sync::Notify::new()),
         });
         let supervisor = tokio::spawn(supervise(
             shared.clone(),
@@ -981,6 +1002,7 @@ fn serve_locked(
         )
         .await;
         supervisor.abort();
+        stop_scheduler(&shared);
         // A pass that wrote a tracked state also writes its inbox event:
         // let it finish rather than drop it half way.
         shared.control.stopping.store(true, Ordering::SeqCst);
@@ -1004,6 +1026,10 @@ struct Shared {
     last_active: Arc<std::sync::Mutex<Instant>>,
     /// The running screen watch, awaited when the process ends.
     watch: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The scheduler thread's stop flag, while one runs.
+    scheduler: std::sync::Mutex<Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>>,
+    /// Wakes the scheduler to read the schedules again.
+    schedule_wake: Arc<tokio::sync::Notify>,
 }
 
 impl Shared {
@@ -1031,6 +1057,7 @@ async fn supervise(
     watch: Duration,
     log_path: PathBuf,
 ) {
+    let mut announced: Option<Vec<String>> = None;
     loop {
         let (socket_for_read, state_for_read) = (socket.clone(), state.clone());
         // A failed read keeps the last list.
@@ -1083,6 +1110,26 @@ async fn supervise(
             }
             Err(_) => None,
         };
+        let features = shared.features();
+        if announced.as_ref() != Some(&features) {
+            let (socket, list) = (socket.clone(), features.join(","));
+            let written = tokio::task::spawn_blocking(move || {
+                if list.is_empty() {
+                    masil(&socket, &["set-option", "-gqu", WANTED_OPTION])
+                } else {
+                    masil(&socket, &["set-option", "-gq", WANTED_OPTION, &list])
+                }
+            })
+            .await;
+            if matches!(written, Ok(Ok(_))) {
+                announced = Some(features.clone());
+            }
+        }
+        if features.iter().any(|feature| feature == "schedules") {
+            start_scheduler(&shared, &socket, &log_path);
+        } else {
+            stop_scheduler(&shared);
+        }
         if let Some(handle) = stopped {
             handle.abort();
             // A badge write in flight lands before the clear below.
@@ -1104,8 +1151,54 @@ async fn supervise(
             _ = shared.reload.notified() => {
                 shared.control.reload.store(true, Ordering::SeqCst);
                 shared.control.wake.notify_one();
+                shared.schedule_wake.notify_one();
             }
         }
+    }
+}
+
+/// Starts the scheduler thread unless one runs.
+fn start_scheduler(shared: &Arc<Shared>, socket: &Path, log_path: &Path) {
+    let Ok(mut slot) = shared.scheduler.lock() else {
+        return;
+    };
+    if slot
+        .as_ref()
+        .is_some_and(|(_, thread)| !thread.is_finished())
+    {
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let control = shared.control.clone();
+    let poke: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        control.poked.store(true, Ordering::SeqCst);
+        control.wake.notify_one();
+    });
+    let path = log_path.to_owned();
+    let logger: Arc<dyn Fn(&str) + Send + Sync> =
+        Arc::new(move |message: &str| log(&path, message));
+    let started = shared.identity["started_ms"].as_u64().unwrap_or(0);
+    let (socket, wake, flag) = (
+        socket.to_owned(),
+        shared.schedule_wake.clone(),
+        stop.clone(),
+    );
+    match std::thread::Builder::new()
+        .name("scheduler".into())
+        .spawn(move || crate::managed::schedules::serve(socket, started, wake, flag, poke, logger))
+    {
+        Ok(thread) => *slot = Some((stop, thread)),
+        Err(error) => log(log_path, &format!("scheduler: {error}")),
+    }
+}
+
+/// Asks the scheduler thread to return; actions it started run on.
+fn stop_scheduler(shared: &Shared) {
+    if let Ok(mut slot) = shared.scheduler.lock()
+        && let Some((stop, _)) = slot.take()
+    {
+        stop.store(true, Ordering::SeqCst);
+        shared.schedule_wake.notify_one();
     }
 }
 
@@ -1347,7 +1440,10 @@ async fn serve_client(
         else {
             return;
         };
-        let (response, stopping) = respond(&body, shared, clients, idle_seconds);
+        let (response, stopping) = match test_request(&body) {
+            Some(id) => (notify_test_reply(shared, id).await, false),
+            None => respond(&body, shared, clients, idle_seconds),
+        };
         let written = tokio::time::timeout(
             DEADLINE,
             ipc::write_frame(&mut stream, &response, RESPONSE_FRAME),
@@ -1360,6 +1456,70 @@ async fn serve_client(
         if !matches!(written, Ok(Ok(()))) {
             return;
         }
+    }
+}
+
+/// The request's ID if it is a well-formed `notify_test`; anything else
+/// goes to `respond`.
+fn test_request(body: &[u8]) -> Option<Value> {
+    let request = serde_json::from_slice::<Value>(body).ok()?;
+    let object = request.as_object()?;
+    let id = object.get("id")?;
+    (object.get("v") == Some(&json!(1))
+        && id
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && id.len() <= 64)
+        && object.get("method") == Some(&json!("notify_test"))
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "v" | "id" | "method" | "params")))
+    .then(|| id.clone())
+}
+
+/// Hands the test to the watch, which owns the notifier, and waits for it.
+async fn notify_test_reply(shared: &Shared, id: Value) -> Value {
+    let failure = |code: &str, message: &str| json!({"v": 1, "id": id, "ok": false, "error": {"code": code, "message": message}});
+    // Just started, or just switched on: the features may not be read yet.
+    let on = || shared.features().iter().any(|feature| feature == "notify");
+    if !on() {
+        shared.reload.notify_one();
+        let deadline = Instant::now() + SPAWN_WAIT;
+        while !on() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !on() {
+            return failure(
+                "notify_off",
+                "notifications are off; run `masil-agent agent notify enable`",
+            );
+        }
+    }
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    match shared.control.test.lock() {
+        Ok(mut slot) if slot.is_none() => *slot = Some(sender),
+        Ok(_) => {
+            return failure(
+                "coordinator_busy",
+                "another notification test is running; retry",
+            );
+        }
+        Err(_) => return failure("coordinator_unavailable", "the watch is unavailable"),
+    }
+    shared.control.wake.notify_one();
+    let answered = tokio::time::timeout(TEST_WAIT, receiver).await;
+    if answered.is_err()
+        && let Ok(mut slot) = shared.control.test.lock()
+    {
+        // Not taken by a watch: the next test may try again.
+        *slot = None;
+    }
+    match answered {
+        Ok(Ok(value)) if value.get("error").is_some() => failure(
+            "notify_invalid",
+            value["error"].as_str().unwrap_or("invalid settings"),
+        ),
+        Ok(Ok(value)) => json!({"v": 1, "id": id, "ok": true, "value": value}),
+        _ => failure("coordinator_unavailable", "the watch did not run the test"),
     }
 }
 
@@ -1453,6 +1613,8 @@ mod tests {
             stop: Arc::default(),
             last_active: Arc::new(std::sync::Mutex::new(Instant::now())),
             watch: std::sync::Mutex::new(None),
+            scheduler: std::sync::Mutex::new(None),
+            schedule_wake: Arc::default(),
         }
     }
 

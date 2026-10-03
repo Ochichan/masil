@@ -10,6 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 const MAX_TEMPLATE_BYTES: u64 = 64 * 1024;
 const MAX_WINDOWS: usize = 16;
@@ -18,6 +19,9 @@ const MAX_PANES: usize = 64;
 const MAX_ARGS: usize = 64;
 const MAX_ARG_BYTES: usize = 8192;
 const MAX_PATH_BYTES: usize = 4096;
+/// Drafts an agent pane may queue, as the prompt queue allows a run.
+const MAX_DRAFTS: usize = 64;
+const MAX_DRAFT_BYTES: usize = 32 * 1024;
 const DIRECT_EXEC: &str = "/usr/bin/env";
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +52,8 @@ struct PaneFile {
     /// An agent pane runs in this masil worktree; `cwd` is then a relative
     /// path inside it.
     worktree: Option<String>,
+    /// Drafts put in the started agent's prompt queue, not sent.
+    queue: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -84,6 +90,8 @@ struct Pane {
     /// resolved against the registry.
     #[serde(skip_serializing_if = "Option::is_none")]
     worktree: Option<(String, Option<String>)>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    queue: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -134,6 +142,12 @@ struct PlanAgent {
     name: String,
     session: Option<String>,
     action: AgentAction,
+    #[serde(skip_serializing_if = "is_zero")]
+    drafts: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 struct PreparedPlan {
@@ -173,6 +187,9 @@ struct ApplyResult {
     run: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Drafts put in the started agent's queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued: Option<usize>,
 }
 
 pub(crate) fn run(args: &[String]) -> Result<i32, String> {
@@ -214,7 +231,13 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
                 return Err("--yes is only valid with layout apply".into());
             }
             let socket = resolve_socket(socket.as_deref());
-            let prepared = runtime()?.block_on(prepare_plan(name, session.as_deref(), socket))?;
+            let prepared = runtime()?.block_on(prepare_plan(
+                load_template(name)?,
+                name,
+                session.as_deref(),
+                socket,
+                Duration::ZERO,
+            ))?;
             print_json(&prepared.output)?;
         }
         "apply" if !rest.is_empty() => {
@@ -335,21 +358,127 @@ fn list_layouts() -> Result<Value, String> {
     Ok(json!({"layouts": layouts}))
 }
 
-fn load_template(name: &str) -> Result<Template, String> {
+/// The file of the layout `name`.
+pub(crate) fn template_path(name: &str) -> Result<PathBuf, String> {
     valid_layout_name(name)?;
-    let path = layouts_dir()?.join(format!("{name}.toml"));
-    let mut file = secure_open(&path)?;
+    Ok(layouts_dir()?.join(format!("{name}.toml")))
+}
+
+/// A template file as parsed, with the SHA-256 of its bytes.
+fn read_file(path: &Path) -> Result<(TemplateFile, String), String> {
+    use sha2::{Digest, Sha256};
+    let mut file = secure_open(path)?;
     let mut bytes = Vec::new();
     file.by_ref()
         .take(MAX_TEMPLATE_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("reading layout {name}: {error}"))?;
+        .map_err(|error| format!("reading layout {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_TEMPLATE_BYTES {
         return Err("layout template exceeds 64 KiB".into());
     }
+    let digest: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let text = std::str::from_utf8(&bytes).map_err(|_| "layout template is not UTF-8")?;
     let parsed: TemplateFile = toml::from_str(text).map_err(|error| error.to_string())?;
+    Ok((parsed, digest))
+}
+
+fn load_template(name: &str) -> Result<Template, String> {
+    let (parsed, _) = read_file(&template_path(name)?)?;
     normalize(parsed)
+}
+
+/// A layout as a schedule keeps it: the file, the digest of what the person
+/// confirmed, and the directory a relative root is taken from.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub(crate) struct Kept {
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: String,
+    pub(crate) base: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session: Option<String>,
+}
+
+/// For `schedule add --layout`: the plan `layout plan` would show, what the
+/// schedule keeps to apply it later as confirmed now, and whether it needs
+/// confirming. That is decided by the template, not by what runs now: an
+/// agent skipped today because it runs may start when the schedule does.
+pub(crate) async fn plan_kept(
+    name: &str,
+    session: Option<&str>,
+    socket: PathBuf,
+) -> Result<(Value, Kept, bool), String> {
+    let path = template_path(name)?;
+    let (parsed, sha256) = read_file(&path)?;
+    let base = std::env::current_dir().map_err(|error| error.to_string())?;
+    let template = normalize_in(parsed, &base)?;
+    let confirm = template
+        .windows
+        .iter()
+        .flat_map(|window| &window.panes)
+        .any(|pane| pane.agent.is_some() || pane.command.is_some());
+    let prepared = prepare_plan(template, name, session, Some(socket), Duration::ZERO).await?;
+    let plan = serde_json::to_value(&prepared.output).map_err(|error| error.to_string())?;
+    let kept = Kept {
+        path,
+        sha256,
+        base,
+        session: session.map(str::to_owned),
+    };
+    Ok((plan, kept, confirm))
+}
+
+/// A scheduled apply, confirmed when the schedule was made. A file that
+/// changed since is not applied. Each agent start waits up to `lock_wait`
+/// for the management lock.
+pub(crate) async fn apply_kept(
+    kept: &Kept,
+    socket: PathBuf,
+    lock_wait: Duration,
+) -> Result<Value, String> {
+    let (parsed, sha256) = read_file(&kept.path)?;
+    if sha256 != kept.sha256 {
+        return Err(format!(
+            "template_changed: {} changed after the schedule was made; run `schedule add` again to confirm it",
+            kept.path.display()
+        ));
+    }
+    let template = normalize_in(parsed, &kept.base)?;
+    let label = kept.path.display().to_string();
+    let prepared = prepare_plan(
+        template,
+        &label,
+        kept.session.as_deref(),
+        Some(socket),
+        lock_wait,
+    )
+    .await?;
+    apply_prepared(prepared, &label, true).await
+}
+
+/// The drafts the template at `path` gives the agent `agent`.
+/// Paths are not resolved: drafts do not depend on them.
+pub(crate) fn drafts_for(path: &Path, agent: &str) -> Result<Vec<String>, String> {
+    let (parsed, _) = read_file(path)?;
+    let drafts = parsed
+        .windows
+        .into_iter()
+        .flat_map(|window| window.panes)
+        .find(|pane| pane.agent.as_ref().is_some_and(|found| found.name == agent))
+        .map(|pane| pane.queue.unwrap_or_default())
+        .ok_or_else(|| format!("{} has no agent pane named {agent}", path.display()))?;
+    if drafts.len() > MAX_DRAFTS
+        || drafts
+            .iter()
+            .any(|draft| draft.trim().is_empty() || draft.len() > MAX_DRAFT_BYTES)
+    {
+        return Err(format!(
+            "the queue of {agent} holds at most {MAX_DRAFTS} drafts, each not empty and at most 32 KiB"
+        ));
+    }
+    Ok(drafts)
 }
 
 fn secure_open(path: &Path) -> Result<File, String> {
@@ -383,10 +512,15 @@ fn secure_open(path: &Path) -> Result<File, String> {
 
 fn normalize(parsed: TemplateFile) -> Result<Template, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    normalize_in(parsed, &cwd)
+}
+
+/// As [`normalize`], with a relative root taken from `base`.
+fn normalize_in(parsed: TemplateFile, base: &Path) -> Result<Template, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute());
-    let mut template = normalize_from(parsed, &cwd, home.as_deref())?;
+    let mut template = normalize_from(parsed, base, home.as_deref())?;
     resolve_worktrees(&mut template)?;
     Ok(template)
 }
@@ -482,6 +616,21 @@ fn normalize_from(
                     return Err("at most one pane may set focus = true".into());
                 }
             }
+            let queue = pane.queue.take().unwrap_or_default();
+            if !queue.is_empty() && pane.agent.is_none() {
+                return Err(format!(
+                    "window {window_index} pane {pane_index} sets queue but is not an agent pane"
+                ));
+            }
+            if queue.len() > MAX_DRAFTS
+                || queue.iter().any(|draft| {
+                    draft.trim().is_empty() || draft.len() > MAX_DRAFT_BYTES || draft.contains('\0')
+                })
+            {
+                return Err(format!(
+                    "window {window_index} pane {pane_index} queue holds at most {MAX_DRAFTS} drafts, each not empty and at most 32 KiB"
+                ));
+            }
             if let Some(spec) = pane.worktree {
                 if pane.agent.is_none() {
                     return Err(format!(
@@ -504,6 +653,7 @@ fn normalize_from(
                     focus: pane.focus,
                     agent: pane.agent,
                     worktree: Some((spec, pane.cwd)),
+                    queue,
                 });
                 continue;
             }
@@ -515,6 +665,7 @@ fn normalize_from(
                 focus: pane.focus,
                 agent: pane.agent,
                 worktree: None,
+                queue,
             });
         }
         windows.push(Window {
@@ -765,11 +916,12 @@ async fn read_only_agents(manager: &Manager) -> Result<(Vec<ExistingAgent>, usiz
 }
 
 async fn prepare_plan(
+    template: Template,
     name: &str,
     session_override: Option<&str>,
     socket: Option<PathBuf>,
+    lock_wait: Duration,
 ) -> Result<PreparedPlan, String> {
-    let template = load_template(name)?;
     let session = session_override.unwrap_or(&template.session).to_owned();
     valid_session_name(&session, 64, "session name")?;
 
@@ -778,7 +930,8 @@ async fn prepare_plan(
     let mut existing_panes = 0;
     let mut session_names = HashSet::new();
     if let Some(socket) = socket
-        && let Ok(candidate) = Manager::new(socket, None)
+        && let Ok(candidate) =
+            Manager::new(socket, None).map(|manager| manager.waiting_for_lock(lock_wait))
         && let Ok((found, panes)) = read_only_agents(&candidate).await
         && let Ok(output) = candidate
             .command(&["list-sessions", "-F", "#{session_name}"])
@@ -859,6 +1012,7 @@ async fn prepare_plan(
                         name: agent.name.clone(),
                         session: agent.session.clone(),
                         action,
+                        drafts: pane.queue.len(),
                     }),
                     Some(action),
                 )
@@ -938,7 +1092,22 @@ async fn apply(
     socket: Option<PathBuf>,
     confirmed: bool,
 ) -> Result<Value, String> {
-    let prepared = prepare_plan(name, session_override, socket).await?;
+    let prepared = prepare_plan(
+        load_template(name)?,
+        name,
+        session_override,
+        socket,
+        Duration::ZERO,
+    )
+    .await?;
+    apply_prepared(prepared, name, confirmed).await
+}
+
+async fn apply_prepared(
+    prepared: PreparedPlan,
+    name: &str,
+    confirmed: bool,
+) -> Result<Value, String> {
     if !prepared.output.errors.is_empty() {
         return Err(format!(
             "layout cannot be applied: {}; review `masil-agent layout plan {name}`",
@@ -1058,14 +1227,25 @@ async fn apply(
                             focused = Some((label.clone(), pane_index, pane_id.clone()));
                         }
                         previous[window_index] = Some(pane_id.clone());
-                        results.push(success_result(
+                        let mut result = success_result(
                             label.clone(),
                             pane_index,
                             "agent",
                             "started",
-                            Some(pane_id),
-                            run,
-                        ));
+                            Some(pane_id.clone()),
+                            run.clone(),
+                        );
+                        if let Some(run) = run.filter(|_| !pane.queue.is_empty()) {
+                            // The agent runs either way; a full queue is told.
+                            match manager
+                                .queue_drafts(&run, &pane_id, &agent.provider, &pane.queue)
+                                .await
+                            {
+                                Ok(added) => result.queued = Some(added),
+                                Err(error) => result.error = Some(error),
+                            }
+                        }
+                        results.push(result);
                     }
                     Err(error) => {
                         results.push(failed_result(label.clone(), pane_index, "agent", error));
@@ -1193,6 +1373,7 @@ fn success_result(
         pane_id,
         run,
         error: None,
+        queued: None,
     }
 }
 
@@ -1205,6 +1386,7 @@ fn failed_result(window: String, pane: usize, kind: &'static str, error: String)
         pane_id: None,
         run: None,
         error: Some(error),
+        queued: None,
     }
 }
 

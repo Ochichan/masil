@@ -1842,7 +1842,7 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
             &[
                 "display-message",
                 "-p",
-                "#{@masil-agent}\u{1f}#{@masil-ui}\u{1f}#{@masil-autosave}\u{1f}#{masil_core_boot_id}\u{1f}#{@masil-inbox}\u{1f}#{@masil-answers}",
+                "#{@masil-agent}\u{1f}#{@masil-ui}\u{1f}#{@masil-autosave}\u{1f}#{masil_core_boot_id}\u{1f}#{@masil-inbox}\u{1f}#{@masil-answers}\u{1f}#{@masil-coordinator-wanted}",
             ],
         ) else {
             // A slow reply is no reason to stop; a socket nobody listens on is.
@@ -1852,17 +1852,18 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
             continue;
         };
         let fields: Vec<_> = state.trim_end_matches('\n').split('\u{1f}').collect();
-        let [agent, ui, value, current, inbox, answers] = fields.as_slice() else {
+        let [agent, ui, value, current, inbox, answers, wanted] = fields.as_slice() else {
             continue;
         };
         // A server restarted on this socket: start its coordinator if a
         // feature needs one.
         if boot.as_deref().is_some_and(|boot| boot != *current) {
             crate::coordinator::restart_if_enabled(Path::new(socket));
-        } else if *inbox == "on" || *answers == "on" {
-            // The inbox and `--answers` runs need a coordinator: bring back
-            // one that ended or runs a replaced executable. A current one
-            // answers at once; with no `--answers` run left nothing starts.
+        } else if *inbox == "on" || *answers == "on" || !wanted.is_empty() {
+            // The inbox, `--answers` runs, notifications and schedules need
+            // a coordinator: bring back one that ended or runs a replaced
+            // executable. A current one answers at once; with none of them
+            // left on, nothing starts.
             crate::coordinator::revive(Path::new(socket));
         }
         boot = Some((*current).to_owned());

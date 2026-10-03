@@ -137,7 +137,71 @@ pub(super) fn run(id: i64) -> Result<i32, String> {
         kind => End::Failed(format!("this masil-agent cannot run {kind} jobs")),
     };
     let tail = output_tail(&registry, id);
-    registry.finish_job(id, end, tail.as_deref(), now_ms())?;
+    if registry.finish_job(id, end, tail.as_deref(), now_ms())?.1 {
+        notify_ended(id);
+    }
+    Ok(0)
+}
+
+/// Tells the user a job ended, if they asked for that (`jobs = true` in
+/// notify.toml), from a short process of its own so that neither this
+/// process nor its caller waits for a hook.
+pub(super) fn notify_ended(id: i64) {
+    if crate::notify::job_settings().is_none() {
+        return;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(["worktree", "job-notify", &id.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    if let Ok(mut child) = command.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+/// `masil-agent worktree job-notify ID`: the notification for an ended job.
+pub(super) fn send_ended(id: i64) -> Result<i32, String> {
+    let Some(settings) = crate::notify::job_settings() else {
+        return Ok(0);
+    };
+    let registry = Registry::open()?;
+    let Some(job) = registry.job(id)? else {
+        return Ok(0);
+    };
+    let kind = match job.state.as_str() {
+        "succeeded" | "too_late" => "job_succeeded",
+        "failed" => "job_failed",
+        "cancelled" => "job_cancelled",
+        "outcome_unknown" => "job_outcome_unknown",
+        _ => return Ok(0),
+    };
+    let mut object = serde_json::json!({"id": job.id, "kind": job.kind, "state": job.state});
+    if settings.detail {
+        object["error"] = serde_json::json!(job.error);
+    }
+    let notice = crate::notify::Notice {
+        id: 0,
+        kind: kind.into(),
+        agent: format!("worktree {} job {}", job.kind, job.id),
+        pane: String::new(),
+        run: String::new(),
+        provider: String::new(),
+        observed_ms: job.ended_ms.unwrap_or_else(now_ms),
+        summary: job
+            .error
+            .as_ref()
+            .map(|error| serde_json::json!({"error": error})),
+        job: Some(object),
+    };
+    crate::notify::send_job(&settings, notice)?;
     Ok(0)
 }
 
@@ -164,20 +228,24 @@ pub(super) fn settle_orphan(registry: &mut Registry, id: i64) -> Result<(), Stri
     }
     let now = now_ms();
     if job.state == "queued" {
-        registry.end_orphan(
+        if registry.end_orphan(
             &job,
             "failed",
             "its helper ended before the job started",
             None,
             now,
-        )?;
+        )? {
+            notify_ended(job.id);
+        }
         return Ok(());
     }
     stop_orphan_child(&job);
     let settled = serde_json::json!({"reconciled": true});
     if job.kind == "remove" {
         let (state, error) = super::remove::settle(registry, &job);
-        registry.end_orphan(&job, state, &error, Some(&settled), now)?;
+        if registry.end_orphan(&job, state, &error, Some(&settled), now)? {
+            notify_ended(job.id);
+        }
         return Ok(());
     }
     let Some(worktree) = job.worktree_id.filter(|_| job.kind == "create") else {
@@ -191,7 +259,9 @@ pub(super) fn settle_orphan(registry: &mut Registry, id: i64) -> Result<(), Stri
         } else {
             "outcome_unknown"
         };
-        registry.end_orphan(&job, state, error, Some(&settled), now)?;
+        if registry.end_orphan(&job, state, error, Some(&settled), now)? {
+            notify_ended(job.id);
+        }
         return Ok(());
     };
     if let Some(row) = registry.worktree(worktree)?
@@ -199,13 +269,15 @@ pub(super) fn settle_orphan(registry: &mut Registry, id: i64) -> Result<(), Stri
     {
         let mut result = row.to_json();
         result["reconciled"] = serde_json::json!(true);
-        registry.end_orphan(
+        if registry.end_orphan(
             &job,
             "succeeded",
             "its helper ended after the worktree was made",
             Some(&result),
             now,
-        )?;
+        )? {
+            notify_ended(job.id);
+        }
         return Ok(());
     }
     let (state, error) = match create::remove_half_made(registry, worktree, Cleanup::Later) {
@@ -225,7 +297,9 @@ pub(super) fn settle_orphan(registry: &mut Registry, id: i64) -> Result<(), Stri
             ),
         ),
     };
-    registry.end_orphan(&job, state, &error, Some(&settled), now)?;
+    if registry.end_orphan(&job, state, &error, Some(&settled), now)? {
+        notify_ended(job.id);
+    }
     Ok(())
 }
 
@@ -280,7 +354,9 @@ pub(super) fn sweep(registry: &mut Registry) -> Result<(), String> {
             continue;
         };
         if job.owner.is_none() && job.state == "queued" && orphaned(&job, now_ms()) {
-            registry.end_orphan(&job, "failed", "its helper did not start", None, now_ms())?;
+            if registry.end_orphan(&job, "failed", "its helper did not start", None, now_ms())? {
+                notify_ended(job.id);
+            }
         } else {
             settle_orphan(registry, id)?;
         }

@@ -146,6 +146,7 @@ pub(crate) fn kind_label(language: Language, kind: &str) -> &'static str {
         "operation_unknown" => word(language, "Outcome unknown", "결과 모름"),
         "error" => word(language, "Error", "오류"),
         "observation_lost" => word(language, "Not observed", "관찰 끊김"),
+        "missed_schedule" => word(language, "Schedule missed", "예약 놓침"),
         _ => word(language, "Event", "사건"),
     }
 }
@@ -177,7 +178,8 @@ fn summary_text(event: &InboxItem) -> String {
         .or_else(|| field("file_path"))
         .or_else(|| field("url"))
         .or_else(|| field("permission"))
-        .or_else(|| field("action"));
+        .or_else(|| field("action"))
+        .or_else(|| field("schedule"));
     match (field("tool"), detail) {
         (Some(tool), Some(detail)) => format!("{tool}: {detail}"),
         (Some(tool), None) => tool.to_owned(),

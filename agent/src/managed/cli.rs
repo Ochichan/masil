@@ -694,6 +694,8 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         "find" => print(&manager.find(args).await?)?,
         "operations" => print(&manager.operations_command(false, args).await?)?,
         "inbox" => print(&super::inbox::command(&manager, args).await?)?,
+        "notify" => print(&super::notifications::command(&manager, args).await?)?,
+        "schedule" => print(&super::schedules::command(&manager, args).await?)?,
         "requests" if args.len() == 1 => {
             let agent = manager.get(&args[0]).await?;
             print(&manager.requests(&agent).await?)?;

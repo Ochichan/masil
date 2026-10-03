@@ -399,6 +399,23 @@ impl Manager {
         Ok(public(&item, false))
     }
 
+    /// Drafts from a layout or a schedule for a run, all or none: a draft
+    /// the run already waits on with the same text is left out. Returns how
+    /// many were added.
+    pub(crate) async fn queue_drafts(
+        &self,
+        run: &str,
+        pane: &str,
+        provider: &str,
+        drafts: &[String],
+    ) -> Result<usize, String> {
+        for draft in drafts {
+            sendable(draft)?;
+        }
+        let mut store = self.operation_store().await?;
+        store.queue_add_drafts(run, pane, provider, drafts, now_ms())
+    }
+
     /// A new item for the agent's run with another item's body and paths
     /// (an earlier run's, one not sent, one sent).
     pub(crate) async fn queue_add_from(&self, agent: &Agent, id: i64) -> Result<Value, String> {

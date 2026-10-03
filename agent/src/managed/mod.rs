@@ -11,19 +11,21 @@ pub(crate) mod find;
 pub(crate) mod fleet;
 pub(crate) mod inbox;
 mod integration;
+mod notifications;
 mod observe;
 mod operations;
 mod prompt;
 pub(crate) mod queue;
 mod remote_cli;
 pub(crate) mod resident;
+pub(crate) mod schedules;
 mod store;
 mod view;
 
 use crate::{detection::Engine, native_ui, observation::now_ms, providers};
 pub(crate) use cli::run;
 use evidence::Evidence;
-pub(crate) use operations::{Through, private_directory};
+pub(crate) use operations::{NotifyEvent, Through, private_directory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -456,6 +458,8 @@ pub(crate) struct Manager {
     cache: Mutex<HashMap<String, (String, Arc<Evidence>)>>,
     /// Set only in the coordinator, whose Manager lives across ticks.
     resident: Option<resident::Resident>,
+    /// How long `lock` waits for another operation; zero refuses at once.
+    lock_wait: std::time::Duration,
 }
 
 impl Manager {
@@ -468,7 +472,16 @@ impl Manager {
             engine: Engine::load()?,
             cache: Mutex::new(HashMap::new()),
             resident: None,
+            lock_wait: std::time::Duration::ZERO,
         })
+    }
+
+    /// A Manager whose operations wait up to `limit` for the management
+    /// lock. Only for work on a thread of its own (scheduled actions): the
+    /// wait blocks the thread.
+    pub(crate) fn waiting_for_lock(mut self, limit: std::time::Duration) -> Self {
+        self.lock_wait = limit;
+        self
     }
 
     pub fn reload(&mut self) -> Result<(), String> {
@@ -1984,8 +1997,12 @@ impl Manager {
         {
             return Err("agent lock must be a private owner file".into());
         }
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(LOCK_BUSY.into());
+        let deadline = std::time::Instant::now() + self.lock_wait;
+        while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(LOCK_BUSY.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         Ok(file)
     }
