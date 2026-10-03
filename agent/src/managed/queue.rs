@@ -20,7 +20,7 @@ const ATTACHMENTS: usize = 16;
 /// The preview a list shows of each body.
 const PREVIEW_CHARS: usize = 200;
 /// The prompt path's own limit (prompt.rs).
-const TEXT_BYTES: usize = 32_768;
+pub(super) const TEXT_BYTES: usize = 32_768;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "heic"];
 
 /// A local path the item refers to, as checked when it was added.
@@ -218,7 +218,7 @@ fn attachments_of(item: &QueueItem) -> Vec<Attachment> {
 
 /// What a list shows of an item: its state, a preview, never more of the
 /// body than PREVIEW_CHARS.
-fn public(item: &QueueItem, held: bool) -> Value {
+pub(super) fn public(item: &QueueItem, held: bool) -> Value {
     let body = item.body.as_deref();
     let preview = body.map(|body| body.chars().take(PREVIEW_CHARS).collect::<String>());
     json!({

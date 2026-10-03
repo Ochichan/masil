@@ -3,6 +3,7 @@ pub(crate) mod answer;
 pub(crate) mod changes;
 mod cli;
 mod commands;
+mod dictation;
 mod durable;
 pub(crate) mod endpoints;
 mod evidence;

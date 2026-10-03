@@ -105,8 +105,13 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
                 .ok()
                 .and_then(|v| v.rsplitn(3, ',').last().map(str::to_owned))
         })
-        .or_else(|| std::env::var("MASIL_AGENT_SOCKET").ok())
-        .ok_or("usage: specify --socket PATH or run this command inside masil")?;
+        .or_else(|| std::env::var("MASIL_AGENT_SOCKET").ok());
+    // Its own signals: SIGINT stops a dictation rather than dropping it.
+    // Stopping and looking need no server.
+    if command == "dictate" {
+        return super::dictation::run(socket.map(PathBuf::from), client, rest);
+    }
+    let socket = socket.ok_or("usage: specify --socket PATH or run this command inside masil")?;
     if command == "ui" || command == "sidebar" {
         let socket = PathBuf::from(&socket)
             .canonicalize()

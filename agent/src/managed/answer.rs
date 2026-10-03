@@ -1145,6 +1145,31 @@ fn recorded(record: &Record) -> Result<Value, String> {
 /// still go around this (it is an accident check), and an ancestry that
 /// cannot be read is refused.
 fn refuse_agent_caller() -> Result<(), String> {
+    match agent_ancestor() {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(
+            "answer_refused: this command runs inside an agent; answer from a terminal or the management window"
+                .into(),
+        ),
+        Err(Ancestry::Unreadable) => Err(
+            "answer_refused: this command's ancestry could not be read; answer from a terminal or the management window"
+                .into(),
+        ),
+        Err(Ancestry::TooDeep) => {
+            Err("answer_refused: this command's ancestry is too deep to check".into())
+        }
+    }
+}
+
+/// Why an ancestry could not be checked.
+pub(super) enum Ancestry {
+    Unreadable,
+    TooDeep,
+}
+
+/// Whether an ancestor of this command is a provider with a terminal: an
+/// agent running masil-agent itself.
+pub(super) fn agent_ancestor() -> Result<bool, Ancestry> {
     let mut pid = std::process::id() as i32;
     for _ in 0..64 {
         let parent = match crate::process::info(pid) {
@@ -1155,25 +1180,20 @@ fn refuse_agent_caller() -> Result<(), String> {
                         .and_then(|argv| crate::providers::identify_process(&argv))
                         .is_some()
                 {
-                    return Err(
-                        "answer_refused: this command runs inside an agent; answer from a terminal or the management window"
-                            .into(),
-                    );
+                    return Ok(true);
                 }
                 info.parent
             }
             // Another user's process, such as login(1) between a terminal
             // and its shell: not an agent of this user, but its parent is.
-            None => crate::process::other_users_parent(pid).ok_or(
-                "answer_refused: this command's ancestry could not be read; answer from a terminal or the management window",
-            )?,
+            None => crate::process::other_users_parent(pid).ok_or(Ancestry::Unreadable)?,
         };
         if parent <= 1 {
-            return Ok(());
+            return Ok(false);
         }
         pid = parent;
     }
-    Err("answer_refused: this command's ancestry is too deep to check".into())
+    Err(Ancestry::TooDeep)
 }
 
 #[cfg(test)]

@@ -121,6 +121,10 @@ pub enum Effect {
     Changes {
         id: String,
     },
+    /// Start or stop a dictation for this agent.
+    Dictate {
+        id: String,
+    },
     Quit,
     Preferences {
         language: Language,
@@ -199,6 +203,8 @@ pub(crate) enum Action {
     Queue,
     /// The agent's working tree changes and checkpoints.
     Changes,
+    /// Start or stop dictating into the agent's queue (`agent dictate`).
+    Dictate,
     /// Open or close the inbox view.
     Inbox,
     /// Focus the oldest unseen inbox event's pane.
@@ -720,7 +726,8 @@ impl App {
             | Action::InterruptAgent
             | Action::Answer
             | Action::Queue
-            | Action::Changes => {
+            | Action::Changes
+            | Action::Dictate => {
                 self.managed
                     && self.connected
                     && self.selected().is_some_and(|row| {
@@ -794,6 +801,9 @@ impl App {
                 id: self.selected_id.clone()?,
             },
             Action::Changes => Effect::Changes {
+                id: self.selected_id.clone()?,
+            },
+            Action::Dictate => Effect::Dictate {
                 id: self.selected_id.clone()?,
             },
             Action::Inbox => {

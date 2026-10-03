@@ -1,5 +1,6 @@
-//! Read-only facts about other processes of this user: argv, parent and
-//! process group. Each returns None when the process is gone or unreadable.
+//! Read-only facts about other processes of this user: argv, environment,
+//! name, parent and process group. Each returns None when the process is gone or
+//! unreadable.
 
 #[cfg(not(target_os = "macos"))]
 use std::fs;
@@ -9,6 +10,13 @@ const MAX_ARGS: usize = 256;
 /// The exact argv of a process.
 #[cfg(target_os = "macos")]
 pub(crate) fn argv(pid: i32) -> Option<Vec<String>> {
+    parse_procargs(&procargs(pid)?)
+}
+
+/// The kernel's argument area of a process: argc, the executable path,
+/// argv and the environment.
+#[cfg(target_os = "macos")]
+fn procargs(pid: i32) -> Option<Vec<u8>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
     let mut argmax: libc::c_int = 0;
     let mut size = std::mem::size_of::<libc::c_int>();
@@ -43,7 +51,8 @@ pub(crate) fn argv(pid: i32) -> Option<Vec<String>> {
     if ok != 0 || size < 4 {
         return None;
     }
-    parse_procargs(&buffer[..size])
+    buffer.truncate(size);
+    Some(buffer)
 }
 
 #[cfg(target_os = "macos")]
@@ -64,6 +73,111 @@ fn parse_procargs(buffer: &[u8]) -> Option<Vec<String>> {
         argv.push(String::from_utf8(part.to_vec()).ok()?);
     }
     (argv.len() == argc as usize).then_some(argv)
+}
+
+/// Every process ID on this machine; most others' processes are not
+/// readable by the calls above.
+#[cfg(target_os = "macos")]
+pub(crate) fn all() -> Vec<i32> {
+    let mut buffer = vec![0 as libc::pid_t; 8192];
+    let bytes = (buffer.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: the buffer holds `bytes` bytes; the call writes at most that.
+    let written = unsafe { libc::proc_listallpids(buffer.as_mut_ptr().cast(), bytes) };
+    if written <= 0 {
+        return Vec::new();
+    }
+    buffer.truncate((written as usize).min(buffer.len()));
+    buffer.into_iter().filter(|pid| *pid > 0).collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn all() -> Vec<i32> {
+    fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A process's environment, as `NAME=value` strings. macOS shows none for
+/// Apple's own platform binaries (an empty list).
+#[cfg(target_os = "macos")]
+pub(crate) fn environment(pid: i32) -> Option<Vec<String>> {
+    parse_environment(&procargs(pid)?)
+}
+
+/// The strings after argc arguments and any NUL padding, up to the next
+/// empty one.
+#[cfg(target_os = "macos")]
+fn parse_environment(buffer: &[u8]) -> Option<Vec<String>> {
+    let argc = usize::try_from(i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = &buffer[4..];
+    let path_end = rest.iter().position(|&b| b == 0)?;
+    let mut position = path_end;
+    while rest.get(position) == Some(&0) {
+        position += 1;
+    }
+    Some(
+        rest[position..]
+            .split(|&b| b == 0)
+            .skip(argc)
+            .skip_while(|part| part.is_empty())
+            .take_while(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect(),
+    )
+}
+
+/// A process's short command name, readable for other users' processes too.
+#[cfg(target_os = "macos")]
+pub(crate) fn name(pid: i32) -> Option<String> {
+    // SAFETY: a zeroed proc_bsdshortinfo is valid; proc_pidinfo writes at
+    // most its size.
+    let mut short: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&mut short as *mut libc::proc_bsdshortinfo).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let bytes: Vec<u8> = short
+        .pbsi_comm
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn name(pid: i32) -> Option<String> {
+    Some(
+        fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()?
+            .trim_end()
+            .to_owned(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn environment(pid: i32) -> Option<Vec<String>> {
+    let bytes = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(
+        bytes
+            .split(|&b| b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect(),
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -197,6 +311,44 @@ mod tests {
         assert_eq!(
             parse_procargs(&buffer),
             Some(vec!["vim".to_string(), "a b".to_string()])
+        );
+    }
+
+    /// A process that is not one of Apple's platform binaries, whose
+    /// environment macOS does show: this test binary, waiting.
+    #[test]
+    #[ignore]
+    fn waits_for_another_test() {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn another_process_environment_is_read() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "process::tests::waits_for_another_test",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .env("MASIL_PROCESS_TEST", "seen")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        // After its exec, not the fork's copy of this process.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let found = environment(pid);
+        let listed = all().contains(&pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(listed);
+        assert!(name(std::process::id() as i32).is_some());
+        assert!(
+            found.as_ref().is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry == "MASIL_PROCESS_TEST=seen")),
+            "{found:?}"
         );
     }
 

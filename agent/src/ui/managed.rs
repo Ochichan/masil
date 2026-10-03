@@ -1693,6 +1693,38 @@ fn dispatch_effect(
                 );
             }
         }
+        Effect::Dictate { id } => {
+            if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {
+                if !(agent.endpoint_id.is_empty() || agent.endpoint_id == "local") {
+                    let boot = expected_boot.to_owned();
+                    let target = TargetIdentity::for_agent(&agent);
+                    tasks.spawn(async move {
+                        action_message(
+                            boot,
+                            Some(target),
+                            Err(
+                                "remote_unsupported: dictation goes to agents of this server"
+                                    .into(),
+                            ),
+                        )
+                    });
+                    return;
+                }
+                let socket = fleet.local.native.socket.clone();
+                let boot = expected_boot.to_owned();
+                let target = TargetIdentity::for_agent(&agent);
+                tasks.spawn(async move {
+                    let result = dictate(&socket, &agent.pane_id).map(|()| {
+                        ActionResult::Receipt(message(
+                            language,
+                            format!("Dictation for {}: started or stopped (m)", agent.name),
+                            format!("{} 받아쓰기: 시작 또는 멈춤 (m)", agent.name),
+                        ))
+                    });
+                    action_message(boot, Some(target), result)
+                });
+            }
+        }
         Effect::Queue { id } => {
             if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {
                 app.queue_request += 1;
@@ -1762,6 +1794,35 @@ fn dispatch_effect(
         Effect::Retry => {}
         Effect::CopyId { .. } | Effect::Preferences { .. } | Effect::Quit => {}
     }
+}
+
+/// `agent dictate --toggle PANE` apart from the desk: its own session, no
+/// terminal, so it ends its dictation however the desk ends; a thread
+/// reaps it. It finds the asking client from this pane.
+fn dictate(socket: &std::path::Path, pane: &str) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("agent")
+        .arg("--socket")
+        .arg(socket)
+        .args(["dictate", "--toggle", pane])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 /// One queue change (when given), then the agent's queue again.

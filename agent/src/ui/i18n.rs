@@ -390,6 +390,7 @@ pub(crate) fn action_label(
         Action::Answer => return word(language, "Answer requests", "요청에 답하기"),
         Action::Queue => return word(language, "Prompt queue", "prompt 대기열"),
         Action::Changes => return word(language, "Changes and checkpoints", "변경과 checkpoint"),
+        Action::Dictate => return word(language, "Dictate into the queue", "대기열에 받아쓰기"),
         Action::Inbox => return word(language, "Inbox", "인박스"),
         Action::NextUnseen => return word(language, "Next unseen event", "다음 안 읽은 사건"),
     };
@@ -441,6 +442,8 @@ pub(crate) fn compact_action_label(
         (Language::Korean, Action::Queue, _, _) => "대기열",
         (Language::English, Action::Changes, _, _) => "Changes",
         (Language::Korean, Action::Changes, _, _) => "변경",
+        (Language::English, Action::Dictate, _, _) => "Dictate",
+        (Language::Korean, Action::Dictate, _, _) => "받아쓰기",
         (Language::English, Action::Inbox, _, _) => "Inbox",
         (Language::Korean, Action::Inbox, _, _) => "인박스",
         (Language::English, Action::NextUnseen, _, _) => "Next",
@@ -585,6 +588,10 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                     "f",
                     "Changed files, diffs and checkpoints; restore a file (files only)",
                 ),
+                Key(
+                    "m",
+                    "Dictate into the queue; m again stops (needs dictation.toml)",
+                ),
                 Key("z", "Expand or restore an owned side panel"),
                 Gap,
                 Group("INBOX"),
@@ -635,6 +642,10 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                     "prompt 대기열: 미리 써 두고 agent가 대기일 때 s로 하나씩 보내기",
                 ),
                 Key("f", "바뀐 파일, diff, checkpoint; 파일 되돌리기(파일만)"),
+                Key(
+                    "m",
+                    "대기열에 받아쓰기; m을 다시 누르면 멈춤(dictation.toml 필요)",
+                ),
                 Key("z", "소유한 사이드패널 확대 또는 복원"),
                 Gap,
                 Group("인박스"),

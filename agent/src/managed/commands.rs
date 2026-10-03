@@ -179,6 +179,13 @@ pub(crate) const VERBS: &[Verb] = &[
         remote: true,
     },
     Verb {
+        name: "dictate",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] [--client CLIENT] dictate TARGET | dictate --toggle TARGET | dictate --stop | dictate --cancel | dictate --status",
+        mutating: true,
+        target_stage: None,
+        remote: false,
+    },
+    Verb {
         name: "requests",
         usage: "masil-agent agent [--socket MASIL_SOCKET] requests TARGET",
         mutating: false,

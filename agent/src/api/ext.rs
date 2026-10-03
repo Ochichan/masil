@@ -77,22 +77,23 @@ fn config_path() -> Result<PathBuf, String> {
         .join("masil/extensions.toml"))
 }
 
-/// The configured extensions; none without a file. The file must be the
-/// user's and not writable by others.
-pub(crate) fn load() -> Result<Vec<Extension>, String> {
-    let path = config_path()?;
+/// A configuration file of the user's (`extensions.toml`,
+/// `dictation.toml`): None when missing. It must be the user's own regular
+/// file of at most 64 KiB, not a symlink, not writable by group or others.
+/// Errors begin with `code`.
+pub(crate) fn read_user_config(path: &Path, code: &str) -> Result<Option<String>, String> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(&path)
+        .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("extension_invalid: {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{code}: {}: {error}", path.display())),
     };
     let metadata = file
         .metadata()
-        .map_err(|error| format!("extension_invalid: {error}"))?;
+        .map_err(|error| format!("{code}: {error}"))?;
     // SAFETY: geteuid has no preconditions.
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
@@ -100,14 +101,22 @@ pub(crate) fn load() -> Result<Vec<Extension>, String> {
         || metadata.len() > 64 * 1024
     {
         return Err(format!(
-            "extension_invalid: {} must be your own file of at most 64 KiB, not writable by group or others",
+            "{code}: {} must be your own file of at most 64 KiB, not writable by group or others",
             path.display()
         ));
     }
     let mut text = String::new();
     file.take(64 * 1024)
         .read_to_string(&mut text)
-        .map_err(|error| format!("extension_invalid: {error}"))?;
+        .map_err(|error| format!("{code}: {error}"))?;
+    Ok(Some(text))
+}
+
+/// The configured extensions; none without a file.
+pub(crate) fn load() -> Result<Vec<Extension>, String> {
+    let Some(text) = read_user_config(&config_path()?, "extension_invalid")? else {
+        return Ok(Vec::new());
+    };
     let parsed: File =
         toml::from_str(&text).map_err(|error| format!("extension_invalid: {error}"))?;
     if parsed.extension.len() > MAX_EXTENSIONS {

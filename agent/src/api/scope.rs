@@ -52,6 +52,12 @@ fn invisible(c: char) -> bool {
         )
 }
 
+/// Whether text would begin, once spaces and invisible characters are
+/// skipped, with `!` or `/`: what providers run as commands.
+pub(crate) fn begins_like_command(text: &str) -> bool {
+    matches!(text.chars().find(|c| !invisible(*c)), Some('!' | '/'))
+}
+
 /// Text a provider reads as a prompt: not blank (a queued item's paths
 /// would come first), not what it would run as a command, and no control
 /// keys but newline and tab (a draft is pasted later as it is).
@@ -181,6 +187,12 @@ pub(crate) fn needed(verb: &str, args: &[String]) -> Option<Scope> {
         "close" | "resume" | "rename" | "attach" => Act,
         // C-c on an approval or question screen declines it.
         "interrupt" => Admin,
+        // Starting one turns on this machine's microphone: no scope.
+        "dictate" => match args {
+            [status] if status == "--status" => Read,
+            [stop] if stop == "--stop" || stop == "--cancel" => Act,
+            _ => return None,
+        },
         "ack" | "save" | "restore" | "reload" => Admin,
         // `answer`, `send-keys`, `start ... --`, interactive and internal
         // verbs: no scope.
@@ -204,7 +216,7 @@ pub(crate) fn allowed(scope: Scope, verb: &str, args: &[String]) -> Result<(), S
 }
 
 /// Every verb some scope may call, for the hello.
-const VERBS: [&str; 36] = [
+const VERBS: [&str; 37] = [
     "list",
     "get",
     "explain",
@@ -241,6 +253,7 @@ const VERBS: [&str; 36] = [
     "save",
     "restore",
     "reload",
+    "dictate",
 ];
 
 /// The verbs a scope may call in some form.
@@ -306,6 +319,8 @@ mod tests {
             ("ui", &[][..]),
             ("focus", &["builder"][..]),
             ("put", &["file"][..]),
+            ("dictate", &["builder"][..]),
+            ("dictate", &["--toggle", "builder"][..]),
         ] {
             assert_eq!(needed(verb, &args(words)), None, "{verb} {words:?}");
         }
@@ -332,6 +347,9 @@ mod tests {
         check("prompt", &["builder", "fix the build"], Scope::Act);
         check("prompt", &["builder", "line one\n\tline two"], Scope::Act);
         check("interrupt", &["builder"], Scope::Admin);
+        check("dictate", &["--status"], Scope::Read);
+        check("dictate", &["--stop"], Scope::Act);
+        check("dictate", &["--cancel"], Scope::Act);
         check("start", &["x", "codex", "--cwd", "/tmp"], Scope::Act);
         check(
             "checkpoint",

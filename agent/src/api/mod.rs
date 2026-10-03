@@ -93,7 +93,7 @@ fn failure(id: &Value, code: &str, message: &str) -> Value {
 
 /// TERM to a process group, and KILL 2 s later to whatever is left in it.
 /// The leader is `child`, reaped here if it was not.
-pub(super) async fn end_group(group: i32, child: &mut tokio::process::Child) {
+pub(crate) async fn end_group(group: i32, child: &mut tokio::process::Child) {
     // SAFETY: the group is the child's; its leader is not reaped yet, or
     // was reaped just now and the group still has its other members.
     if unsafe { libc::killpg(group, libc::SIGTERM) } != 0 {
