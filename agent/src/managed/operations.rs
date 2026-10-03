@@ -101,7 +101,33 @@ const FEATURES: &[(&str, &str)] = &[
     ("notify", NOTIFY_SCHEMA),
     ("schedules", SCHEDULES_SCHEMA),
     ("remote_links", REMOTE_LINKS_SCHEMA),
+    ("extensions", EXTENSIONS_SCHEMA),
 ];
+
+/// Resident extensions this server's coordinator keeps (P9,
+/// docs/extensions.md); their state survives a coordinator that is
+/// replaced, so a failing one is not started again by the next.
+const EXTENSIONS_SCHEMA: &str = "
+CREATE TABLE extensions (
+  name TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  restarts INTEGER NOT NULL DEFAULT 0,
+  window_ms INTEGER NOT NULL DEFAULT 0,
+  failed_ms INTEGER,
+  changed_ms INTEGER NOT NULL
+);
+";
+
+/// A resident extension as stored.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExtensionRow {
+    pub(crate) name: String,
+    pub(crate) enabled: bool,
+    pub(crate) state: String,
+    pub(crate) restarts: i64,
+    pub(crate) window_ms: i64,
+}
 
 /// Connections this server's coordinator holds to endpoints (P8b,
 /// docs/agent-endpoints.md): what the person asked for, where the merged
@@ -892,6 +918,25 @@ impl Store {
             && !features.iter().any(|name| name == "schedules")
         {
             features.push("schedules".into());
+        }
+        let extensions: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'extensions')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if extensions
+            && conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM extensions WHERE enabled = 1 AND state != 'failed' AND state != 'stopped')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql)?
+            && !features.iter().any(|name| name == "extensions")
+        {
+            features.push("extensions".into());
         }
         // A link counts while its endpoint is still configured and on.
         let links: bool = conn
@@ -1701,6 +1746,109 @@ impl Store {
         Some((store.inbox_enabled().unwrap_or(false), instance))
     }
 
+    // Resident extensions (P9).
+
+    pub fn extensions(&self) -> Result<Vec<ExtensionRow>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT name, enabled, state, restarts, window_ms FROM extensions ORDER BY name",
+            )
+            .map_err(sql)?;
+        statement
+            .query_map([], |row| {
+                Ok(ExtensionRow {
+                    name: row.get(0)?,
+                    enabled: row.get(1)?,
+                    state: row.get(2)?,
+                    restarts: row.get(3)?,
+                    window_ms: row.get(4)?,
+                })
+            })
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)
+    }
+
+    /// The stored extensions, read-only; none without a store or table.
+    pub fn extensions_readonly(socket: &Path) -> Result<Vec<ExtensionRow>, String> {
+        let Some(store) = Self::readonly(socket)? else {
+            return Ok(Vec::new());
+        };
+        let table: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'extensions')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if table {
+            store.extensions()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Switches a resident extension on (afresh: no restarts counted) or
+    /// off. At most `limit` are on.
+    pub fn extension_set(
+        &mut self,
+        name: &str,
+        enabled: bool,
+        limit: i64,
+        now: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        if enabled {
+            let on: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM extensions WHERE enabled = 1 AND name != ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            if on >= limit {
+                return Err(format!(
+                    "extension_limit: at most {limit} resident extensions per server"
+                ));
+            }
+        }
+        tx.execute(
+            "INSERT INTO extensions (name, enabled, state, restarts, window_ms, failed_ms, changed_ms)
+             VALUES (?1, ?2, ?3, 0, 0, NULL, ?4)
+             ON CONFLICT (name) DO UPDATE SET enabled = ?2, state = ?3, restarts = 0,
+               window_ms = 0, failed_ms = NULL, changed_ms = ?4",
+            params![name, enabled, if enabled { "starting" } else { "disabled" }, now as i64],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
+    /// What became of a resident extension, while it is still on.
+    pub fn extension_state(
+        &mut self,
+        name: &str,
+        state: &str,
+        restarts: i64,
+        window_ms: i64,
+        now: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE extensions SET state = ?2, restarts = ?3, window_ms = ?4,
+                   failed_ms = CASE WHEN ?2 = 'failed' THEN ?5 ELSE failed_ms END
+                 WHERE name = ?1 AND enabled = 1",
+                params![name, state, restarts, window_ms, now as i64],
+            )
+            .map(drop)
+            .map_err(sql)
+    }
+
     // Remote links (P8b).
 
     fn link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LinkRow> {
@@ -2148,6 +2296,69 @@ impl Store {
             open: open.into_iter().take(open_limit as usize).collect(),
             truncated,
         }))
+    }
+
+    /// The events recorded after `after` (any source), up to 200, and where
+    /// the next read starts; with None, nothing and the current end. Read
+    /// without changing anything, in one transaction (extension API).
+    pub fn inbox_since(
+        socket: &Path,
+        after: Option<i64>,
+    ) -> Result<Option<(Vec<Value>, i64)>, String> {
+        const LIMIT: i64 = 200;
+        let Some(mut store) = Self::readonly(socket)? else {
+            return Ok(None);
+        };
+        let tx = store.conn.transaction().map_err(sql)?;
+        if !Self::inbox_table_in(&tx)? {
+            return Ok(None);
+        }
+        let seq: i64 = tx
+            .query_row(
+                "SELECT value FROM meta WHERE name = 'store_seq'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        let Some(after) = after else {
+            return Ok(Some((Vec::new(), seq)));
+        };
+        let mut statement = tx
+            .prepare(
+                "SELECT id, store_seq, source, kind, provider, pane, run, summary, observed_ms,
+                   acked_ms IS NOT NULL, resolution
+                 FROM inbox_events WHERE store_seq > ?1 ORDER BY store_seq LIMIT ?2",
+            )
+            .map_err(sql)?;
+        let items: Vec<Value> = statement
+            .query_map(params![after, LIMIT], |row| {
+                let summary: Option<String> = row.get(7)?;
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "seq": row.get::<_, i64>(1)?,
+                    "source": row.get::<_, String>(2)?,
+                    "kind": row.get::<_, String>(3)?,
+                    "provider": row.get::<_, String>(4)?,
+                    "pane": row.get::<_, String>(5)?,
+                    "run": row.get::<_, String>(6)?,
+                    "summary": summary.and_then(|text| serde_json::from_str::<Value>(&text).ok()),
+                    "observed_ms": row.get::<_, i64>(8)?,
+                    "read": row.get::<_, bool>(9)?,
+                    "resolution": row.get::<_, Option<String>>(10)?,
+                }))
+            })
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)?;
+        let next = if items.len() as i64 >= LIMIT {
+            items
+                .last()
+                .and_then(|item| item["seq"].as_i64())
+                .unwrap_or(after)
+        } else {
+            seq
+        };
+        Ok(Some((items, next)))
     }
 
     /// The store's inbox switch, or why it could not be read.
@@ -4450,6 +4661,7 @@ mod tests {
         assert_eq!(
             status["features"],
             json!([
+                "extensions",
                 "inbox",
                 "notify",
                 "prompt_queue",
@@ -4572,6 +4784,7 @@ mod tests {
         assert_eq!(
             store.status().unwrap()["features"],
             json!([
+                "extensions",
                 "inbox",
                 "later",
                 "notify",
@@ -4606,6 +4819,7 @@ mod tests {
             json!([
                 "alpha",
                 "beta",
+                "extensions",
                 "gamma",
                 "inbox",
                 "notify",

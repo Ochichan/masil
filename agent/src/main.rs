@@ -1,6 +1,7 @@
 //! Observer CLI and opt-in terminal management UI. Queries never start a daemon;
 //! `agent coordinator start` and later mutating commands start the coordinator.
 mod agent_stream;
+mod api;
 mod attention;
 mod changes;
 mod checkpoint;
@@ -733,6 +734,21 @@ fn execute() -> Result<i32, String> {
     }
     if args[0] == "agentd" {
         return coordinator::run(&args[1..]);
+    }
+    if matches!(args[0].as_str(), "mcp" | "api" | "ext") {
+        let result = match args[0].as_str() {
+            "mcp" => api::mcp::run(&args[1..]),
+            "ext" => api::ext::run(&args[1..]),
+            _ => api::run(&args[1..]),
+        };
+        return match result {
+            Ok(code) => Ok(code),
+            Err(message) => {
+                let (class, code) = managed::failure::classify(&message);
+                eprintln!("masil-agent: error[{code}]: {message}");
+                Ok(class.exit_code())
+            }
+        };
     }
     if args.len() < 3 || args[0] != "--socket" {
         return Err("expected --socket PATH command".into());

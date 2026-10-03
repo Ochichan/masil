@@ -81,7 +81,7 @@ pub(crate) struct Paths {
     pub(crate) log: PathBuf,
 }
 
-fn digest16(socket: &Path) -> String {
+pub(crate) fn digest16(socket: &Path) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(socket.as_os_str().as_bytes())[..8]
         .iter()
@@ -127,7 +127,7 @@ pub(crate) struct ServerInfo {
 }
 
 /// Runs one native command with a time limit and returns standard output.
-fn masil(socket: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn masil(socket: &Path, args: &[&str]) -> Result<String, String> {
     let binary = crate::native_ui::native_executable()?;
     let mut child = Command::new(binary)
         .arg("-u")
@@ -422,6 +422,13 @@ pub(crate) fn endpoint_call(
         (Some(value), None) => Ok(value.clone()),
         (None, None) => Err("not_connected: an answer without a value".into()),
     }
+}
+
+/// The running coordinator's resident extensions; None if none runs.
+pub(crate) fn extensions_status(socket: &Path) -> Option<Value> {
+    let state = crate::managed::state_base().ok()?;
+    let paths = paths(socket, &state).ok()?;
+    request(&paths.listen, "extensions_status", HELLO_TIMEOUT).ok()
 }
 
 /// What the running coordinator's links are doing; None if none runs.
@@ -965,6 +972,8 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     let log_path = paths.log.clone();
     std::panic::set_hook(Box::new(move |info| {
         log(&log_path, &format!("panic: {info}"));
+        // No resident extension outlives the process.
+        crate::api::ext::sweep_on_panic();
         std::process::exit(0);
     }));
     rebuild_environment();
@@ -1037,6 +1046,7 @@ fn serve_locked(
             scheduler: std::sync::Mutex::new(None),
             schedule_wake: Arc::new(tokio::sync::Notify::new()),
             links: Arc::default(),
+            residents: Arc::default(),
         });
         let supervisor = tokio::spawn(supervise(
             shared.clone(),
@@ -1061,6 +1071,9 @@ fn serve_locked(
         shared.links.stop();
         // Its last act settles what came from the endpoints.
         shared.links.stopped(DEADLINE).await;
+        // Each extension gets TERM, and KILL 2 s later.
+        shared.residents.stop();
+        shared.residents.stopped(DEADLINE).await;
         // A pass that wrote a tracked state also writes its inbox event:
         // let it finish rather than drop it half way.
         shared.control.stopping.store(true, Ordering::SeqCst);
@@ -1090,6 +1103,8 @@ struct Shared {
     schedule_wake: Arc<tokio::sync::Notify>,
     /// Connections to endpoints (P8b).
     links: Arc<crate::managed::links::Links>,
+    /// Resident extensions (P9).
+    residents: Arc<crate::api::ext::Residents>,
 }
 
 impl Shared {
@@ -1204,6 +1219,17 @@ async fn supervise(
         } else {
             shared.links.stop();
         }
+        if features.iter().any(|feature| feature == "extensions") {
+            let path = log_path.clone();
+            let logger: Arc<dyn Fn(&str) + Send + Sync> =
+                Arc::new(move |message: &str| log(&path, message));
+            shared
+                .residents
+                .start(socket.clone(), shared.control.inbox_changed.clone(), logger);
+            shared.residents.wake();
+        } else {
+            shared.residents.stop();
+        }
         if let Some(handle) = stopped {
             handle.abort();
             // A badge write in flight lands before the clear below.
@@ -1227,6 +1253,7 @@ async fn supervise(
                 shared.control.wake.notify_one();
                 shared.schedule_wake.notify_one();
                 shared.links.wake();
+                shared.residents.wake();
             }
         }
     }
@@ -1723,6 +1750,7 @@ fn respond(
         }
         Some("stop") => (ok(json!({"stopping": true})), true),
         Some("links_status") => (ok(shared.links.status()), false),
+        Some("extensions_status") => (ok(shared.residents.status()), false),
         // A report or inbox write: the watch looks at the panes now.
         Some("poke") => {
             POKES.fetch_add(1, Ordering::SeqCst);
@@ -1762,6 +1790,7 @@ mod tests {
             scheduler: std::sync::Mutex::new(None),
             schedule_wake: Arc::default(),
             links: Arc::default(),
+            residents: Arc::default(),
         }
     }
 

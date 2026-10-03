@@ -2130,10 +2130,60 @@ pub(crate) fn operation_store_status(socket: &Path) -> Result<Option<Value>, Str
     operations::Store::inspect(socket)
 }
 
+/// Every verb the agent CLI has (the extension API classifies each).
+#[cfg(test)]
+pub(crate) fn verb_names() -> Vec<&'static str> {
+    commands::VERBS.iter().map(|verb| verb.name).collect()
+}
+
+/// This server's inbox events after a point (extension API subscriptions).
+pub(crate) fn inbox_since(
+    socket: &Path,
+    after: Option<i64>,
+) -> Result<Option<(Vec<Value>, i64)>, String> {
+    operations::Store::inbox_since(socket, after)
+}
+
 /// The state directory this process uses for operation stores, from its own
 /// environment: absolute XDG_STATE_HOME, else HOME/.local/state.
 pub(crate) fn state_base() -> Result<std::path::PathBuf, String> {
     operations::state_base()
+}
+
+/// Resident extensions as stored for this server (P9), read without
+/// creating anything; none without a store.
+pub(crate) fn extension_rows(socket: &Path) -> Result<Vec<Value>, String> {
+    Ok(operations::Store::extensions_readonly(socket)?
+        .into_iter()
+        .map(|row| {
+            json!({
+                "name": row.name,
+                "enabled": row.enabled,
+                "state": row.state,
+                "restarts": row.restarts,
+                "window_ms": row.window_ms,
+            })
+        })
+        .collect())
+}
+
+pub(crate) fn extension_set(
+    socket: &Path,
+    name: &str,
+    enabled: bool,
+    limit: i64,
+) -> Result<(), String> {
+    operations::Store::open(socket)?.extension_set(name, enabled, limit, now_ms())
+}
+
+pub(crate) fn extension_state(
+    socket: &Path,
+    name: &str,
+    state: &str,
+    restarts: i64,
+    window_ms: i64,
+) -> Result<(), String> {
+    operations::Store::open(socket)?.extension_state(name, state, restarts, window_ms, now_ms())
 }
 
 /// Coordinator features switched on for `socket` in the stores under `base`.

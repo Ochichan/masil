@@ -208,6 +208,9 @@ pub(crate) struct WatchControl {
     /// `agent notify test` waits here for the routes' results.
     pub test: Mutex<Option<tokio::sync::oneshot::Sender<serde_json::Value>>>,
     pub report: Mutex<WatchReport>,
+    /// The badge was counted after a pass or a poke: inbox events may have
+    /// been written (resident extensions read them then).
+    pub inbox_changed: Arc<Notify>,
 }
 
 impl Manager {
@@ -389,6 +392,7 @@ pub(crate) async fn watch(
             || badge.retry_in(started).is_some_and(|retry| retry.is_zero())
         {
             badge.count(&manager, started).await;
+            control.inbox_changed.notify_one();
         }
         if started.saturating_sub(last_reopen) >= timing.reopen {
             if let Some(resident) = &manager.resident
@@ -520,6 +524,7 @@ pub(crate) async fn watch(
             }
             // A pass can record or resolve events.
             badge.count(&manager, now_ms()).await;
+            control.inbox_changed.notify_one();
             if let Err(error) = notify(&manager, &mut notifier).await {
                 errors.note(&error, &log, &control);
             }
