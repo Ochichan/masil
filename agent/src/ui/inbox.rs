@@ -425,15 +425,15 @@ impl App {
             None
         };
         if let Some(message) = message {
+            // Wrapped: on a narrow screen the command is on the next lines,
+            // not cut off.
             frame.render_widget(
-                Paragraph::new(clip_line(
-                    vec![Span::styled(
-                        message.to_owned(),
-                        Style::default().fg(palette.text),
-                    )],
-                    list.width as usize,
-                )),
-                Rect::new(list.x, list.y, list.width, 1.min(list.height)),
+                Paragraph::new(Span::styled(
+                    message.to_owned(),
+                    Style::default().fg(palette.text),
+                ))
+                .wrap(ratatui::widgets::Wrap { trim: true }),
+                list,
             );
             return;
         }

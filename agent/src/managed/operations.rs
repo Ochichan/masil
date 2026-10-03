@@ -100,7 +100,36 @@ const FEATURES: &[(&str, &str)] = &[
     ("prompt_queue", PROMPT_QUEUE_SCHEMA),
     ("notify", NOTIFY_SCHEMA),
     ("schedules", SCHEDULES_SCHEMA),
+    ("remote_links", REMOTE_LINKS_SCHEMA),
 ];
+
+/// Connections this server's coordinator holds to endpoints (P8b,
+/// docs/agent-endpoints.md): what the person asked for, where the merged
+/// inbox stands, and the caller's SSH agent and configuration root.
+const REMOTE_LINKS_SCHEMA: &str = "
+CREATE TABLE remote_links (
+  endpoint TEXT PRIMARY KEY,
+  desired TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  instance INTEGER,
+  cursor INTEGER,
+  ssh_auth_sock TEXT,
+  config_root TEXT,
+  changed_ms INTEGER NOT NULL
+);
+";
+
+/// A link as stored.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LinkRow {
+    pub(crate) endpoint: String,
+    pub(crate) desired: String,
+    pub(crate) revision: i64,
+    pub(crate) instance: Option<i64>,
+    pub(crate) cursor: Option<i64>,
+    pub(crate) ssh_auth_sock: Option<String>,
+    pub(crate) config_root: Option<String>,
+}
 
 /// Schedules (docs/schedules.md). A run row is claimed before its action
 /// starts, so a due time runs at most once; `missed` rows settle the times
@@ -141,6 +170,21 @@ pub(crate) struct ScheduleRow {
     pub(crate) changed_ms: i64,
     pub(crate) last_due: Option<i64>,
     pub(crate) last_state: Option<String>,
+}
+
+/// One read of a server's inbox for another server's stream (P8b).
+#[derive(Debug)]
+pub(crate) struct StreamInbox {
+    pub(crate) instance: i64,
+    pub(crate) enabled: bool,
+    /// The snapshot's `store_seq`.
+    pub(crate) as_of: i64,
+    /// Where the next read starts.
+    pub(crate) cursor: i64,
+    pub(crate) items: Vec<Value>,
+    /// Ids open (unread and unresolved) as of the snapshot, newest first.
+    pub(crate) open: Vec<i64>,
+    pub(crate) truncated: bool,
 }
 
 /// What `schedule_record` settled: the due time this caller may run, and
@@ -848,6 +892,33 @@ impl Store {
             && !features.iter().any(|name| name == "schedules")
         {
             features.push("schedules".into());
+        }
+        // A link counts while its endpoint is still configured and on.
+        let links: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'remote_links')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if links {
+            let mut statement = conn
+                .prepare(
+                    "SELECT endpoint, config_root FROM remote_links WHERE desired = 'connected'",
+                )
+                .map_err(sql)?;
+            let wanted: Vec<(String, Option<String>)> = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(sql)?
+                .collect::<Result<_, _>>()
+                .map_err(sql)?;
+            let live = wanted.iter().any(|(endpoint, root)| {
+                super::endpoints::load_in(root.as_deref().map(Path::new))
+                    .is_ok_and(|all| all.iter().any(|e| e.id == *endpoint && e.enabled))
+            });
+            if live && !features.iter().any(|name| name == "remote") {
+                features.push("remote".into());
+            }
         }
         // An `--answers` run keeps its secret until the coordinator sees it end.
         let secrets: bool = conn
@@ -1628,6 +1699,455 @@ impl Store {
         let store = Self::readonly(socket).ok().flatten()?;
         let instance = store.instance().ok()?.to_string();
         Some((store.inbox_enabled().unwrap_or(false), instance))
+    }
+
+    // Remote links (P8b).
+
+    fn link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LinkRow> {
+        Ok(LinkRow {
+            endpoint: row.get(0)?,
+            desired: row.get(1)?,
+            revision: row.get(2)?,
+            instance: row.get(3)?,
+            cursor: row.get(4)?,
+            ssh_auth_sock: row.get(5)?,
+            config_root: row.get(6)?,
+        })
+    }
+
+    const LINK_COLUMNS: &'static str =
+        "endpoint, desired, revision, instance, cursor, ssh_auth_sock, config_root";
+
+    pub fn links(&self) -> Result<Vec<LinkRow>, String> {
+        let mut statement = self
+            .conn
+            .prepare(&format!(
+                "SELECT {} FROM remote_links ORDER BY endpoint",
+                Self::LINK_COLUMNS
+            ))
+            .map_err(sql)?;
+        statement
+            .query_map([], Self::link_row)
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)
+    }
+
+    /// The links, read without creating or changing anything.
+    pub fn links_readonly(socket: &Path) -> Result<Vec<LinkRow>, String> {
+        let Some(store) = Self::readonly(socket)? else {
+            return Ok(Vec::new());
+        };
+        let has_table: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'remote_links')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if !has_table {
+            return Ok(Vec::new());
+        }
+        store.links()
+    }
+
+    /// Records what the person wants of a link. Every change is a new
+    /// revision, so work begun for an earlier one cannot write. Stopping
+    /// settles the endpoint's merged events.
+    pub fn link_set(
+        &mut self,
+        endpoint: &str,
+        connected: bool,
+        ssh_auth_sock: Option<&str>,
+        config_root: Option<&str>,
+        now: u64,
+    ) -> Result<LinkRow, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let desired = if connected { "connected" } else { "stopped" };
+        tx.execute(
+            "INSERT INTO remote_links (endpoint, desired, revision, ssh_auth_sock, config_root, changed_ms)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5)
+             ON CONFLICT (endpoint) DO UPDATE SET desired = ?2, revision = revision + 1,
+               ssh_auth_sock = CASE WHEN ?6 THEN ?3 ELSE ssh_auth_sock END,
+               config_root = CASE WHEN ?6 THEN ?4 ELSE config_root END,
+               changed_ms = ?5",
+            params![endpoint, desired, ssh_auth_sock, config_root, now as i64, connected],
+        )
+        .map_err(sql)?;
+        if !connected {
+            Self::link_settle_in(&tx, endpoint, "remote_disconnected", now)?;
+        }
+        let row = tx
+            .query_row(
+                &format!(
+                    "SELECT {} FROM remote_links WHERE endpoint = ?1",
+                    Self::LINK_COLUMNS
+                ),
+                [endpoint],
+                Self::link_row,
+            )
+            .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(row)
+    }
+
+    fn link_settle_in(
+        tx: &Connection,
+        endpoint: &str,
+        resolution: &str,
+        now: u64,
+    ) -> Result<usize, String> {
+        if !Self::inbox_table_in(tx)? {
+            return Ok(0);
+        }
+        tx.execute(
+            "UPDATE inbox_events SET resolved_ms = ?2, resolution = ?3
+             WHERE source = ?1 AND resolved_ms IS NULL",
+            params![format!("endpoint:{endpoint}"), now as i64, resolution],
+        )
+        .map_err(sql)
+    }
+
+    fn inbox_table_in(tx: &Connection) -> Result<bool, String> {
+        tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'inbox_events')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql)
+    }
+
+    /// Settles an endpoint's open merged events (`remote_disconnected` and
+    /// the like); none is waiting here while nothing is seen of it.
+    pub fn link_settle(
+        &mut self,
+        endpoint: &str,
+        resolution: &str,
+        now: u64,
+    ) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let settled = Self::link_settle_in(&tx, endpoint, resolution, now)?;
+        tx.commit().map_err(sql)?;
+        Ok(settled)
+    }
+
+    /// Merges an endpoint's inbox events, in the transaction that moves the
+    /// link's cursor, and only while the link is still the one `revision`
+    /// names and wanted. A new remote store instance settles what came from
+    /// the old one. Returns how many events were added, or None when the
+    /// link changed meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn link_merge(
+        &mut self,
+        endpoint: &str,
+        revision: i64,
+        instance: i64,
+        items: &[Value],
+        cursor: i64,
+        skew_ms: i64,
+        seed: bool,
+        now: u64,
+    ) -> Result<Option<usize>, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let link: Option<(String, i64, Option<i64>, Option<i64>)> = tx
+            .query_row(
+                "SELECT desired, revision, instance, cursor FROM remote_links WHERE endpoint = ?1",
+                [endpoint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some((desired, current, known, at)) = link else {
+            return Ok(None);
+        };
+        if desired != "connected" || current != revision {
+            return Ok(None);
+        }
+        let source = format!("endpoint:{endpoint}");
+        if known.is_some_and(|known| known != instance) {
+            Self::link_settle_in(&tx, endpoint, "remote_replaced", now)?;
+        } else if known == Some(instance) && at.is_some_and(|at| cursor < at) {
+            // An earlier connection's late batch: never go back.
+            return Ok(Some(0));
+        }
+        let mut added = 0;
+        for item in items {
+            let (Some(id), Some(seq), Some(kind)) = (
+                item["id"].as_i64(),
+                item["seq"].as_i64(),
+                item["kind"].as_str(),
+            ) else {
+                continue;
+            };
+            let pane = format!("{endpoint}::{}", item["pane"].as_str().unwrap_or_default());
+            let run = item["run"].as_str().unwrap_or_default();
+            let source_ref = format!("{instance}:{id}:{seq}");
+            let mut summary = item["summary"].clone();
+            if let Some(agent) = item["agent"].as_str() {
+                let name = json!(format!("{endpoint}::{agent}"));
+                if summary.is_object() {
+                    summary["endpoint_agent"] = name.clone();
+                }
+                // Too large with the name, the summary would go entirely;
+                // the name is what a notification needs.
+                if !summary.is_object() || summary.to_string().len() > INBOX_SUMMARY_BYTES {
+                    summary = json!({"endpoint_agent": name});
+                }
+            }
+            let observed = item["observed_ms"].as_i64().unwrap_or(now as i64) + skew_ms;
+            let inserted = Self::inbox_insert_in(
+                &tx,
+                &InboxEvent {
+                    source: &source,
+                    source_ref: &source_ref,
+                    provider: item["provider"].as_str().unwrap_or_default(),
+                    pane: &pane,
+                    run,
+                    revision: None,
+                    kind,
+                    native_ref: None,
+                    summary: (!summary.is_null()).then_some(summary),
+                    observed_ms: observed.max(0) as u64,
+                },
+            )?;
+            let Some(local) = inserted else {
+                // Known already: an event settled while the link was down
+                // and still open there is open again (it was notified once).
+                if seed {
+                    tx.execute(
+                        "UPDATE inbox_events SET resolved_ms = NULL, resolution = NULL
+                         WHERE source = ?1 AND source_ref = ?2 AND resolution = 'remote_disconnected'",
+                        params![source, source_ref],
+                    )
+                    .map_err(sql)?;
+                }
+                continue;
+            };
+            added += 1;
+            // What was read or settled there arrives so here.
+            if item["read"] == true {
+                tx.execute(
+                    "UPDATE inbox_events SET acked_ms = ?2 WHERE id = ?1",
+                    params![local, now as i64],
+                )
+                .map_err(sql)?;
+            }
+            if let Some(resolution) = item["resolution"].as_str() {
+                tx.execute(
+                    "UPDATE inbox_events SET resolved_ms = ?2, resolution = ?3 WHERE id = ?1",
+                    params![local, now as i64, resolution],
+                )
+                .map_err(sql)?;
+            }
+            // A re-armed event: its earlier copy is done.
+            tx.execute(
+                "UPDATE inbox_events SET resolved_ms = ?3, resolution = 'superseded'
+                 WHERE source = ?1 AND source_ref LIKE ?2 AND id != ?4 AND resolved_ms IS NULL",
+                params![source, format!("{instance}:{id}:%"), now as i64, local],
+            )
+            .map_err(sql)?;
+        }
+        tx.execute(
+            "UPDATE remote_links SET instance = ?2, cursor = ?3 WHERE endpoint = ?1",
+            params![endpoint, instance, cursor],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(Some(added))
+    }
+
+    /// Settles merged events the endpoint no longer has open: those of
+    /// `instance` it had recorded by `as_of` and does not list.
+    pub fn link_open(
+        &mut self,
+        endpoint: &str,
+        instance: i64,
+        as_of: i64,
+        open: &[i64],
+        now: u64,
+    ) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        if !Self::inbox_table_in(&tx)? {
+            return Ok(0);
+        }
+        let open: std::collections::HashSet<i64> = open.iter().copied().collect();
+        let rows: Vec<(i64, String)> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, source_ref FROM inbox_events
+                     WHERE source = ?1 AND resolved_ms IS NULL AND source_ref LIKE ?2",
+                )
+                .map_err(sql)?;
+            statement
+                .query_map(
+                    params![format!("endpoint:{endpoint}"), format!("{instance}:%")],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(sql)?
+                .collect::<Result<_, _>>()
+                .map_err(sql)?
+        };
+        let mut settled = 0;
+        for (local, source_ref) in rows {
+            let mut parts = source_ref.split(':').skip(1);
+            let (Some(Ok(id)), Some(Ok(seq))) = (
+                parts.next().map(str::parse::<i64>),
+                parts.next().map(str::parse::<i64>),
+            ) else {
+                continue;
+            };
+            if seq <= as_of && !open.contains(&id) {
+                settled += tx
+                    .execute(
+                        "UPDATE inbox_events SET resolved_ms = ?2, resolution = 'remote_resolved'
+                         WHERE id = ?1 AND resolved_ms IS NULL",
+                        params![local, now as i64],
+                    )
+                    .map_err(sql)?;
+            }
+        }
+        tx.commit().map_err(sql)?;
+        Ok(settled)
+    }
+
+    /// What an endpoint's stream sends another server (P8b), read without
+    /// changing anything and in one read transaction: the events recorded
+    /// after `after`, or with None the open ones (up to `limit`, newest), and
+    /// the ids still open as of the same snapshot. None without a store or
+    /// an inbox table.
+    pub fn stream_inbox(
+        socket: &Path,
+        after: Option<i64>,
+        limit: i64,
+        open_limit: i64,
+    ) -> Result<Option<StreamInbox>, String> {
+        let Some(mut store) = Self::readonly(socket)? else {
+            return Ok(None);
+        };
+        let tx = store.conn.transaction().map_err(sql)?;
+        let has_table: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'inbox_events')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if !has_table {
+            return Ok(None);
+        }
+        let meta = |name: &str| -> Result<i64, String> {
+            tx.query_row("SELECT value FROM meta WHERE name = ?1", [name], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(sql)
+            .map(|value| value.unwrap_or(0))
+        };
+        let (instance, seq, fence) = (meta("instance")?, meta("store_seq")?, meta("inbox_fence")?);
+        let enabled = Self::inbox_enabled_in(&tx)?;
+        let row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
+            let summary: Option<String> = row.get(6)?;
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "seq": row.get::<_, i64>(1)?,
+                "kind": row.get::<_, String>(2)?,
+                "provider": row.get::<_, String>(3)?,
+                "pane": row.get::<_, String>(4)?,
+                "run": row.get::<_, String>(5)?,
+                "summary": summary.and_then(|text| serde_json::from_str::<Value>(&text).ok()),
+                "observed_ms": row.get::<_, i64>(7)?,
+                "read": row.get::<_, bool>(8)?,
+                "resolution": row.get::<_, Option<String>>(9)?,
+            }))
+        };
+        const COLUMNS: &str = "id, store_seq, kind, provider, pane, run, summary, observed_ms,
+            acked_ms IS NOT NULL OR store_seq <= ?2, resolution";
+        let (items, cursor) = match after {
+            Some(after) => {
+                let mut statement = tx
+                    .prepare(&format!(
+                        "SELECT {COLUMNS} FROM inbox_events
+                         WHERE store_seq > ?1 AND source NOT LIKE 'endpoint:%'
+                         ORDER BY store_seq LIMIT ?3"
+                    ))
+                    .map_err(sql)?;
+                let items: Vec<Value> = statement
+                    .query_map(params![after, fence, limit], row)
+                    .map_err(sql)?
+                    .collect::<Result<_, _>>()
+                    .map_err(sql)?;
+                // Cut short: go on from the last row read, not past rows
+                // never sent.
+                let cursor = if items.len() as i64 >= limit {
+                    items
+                        .last()
+                        .and_then(|item| item["seq"].as_i64())
+                        .unwrap_or(after)
+                } else {
+                    seq
+                };
+                (items, cursor)
+            }
+            None => {
+                let mut statement = tx
+                    .prepare(&format!(
+                        "SELECT {COLUMNS} FROM inbox_events
+                         WHERE resolved_ms IS NULL AND acked_ms IS NULL AND store_seq > ?2
+                           AND source NOT LIKE 'endpoint:%'
+                         ORDER BY store_seq DESC LIMIT ?3"
+                    ))
+                    .map_err(sql)?;
+                let mut items: Vec<Value> = statement
+                    .query_map(params![0, fence, limit], row)
+                    .map_err(sql)?
+                    .collect::<Result<_, _>>()
+                    .map_err(sql)?;
+                items.reverse();
+                (items, seq)
+            }
+        };
+        let open: Vec<i64> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id FROM inbox_events
+                     WHERE resolved_ms IS NULL AND acked_ms IS NULL AND store_seq > ?1
+                       AND source NOT LIKE 'endpoint:%'
+                     ORDER BY store_seq DESC LIMIT ?2",
+                )
+                .map_err(sql)?;
+            statement
+                .query_map(params![fence, open_limit + 1], |row| row.get(0))
+                .map_err(sql)?
+                .collect::<Result<_, _>>()
+                .map_err(sql)?
+        };
+        let truncated = open.len() as i64 > open_limit;
+        Ok(Some(StreamInbox {
+            instance,
+            enabled,
+            as_of: seq,
+            cursor,
+            items,
+            open: open.into_iter().take(open_limit as usize).collect(),
+            truncated,
+        }))
     }
 
     /// The store's inbox switch, or why it could not be read.
@@ -3112,7 +3632,8 @@ impl Store {
             .conn
             .prepare(
                 "SELECT DISTINCT run FROM inbox_events
-                 WHERE resolved_ms IS NULL AND source != 'operation' AND run != ''",
+                 WHERE resolved_ms IS NULL AND source != 'operation' AND run != ''
+                   AND source NOT LIKE 'endpoint:%'",
             )
             .map_err(sql)?;
         statement
@@ -3933,6 +4454,7 @@ mod tests {
                 "notify",
                 "prompt_queue",
                 "provider_secrets",
+                "remote_links",
                 "schedules"
             ])
         );
@@ -4055,6 +4577,7 @@ mod tests {
                 "notify",
                 "prompt_queue",
                 "provider_secrets",
+                "remote_links",
                 "schedules"
             ])
         );
@@ -4088,6 +4611,7 @@ mod tests {
                 "notify",
                 "prompt_queue",
                 "provider_secrets",
+                "remote_links",
                 "schedules"
             ])
         );
@@ -4512,6 +5036,165 @@ mod tests {
                 .unwrap_err()
                 .starts_with("schedule_absent")
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn merged_endpoint_events_follow_the_endpoint_and_the_link() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        store.set_inbox_enabled(true).unwrap();
+        let link = store
+            .link_set("build", true, Some("/agent.sock"), None, 1)
+            .unwrap();
+        let item = |id: i64, seq: i64, kind: &str| {
+            json!({"id": id, "seq": seq, "kind": kind, "provider": "codex", "pane": "%3",
+                   "run": "r1", "observed_ms": 1000, "read": false, "resolution": null,
+                   "agent": "reviewer", "summary": {"tool": "Bash"}})
+        };
+        let merged = |store: &Store, all: bool| -> Vec<(String, Option<String>)> {
+            store.inbox(all, 100).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["source"] == "endpoint:build")
+                .map(|event| {
+                    (
+                        event["pane"].as_str().unwrap().to_owned(),
+                        event["resolution"].as_str().map(str::to_owned),
+                    )
+                })
+                .collect()
+        };
+        let added = store
+            .link_merge(
+                "build",
+                link.revision,
+                7,
+                &[item(1, 10, "blocked")],
+                10,
+                0,
+                true,
+                2,
+            )
+            .unwrap();
+        assert_eq!(added, Some(1));
+        assert_eq!(merged(&store, false), [("build::%3".to_owned(), None)]);
+        let event = store.inbox(false, 10).unwrap()["events"][0].clone();
+        assert_eq!(event["summary"]["endpoint_agent"], "build::reviewer");
+        // The same rows again (a reconnect's seed) add nothing.
+        assert_eq!(
+            store
+                .link_merge(
+                    "build",
+                    link.revision,
+                    7,
+                    &[item(1, 10, "blocked")],
+                    10,
+                    0,
+                    true,
+                    3
+                )
+                .unwrap(),
+            Some(0)
+        );
+        // An older connection's batch never moves the cursor back.
+        assert_eq!(
+            store
+                .link_merge("build", link.revision, 7, &[], 5, 0, false, 3)
+                .unwrap(),
+            Some(0)
+        );
+        // A re-armed event: the earlier copy is superseded.
+        store
+            .link_merge(
+                "build",
+                link.revision,
+                7,
+                &[item(1, 12, "blocked")],
+                12,
+                0,
+                false,
+                4,
+            )
+            .unwrap();
+        let all = merged(&store, true);
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&("build::%3".to_owned(), Some("superseded".to_owned()))));
+        // Settled there: settled here.
+        assert_eq!(store.link_open("build", 7, 12, &[], 5).unwrap(), 1);
+        assert_eq!(merged(&store, false), []);
+        // Down long enough: settled; a later seed reopens what is still open.
+        store
+            .link_merge(
+                "build",
+                link.revision,
+                7,
+                &[item(2, 13, "approval_requested")],
+                13,
+                0,
+                false,
+                6,
+            )
+            .unwrap();
+        store
+            .link_settle("build", "remote_disconnected", 7)
+            .unwrap();
+        assert_eq!(merged(&store, false), []);
+        store
+            .link_merge(
+                "build",
+                link.revision,
+                7,
+                &[item(2, 13, "approval_requested")],
+                13,
+                0,
+                true,
+                8,
+            )
+            .unwrap();
+        assert_eq!(merged(&store, false).len(), 1);
+        // A new store there settles what came from the old one.
+        store
+            .link_merge(
+                "build",
+                link.revision,
+                8,
+                &[item(1, 2, "error")],
+                2,
+                0,
+                true,
+                9,
+            )
+            .unwrap();
+        let resolutions: Vec<Option<String>> =
+            merged(&store, true).into_iter().map(|(_, r)| r).collect();
+        assert!(resolutions.contains(&Some("remote_replaced".to_owned())));
+        // Another revision (disconnect, connect) refuses the old work.
+        let link = store.link_set("build", false, None, None, 10).unwrap();
+        assert_eq!(
+            store
+                .link_merge(
+                    "build",
+                    link.revision - 1,
+                    8,
+                    &[item(3, 3, "error")],
+                    3,
+                    0,
+                    false,
+                    11
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(merged(&store, false), []);
+        // Disconnecting keeps the recorded agent socket; connecting replaces it.
+        assert_eq!(
+            store.links().unwrap()[0].ssh_auth_sock.as_deref(),
+            Some("/agent.sock")
+        );
+        store.link_set("build", true, None, None, 12).unwrap();
+        assert_eq!(store.links().unwrap()[0].ssh_auth_sock, None);
         fs::remove_dir_all(dir).unwrap();
     }
 

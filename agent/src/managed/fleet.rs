@@ -137,9 +137,10 @@ impl Fleet {
             for endpoint in &endpoints {
                 if endpoint.enabled && !state.pending.contains_key(&endpoint.id) {
                     let request_endpoint = endpoint.clone();
+                    let local = self.local.native.socket.clone();
                     let handle = state.work.spawn(async move {
                         let result = request_endpoint
-                            .call(&Request::List)
+                            .call_through(&Request::List, Some(&local))
                             .await
                             .and_then(parse_inventory);
                         let fingerprint = key(&request_endpoint);
@@ -252,11 +253,15 @@ impl Fleet {
         agent: &Agent,
         action: Action,
     ) -> Result<Value, String> {
+        // Reads may go through this server's link; the rest call.
         endpoint
-            .call(&Request::Action {
-                expected: Expected::from(agent),
-                action,
-            })
+            .call_through(
+                &Request::Action {
+                    expected: Expected::from(agent),
+                    action,
+                },
+                Some(&self.local.native.socket),
+            )
             .await
     }
     pub async fn read(&self, agent: &Agent, history: bool) -> Result<String, String> {
@@ -302,17 +307,30 @@ impl Fleet {
             self.local.prompt(agent, text).await
         }
     }
-    /// Local interrupts are durable operations; an endpoint receives the key.
+    /// Interrupts are durable operations here and on an endpoint.
     pub async fn interrupt(&self, agent: &Agent) -> Result<Value, String> {
         if let Some(e) = self.remote(agent)? {
-            self.action(
-                e,
-                agent,
-                Action::Keys {
-                    keys: vec!["C-c".into()],
-                },
-            )
-            .await
+            match self
+                .action(e.clone(), agent, Action::Interrupt { operation: None })
+                .await
+            {
+                // An endpoint older than durable remote interrupts still
+                // takes the key press.
+                Err(error) if error.starts_with("remote_unsupported") => {
+                    let mut sent = self
+                        .action(
+                            e,
+                            agent,
+                            Action::Keys {
+                                keys: vec!["C-c".into()],
+                            },
+                        )
+                        .await?;
+                    sent["durable"] = json!(false);
+                    Ok(sent)
+                }
+                result => result,
+            }
         } else {
             self.local.interrupt(agent, None).await
         }
@@ -334,8 +352,11 @@ impl Fleet {
         self.local.inbox_mark_read(ids, through_seq).await
     }
 
-    /// The pending requests masil can answer for this agent (local only).
+    /// The pending requests masil can answer for this agent.
     pub async fn requests(&self, agent: &Agent) -> Result<Value, String> {
+        if let Some(e) = self.remote(agent)? {
+            return self.action(e, agent, Action::Requests).await;
+        }
         let agent = self.answering(agent).await?;
         self.local.requests(&agent).await
     }
@@ -346,16 +367,21 @@ impl Fleet {
         request: &str,
         reply: super::answer::Reply,
     ) -> Result<Value, String> {
+        if let Some(e) = self.remote(agent)? {
+            let action = Action::Answer {
+                request: request.into(),
+                args: reply.words(),
+            };
+            return self.action(e, agent, action).await;
+        }
         let agent = self.answering(agent).await?;
         self.local.answer(&agent, request, reply).await
     }
 
-    /// The agent's prompt queue (local agents only, until P8).
+    /// The agent's prompt queue.
     pub async fn queue_view(&self, agent: &Agent) -> Result<Value, String> {
-        if self.remote(agent)?.is_some() {
-            return Err(
-                "queue_remote_unsupported: a remote agent's prompt queue is not offered yet".into(),
-            );
+        if let Some(e) = self.remote(agent)? {
+            return self.action(e, agent, Action::Queue { args: vec![] }).await;
         }
         let agent = self.local.get(&agent.pane_id).await?;
         self.local.queue_view(&agent).await
@@ -366,25 +392,59 @@ impl Fleet {
         agent: &Agent,
         op: super::queue::QueueOp,
     ) -> Result<Value, String> {
-        if self.remote(agent)?.is_some() {
-            return Err(
-                "queue_remote_unsupported: a remote agent's prompt queue is not offered yet".into(),
-            );
+        if let Some(e) = self.remote(agent)? {
+            // A path typed or dropped here names a file here: it is sent to
+            // the agent's attachment directory there, and the item names
+            // the copy.
+            if let super::queue::QueueOp::Attach { id, path, revision } = &op {
+                let local = std::path::PathBuf::from(super::queue::dropped_path(path));
+                if !local.is_absolute() {
+                    return Err("invalid_argument: for an endpoint's agent, drop the file or give its absolute path on this machine".into());
+                }
+                let receipt = super::transfer::send(
+                    &e,
+                    &local,
+                    super::transfer::Destination::Attachment {
+                        run: agent.run.clone(),
+                    },
+                )
+                .await?;
+                let remote = receipt["path"]
+                    .as_str()
+                    .ok_or("endpoint_unreachable: the receipt names no path")?
+                    .to_owned();
+                let args = vec![
+                    "attach".into(),
+                    id.to_string(),
+                    remote,
+                    "--revision".into(),
+                    revision.to_string(),
+                ];
+                return self.action(e, agent, Action::Queue { args }).await;
+            }
+            return self
+                .action(e, agent, Action::Queue { args: op.words() })
+                .await;
         }
         self.local.queue_op(agent, op).await
     }
 
-    /// Working tree changes, checkpoints and restore (P6): this machine's
-    /// agents only.
+    /// Working tree changes, checkpoints and restore (P6). An endpoint's
+    /// agent offers its changes and diffs only.
     pub async fn changes_op(
         &self,
         agent: &Agent,
         op: super::changes::ChangesOp,
     ) -> Result<Value, String> {
-        if self.remote(agent)?.is_some() {
-            return Err(
-                "changes_remote_unsupported: a remote agent's changes and checkpoints are not offered yet".into(),
-            );
+        if let Some(e) = self.remote(agent)? {
+            let args = match op {
+                super::changes::ChangesOp::List => vec![],
+                super::changes::ChangesOp::Diff { path } => vec!["--file".into(), path],
+                _ => {
+                    return Err("remote_unsupported: checkpoints of an endpoint's agent are made and restored on that host".into());
+                }
+            };
+            return self.action(e, agent, Action::Changes { args }).await;
         }
         let agent = self.local.get(&agent.pane_id).await?;
         self.local.changes_op(&agent, op).await
@@ -393,11 +453,6 @@ impl Fleet {
     /// The agent as its pane runs it now: answers find the provider's server
     /// through the pane's current processes, not a listed copy.
     async fn answering(&self, agent: &Agent) -> Result<Agent, String> {
-        if self.remote(agent)?.is_some() {
-            return Err(
-                "answer_channel_none: answers to a remote agent are not offered yet".into(),
-            );
-        }
         let current = self.local.get(&agent.pane_id).await?;
         if current.run != agent.run || current.generation != agent.generation {
             return Err("target_absent: the pane runs another agent now".into());
@@ -492,6 +547,10 @@ impl Fleet {
             args: args.to_vec(),
             session: session.map(str::to_owned),
             split: split.map(str::to_owned),
+            boot: None,
+            operation_id: None,
+            worktree: None,
+            answers: false,
         })
         .await
     }

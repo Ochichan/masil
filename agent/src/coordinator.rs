@@ -30,6 +30,8 @@ static POKES: AtomicUsize = AtomicUsize::new(0);
 pub(crate) const GENERATION: u64 = 2;
 const REQUEST_FRAME: usize = 8 * 1024;
 const RESPONSE_FRAME: usize = 64 * 1024;
+/// An `endpoint_call` answer: an endpoint's list fits.
+pub(crate) const LINK_FRAME: usize = 1024 * 1024 + 8 * 1024;
 const CLIENT_LIMIT: usize = 32;
 const DEADLINE: Duration = Duration::from_secs(3);
 const DEFAULT_IDLE: Duration = Duration::from_secs(600);
@@ -323,14 +325,27 @@ fn holder(path: &Path) -> Option<Value> {
 // -------------------------------------------------------------------- client
 
 fn request(listen: &Path, method: &str, timeout: Duration) -> Result<Value, String> {
+    request_with(listen, method, Value::Null, timeout, RESPONSE_FRAME)
+}
+
+fn request_with(
+    listen: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    frame: usize,
+) -> Result<Value, String> {
     let mut stream = StdUnixStream::connect(listen)
         .map_err(|error| format!("coordinator_unavailable: {error}"))?;
     stream
         .set_read_timeout(Some(timeout))
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(|error| error.to_string())?;
-    let body = serde_json::to_vec(&json!({"v": 1, "id": "cli", "method": method}))
-        .map_err(|error| error.to_string())?;
+    let mut message = json!({"v": 1, "id": "cli", "method": method});
+    if !params.is_null() {
+        message["params"] = params;
+    }
+    let body = serde_json::to_vec(&message).map_err(|error| error.to_string())?;
     stream
         .write_all(&(body.len() as u32).to_be_bytes())
         .and_then(|()| stream.write_all(&body))
@@ -340,7 +355,7 @@ fn request(listen: &Path, method: &str, timeout: Duration) -> Result<Value, Stri
         .read_exact(&mut header)
         .map_err(|error| format!("coordinator_unavailable: {error}"))?;
     let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > RESPONSE_FRAME {
+    if length == 0 || length > frame {
         return Err("coordinator_unavailable: invalid response frame".into());
     }
     let mut body = vec![0; length];
@@ -375,6 +390,45 @@ pub(crate) fn notify_test(socket: &Path) -> Result<Value, String> {
         "notify_test",
         TEST_WAIT + Duration::from_secs(2),
     )
+}
+
+/// A read through this server's link to an endpoint (P8b). Never starts a
+/// coordinator: with none running, or no link up, the caller makes its own
+/// call (`not_connected`).
+pub(crate) fn endpoint_call(
+    socket: &Path,
+    endpoint: &str,
+    key: &str,
+    request: &Value,
+) -> Result<Value, String> {
+    // Anything short of the endpoint's own answer means: call it yourself.
+    let not_connected = |error: String| format!("not_connected: {error}");
+    let state = crate::managed::state_base().map_err(not_connected)?;
+    let paths = paths(socket, &state).map_err(not_connected)?;
+    if !paths.listen.exists() {
+        return Err("not_connected: no coordinator".into());
+    }
+    let params = json!({"endpoint": endpoint, "key": key, "request": request});
+    let reply = request_with(
+        &paths.listen,
+        "endpoint_call",
+        params,
+        crate::managed::links::CALL_DEADLINE + Duration::from_secs(1),
+        LINK_FRAME,
+    )
+    .map_err(not_connected)?;
+    match (reply.get("value"), reply["error"].as_str()) {
+        (_, Some(error)) => Err(error.to_owned()),
+        (Some(value), None) => Ok(value.clone()),
+        (None, None) => Err("not_connected: an answer without a value".into()),
+    }
+}
+
+/// What the running coordinator's links are doing; None if none runs.
+pub(crate) fn links_status(socket: &Path) -> Option<Value> {
+    let state = crate::managed::state_base().ok()?;
+    let paths = paths(socket, &state).ok()?;
+    request(&paths.listen, "links_status", HELLO_TIMEOUT).ok()
 }
 
 fn hello(listen: &Path) -> Option<Value> {
@@ -431,7 +485,7 @@ fn current(value: &Value, server: &ServerInfo) -> bool {
 
 /// The executable this process runs, as a path and the file's identity, so
 /// a rebuilt binary is noticed and its coordinator replaced.
-fn exe_identity() -> Value {
+pub(crate) fn exe_identity() -> Value {
     let Ok(path) = std::env::current_exe().and_then(|path| path.canonicalize()) else {
         return Value::Null;
     };
@@ -449,7 +503,7 @@ fn exe_identity() -> Value {
 
 /// Whether the file a coordinator recorded as its executable is still the
 /// same file. An unknown identity counts as changed.
-fn exe_unchanged(recorded: &Value) -> bool {
+pub(crate) fn exe_unchanged(recorded: &Value) -> bool {
     let Some(path) = recorded["path"].as_str() else {
         return false;
     };
@@ -982,6 +1036,7 @@ fn serve_locked(
             watch: std::sync::Mutex::new(None),
             scheduler: std::sync::Mutex::new(None),
             schedule_wake: Arc::new(tokio::sync::Notify::new()),
+            links: Arc::default(),
         });
         let supervisor = tokio::spawn(supervise(
             shared.clone(),
@@ -1003,6 +1058,9 @@ fn serve_locked(
         .await;
         supervisor.abort();
         stop_scheduler(&shared);
+        shared.links.stop();
+        // Its last act settles what came from the endpoints.
+        shared.links.stopped(DEADLINE).await;
         // A pass that wrote a tracked state also writes its inbox event:
         // let it finish rather than drop it half way.
         shared.control.stopping.store(true, Ordering::SeqCst);
@@ -1030,6 +1088,8 @@ struct Shared {
     scheduler: std::sync::Mutex<Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>>,
     /// Wakes the scheduler to read the schedules again.
     schedule_wake: Arc<tokio::sync::Notify>,
+    /// Connections to endpoints (P8b).
+    links: Arc<crate::managed::links::Links>,
 }
 
 impl Shared {
@@ -1130,6 +1190,20 @@ async fn supervise(
         } else {
             stop_scheduler(&shared);
         }
+        if features.iter().any(|feature| feature == "remote") {
+            let control = shared.control.clone();
+            let poke: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                control.poked.store(true, Ordering::SeqCst);
+                control.wake.notify_one();
+            });
+            let path = log_path.clone();
+            let logger: Arc<dyn Fn(&str) + Send + Sync> =
+                Arc::new(move |message: &str| log(&path, message));
+            shared.links.start(socket.clone(), poke, logger);
+            shared.links.wake();
+        } else {
+            shared.links.stop();
+        }
         if let Some(handle) = stopped {
             handle.abort();
             // A badge write in flight lands before the clear below.
@@ -1152,6 +1226,7 @@ async fn supervise(
                 shared.control.reload.store(true, Ordering::SeqCst);
                 shared.control.wake.notify_one();
                 shared.schedule_wake.notify_one();
+                shared.links.wake();
             }
         }
     }
@@ -1346,14 +1421,17 @@ async fn accept_loop(
         tokio::net::UnixListener::from_std(listener).map_err(|error| error.to_string())?;
     let mut guard = Some(guard);
     let clients = Arc::new(AtomicUsize::new(0));
+    // Clients that asked for more than reads through a link: those alone
+    // are activity (a desk reads through links every second).
+    let working = Arc::new(AtomicUsize::new(0));
     let last_active = shared.last_active.clone();
     let stop = shared.stop.clone();
     // A feature is work: the process stays while one is on.
     let busy =
-        |clients: &AtomicUsize| clients.load(Ordering::SeqCst) > 0 || !shared.features().is_empty();
+        |working: &AtomicUsize| working.load(Ordering::SeqCst) > 0 || !shared.features().is_empty();
     loop {
         let quiet_since = *last_active.lock().map_err(|_| "poisoned")?;
-        let deadline = if busy(&clients) {
+        let deadline = if busy(&working) {
             Instant::now() + idle
         } else {
             quiet_since + idle
@@ -1380,12 +1458,15 @@ async fn accept_loop(
                     continue;
                 }
                 clients.fetch_add(1, Ordering::SeqCst);
-                let (clients, last_active, shared) =
-                    (clients.clone(), last_active.clone(), shared.clone());
+                let (clients, working, last_active, shared) =
+                    (clients.clone(), working.clone(), last_active.clone(), shared.clone());
                 let idle_seconds = idle.as_secs();
                 tokio::spawn(async move {
-                    serve_client(stream, &shared, &clients, idle_seconds).await;
-                    if clients.fetch_sub(1, Ordering::SeqCst) == 1
+                    let active =
+                        serve_client(stream, &shared, &clients, &working, idle_seconds).await;
+                    clients.fetch_sub(1, Ordering::SeqCst);
+                    if active
+                        && working.fetch_sub(1, Ordering::SeqCst) == 1
                         && let Ok(mut last) = last_active.lock()
                     {
                         *last = Instant::now();
@@ -1413,7 +1494,7 @@ async fn accept_loop(
                 }
             }
             _ = tokio::time::sleep_until(deadline.into()) => {
-                let quiet = !busy(&clients)
+                let quiet = !busy(&working)
                     && last_active.lock().map(|last| last.elapsed() >= idle).unwrap_or(true);
                 if quiet {
                     break;
@@ -1428,34 +1509,98 @@ async fn accept_loop(
     Ok(())
 }
 
+/// Serves one client. One that asks for more than reads through a link is
+/// counted in `working` (true is returned; the caller uncounts it).
 async fn serve_client(
     mut stream: tokio::net::UnixStream,
     shared: &Shared,
     clients: &AtomicUsize,
+    working: &AtomicUsize,
     idle_seconds: u64,
-) {
+) -> bool {
+    let mut active = false;
+    let count = |active: &mut bool| {
+        if !*active {
+            *active = true;
+            working.fetch_add(1, Ordering::SeqCst);
+        }
+    };
     loop {
         let Ok(Ok(body)) =
             tokio::time::timeout(DEADLINE, ipc::read_frame(&mut stream, REQUEST_FRAME)).await
         else {
-            return;
+            return active;
         };
-        let (response, stopping) = match test_request(&body) {
-            Some(id) => (notify_test_reply(shared, id).await, false),
-            None => respond(&body, shared, clients, idle_seconds),
+        let (response, stopping, frame) = if let Some(id) = test_request(&body) {
+            count(&mut active);
+            (notify_test_reply(shared, id).await, false, RESPONSE_FRAME)
+        } else if let Some((id, params)) = link_request(&body) {
+            (
+                endpoint_call_reply(shared, id, &params).await,
+                false,
+                LINK_FRAME,
+            )
+        } else {
+            count(&mut active);
+            let (response, stopping) = respond(&body, shared, clients, idle_seconds);
+            (response, stopping, RESPONSE_FRAME)
         };
-        let written = tokio::time::timeout(
-            DEADLINE,
-            ipc::write_frame(&mut stream, &response, RESPONSE_FRAME),
-        )
-        .await;
+        let written =
+            tokio::time::timeout(DEADLINE, ipc::write_frame(&mut stream, &response, frame)).await;
         if stopping {
             shared.stop.notify_one();
-            return;
+            return active;
         }
         if !matches!(written, Ok(Ok(()))) {
-            return;
+            return active;
         }
+    }
+}
+
+/// The ID and params of a well-formed `endpoint_call`.
+fn link_request(body: &[u8]) -> Option<(Value, Value)> {
+    let request = serde_json::from_slice::<Value>(body).ok()?;
+    let object = request.as_object()?;
+    let id = object.get("id")?;
+    (object.get("v") == Some(&json!(1))
+        && id
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && id.len() <= 64)
+        && object.get("method") == Some(&json!("endpoint_call"))
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "v" | "id" | "method" | "params")))
+    .then(|| {
+        (
+            id.clone(),
+            object.get("params").cloned().unwrap_or(Value::Null),
+        )
+    })
+}
+
+/// A read through an endpoint's link, or `not_connected`.
+async fn endpoint_call_reply(shared: &Shared, id: Value, params: &Value) -> Value {
+    let failure = |error: String| {
+        let code = error.split(':').next().unwrap_or("failed").to_owned();
+        json!({"v": 1, "id": id, "ok": false, "error": {"code": code, "message": error}})
+    };
+    let (Some(endpoint), Some(key)) = (params["endpoint"].as_str(), params["key"].as_str()) else {
+        return failure("invalid_request: endpoint_call needs endpoint, key and request".into());
+    };
+    let request = serde_json::to_vec(&params["request"])
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| crate::managed::endpoints::decode_request(&bytes));
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => return failure(format!("invalid_request: {error}")),
+    };
+    // The endpoint's own answer, error or not, comes as a value; a refusal
+    // here (no link, a bad request) is an error, and the caller then makes
+    // its own call.
+    match shared.links.call(endpoint, key, request).await {
+        Ok(value) => json!({"v": 1, "id": id, "ok": true, "value": {"value": value}}),
+        Err(error) if error.starts_with("not_connected") => failure(error),
+        Err(error) => json!({"v": 1, "id": id, "ok": true, "value": {"error": error}}),
     }
 }
 
@@ -1577,6 +1722,7 @@ fn respond(
             (ok(value), false)
         }
         Some("stop") => (ok(json!({"stopping": true})), true),
+        Some("links_status") => (ok(shared.links.status()), false),
         // A report or inbox write: the watch looks at the panes now.
         Some("poke") => {
             POKES.fetch_add(1, Ordering::SeqCst);
@@ -1615,6 +1761,7 @@ mod tests {
             watch: std::sync::Mutex::new(None),
             scheduler: std::sync::Mutex::new(None),
             schedule_wake: Arc::default(),
+            links: Arc::default(),
         }
     }
 

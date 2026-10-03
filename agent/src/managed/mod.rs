@@ -11,6 +11,7 @@ pub(crate) mod find;
 pub(crate) mod fleet;
 pub(crate) mod inbox;
 mod integration;
+pub(crate) mod links;
 mod notifications;
 mod observe;
 mod operations;
@@ -20,6 +21,9 @@ mod remote_cli;
 pub(crate) mod resident;
 pub(crate) mod schedules;
 mod store;
+pub(crate) mod stream;
+pub(crate) mod tokens;
+pub(crate) mod transfer;
 mod view;
 
 use crate::{detection::Engine, native_ui, observation::now_ms, providers};
@@ -174,6 +178,9 @@ struct RunEvidence {
     /// ready channel is observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     answer_channel_state: Option<String>,
+    /// The SHA-256 of the run's token (tokens.rs); hooks must show it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1377,6 +1384,15 @@ impl Manager {
             "-c".into(),
             format_literal_path(&cwd),
         ]);
+        // Without a token (an unwritable state directory) the hooks are
+        // checked by their process tree alone, as before tokens.
+        let token = tokens::create(&self.native.socket, run).ok();
+        if let Some((path, _)) = &token {
+            command.extend([
+                "-e".into(),
+                format!("{}={}", tokens::VARIABLE, path.display()).into(),
+            ]);
+        }
         for (key, value) in [
             ("MASIL_AGENT_RUN", run.to_owned()),
             (
@@ -1417,13 +1433,18 @@ impl Manager {
             command.push(answer::EXEC_FLAG.into());
         }
         command.extend(argv.iter().map(OsString::from));
-        let result = self
-            .native
-            .tmux(command, None)
-            .await
-            .map_err(server_unreachable)?;
+        let result = match self.native.tmux(command, None).await {
+            Ok(result) => result,
+            Err(error) => {
+                tokens::remove(&self.native.socket, run);
+                return Err(server_unreachable(error));
+            }
+        };
+        let token = token.map(|(_, hash)| hash);
         let (mut outcome, verdict) = self
-            .finish_launch(result, provider, name, run, session, argv, args, answers)
+            .finish_launch(
+                result, provider, name, run, session, argv, args, answers, token,
+            )
             .await
             .map_err(String::from)?;
         let pane = outcome["pane_id"].as_str().unwrap_or_default().to_owned();
@@ -1504,6 +1525,7 @@ impl Manager {
         argv: Vec<String>,
         args: Vec<String>,
         answers: bool,
+        token: Option<String>,
     ) -> Result<(Value, Option<String>), failure::AfterEffect> {
         let line = String::from_utf8(result.stdout)
             .map_err(|_| failure::AfterEffect::new("invalid launch result"))?;
@@ -1539,12 +1561,13 @@ impl Manager {
             requested: None,
             conflict: None,
         });
-        let evidence = if binding.is_some() || answers {
+        let evidence = if binding.is_some() || answers || token.is_some() {
             Some(
                 encode(&RunEvidence {
                     run: run.into(),
                     binding,
                     answer_channel: answers.then(|| answer::CHANNEL.to_owned()),
+                    token,
                     ..RunEvidence::default()
                 })
                 .map_err(failure::AfterEffect::new)?,

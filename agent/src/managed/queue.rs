@@ -239,6 +239,56 @@ fn public(item: &QueueItem, held: bool) -> Value {
     })
 }
 
+impl QueueOp {
+    /// The words `agent queue TARGET` takes for this change, for an
+    /// endpoint to parse as its own CLI does.
+    pub(crate) fn words(&self) -> Vec<String> {
+        let revision = |revision: &i64| ["--revision".to_owned(), revision.to_string()];
+        match self {
+            Self::Add { body } => vec!["add".into(), body.clone()],
+            Self::Show { id } => vec!["show".into(), id.to_string()],
+            Self::Edit {
+                id,
+                body,
+                revision: r,
+            } => {
+                let mut words = vec!["edit".into(), id.to_string(), body.clone()];
+                words.extend(revision(r));
+                words
+            }
+            Self::Attach {
+                id,
+                path,
+                revision: r,
+            } => {
+                let mut words = vec!["attach".into(), id.to_string(), dropped_path(path)];
+                words.extend(revision(r));
+                words
+            }
+            Self::Move {
+                id,
+                position,
+                revision: r,
+            } => {
+                let mut words = vec!["move".into(), id.to_string(), position.to_string()];
+                words.extend(revision(r));
+                words
+            }
+            Self::Remove { id, revision: r } => {
+                let mut words = vec!["remove".into(), id.to_string()];
+                words.extend(revision(r));
+                words
+            }
+            Self::Send { id, revision: r } => {
+                let mut words = vec!["send".into(), id.to_string()];
+                words.extend(revision(r));
+                words
+            }
+            Self::AddFrom { id } => vec!["add".into(), "--from".into(), id.to_string()],
+        }
+    }
+}
+
 /// A change the management window asks for (ui/queue.rs).
 #[derive(Clone, Debug)]
 pub(crate) enum QueueOp {

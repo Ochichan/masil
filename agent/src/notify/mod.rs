@@ -249,13 +249,20 @@ pub(crate) struct Notice {
 
 impl Notice {
     pub(crate) fn from_event(event: &NotifyEvent, agent: Option<String>) -> Self {
-        // A schedule's event has no pane; its schedule names it.
+        // A schedule's event has no pane; its schedule names it. An
+        // endpoint's event carries `endpoint::agent`.
         let schedule = event
             .summary
             .as_ref()
             .and_then(|summary| summary["schedule"].as_str())
             .filter(|_| event.pane.is_empty())
             .map(|name| format!("schedule {name}"));
+        let remote = event
+            .summary
+            .as_ref()
+            .and_then(|summary| summary["endpoint_agent"].as_str())
+            .map(str::to_owned);
+        let schedule = remote.or(schedule);
         Self {
             id: event.id,
             kind: event.kind.clone(),

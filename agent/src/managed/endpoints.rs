@@ -69,6 +69,39 @@ pub(crate) enum Request {
         args: Vec<String>,
         session: Option<String>,
         split: Option<String>,
+        /// A key the caller chose, pinned to the server boot it read; the
+        /// endpoint's store records it. Fields left out when unset, so an
+        /// older endpoint still takes a plain start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        /// A masil worktree found from `cwd` on the endpoint host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        answers: bool,
+    },
+    /// `agent find ARGS`.
+    Find {
+        args: Vec<String>,
+    },
+    /// `agent operations ARGS` and `agent operation ARGS`.
+    Operations {
+        single: bool,
+        args: Vec<String>,
+    },
+    /// `agent inbox ARGS`, without enable or disable.
+    Inbox {
+        args: Vec<String>,
+    },
+    /// `worktree list` or `worktree jobs`, read only.
+    Worktrees {
+        args: Vec<String>,
+    },
+    /// What a path on the endpoint host is.
+    Stat {
+        path: String,
     },
 }
 
@@ -126,6 +159,28 @@ pub(crate) enum Action {
     Resume {
         name: String,
     },
+    /// A durable interrupt; with `operation`, keyed to the expected run.
+    Interrupt {
+        operation: Option<String>,
+    },
+    /// A close keyed to the expected run.
+    CloseOperation {
+        operation: String,
+    },
+    Requests,
+    /// `answer TARGET REQUEST ARGS`.
+    Answer {
+        request: String,
+        args: Vec<String>,
+    },
+    /// `queue TARGET ARGS`; no args shows the queue.
+    Queue {
+        args: Vec<String>,
+    },
+    /// `changes TARGET ARGS`, read only.
+    Changes {
+        args: Vec<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -143,6 +198,41 @@ impl Endpoint {
             return Err(format!("target_absent: endpoint '{}' is disabled", self.id));
         }
         self.clone().call_owned(request.clone()).await
+    }
+
+    /// As `call`, but a list, get or read first goes through the link the
+    /// coordinator of `local` (this server) holds, if one is up; otherwise
+    /// it is a call of its own. Nothing is started for it.
+    pub async fn call_through(
+        &self,
+        request: &Request,
+        local: Option<&Path>,
+    ) -> Result<Value, String> {
+        let streamed = matches!(
+            request,
+            Request::List
+                | Request::Get { .. }
+                | Request::Action {
+                    action: Action::Read { .. },
+                    ..
+                }
+        );
+        if let (true, true, Some(local)) = (self.enabled, streamed, local) {
+            let local = local.to_owned();
+            let id = self.id.clone();
+            let key = super::fleet::key(self);
+            let body = serde_json::to_value(request).map_err(|error| error.to_string())?;
+            let through = tokio::task::spawn_blocking(move || {
+                crate::coordinator::endpoint_call(&local, &id, &key, &body)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            match through {
+                Err(error) if error.starts_with("not_connected") => {}
+                result => return result,
+            }
+        }
+        self.call(request).await
     }
 
     async fn call_owned(self, request: Request) -> Result<Value, String> {
@@ -201,15 +291,19 @@ impl Endpoint {
             tokio::join!(write, read_stdout, read_stderr, wait)
         };
 
-        let (write, stdout, stderr, status) =
-            match tokio::time::timeout(CALL_DEADLINE, operation).await {
-                Ok(result) => result,
-                Err(_) => {
-                    process_group.kill();
-                    let _ = child.wait().await;
-                    return Err(endpoint_unreachable(&id, "timed out after 8 seconds"));
-                }
-            };
+        let deadline = deadline(&request);
+        let (write, stdout, stderr, status) = match tokio::time::timeout(deadline, operation).await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                process_group.kill();
+                let _ = child.wait().await;
+                return Err(endpoint_unreachable(
+                    &id,
+                    format!("timed out after {} seconds", deadline.as_secs()),
+                ));
+            }
+        };
         process_group.disarm();
         write.map_err(|error| endpoint_unreachable(&id, error))?;
         let stdout = stdout.map_err(|error| endpoint_unreachable(&id, error))?;
@@ -236,7 +330,9 @@ impl Endpoint {
         }
         match (envelope.ok, envelope.value, envelope.error) {
             (true, Some(value), None) => Ok(value),
-            (false, None, Some(error)) if !error.is_empty() && error.len() <= 4096 => Err(error),
+            (false, None, Some(error)) if !error.is_empty() && error.len() <= 4096 => {
+                Err(older(&id, error))
+            }
             _ => Err(endpoint_unreachable(
                 &id,
                 "returned an invalid RPC envelope",
@@ -272,6 +368,85 @@ impl Endpoint {
                 .arg("rpc");
             command
         }
+    }
+}
+
+impl Endpoint {
+    /// The receiving end of a file transfer (P8c): fixed arguments; what is
+    /// sent and where go on standard input.
+    pub(crate) fn receive_command(&self) -> Command {
+        let fixed = [
+            self.binary.as_str(),
+            "agent",
+            "--socket",
+            &self.socket,
+            "receive",
+        ];
+        if let Some(host) = &self.host {
+            let mut command = Command::new("ssh");
+            let remote = fixed
+                .into_iter()
+                .map(shell_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            for option in [
+                "BatchMode=yes",
+                "StrictHostKeyChecking=yes",
+                "ConnectTimeout=5",
+                "ServerAliveInterval=15",
+                "ServerAliveCountMax=3",
+            ] {
+                command.arg("-o").arg(option);
+            }
+            command.arg("--").arg(host).arg(remote);
+            command
+        } else {
+            let mut command = Command::new(&self.binary);
+            command.args(&fixed[1..]);
+            command
+        }
+    }
+
+    /// The long-lived stream a coordinator holds (P8b): fixed arguments
+    /// only, keepalives for a peer that went silent, the caller's SSH
+    /// agent when it recorded one.
+    pub(crate) fn stream_command(&self, ssh_auth_sock: Option<&str>) -> Command {
+        let fixed = [
+            self.binary.as_str(),
+            "agent",
+            "--socket",
+            &self.socket,
+            "rpc",
+            "--stream",
+            "--no-start",
+        ];
+        let mut command = if let Some(host) = &self.host {
+            let mut command = Command::new("ssh");
+            let remote = fixed
+                .into_iter()
+                .map(shell_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            for option in [
+                "BatchMode=yes",
+                "StrictHostKeyChecking=yes",
+                "ConnectTimeout=5",
+                "ServerAliveInterval=30",
+                "ServerAliveCountMax=3",
+            ] {
+                command.arg("-o").arg(option);
+            }
+            command.arg("--").arg(host).arg(remote);
+            command
+        } else {
+            let mut command = Command::new(&self.binary);
+            command.args(&fixed[1..]);
+            command
+        };
+        if let Some(sock) = ssh_auth_sock {
+            command.env("SSH_AUTH_SOCK", sock);
+        }
+        command
     }
 }
 
@@ -350,6 +525,23 @@ fn shell_quote(value: &str) -> String {
 
 pub(crate) fn load() -> Result<Vec<Endpoint>, String> {
     load_from(&config_path()?)
+}
+
+/// The endpoints under a configuration root a caller recorded (the
+/// coordinator's own environment may name another), else this process's.
+pub(crate) fn load_in(root: Option<&Path>) -> Result<Vec<Endpoint>, String> {
+    match root {
+        Some(root) => load_from(&root.join("masil/endpoints.json")),
+        None => load(),
+    }
+}
+
+/// This process's configuration root: `XDG_CONFIG_HOME`, else
+/// `HOME/.config`.
+pub(crate) fn config_root() -> Option<PathBuf> {
+    config_path()
+        .ok()
+        .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
 }
 
 fn load_from(path: &Path) -> Result<Vec<Endpoint>, String> {
@@ -711,7 +903,7 @@ pub(crate) async fn serve(manager: &Manager, bytes: &[u8]) -> Value {
     }
 }
 
-fn decode_request(bytes: &[u8]) -> Result<Request, String> {
+pub(crate) fn decode_request(bytes: &[u8]) -> Result<Request, String> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     let object = value
         .as_object()
@@ -735,7 +927,14 @@ fn decode_request(bytes: &[u8]) -> Result<Request, String> {
             "args",
             "session",
             "split",
+            "boot",
+            "operation_id",
+            "worktree",
+            "answers",
         ],
+        "find" | "inbox" | "worktrees" => &["operation", "args"],
+        "operations" => &["operation", "single", "args"],
+        "stat" => &["operation", "path"],
         _ => {
             return Err(format!(
                 "unknown_method: unknown RPC operation '{operation}'"
@@ -780,25 +979,109 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
             args,
             session,
             split,
+            boot,
+            operation_id,
+            worktree,
+            answers,
         } => {
-            manager
-                .start(
-                    &name,
-                    &provider,
-                    Path::new(&cwd),
-                    &args,
-                    session.as_deref(),
-                    split.as_deref(),
-                )
-                .await
+            let key = match (&boot, &operation_id) {
+                (Some(pin), Some(id)) => Some(super::durable::ClientKey { pin, id }),
+                (None, None) => None,
+                _ => return Err("usage: --operation ID and --boot BOOT go together".into()),
+            };
+            let cwd = PathBuf::from(cwd);
+            let cwd = match worktree {
+                Some(spec) => crate::worktree::start_dir(&spec, &cwd, None)?,
+                None => cwd,
+            };
+            super::cli::launch(
+                manager,
+                &name,
+                &provider,
+                &cwd,
+                &args,
+                session.as_deref(),
+                split.as_deref(),
+                key,
+                answers,
+            )
+            .await
         }
+        Request::Find { args } => manager.find(&args).await,
+        Request::Operations { single, args } => {
+            // Reads, and resolving one operation; reconcile and adopt act
+            // on the whole store and stay on that host.
+            let first = args.first().map(String::as_str);
+            let allowed = if single {
+                first.is_some_and(|word| !word.starts_with('-'))
+            } else {
+                matches!(first, None | Some("list" | "status" | "--all" | "--limit"))
+            };
+            if !allowed {
+                return Err(
+                    "remote_unsupported: run operations reconcile and adopt on that host".into(),
+                );
+            }
+            manager.operations_command(single, &args).await
+        }
+        Request::Inbox { args } => {
+            let first = args.first().map(String::as_str);
+            if !matches!(
+                first,
+                None | Some("list" | "--all" | "--limit" | "ack" | "read-all" | "status")
+            ) {
+                return Err("remote_unsupported: switch an endpoint's inbox on that host".into());
+            }
+            super::inbox::command(manager, &args).await
+        }
+        Request::Worktrees { args } => {
+            let (verb, rest) = args.split_first().ok_or("usage: worktree list | jobs")?;
+            let rest = rest.to_vec();
+            let verb = verb.clone();
+            tokio::task::spawn_blocking(move || match verb.as_str() {
+                "list" => crate::worktree::listing(&rest),
+                "jobs" => crate::worktree::job_listing(&rest),
+                _ => Err(
+                    "remote_unsupported: only worktree list and jobs are offered for an endpoint"
+                        .into(),
+                ),
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        }
+        Request::Stat { path } => stat(&path),
         Request::Action { expected, action } => {
+            // A keyed retry is answered from the store, whatever became of
+            // the pane: it never acts twice and still finds its record.
+            let keyed = match &action {
+                Action::Interrupt {
+                    operation: Some(id),
+                } => Some(format!("run:{}/interrupt/{id}", expected.run)),
+                Action::CloseOperation { operation } => {
+                    Some(format!("run:{}/close/{operation}", expected.run))
+                }
+                _ => None,
+            };
+            if let Some(key) = keyed
+                && let Ok(record) = manager.operations_command(true, &[key]).await
+            {
+                return Ok(record);
+            }
             // Events recorded after this read were not shown to the caller.
             let read_at = crate::observation::now_ms();
             let agent = manager.get(&expected.pane_id).await?;
+            // Reading or queueing for the same run goes on while it works.
+            // A keyed interrupt names its run; an unkeyed one is for the
+            // state the caller saw, as here.
             let allow_revision_change = matches!(
                 action,
-                Action::Receipt { .. } | Action::ConnectionStatus { .. }
+                Action::Receipt { .. }
+                    | Action::ConnectionStatus { .. }
+                    | Action::Interrupt { operation: Some(_) }
+                    | Action::Requests
+                    | Action::Answer { .. }
+                    | Action::Queue { .. }
+                    | Action::Changes { .. }
             );
             verify_expected(&expected, &agent, allow_revision_change)?;
             match action {
@@ -831,6 +1114,32 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
                     manager.close(&agent).await?;
                     Ok(json!({"stage":"pane_closed", "pane_id":agent.pane_id, "run":agent.run}))
                 }
+                Action::Interrupt { operation } => {
+                    let key = operation.as_deref().map(|id| super::durable::ClientKey {
+                        pin: &agent.run,
+                        id,
+                    });
+                    manager.interrupt(&agent, key).await
+                }
+                Action::CloseOperation { operation } => {
+                    let key = super::durable::ClientKey {
+                        pin: &agent.run,
+                        id: &operation,
+                    };
+                    manager.close_with_operation(&agent, Some(key)).await
+                }
+                Action::Requests => manager.requests(&agent).await,
+                Action::Answer { request, args } => {
+                    let reply = super::cli::answer_reply(&args)?;
+                    manager.answer(&agent, &request, reply).await
+                }
+                Action::Queue { args } => {
+                    let (value, _) = super::cli::queue_words(manager, &agent, &args, None).await?;
+                    Ok(value)
+                }
+                Action::Changes { args } => {
+                    super::cli::changes_words(manager, &agent, &args, true).await
+                }
                 Action::Resume { name } => {
                     let session = manager.resume_session(&agent)?;
                     manager
@@ -846,6 +1155,69 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
                 }
             }
         }
+    }
+}
+
+/// What a path on this host is, for a caller on another: a directory to
+/// write to, a file and its size, or nothing.
+fn stat(path: &str) -> Result<Value, String> {
+    validate_text("path", path, 1, 4096)?;
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err("invalid_argument: an endpoint path must be absolute".into());
+    }
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(json!({"path": path, "exists": false}));
+        }
+        Err(error) => return Err(format!("invalid_argument: {}: {error}", path.display())),
+    };
+    let kind = if metadata.is_dir() {
+        "directory"
+    } else if metadata.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    // A directory is written into only if it can also be searched.
+    let mode = if metadata.is_dir() {
+        libc::W_OK | libc::X_OK
+    } else {
+        libc::W_OK
+    };
+    let writable = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .is_ok_and(|text| unsafe { libc::access(text.as_ptr(), mode) } == 0);
+    Ok(json!({
+        "path": path,
+        "exists": true,
+        "kind": kind,
+        "size": metadata.len(),
+        "writable": writable,
+    }))
+}
+
+/// How long a call may take: an `--answers` start also waits up to 8 s for
+/// the provider's answer server to come up.
+fn deadline(request: &Request) -> Duration {
+    match request {
+        Request::Start { answers: true, .. } => CALL_DEADLINE + Duration::from_secs(12),
+        _ => CALL_DEADLINE,
+    }
+}
+
+/// An endpoint whose masil-agent predates an operation refuses it as
+/// unknown; that is said as such, not as a bad request.
+fn older(id: &str, error: String) -> String {
+    let unknown = error.starts_with("unknown_method: unknown RPC operation")
+        || (error.starts_with("invalid_argument:")
+            && (error.contains("unknown variant") || error.contains("unknown field")));
+    if unknown {
+        format!(
+            "remote_unsupported: endpoint '{id}' runs a masil-agent without this operation; update it ({error})"
+        )
+    } else {
+        error
     }
 }
 

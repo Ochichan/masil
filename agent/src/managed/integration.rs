@@ -862,6 +862,17 @@ async fn hook(
         log_refusal(target.id, &pane, &error);
         return Err(error);
     }
+    // And the run's token, for a run launched with one.
+    if let Some(expected) = agent
+        .run_evidence
+        .as_ref()
+        .filter(|evidence| evidence.run == run)
+        .and_then(|evidence| evidence.token.as_deref())
+        && let Err(error) = super::tokens::check(&manager.native.socket, expected)
+    {
+        log_refusal(target.id, &pane, &error);
+        return Err(error);
+    }
     if mapped.event_only {
         if let (Some(callback_session), Some(bound_session)) =
             (mapped.session.as_deref(), agent.session_id.as_deref())

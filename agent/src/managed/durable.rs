@@ -175,7 +175,15 @@ impl Manager {
         agent: &Agent,
         key: Option<ClientKey<'_>>,
     ) -> Result<Value, String> {
-        self.effect(agent, Effect::Close, key).await
+        let outcome = self.effect(agent, Effect::Close, key).await?;
+        let stage = outcome["stage"].as_str().unwrap_or_default();
+        if !matches!(
+            stage,
+            "not_applied" | "outcome_unknown" | "rejected_before_effect"
+        ) {
+            super::tokens::remove(&self.native.socket, &agent.run);
+        }
+        Ok(outcome)
     }
 
     async fn effect(

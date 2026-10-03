@@ -939,6 +939,30 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
+    /// The words `agent answer TARGET REQUEST` takes for this reply, for an
+    /// endpoint to parse as its own CLI does.
+    pub(crate) fn words(&self) -> Vec<String> {
+        let mut words: Vec<String> = match self {
+            Self::Once => vec!["--choice".into(), "once".into()],
+            Self::Always => vec!["--choice".into(), "always".into()],
+            Self::Reject { .. } => vec!["--choice".into(), "reject".into()],
+            Self::Answers(answers) => answers
+                .iter()
+                .flat_map(|answer| ["--answer".to_owned(), answer.clone()])
+                .collect(),
+            Self::RejectQuestion => vec!["--reject".into()],
+        };
+        if let Self::Reject {
+            message: Some(message),
+        } = self
+        {
+            words.extend(["--message".into(), message.clone()]);
+        }
+        words
+    }
+}
+
+impl Reply {
     /// The route and body for request `id`; they depend on the reply alone.
     fn post(&self, id: &str) -> (String, Value) {
         match self {

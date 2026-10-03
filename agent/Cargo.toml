@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "io-util", "time", "sync", "signal", "process"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "io-util", "io-std", "time", "sync", "signal", "process"] }
 reqwest = { version = "0.13.5", default-features = false }
 libc = "0.2"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }

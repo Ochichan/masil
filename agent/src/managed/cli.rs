@@ -76,7 +76,12 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
         print(&super::provider_contract(&engine, &rest[1])?)?;
         return Ok(0);
     }
-    if command == "endpoints" || command == "endpoint" {
+    // Links are this server's (P8b); the rest edits endpoints.json.
+    let link_command = matches!(
+        rest.first().map(String::as_str),
+        Some("connect" | "disconnect" | "status")
+    );
+    if (command == "endpoints" || command == "endpoint") && !link_command {
         print(&super::endpoints::configure(rest)?)?;
         return Ok(0);
     }
@@ -131,6 +136,14 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
     }
     if command == "open-native" {
         return super::remote_cli::open_native(&socket, rest);
+    }
+    // Before a Manager: the stream says when no server runs, and waits.
+    if command == "rpc" && rest == ["--stream", "--no-start"] {
+        return super::stream::serve(&socket);
+    }
+    // A file from another server needs no server here.
+    if command == "receive" && rest.is_empty() {
+        return super::transfer::receive();
     }
     let manager = Manager::new(PathBuf::from(socket), client)?;
     tokio::runtime::Builder::new_current_thread()
@@ -317,41 +330,163 @@ pub(super) fn capability_report(agent: &Agent) -> serde_json::Value {
     json!({"pane_id":agent.pane_id,"run":agent.run,"provider":agent.provider,"process":agent.process,"state":agent.state,"binding":agent.binding,"capabilities":agent.capabilities})
 }
 
-/// `agent queue ...` (queue.rs).
-async fn queue_command(manager: &Manager, args: &[String]) -> Result<i32, String> {
-    let usage = || {
-        "usage: queue TARGET [show ID | add TEXT [--attach PATH]... | add --from ID | edit ID TEXT | attach ID PATH | detach ID N | move ID POSITION | remove ID | send [ID]] [--revision N] | queue --held [remove ID]".to_owned()
-    };
-    // --revision N may come anywhere after the target.
+/// Starts an agent as `agent start` does, here or for an endpoint's RPC:
+/// verifies an `--answers` channel and starts a coordinator that should be
+/// running and is not, without waiting for it (D1).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn launch(
+    manager: &Manager,
+    name: &str,
+    provider: &str,
+    cwd: &std::path::Path,
+    extra: &[String],
+    session: Option<&str>,
+    split: Option<&str>,
+    key: Option<super::durable::ClientKey<'_>>,
+    answers: bool,
+) -> Result<Value, String> {
+    let mut outcome = manager
+        .start_with_operation(name, provider, cwd, extra, session, split, key, answers)
+        .await?;
+    // The channel is only used once the server refuses requests without its
+    // password; one that does not is stopped.
+    if answers && let Some(pane) = outcome["pane_id"].as_str() {
+        let agent = manager.get(pane).await?;
+        let channel = manager.verify_answers(&agent).await?;
+        // Without the record the coordinator does not observe the run;
+        // answering still works.
+        let _ = manager.record_answer_channel(pane, channel).await;
+        outcome["answer_channel"] = json!(channel);
+    }
+    let socket = manager.native.socket.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let enabled = super::state_base()
+            .and_then(|base| super::coordinator_features(&base, &socket))
+            .is_ok_and(|features| !features.is_empty());
+        if enabled {
+            crate::coordinator::spawn_detached(&socket);
+            // A running one looks at the new pane now.
+            crate::coordinator::poke(&socket);
+        }
+    })
+    .await;
+    Ok(outcome)
+}
+
+/// The reply of `answer TARGET REQUEST ...`, from the words after REQUEST.
+pub(super) fn answer_reply(args: &[String]) -> Result<super::answer::Reply, String> {
+    let mut choice = None;
+    let mut message = None;
+    let mut answers = Vec::new();
+    let mut reject = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--choice" if choice.is_none() => choice = Some(value(args, i)?),
+            "--message" if message.is_none() => message = Some(value(args, i)?.to_owned()),
+            "--answer" => answers.push(value(args, i)?.to_owned()),
+            "--reject" if !reject => {
+                reject = true;
+                i += 1;
+                continue;
+            }
+            other => {
+                return Err(format!("usage: unknown or repeated answer option: {other}"));
+            }
+        }
+        i += 2;
+    }
+    Ok(match (choice, answers.is_empty(), reject) {
+        (Some("once"), true, false) => super::answer::Reply::Once,
+        (Some("always"), true, false) if message.is_none() => super::answer::Reply::Always,
+        (Some("reject"), true, false) => super::answer::Reply::Reject { message },
+        (None, false, false) if message.is_none() => super::answer::Reply::Answers(answers),
+        (None, true, true) if message.is_none() => super::answer::Reply::RejectQuestion,
+        (Some(other), _, _) if !["once", "always", "reject"].contains(&other) => {
+            return Err("invalid_argument: --choice is once, always or reject".into());
+        }
+        _ => {
+            return Err("usage: answer TARGET REQUEST --choice once|always|reject [--message TEXT] | --answer TEXT... | --reject".into());
+        }
+    })
+}
+
+fn queue_usage() -> String {
+    "usage: queue TARGET [show ID | add TEXT [--attach PATH]... | add --from ID | edit ID TEXT | attach ID PATH | detach ID N | move ID POSITION | remove ID | send [ID]] [--revision N] | queue --held [remove ID]".to_owned()
+}
+
+/// `--revision N` may come anywhere after the target.
+fn queue_revision(args: &[String]) -> Result<(Option<i64>, Vec<&str>), String> {
     let mut revision = None;
     let mut words = Vec::new();
     let mut index = 0;
     while index < args.len() {
         if args[index] == "--revision" {
             let value = value(args, index)?;
-            revision = Some(value.parse::<i64>().map_err(|_| usage())?);
+            revision = Some(value.parse::<i64>().map_err(|_| queue_usage())?);
             index += 2;
         } else {
             words.push(args[index].as_str());
             index += 1;
         }
     }
-    let number = |text: &str| text.parse::<i64>().map_err(|_| usage());
-    let here = std::env::current_dir().map_err(|error| error.to_string())?;
+    Ok((revision, words))
+}
+
+/// `agent queue ...` (queue.rs).
+async fn queue_command(manager: &Manager, args: &[String]) -> Result<i32, String> {
+    let (revision, words) = queue_revision(args)?;
+    let number = |text: &str| text.parse::<i64>().map_err(|_| queue_usage());
     if words.first() == Some(&"--held") {
         return match words[1..] {
             [] => print(&manager.queue_held().await?).map(|()| 0),
             ["remove", id] => {
                 print(&manager.queue_remove(number(id)?, revision).await?).map(|()| 0)
             }
-            _ => Err(usage()),
+            _ => Err(queue_usage()),
         };
     }
-    let Some(target) = words.first() else {
-        return Err(usage());
+    // The target is the first word that is not `--revision N`.
+    let Some(at) = (0..args.len())
+        .find(|&at| args[at] != "--revision" && (at == 0 || args[at - 1] != "--revision"))
+    else {
+        return Err(queue_usage());
     };
-    let agent = manager.get(target).await?;
-    let value = match words[1..] {
+    let agent = manager.get(&args[at]).await?;
+    let here = std::env::current_dir().map_err(|error| error.to_string())?;
+    let mut rest = args.to_vec();
+    rest.remove(at);
+    let (value, record) = queue_words(manager, &agent, &rest, Some(&here)).await?;
+    if record {
+        return print_record(manager, &value, false).await;
+    }
+    print(&value).map(|()| 0)
+}
+
+/// One queue command for `agent`, the words after the target. Returns the
+/// value and whether it is a prompt record (its stage sets the exit code).
+/// Without `base` (an endpoint's RPC), attachment paths must be absolute.
+pub(super) async fn queue_words(
+    manager: &Manager,
+    agent: &Agent,
+    args: &[String],
+    base: Option<&std::path::Path>,
+) -> Result<(Value, bool), String> {
+    let usage = queue_usage;
+    let (revision, words) = queue_revision(args)?;
+    let number = |text: &str| text.parse::<i64>().map_err(|_| usage());
+    let absolute = |path: &str| {
+        if base.is_none() && !std::path::Path::new(path).is_absolute() {
+            Err(format!(
+                "invalid_argument: {path} must be an absolute path on the endpoint host"
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let here = base.unwrap_or(std::path::Path::new("/"));
+    let agent = agent.clone();
+    let value = match words[..] {
         [] => manager.queue_view(&agent).await?,
         ["show", id] => manager.queue_show(number(id)?).await?,
         ["add", "--from", id] => manager.queue_add_from(&agent, number(id)?).await?,
@@ -362,7 +497,9 @@ async fn queue_command(manager: &Manager, args: &[String]) -> Result<i32, String
             while index < rest.len() {
                 match rest[index] {
                     "--attach" => {
-                        paths.push(rest.get(index + 1).ok_or_else(usage)?.to_string());
+                        let path = rest.get(index + 1).ok_or_else(usage)?;
+                        absolute(path)?;
+                        paths.push(path.to_string());
                         index += 2;
                     }
                     text if body.is_none() => {
@@ -373,7 +510,7 @@ async fn queue_command(manager: &Manager, args: &[String]) -> Result<i32, String
                 }
             }
             manager
-                .queue_add(&agent, body.ok_or_else(usage)?, &paths, &here)
+                .queue_add(&agent, body.ok_or_else(usage)?, &paths, here)
                 .await?
         }
         ["edit", id, text] => {
@@ -382,8 +519,9 @@ async fn queue_command(manager: &Manager, args: &[String]) -> Result<i32, String
                 .await?
         }
         ["attach", id, path] => {
+            absolute(path)?;
             manager
-                .queue_attach(&agent, number(id)?, path, revision, &here)
+                .queue_attach(&agent, number(id)?, path, revision, here)
                 .await?
         }
         ["detach", id, at] => {
@@ -398,19 +536,16 @@ async fn queue_command(manager: &Manager, args: &[String]) -> Result<i32, String
                 .await?
         }
         ["remove", id] => manager.queue_remove(number(id)?, revision).await?,
-        ["send"] => {
-            let outcome = manager.queue_send(&agent, None, revision).await?;
-            return print_record(manager, &outcome, false).await;
-        }
+        ["send"] => return Ok((manager.queue_send(&agent, None, revision).await?, true)),
         ["send", id] => {
             let outcome = manager
                 .queue_send(&agent, Some(number(id)?), revision)
                 .await?;
-            return print_record(manager, &outcome, false).await;
+            return Ok((outcome, true));
         }
         _ => return Err(usage()),
     };
-    print(&value).map(|()| 0)
+    Ok((value, false))
 }
 
 fn value(args: &[String], index: usize) -> Result<&str, String> {
@@ -423,9 +558,22 @@ fn value(args: &[String], index: usize) -> Result<&str, String> {
 /// tree changes, one file's diff, or a review request queued for another
 /// agent (never sent by itself).
 async fn changes_command(manager: &Manager, args: &[String]) -> Result<i32, String> {
+    let agent = manager.get(&args[0]).await?;
+    print(&changes_words(manager, &agent, &args[1..], false).await?)?;
+    Ok(0)
+}
+
+/// `changes` for `agent`, the words after the target. An endpoint's RPC
+/// (`remote`) only reads: no `--handoff`.
+pub(super) async fn changes_words(
+    manager: &Manager,
+    agent: &Agent,
+    args: &[String],
+    remote: bool,
+) -> Result<Value, String> {
     let mut file = None;
     let mut handoff = None;
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--file" if file.is_none() => file = Some(value(args, i)?.to_owned()),
@@ -441,14 +589,15 @@ async fn changes_command(manager: &Manager, args: &[String]) -> Result<i32, Stri
     if file.is_some() && handoff.is_some() {
         return Err("usage: --file and --handoff do not go together".into());
     }
-    let agent = manager.get(&args[0]).await?;
+    if remote && handoff.is_some() {
+        return Err("remote_unsupported: --handoff is not offered for an endpoint's agent".into());
+    }
     let op = match (file, handoff) {
         (Some(path), _) => super::changes::ChangesOp::Diff { path },
         (None, Some(reviewer)) => super::changes::ChangesOp::Handoff { reviewer },
         (None, None) => super::changes::ChangesOp::List,
     };
-    print(&manager.changes_op(&agent, op).await?)?;
-    Ok(0)
+    manager.changes_op(agent, op).await
 }
 
 /// `restore ID PATH... [--confirm TOKEN]`.
@@ -605,42 +754,18 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                 Some(spec) => crate::worktree::start_dir(spec, &here, cwd.as_deref())?,
                 None => cwd.unwrap_or(here),
             };
-            let mut outcome = manager
-                .start_with_operation(
-                    &args[0],
-                    &args[1],
-                    &cwd,
-                    &extra,
-                    session,
-                    split,
-                    client_key(boot, operation, "--boot BOOT")?,
-                    answers,
-                )
-                .await?;
-            // The channel is only used once the server refuses requests
-            // without its password; one that does not is stopped.
-            if answers && let Some(pane) = outcome["pane_id"].as_str() {
-                let agent = manager.get(pane).await?;
-                let channel = manager.verify_answers(&agent).await?;
-                // Without the record the coordinator does not observe the
-                // run; answering still works.
-                let _ = manager.record_answer_channel(pane, channel).await;
-                outcome["answer_channel"] = json!(channel);
-            }
-            // A new agent needs watching: start a coordinator that should be
-            // running and is not, without waiting for it (D1).
-            let socket = manager.native.socket.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let enabled = super::state_base()
-                    .and_then(|base| super::coordinator_features(&base, &socket))
-                    .is_ok_and(|features| !features.is_empty());
-                if enabled {
-                    crate::coordinator::spawn_detached(&socket);
-                    // A running one looks at the new pane now.
-                    crate::coordinator::poke(&socket);
-                }
-            })
-            .await;
+            let outcome = launch(
+                &manager,
+                &args[0],
+                &args[1],
+                &cwd,
+                &extra,
+                session,
+                split,
+                client_key(boot, operation, "--boot BOOT")?,
+                answers,
+            )
+            .await?;
             return print_record(&manager, &outcome, false).await;
         }
         "rename" | "attach" if args.len() == 2 => {
@@ -692,6 +817,20 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             return print_record(&manager, &outcome, false).await;
         }
         "find" => print(&manager.find(args).await?)?,
+        "endpoints" | "endpoint" => print(&super::links::command(&manager, args).await?)?,
+        "worktree" if !args.is_empty() => {
+            let (verb, rest) = (args[0].clone(), args[1..].to_vec());
+            let value = tokio::task::spawn_blocking(move || match verb.as_str() {
+                "list" => crate::worktree::listing(&rest),
+                "jobs" => crate::worktree::job_listing(&rest),
+                _ => {
+                    Err("usage: agent worktree list | jobs; see masil-agent worktree --help".into())
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            print(&value)?;
+        }
         "operations" => print(&manager.operations_command(false, args).await?)?,
         "inbox" => print(&super::inbox::command(&manager, args).await?)?,
         "notify" => print(&super::notifications::command(&manager, args).await?)?,
@@ -730,40 +869,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             }
         }
         "answer" if args.len() >= 3 => {
-            let mut choice = None;
-            let mut message = None;
-            let mut answers = Vec::new();
-            let mut reject = false;
-            let mut i = 2;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--choice" if choice.is_none() => choice = Some(value(args, i)?),
-                    "--message" if message.is_none() => message = Some(value(args, i)?.to_owned()),
-                    "--answer" => answers.push(value(args, i)?.to_owned()),
-                    "--reject" if !reject => {
-                        reject = true;
-                        i += 1;
-                        continue;
-                    }
-                    other => {
-                        return Err(format!("usage: unknown or repeated answer option: {other}"));
-                    }
-                }
-                i += 2;
-            }
-            let reply = match (choice, answers.is_empty(), reject) {
-                (Some("once"), true, false) => super::answer::Reply::Once,
-                (Some("always"), true, false) if message.is_none() => super::answer::Reply::Always,
-                (Some("reject"), true, false) => super::answer::Reply::Reject { message },
-                (None, false, false) if message.is_none() => super::answer::Reply::Answers(answers),
-                (None, true, true) if message.is_none() => super::answer::Reply::RejectQuestion,
-                (Some(other), _, _) if !["once", "always", "reject"].contains(&other) => {
-                    return Err("invalid_argument: --choice is once, always or reject".into());
-                }
-                _ => {
-                    return Err("usage: answer TARGET REQUEST --choice once|always|reject [--message TEXT] | --answer TEXT... | --reject".into());
-                }
-            };
+            let reply = answer_reply(&args[2..])?;
             let agent = manager.get(&args[0]).await?;
             print(&manager.answer(&agent, &args[1], reply).await?)?;
         }

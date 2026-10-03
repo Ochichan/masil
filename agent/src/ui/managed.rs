@@ -1440,14 +1440,23 @@ fn dispatch_effect(
             }
         }
         Effect::InboxFocus { pane, run } => {
-            let local = |agent: &&Agent| {
-                (agent.endpoint_id.is_empty() || agent.endpoint_id == "local") && !agent.stale
+            // An endpoint's merged event names `endpoint::%pane`.
+            let (endpoint, pane) = match pane.split_once("::") {
+                Some((endpoint, pane)) => (Some(endpoint.to_owned()), pane.to_owned()),
+                None => (None, pane),
+            };
+            let owner = |agent: &&Agent| match &endpoint {
+                Some(endpoint) => agent.endpoint_id == *endpoint && !agent.stale,
+                None => {
+                    (agent.endpoint_id.is_empty() || agent.endpoint_id == "local") && !agent.stale
+                }
             };
             let listed = agents
                 .values()
-                .filter(local)
+                .filter(owner)
                 .find(|agent| agent.pane_id == pane && agent.run == run)
                 .cloned();
+            let remote = endpoint.is_some();
             let origin = owned_pane.map(str::to_owned);
             let boot = expected_boot.to_owned();
             tasks.spawn(async move {
@@ -1455,6 +1464,11 @@ fn dispatch_effect(
                     // An agent the saved view hides is still a local agent.
                     let agent = match listed {
                         Some(agent) => agent,
+                        None if remote => {
+                            return Err(
+                                "target_absent: the endpoint's agent is not listed now".to_owned()
+                            );
+                        }
                         None => fleet
                             .local_agents()
                             .await?

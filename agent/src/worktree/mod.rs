@@ -380,6 +380,12 @@ fn report(job: &Job) -> Result<i32, String> {
 }
 
 fn list(args: &[String]) -> Result<i32, String> {
+    print(&listing(args)?)?;
+    Ok(0)
+}
+
+/// `worktree list [REPO] [--all]` as a value; an endpoint's RPC reads it.
+pub(crate) fn listing(args: &[String]) -> Result<Value, String> {
     let parsed = parse(args, &[], &["--all"])?;
     let key = match parsed.positional.as_slice() {
         [] => None,
@@ -403,13 +409,18 @@ fn list(args: &[String]) -> Result<i32, String> {
         value["runs"] = json!(runs);
         worktrees.push(value);
     }
-    print(&json!({"worktrees": worktrees}))?;
-    Ok(0)
+    Ok(json!({"worktrees": worktrees}))
 }
 
 fn jobs(args: &[String]) -> Result<i32, String> {
+    print(&job_listing(args)?)?;
+    Ok(0)
+}
+
+/// `worktree jobs [ID]` as a value.
+pub(crate) fn job_listing(args: &[String]) -> Result<Value, String> {
     let registry = Registry::open()?;
-    match args {
+    Ok(match args {
         [] => {
             let jobs: Vec<Value> = registry
                 .jobs(JOB_LIST)?
@@ -422,7 +433,7 @@ fn jobs(args: &[String]) -> Result<i32, String> {
                     value
                 })
                 .collect();
-            print(&json!({"jobs": jobs}))?;
+            json!({"jobs": jobs})
         }
         [id] => {
             let id = job_id(id)?;
@@ -433,11 +444,10 @@ fn jobs(args: &[String]) -> Result<i32, String> {
             if job.open() {
                 value["owner_alive"] = json!(helper::alive(&job));
             }
-            print(&value)?;
+            value
         }
         _ => return Err(format!("usage: {HELP}")),
-    }
-    Ok(0)
+    })
 }
 
 fn cancel(args: &[String]) -> Result<i32, String> {

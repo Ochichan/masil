@@ -973,6 +973,7 @@ async fn sweep(
     // gone turns the `answers` feature off. A failure here does not hold up
     // the inbox's ended runs; the next sweep tries again.
     let _ = manager.prune_answer_secrets(&live).await;
+    super::tokens::prune_ended(&manager.native.socket, &live);
     let Some(open) = manager
         .with_resident_store(|store| store.open_runs())
         .await?
