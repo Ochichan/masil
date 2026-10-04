@@ -965,8 +965,19 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
         }
         Request::View { args } => manager.view(&args).await,
         Request::Save { path } => manager.save(Path::new(&path)).await,
+        // Over an endpoint the call returns without watching readiness: a
+        // long wait would outlast the caller's timeout.
         Request::Restore { path, allow_fresh } => {
-            manager.restore(Path::new(&path), allow_fresh).await
+            manager
+                .restore(
+                    Path::new(&path),
+                    super::store::RestoreOptions {
+                        allow_fresh,
+                        again: false,
+                        wait: std::time::Duration::ZERO,
+                    },
+                )
+                .await
         }
         Request::Get { target } => {
             validate_text("agent target", &target, 1, 128)?;

@@ -227,7 +227,15 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
         ["restore"] | ["restore", _] => {
             let (name, snapshot) = selected_snapshot(&words, "restore", &text)?;
             let plan = plan_restore(server, &snapshot)?;
-            let report = execute_restore(server, &plan, options.client.as_deref())?;
+            let report = execute_restore(
+                server,
+                &plan,
+                options.client.as_deref(),
+                &text(
+                    "Restoring: waiting for shells to be ready…",
+                    "불러오는 중: shell이 준비되기를 기다립니다…",
+                ),
+            )?;
             let message = if report.restored.is_empty()
                 && report.skipped.is_empty()
                 && report.errors.is_empty()
@@ -260,6 +268,18 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
                         &format!(". 실패: {}", report.errors.join("; ")),
                     ));
                 }
+                if !report.shell_unconfirmed.is_empty() {
+                    message.push_str(&text(
+                        &format!(
+                            "; shell not ready, nothing typed: {}",
+                            report.shell_unconfirmed.join(", ")
+                        ),
+                        &format!(
+                            ". shell이 준비되지 않아 명령을 치지 않음: {}",
+                            report.shell_unconfirmed.join(", ")
+                        ),
+                    ));
+                }
                 message
             };
             tell(server, options.client.as_deref(), &message);
@@ -269,6 +289,7 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
                     serde_json::json!({"stage": "restored", "snapshot": name,
                         "restored": report.restored, "skipped": report.skipped,
                         "errors": report.errors,
+                        "shell_unconfirmed": report.shell_unconfirmed,
                         "panes": report.panes, "commands": report.commands,
                         "layout_fallbacks": report.layout_fallbacks, "message": message})
                     .to_string(),
@@ -955,7 +976,15 @@ struct Report {
     panes: usize,
     commands: usize,
     layout_fallbacks: usize,
+    /// Commands to type once each pane's shell is ready: pane ID and line.
+    typing: Vec<(String, String)>,
+    /// Panes whose shell was not ready in time (`session:window.pane`);
+    /// nothing was typed there.
+    shell_unconfirmed: Vec<String>,
 }
+
+/// One wait for every restored shell to be ready to read a command.
+const SHELL_WAIT: Duration = Duration::from_secs(10);
 
 /// Seconds a session may have existed and still count as just started.
 const FRESH_SECONDS: u64 = 600;
@@ -1151,6 +1180,7 @@ fn execute_restore(
     server: &Server,
     plan: &RestorePlan,
     client: Option<&str>,
+    waiting: &str,
 ) -> Result<Report, String> {
     let mut report = Report::default();
     let mut started = HashSet::new();
@@ -1177,6 +1207,17 @@ fn execute_restore(
             continue;
         }
         report.restored.push(session.name.clone());
+    }
+    // Typed before any client is moved to a restored session, so nothing
+    // a person types there runs together with a restored command.
+    if !report.typing.is_empty() && client.is_some() {
+        tell(server, client, waiting);
+    }
+    let unready = type_when_ready(server, &mut report);
+    for session in &plan.sessions {
+        if session.action != "create" || !report.restored.contains(&session.name) {
+            continue;
+        }
         if let Some(client) = client
             && preferred.as_deref() == Some(session.name.as_str())
         {
@@ -1221,7 +1262,101 @@ fn execute_restore(
             }
         }
     }
+    // Named after any rename above.
+    report.shell_unconfirmed = unready
+        .iter()
+        .map(|id| {
+            masil(
+                server,
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    id,
+                    "#{session_name}:#{window_index}.#{pane_index}",
+                ],
+            )
+            .map(|label| label.trim().to_owned())
+            .unwrap_or_else(|_| id.clone())
+        })
+        .collect();
     Ok(report)
+}
+
+/// Types each restored pane's command once its shell is ready to read it:
+/// the shell leads the pane's foreground and its screen was the same at two
+/// checks in a row (a prompt drawn, startup output done). One deadline for
+/// all panes; a pane not ready by then gets nothing typed, since a command
+/// typed into a starting shell or another program can be lost or misread.
+/// Returns the panes nothing was typed into because their shell was not
+/// ready in time.
+fn type_when_ready(server: &Server, report: &mut Report) -> Vec<String> {
+    let deadline = std::time::Instant::now() + SHELL_WAIT;
+    let mut pending = std::mem::take(&mut report.typing);
+    let mut screens: HashMap<String, String> = HashMap::new();
+    while !pending.is_empty() {
+        let status = masil(
+            server,
+            &[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}\t#{pane_pid}\t#{masil_foreground_pgid}\t#{pane_current_command}\t#{b:default-shell}",
+            ],
+        )
+        .ok();
+        let listed: Option<HashSet<&str>> = status.as_deref().map(|status| {
+            status
+                .lines()
+                .filter_map(|line| line.split('\t').next())
+                .collect()
+        });
+        let shells: HashSet<&str> = status
+            .as_deref()
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<_> = line.split('\t').collect();
+                let [id, pid, group, command, shell] = fields.as_slice() else {
+                    return None;
+                };
+                (pid == group && (command == shell || SHELLS.contains(command))).then_some(*id)
+            })
+            .collect();
+        pending.retain(|(id, line)| {
+            // Closed meanwhile: nothing to wait for.
+            if listed
+                .as_ref()
+                .is_some_and(|listed| !listed.contains(id.as_str()))
+            {
+                return false;
+            }
+            if !shells.contains(id.as_str()) {
+                screens.remove(id);
+                return true;
+            }
+            let Ok(screen) = masil(server, &["capture-pane", "-p", "-t", id]) else {
+                return true;
+            };
+            // A blank screen is a shell still starting, not a prompt.
+            if screen.trim().is_empty()
+                || screens.insert(id.clone(), screen.clone()).as_deref() != Some(screen.as_str())
+            {
+                return true;
+            }
+            if masil(server, &["send-keys", "-t", id, "-l", "--", line]).is_ok()
+                && masil(server, &["send-keys", "-t", id, "Enter"]).is_ok()
+            {
+                report.commands += 1;
+            }
+            false
+        });
+        if pending.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    pending.into_iter().map(|(id, _)| id).collect()
 }
 
 /// Text for an argument the core expands as a format (-s, -n, -c, -T and
@@ -1380,12 +1515,7 @@ fn restore_session(
                 })
                 .filter(|_| pane.origin.is_empty() || started.insert(pane.origin.clone()))
             {
-                let line = shell_line(argv);
-                if masil(server, &["send-keys", "-t", id, "-l", "--", &line]).is_ok()
-                    && masil(server, &["send-keys", "-t", id, "Enter"]).is_ok()
-                {
-                    report.commands += 1;
-                }
+                report.typing.push((id.clone(), shell_line(argv)));
             }
             if pane.active {
                 active = Some(id.clone());

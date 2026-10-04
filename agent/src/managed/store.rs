@@ -1,10 +1,11 @@
-//! Versioned agent snapshots and crash-safe restore receipts.
+//! Versioned agent snapshots and crash-safe restore plans.
 
+use super::operations::RestoreTarget;
 use super::{Agent, Manager, executable, valid_name, validate_args};
 use crate::{observation::now_ms, providers};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -80,7 +81,9 @@ impl Manager {
         let path = canonical_snapshot_path(path)?;
         let _snapshot_lock = snapshot_lock(&path)?;
         let receipt = receipt_path(&path)?;
-        if fs::symlink_metadata(&receipt).is_ok() {
+        if fs::symlink_metadata(&receipt).is_ok()
+            || fs::symlink_metadata(claims_path(&path)?).is_ok()
+        {
             return Err("snapshot has a restore receipt; choose a new snapshot path".into());
         }
         if let Ok(existing) = fs::symlink_metadata(&path) {
@@ -117,21 +120,63 @@ impl Manager {
         }))
     }
 
-    /// Restore resumable entries. A second call retries only entries whose
-    /// prior failure was proven to happen before any launch attempt.
-    pub async fn restore(&self, path: &Path, allow_fresh: bool) -> Result<Value, String> {
+    /// Restore resumable entries (T1-d). The plan lives in this server's
+    /// operation store, keyed by the snapshot's SHA-256; each launch is a
+    /// durable start (`boot:<boot>/start/restore.<plan>.<index>.<attempt>`),
+    /// so a repeated or interrupted restore never starts a target twice. A
+    /// claim beside the snapshot tells another server that this one
+    /// restored it. Then every launched target is watched until it is
+    /// ready, or `wait` runs out.
+    pub async fn restore(&self, path: &Path, options: RestoreOptions) -> Result<Value, String> {
         let path = canonical_snapshot_path(path)?;
-        let _snapshot_lock = snapshot_lock(&path)?;
-        let _restore_lock = restore_lock(self)?;
-        let snapshot: Snapshot = read_json(&path, "snapshot")?;
+        let snapshot_lock = snapshot_lock(&path)?;
+        let restore_lock = restore_lock(self)?;
+        let text = read_text(&path, "snapshot")?;
+        let snapshot: Snapshot =
+            serde_json::from_str(&text).map_err(|error| format!("invalid snapshot: {error}"))?;
         validate_snapshot(&snapshot)?;
+        let boot = self.boot().await?;
+        let socket = self.native.socket.to_string_lossy().into_owned();
+        // A receipt from before plans: what it proved carries over, in the
+        // transaction that makes the plan (a bad receipt refuses every time).
         let receipt_path = receipt_path(&path)?;
-        let mut receipt = load_receipt(&receipt_path, &snapshot)?;
-        let mut journal: BTreeMap<usize, ReceiptEntry> = receipt
-            .entries
-            .drain(..)
-            .map(|entry| (entry.index, entry))
-            .collect();
+        let mut legacy = Vec::new();
+        if fs::symlink_metadata(&receipt_path).is_ok() {
+            let receipt = load_receipt(&receipt_path, &snapshot)?;
+            for entry in &receipt.entries {
+                let (stage, detail) = match entry.state {
+                    ReceiptState::Started => ("started", None),
+                    ReceiptState::Pending => (
+                        "unknown",
+                        Some("a previous launch was pending; inspect native panes, then restore with --again".to_owned()),
+                    ),
+                    ReceiptState::FailedNotStarted => ("failed_not_started", entry.error.clone()),
+                };
+                legacy.push((
+                    snapshot.agents[entry.index].name.clone(),
+                    RestoreTarget {
+                        index: entry.index,
+                        stage: stage.into(),
+                        boot: Some(boot.clone()),
+                        attempt: 0,
+                        start_key: None,
+                        pane_id: entry.pane_id.clone(),
+                        run: entry.run.clone(),
+                        detail,
+                    },
+                ));
+            }
+        }
+        let mut store = self.operation_store().await?;
+        let (plan, _) = store.restore_plan(
+            &super::prompt::sha256(&text),
+            &path.to_string_lossy(),
+            &legacy,
+            now_ms(),
+        )?;
+        let rows = store.restore_targets(plan)?;
+        let claims_path = claims_path(&path)?;
+        let mut claims = load_claims(&claims_path, &snapshot)?;
         let current = self.list().await?;
         let mut live_names: HashSet<String> = current
             .iter()
@@ -149,31 +194,79 @@ impl Manager {
             })
             .collect();
         let mut results = Vec::with_capacity(snapshot.agents.len());
+        // Targets launched now: (result index, row).
+        let mut launched: Vec<(usize, RestoreTarget)> = Vec::new();
+        // Each other server is asked once.
+        let mut boots: HashMap<String, Option<String>> = HashMap::new();
 
         for (index, entry) in snapshot.agents.iter().enumerate() {
-            if let Some(previous) = journal.get(&index) {
-                match previous.state {
-                    ReceiptState::Started => {
+            let row = rows.get(&index);
+            let same_boot = row.is_some_and(|row| row.boot.as_deref() == Some(boot.as_str()));
+            if let Some(row) = row {
+                let live = row.run.as_ref().is_some_and(|run| {
+                    current
+                        .iter()
+                        .any(|agent| &agent.run == run && agent.process == "running")
+                });
+                match row.stage.as_str() {
+                    "started"
+                    | "ready"
+                    | "readiness_unconfirmed"
+                    | "resume_mismatch"
+                    | "exited"
+                        if (same_boot || live) && !options.again =>
+                    {
                         results.push(json!({
                             "index": index, "name": entry.name, "stage": "already_restored",
-                            "action": "skipped", "pane_id": previous.pane_id,
-                            "run": previous.run,
+                            "action": "skipped", "pane_id": row.pane_id, "run": row.run,
+                            "readiness": row.stage,
                         }));
                         continue;
                     }
-                    ReceiptState::Pending => {
+                    // Launched before the plan kept keys: nothing to ask.
+                    "unknown" if row.start_key.is_none() && !options.again => {
                         results.push(unknown_result(
                             index,
                             entry,
-                            "a previous launch was pending; inspect native panes before retrying",
+                            row.detail.as_deref().unwrap_or("launch outcome unknown"),
                         ));
                         continue;
                     }
-                    ReceiptState::FailedNotStarted => {}
+                    _ => {}
                 }
             }
+            // A launch of this boot cut off before its result was kept:
+            // its key answers (when it was admitted), and the checks below
+            // would only see the agent it may have started.
+            let asking = !options.again
+                && same_boot
+                && match row
+                    .filter(|row| matches!(row.stage.as_str(), "pending" | "unknown"))
+                    .and_then(|row| row.start_key.as_deref())
+                {
+                    Some(key) => store.get(key)?.is_some(),
+                    None => false,
+                };
+            // Restored by another server that still runs.
+            let claimed_elsewhere = match claims.get(&index) {
+                Some(claim) if claim.socket != socket && !asking && !options.again => {
+                    if !boots.contains_key(&claim.socket) {
+                        let found = server_boot(Path::new(&claim.socket)).await;
+                        boots.insert(claim.socket.clone(), found);
+                    }
+                    boots[&claim.socket].as_deref() == Some(claim.boot.as_str())
+                }
+                _ => false,
+            };
+            if claimed_elsewhere && let Some(claim) = claims.get(&index) {
+                results.push(json!({
+                    "index": index, "name": entry.name, "stage": "already_restored",
+                    "action": "skipped", "restored_by": claim.socket,
+                }));
+                continue;
+            }
 
-            if current.iter().any(|agent| same_native_run(agent, entry)) {
+            if !asking && current.iter().any(|agent| same_native_run(agent, entry)) {
                 results.push(json!({
                     "index": index, "name": entry.name, "stage": "already_running",
                     "action": "skipped", "reason": "saved_native_run_is_live",
@@ -181,7 +274,8 @@ impl Manager {
                 }));
                 continue;
             }
-            if let Some(session) = entry.native_session_ref.as_ref()
+            if !asking
+                && let Some(session) = entry.native_session_ref.as_ref()
                 && live_sessions.contains(&(entry.provider.clone(), session.clone()))
             {
                 results.push(json!({
@@ -192,14 +286,14 @@ impl Manager {
                 }));
                 continue;
             }
-            if live_names.contains(&entry.name) {
+            if !asking && live_names.contains(&entry.name) {
                 results.push(json!({
                     "index": index, "name": entry.name, "stage": "already_running",
                     "action": "skipped", "reason": "agent_name_is_already_running",
                 }));
                 continue;
             }
-            if entry.native_session_ref.is_none() && !allow_fresh {
+            if !asking && entry.native_session_ref.is_none() && !options.allow_fresh {
                 results.push(json!({
                     "index": index, "name": entry.name,
                     "stage": "fresh_start_not_allowed", "action": "skipped",
@@ -207,21 +301,63 @@ impl Manager {
                 continue;
             }
 
+            let mut target = RestoreTarget {
+                index,
+                stage: "pending".into(),
+                boot: Some(boot.clone()),
+                // The same key in this boot asks what it did; a new attempt
+                // (--again) gets a key of its own.
+                attempt: match row {
+                    Some(row) if same_boot && options.again && row.start_key.is_some() => {
+                        row.attempt + 1
+                    }
+                    Some(row) if same_boot => row.attempt,
+                    _ => 0,
+                },
+                start_key: None,
+                pane_id: None,
+                run: None,
+                detail: None,
+            };
             let args = entry.original_args.as_deref().unwrap_or(&[]);
-            if let Err(error) = preflight(entry, args) {
+            if !asking && let Err(error) = preflight(entry, args) {
                 let error = bounded_error(error);
-                journal.insert(
-                    index,
-                    ReceiptEntry {
-                        index,
-                        state: ReceiptState::FailedNotStarted,
-                        pane_id: None,
-                        run: None,
-                        error: Some(error.clone()),
-                    },
-                );
-                receipt.entries = journal.values().cloned().collect();
-                write_json_atomic(&receipt_path, &receipt)?;
+                target.stage = "failed_not_started".into();
+                target.detail = Some(error.clone());
+                store.restore_set(plan, &entry.name, &target, now_ms())?;
+                results.push(json!({
+                    "index": index, "name": entry.name, "stage": "failed_not_started",
+                    "action": "not_launched", "error": error, "can_retry": true,
+                }));
+                continue;
+            }
+            let id = format!("restore.{plan}.{index}.{}", target.attempt);
+            target.start_key = Some(super::operations::key(
+                &format!("boot:{boot}"),
+                "start",
+                &id,
+            ));
+            store.restore_set(plan, &entry.name, &target, now_ms())?;
+            // Claimed before the launch: another server must not start it
+            // while this one's outcome may still be unknown.
+            let previous_claim = claims.insert(
+                index,
+                Claim {
+                    socket: socket.clone(),
+                    boot: boot.clone(),
+                    start_key: target.start_key.clone().unwrap_or_default(),
+                    at_ms: now_ms(),
+                },
+            );
+            if let Err(error) = write_claims(&claims_path, &snapshot, &claims) {
+                let error = bounded_error(format!("restore claim: {error}"));
+                match previous_claim {
+                    Some(claim) => claims.insert(index, claim),
+                    None => claims.remove(&index),
+                };
+                target.stage = "failed_not_started".into();
+                target.detail = Some(error.clone());
+                store.restore_set(plan, &entry.name, &target, now_ms())?;
                 results.push(json!({
                     "index": index, "name": entry.name, "stage": "failed_not_started",
                     "action": "not_launched", "error": error, "can_retry": true,
@@ -229,66 +365,45 @@ impl Manager {
                 continue;
             }
 
-            journal.insert(
-                index,
-                ReceiptEntry {
-                    index,
-                    state: ReceiptState::Pending,
-                    pane_id: None,
-                    run: None,
-                    error: None,
-                },
-            );
-            receipt.entries = journal.values().cloned().collect();
-            write_json_atomic(&receipt_path, &receipt)?;
-
-            match self
-                .start(
+            let started = self
+                .start_with_operation(
                     &entry.name,
                     &entry.provider,
                     Path::new(&entry.cwd),
                     args,
                     entry.native_session_ref.as_deref(),
                     None,
+                    Some(super::durable::ClientKey {
+                        pin: &boot,
+                        id: &id,
+                    }),
+                    false,
                 )
-                .await
-            {
-                Ok(mut outcome) => {
-                    let pane_id = outcome
+                .await;
+            let stage = match &started {
+                Ok(outcome) => outcome
+                    .get("stage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("outcome_unknown")
+                    .to_owned(),
+                Err(error) => super::failure::classify(error).1.to_owned(),
+            };
+            match (stage.as_str(), started) {
+                ("process_started" | "process_exited", Ok(mut outcome)) => {
+                    target.pane_id = outcome
                         .get("pane_id")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
-                    let run = outcome
+                    target.run = outcome
                         .get("run")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
-                    let (Some(pane_id), Some(run)) = (pane_id, run) else {
-                        results.push(unknown_result(
-                            index,
-                            entry,
-                            "process start returned without a complete native receipt",
-                        ));
-                        continue;
+                    target.stage = if stage == "process_exited" {
+                        "exited".into()
+                    } else {
+                        "started".into()
                     };
-                    journal.insert(
-                        index,
-                        ReceiptEntry {
-                            index,
-                            state: ReceiptState::Started,
-                            pane_id: Some(pane_id),
-                            run: Some(run),
-                            error: None,
-                        },
-                    );
-                    receipt.entries = journal.values().cloned().collect();
-                    if let Err(error) = write_json_atomic(&receipt_path, &receipt) {
-                        results.push(unknown_result(
-                            index,
-                            entry,
-                            &format!("process start returned, but its receipt failed: {error}"),
-                        ));
-                        break;
-                    }
+                    store.restore_set(plan, &entry.name, &target, now_ms())?;
                     live_names.insert(entry.name.clone());
                     if let Some(session) = entry.native_session_ref.as_ref() {
                         live_sessions.insert((entry.provider.clone(), session.clone()));
@@ -296,63 +411,326 @@ impl Manager {
                     if let Some(object) = outcome.as_object_mut() {
                         object.insert("index".into(), json!(index));
                         object.insert("action".into(), json!("launched"));
+                        if target.stage == "exited" {
+                            object.insert("readiness".into(), json!("exited"));
+                        }
+                    }
+                    if target.stage == "started" {
+                        launched.push((results.len(), target.clone()));
                     }
                     results.push(outcome);
                 }
-                // The child refused its directory and never started the agent.
-                Err(error) if error.starts_with("cwd_rejected") => {
-                    let error = bounded_error(error);
-                    journal.insert(
-                        index,
-                        ReceiptEntry {
-                            index,
-                            state: ReceiptState::FailedNotStarted,
-                            pane_id: None,
-                            run: None,
-                            error: Some(error.clone()),
-                        },
-                    );
-                    receipt.entries = journal.values().cloned().collect();
-                    write_json_atomic(&receipt_path, &receipt)?;
-                    results.push(json!({
+                // Proven not to have started: a retry starts it.
+                (
+                    "cwd_rejected"
+                    | "rejected_before_effect"
+                    | "not_applied"
+                    | "usage"
+                    | "invalid_argument"
+                    | "identity_mismatch"
+                    | "unknown_provider",
+                    result,
+                ) => {
+                    let error = bounded_error(match result {
+                        Ok(outcome) => format!("launch ended as {stage}: {outcome}"),
+                        Err(error) => error,
+                    });
+                    target.stage = "failed_not_started".into();
+                    target.detail = Some(error.clone());
+                    store.restore_set(plan, &entry.name, &target, now_ms())?;
+                    // Proven not started: the claim goes back to what it was
+                    // (another server's, under --again), or goes.
+                    match previous_claim {
+                        Some(claim) => claims.insert(index, claim),
+                        None => claims.remove(&index),
+                    };
+                    let mut result = json!({
                         "index": index, "name": entry.name, "stage": "failed_not_started",
                         "action": "not_launched", "error": error, "can_retry": true,
-                    }));
+                    });
+                    if let Err(error) = write_claims(&claims_path, &snapshot, &claims) {
+                        result["claim_error"] = json!(bounded_error(error));
+                    }
+                    results.push(result);
                 }
-                Err(error) => {
-                    // Manager::start may have reached tmux before returning an
-                    // error. Keep the durable pending marker and fail closed.
-                    results.push(unknown_result(index, entry, &bounded_error(error)));
+                (_, result) => {
+                    // The launch may have reached the server: the key is
+                    // kept, and the next restore asks it what happened.
+                    let error = bounded_error(match result {
+                        Ok(outcome) => format!("launch ended as {stage}: {outcome}"),
+                        Err(error) => error,
+                    });
+                    target.stage = "unknown".into();
+                    target.detail = Some(error.clone());
+                    store.restore_set(plan, &entry.name, &target, now_ms())?;
+                    let mut result = unknown_result(index, entry, &error);
+                    result["can_retry"] = json!(true);
+                    results.push(result);
                 }
             }
         }
 
-        let launched = result_count(&results, "process_started");
+        // Watching readiness needs neither lock: another restore or a save
+        // may go on meanwhile.
+        drop(snapshot_lock);
+        drop(restore_lock);
+        // AM-13: one deadline for every target launched now.
+        if !launched.is_empty() && !options.wait.is_zero() {
+            let ready = self.readiness(&snapshot, &mut launched, options.wait).await;
+            // Only onto the same launch: another restore may have started
+            // the target again while this one watched.
+            for (_, target) in &launched {
+                store.restore_settle(plan, target, now_ms())?;
+            }
+            for ((slot, target), reason) in launched.iter().zip(ready) {
+                results[*slot]["readiness"] = json!(target.stage);
+                if let Some(reason) = reason {
+                    results[*slot]["readiness_reason"] = json!(reason);
+                }
+            }
+        } else {
+            for (slot, _) in &launched {
+                results[*slot]["readiness"] = json!("not_checked");
+            }
+        }
+
+        let readiness = |stage: &str| {
+            results
+                .iter()
+                .filter(|result| result.get("readiness").and_then(Value::as_str) == Some(stage))
+                .count()
+        };
+        let launched_count = result_count(&results, "process_started");
         let already_running = result_count(&results, "already_running");
         let already_restored = result_count(&results, "already_restored");
         let failed = result_count(&results, "failed_not_started");
         let unknown = result_count(&results, "unknown");
         let fresh_denied = result_count(&results, "fresh_start_not_allowed");
-        let satisfied = launched + already_running + already_restored;
+        // A target that ended before it could be seen ready is not restored.
+        let ended = results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result.get("stage").and_then(Value::as_str),
+                    Some("process_started" | "already_restored")
+                ) && result.get("readiness").and_then(Value::as_str) == Some("exited")
+            })
+            .count();
+        let satisfied = launched_count + already_running + already_restored - ended;
         Ok(json!({
             "stage": "restore_finished",
             "version": VERSION,
             "snapshot_id": snapshot.snapshot_id,
-            "receipt": receipt_path.to_string_lossy(),
+            "plan": plan,
             "all_started": satisfied == snapshot.agents.len(),
             "partial": satisfied != snapshot.agents.len(),
             "counts": {
                 "total": snapshot.agents.len(),
-                "launched": launched,
+                "launched": launched_count,
                 "already_running": already_running,
                 "already_restored": already_restored,
                 "failed_not_started": failed,
                 "unknown": unknown,
                 "fresh_start_not_allowed": fresh_denied,
+                "ready": readiness("ready"),
+                "readiness_unconfirmed": readiness("readiness_unconfirmed"),
+                "resume_mismatch": readiness("resume_mismatch"),
+                "exited": readiness("exited"),
             },
             "entries": results,
         }))
     }
+
+    /// Watches the targets launched by a restore until each is ready or
+    /// cannot be shown to be, under one deadline. A fresh target is ready
+    /// once it shows idle or working. A resumed one is ready when it
+    /// reported the session it was asked to resume (`binding.resume`
+    /// `verified`); without any callback a few seconds after it is up, or
+    /// for OpenCode and Kilo (which report it with the first prompt), that
+    /// cannot be shown, and it is `readiness_unconfirmed` at once.
+    async fn readiness(
+        &self,
+        snapshot: &Snapshot,
+        targets: &mut [(usize, RestoreTarget)],
+        wait: std::time::Duration,
+    ) -> Vec<Option<&'static str>> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut reasons: Vec<Option<&'static str>> = vec![None; targets.len()];
+        let mut up_since: Vec<Option<std::time::Instant>> = vec![None; targets.len()];
+        loop {
+            // A pass that could not read the server decides nothing.
+            let (Ok(agents), Ok(panes)) = (
+                self.list().await,
+                self.command(&["list-panes", "-a", "-F", "#{pane_id}"])
+                    .await,
+            ) else {
+                if std::time::Instant::now() >= deadline {
+                    Self::unconfirmed(targets, &mut reasons);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                continue;
+            };
+            let now = std::time::Instant::now();
+            for (number, (_, target)) in targets.iter_mut().enumerate() {
+                if target.stage != "started" {
+                    continue;
+                }
+                let entry = &snapshot.agents[target.index];
+                let agent = agents
+                    .iter()
+                    .find(|agent| Some(&agent.run) == target.run.as_ref());
+                let Some(agent) = agent else {
+                    let gone = target
+                        .pane_id
+                        .as_ref()
+                        .is_some_and(|pane| !panes.lines().any(|line| line == pane));
+                    if gone {
+                        target.stage = "exited".into();
+                    }
+                    continue;
+                };
+                if agent.process == "exited" {
+                    target.stage = "exited".into();
+                    continue;
+                }
+                let up = ["idle", "working"].contains(&agent.state.as_str());
+                if up && up_since[number].is_none() {
+                    up_since[number] = Some(now);
+                }
+                if entry.native_session_ref.is_none() {
+                    if up {
+                        target.stage = "ready".into();
+                    }
+                    continue;
+                }
+                match agent.binding.resume.as_deref() {
+                    Some("verified") => target.stage = "ready".into(),
+                    Some("mismatch") => target.stage = "resume_mismatch".into(),
+                    Some("awaiting_prompt") if up => {
+                        target.stage = "readiness_unconfirmed".into();
+                        reasons[number] = Some("session_reported_with_first_prompt");
+                    }
+                    _ if up
+                        && !agent.capabilities.callbacks_seen
+                        && up_since[number]
+                            .is_some_and(|since| now.duration_since(since) >= CALLBACK_GRACE) =>
+                    {
+                        target.stage = "readiness_unconfirmed".into();
+                        reasons[number] = Some("no_session_report");
+                    }
+                    _ => {}
+                }
+            }
+            if targets.iter().all(|(_, target)| target.stage != "started") {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                Self::unconfirmed(targets, &mut reasons);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        reasons
+    }
+}
+
+impl Manager {
+    /// Targets still undecided at the deadline.
+    fn unconfirmed(targets: &mut [(usize, RestoreTarget)], reasons: &mut [Option<&'static str>]) {
+        for (number, (_, target)) in targets.iter_mut().enumerate() {
+            if target.stage == "started" {
+                target.stage = "readiness_unconfirmed".into();
+                reasons[number] = Some("deadline");
+            }
+        }
+    }
+}
+
+/// How long a resumed agent that is up may go without any callback before
+/// its resume is taken as one that cannot be shown.
+const CALLBACK_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `restore` options: fresh starts allowed, launch again what this server
+/// or another already restored, and how long to watch for readiness.
+pub(crate) struct RestoreOptions {
+    pub allow_fresh: bool,
+    pub again: bool,
+    pub wait: std::time::Duration,
+}
+
+/// Which server launched a target (beside the snapshot, for other servers).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Claim {
+    socket: String,
+    boot: String,
+    start_key: String,
+    at_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Claims {
+    version: u32,
+    snapshot_id: String,
+    claims: BTreeMap<usize, Claim>,
+}
+
+fn claims_path(snapshot: &Path) -> Result<PathBuf, String> {
+    let name = snapshot
+        .file_name()
+        .ok_or("snapshot path has no filename")?
+        .to_string_lossy();
+    Ok(snapshot.with_file_name(format!(".{name}.restore-claims.json")))
+}
+
+fn load_claims(path: &Path, snapshot: &Snapshot) -> Result<BTreeMap<usize, Claim>, String> {
+    if fs::symlink_metadata(path).is_err() {
+        return Ok(BTreeMap::new());
+    }
+    let claims: Claims = read_json(path, "restore claims")?;
+    if claims.version != VERSION
+        || claims.snapshot_id != snapshot.snapshot_id
+        || claims
+            .claims
+            .keys()
+            .any(|index| *index >= snapshot.agents.len())
+    {
+        return Err("restore claims do not belong to this snapshot".into());
+    }
+    Ok(claims.claims)
+}
+
+fn write_claims(
+    path: &Path,
+    snapshot: &Snapshot,
+    claims: &BTreeMap<usize, Claim>,
+) -> Result<(), String> {
+    write_json_atomic(
+        path,
+        &Claims {
+            version: VERSION,
+            snapshot_id: snapshot.snapshot_id.clone(),
+            claims: claims.clone(),
+        },
+    )
+}
+
+/// The boot ID of the server at `socket`, if one answers there.
+async fn server_boot(socket: &Path) -> Option<String> {
+    let context = crate::native_ui::Context {
+        socket: socket.to_path_buf(),
+        client: None,
+    };
+    let output = context
+        .tmux(
+            ["display-message", "-p", "#{masil_core_boot_id}"].map(std::ffi::OsString::from),
+            None,
+        )
+        .await
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()).filter(|boot| !boot.is_empty())
 }
 
 fn saved_agent(agent: &Agent) -> SavedAgent {
@@ -580,6 +958,26 @@ pub(crate) fn validate_private_metadata(
         return Err(format!("{label} must be a private owner file"));
     }
     Ok(())
+}
+
+/// A private file's text, bounded as `read_json` reads it.
+fn read_text(path: &Path, label: &str) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| format!("{label}: {error}"))?;
+    validate_private_metadata(&metadata, label)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| format!("{label}: {error}"))?;
+    validate_private_metadata(&file.metadata().map_err(|error| error.to_string())?, label)?;
+    let mut text = String::new();
+    file.take(MAX_FILE + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("{label}: {error}"))?;
+    if text.len() as u64 > MAX_FILE {
+        return Err(format!("{label} exceeds {MAX_FILE} bytes"));
+    }
+    Ok(text)
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T, String> {

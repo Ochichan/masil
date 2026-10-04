@@ -553,6 +553,48 @@ pub(super) async fn queue_words(
     Ok((value, false))
 }
 
+/// `restore FILE [--allow-fresh] [--again] [--wait SECONDS]`.
+fn restore_options(args: &[String]) -> Result<super::store::RestoreOptions, String> {
+    // An extension API call is cut off after a minute: no wait unless asked,
+    // and never one that could outlast the call.
+    let api = std::env::var_os("MASIL_API_CALL").is_some();
+    let limit = if api { 20.0 } else { 120.0 };
+    let mut options = super::store::RestoreOptions {
+        allow_fresh: false,
+        again: false,
+        wait: Duration::from_secs(if api { 0 } else { 30 }),
+    };
+    let mut seen = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let option = args[i].as_str();
+        if seen.contains(&option) {
+            return Err("usage: repeated restore option".into());
+        }
+        seen.push(option);
+        match option {
+            "--allow-fresh" => options.allow_fresh = true,
+            "--again" => options.again = true,
+            "--wait" => {
+                let seconds = value(args, i)?
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|seconds| (0.0..=limit).contains(seconds))
+                    .ok_or(format!("invalid_argument: --wait takes 0–{limit} seconds"))?;
+                options.wait = Duration::from_secs_f64(seconds);
+                i += 1;
+            }
+            _ => {
+                return Err(
+                    "usage: restore FILE [--allow-fresh] [--again] [--wait SECONDS]".into(),
+                );
+            }
+        }
+        i += 1;
+    }
+    Ok(options)
+}
+
 fn value(args: &[String], index: usize) -> Result<&str, String> {
     args.get(index + 1)
         .map(String::as_str)
@@ -679,10 +721,11 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "view" => print(&manager.view(args).await?)?,
         "save" if args.len() == 1 => print(&manager.save(std::path::Path::new(&args[0])).await?)?,
-        "restore" if args.len() == 1 || (args.len() == 2 && args[1] == "--allow-fresh") => {
+        "restore" if !args.is_empty() => {
+            let options = restore_options(&args[1..])?;
             print(
                 &manager
-                    .restore(std::path::Path::new(&args[0]), args.len() == 2)
+                    .restore(std::path::Path::new(&args[0]), options)
                     .await?,
             )?;
         }

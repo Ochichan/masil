@@ -111,7 +111,54 @@ const FEATURES: &[(&str, &str)] = &[
     ("remote_links", REMOTE_LINKS_SCHEMA),
     ("extensions", EXTENSIONS_SCHEMA),
     ("operations_compaction", COMPACTION_SCHEMA),
+    ("restore_plans", RESTORE_SCHEMA),
 ];
+
+/// T1-d (AM-14): an agent restore's plan, found by the snapshot's SHA-256,
+/// and how far each of its targets got. The store is this server's, so
+/// another server keeps its own plan (claims beside the snapshot tell it
+/// what this one restored).
+const RESTORE_SCHEMA: &str = "
+CREATE TABLE restore_plans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_sha256 TEXT NOT NULL UNIQUE,
+  snapshot_path TEXT NOT NULL,
+  created_ms INTEGER NOT NULL,
+  updated_ms INTEGER NOT NULL
+);
+CREATE TABLE restore_targets (
+  plan_id INTEGER NOT NULL REFERENCES restore_plans(id) ON DELETE CASCADE,
+  target INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  boot TEXT,
+  attempt INTEGER NOT NULL,
+  start_key TEXT,
+  pane_id TEXT,
+  run TEXT,
+  detail TEXT,
+  updated_ms INTEGER NOT NULL,
+  PRIMARY KEY (plan_id, target)
+);
+";
+
+/// A restore plan unused this long is dropped.
+const RESTORE_KEEP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// One target of a restore plan: its snapshot index and progress
+/// (`pending`, `started`, `ready`, `readiness_unconfirmed`,
+/// `resume_mismatch`, `exited`, `failed_not_started`, `unknown`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RestoreTarget {
+    pub index: usize,
+    pub stage: String,
+    pub boot: Option<String>,
+    pub attempt: u32,
+    pub start_key: Option<String>,
+    pub pane_id: Option<String>,
+    pub run: Option<String>,
+    pub detail: Option<String>,
+}
 
 /// T1-e (RL-02): a live namespace (a run that still runs, this server's
 /// boot) never ends, so its finished records are compacted after the
@@ -1209,6 +1256,174 @@ impl Store {
 
     /// Admit a request and commit its dispatch intent in one transaction.
     /// `intent` holds what reconcile needs to judge this attempt later.
+    /// The plan for a snapshot, made the first time with `legacy` (what a
+    /// receipt from before plans proved) in the same transaction; true when
+    /// it is new. Plans unused for `RESTORE_KEEP_MS` go first. IDs are never
+    /// reused, so a new plan's start keys are its own.
+    pub fn restore_plan(
+        &mut self,
+        sha256: &str,
+        path: &str,
+        legacy: &[(String, RestoreTarget)],
+        now: u64,
+    ) -> Result<(i64, bool), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        tx.execute(
+            "DELETE FROM restore_plans WHERE updated_ms < ?1",
+            [now.saturating_sub(RESTORE_KEEP_MS) as i64],
+        )
+        .map_err(sql)?;
+        let found: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM restore_plans WHERE snapshot_sha256 = ?1",
+                [sha256],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        let plan = match found {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE restore_plans SET updated_ms = ?2, snapshot_path = ?3 WHERE id = ?1",
+                    params![id, now as i64, path],
+                )
+                .map_err(sql)?;
+                (id, false)
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO restore_plans (snapshot_sha256, snapshot_path, created_ms, updated_ms)
+                     VALUES (?1, ?2, ?3, ?3)",
+                    params![sha256, path, now as i64],
+                )
+                .map_err(sql)?;
+                let id = tx.last_insert_rowid();
+                for (name, target) in legacy {
+                    Self::restore_set_in(&tx, id, name, target, now)?;
+                }
+                (id, true)
+            }
+        };
+        tx.commit().map_err(sql)?;
+        Ok(plan)
+    }
+
+    /// The targets of a plan that got anywhere, by snapshot index.
+    pub fn restore_targets(
+        &self,
+        plan: i64,
+    ) -> Result<std::collections::BTreeMap<usize, RestoreTarget>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT target, stage, boot, attempt, start_key, pane_id, run, detail
+                 FROM restore_targets WHERE plan_id = ?1",
+            )
+            .map_err(sql)?;
+        statement
+            .query_map([plan], |row| {
+                let index = row.get::<_, i64>(0)? as usize;
+                Ok((
+                    index,
+                    RestoreTarget {
+                        index,
+                        stage: row.get(1)?,
+                        boot: row.get(2)?,
+                        attempt: row.get::<_, i64>(3)? as u32,
+                        start_key: row.get(4)?,
+                        pane_id: row.get(5)?,
+                        run: row.get(6)?,
+                        detail: row.get(7)?,
+                    },
+                ))
+            })
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql)
+    }
+
+    /// Records how far a target got.
+    pub fn restore_set(
+        &mut self,
+        plan: i64,
+        name: &str,
+        target: &RestoreTarget,
+        now: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        Self::restore_set_in(&tx, plan, name, target, now)?;
+        tx.commit().map_err(sql)
+    }
+
+    /// A readiness verdict, kept only while the row is still that launch's.
+    pub fn restore_settle(
+        &mut self,
+        plan: i64,
+        target: &RestoreTarget,
+        now: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE restore_targets SET stage = ?4, updated_ms = ?5
+                 WHERE plan_id = ?1 AND target = ?2 AND start_key IS ?3",
+                params![
+                    plan,
+                    target.index as i64,
+                    target.start_key,
+                    target.stage,
+                    now as i64
+                ],
+            )
+            .map(drop)
+            .map_err(sql)
+    }
+
+    fn restore_set_in(
+        tx: &Connection,
+        plan: i64,
+        name: &str,
+        target: &RestoreTarget,
+        now: u64,
+    ) -> Result<(), String> {
+        tx.execute(
+            "INSERT INTO restore_targets (plan_id, target, name, stage, boot, attempt, start_key,
+               pane_id, run, detail, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT (plan_id, target) DO UPDATE SET name = excluded.name,
+               stage = excluded.stage, boot = excluded.boot, attempt = excluded.attempt,
+               start_key = excluded.start_key, pane_id = excluded.pane_id, run = excluded.run,
+               detail = excluded.detail, updated_ms = excluded.updated_ms",
+            params![
+                plan,
+                target.index as i64,
+                name,
+                target.stage,
+                target.boot,
+                target.attempt as i64,
+                target.start_key,
+                target.pane_id,
+                target.run,
+                target.detail,
+                now as i64
+            ],
+        )
+        .map_err(sql)?;
+        tx.execute(
+            "UPDATE restore_plans SET updated_ms = ?2 WHERE id = ?1",
+            params![plan, now as i64],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
     /// Room for one more record: under `CAPACITY` whole records and
     /// `COMPACTED_CAPACITY` compacted ones.
     fn check_capacity_in(tx: &Connection) -> Result<(), String> {
@@ -4965,6 +5180,7 @@ mod tests {
                 "prompt_queue",
                 "provider_secrets",
                 "remote_links",
+                "restore_plans",
                 "schedules"
             ])
         );
@@ -5090,6 +5306,7 @@ mod tests {
                 "prompt_queue",
                 "provider_secrets",
                 "remote_links",
+                "restore_plans",
                 "schedules"
             ])
         );
@@ -5126,6 +5343,7 @@ mod tests {
                 "prompt_queue",
                 "provider_secrets",
                 "remote_links",
+                "restore_plans",
                 "schedules"
             ])
         );

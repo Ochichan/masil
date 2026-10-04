@@ -292,7 +292,7 @@ pub(crate) const VERBS: &[Verb] = &[
     },
     Verb {
         name: "restore",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] restore FILE [--allow-fresh]",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] restore FILE [--allow-fresh] [--again (local only)] [--wait SECONDS (local only)]",
         mutating: true,
         target_stage: None,
         remote: true,
