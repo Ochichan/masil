@@ -118,6 +118,10 @@ static int	window_copy_update_selection(struct window_mode_entry *, int,
 		    int);
 static void	window_copy_synchronize_cursor(struct window_mode_entry *, int);
 static void    *window_copy_get_selection(struct window_mode_entry *, size_t *);
+static int	window_copy_position_valid(struct grid *, u_int, u_int);
+static void	window_copy_status_message(struct window_pane *, const char *);
+static void	window_copy_invalidate_selection(struct window_mode_entry *,
+		    const char *);
 static void	window_copy_copy_buffer(struct window_mode_entry *,
 		    const char *, void *, size_t, int, int);
 static void	window_copy_pipe(struct window_mode_entry *,
@@ -301,6 +305,8 @@ struct window_copy_mode_data {
 	int		 scroll_exit;	/* exit on scroll to end? */
 	int		 hide_position;	/* hide position marker */
 	int		 line_numbers;	/* 0 off, 1 from option, 2 default */
+	int		 selection_invalidated; /* masil: block stale match copies. */
+	int		 selection_invalidated_notified; /* masil: alert once. */
 
 	enum {
 		SEL_CHAR,		/* select one char at a time */
@@ -363,6 +369,19 @@ struct window_copy_mode_data {
 #define WINDOW_COPY_REFRESH_INTERVAL 50000
 	int		 refresh_active;
 };
+
+static void
+window_copy_reset_drag_position(struct window_copy_mode_data *data)
+{
+	/* masil: use the fixed endpoint as a valid direction anchor. */
+	if (data->cursordrag == CURSORDRAG_SEL) {
+		data->dx = data->endselrx;
+		data->dy = data->endselry;
+	} else {
+		data->dx = data->selrx;
+		data->dy = data->selry;
+	}
+}
 
 static void
 window_copy_scroll_timer(__unused int fd, __unused short events, void *arg)
@@ -1151,6 +1170,9 @@ window_copy_formats(struct window_mode_entry *wme, struct format_tree *ft)
 		format_add(ft, "selection_active", "0");
 		format_add(ft, "selection_present", "0");
 	}
+	/* masil: formats must expose a selection that cannot be copied safely. */
+	format_add(ft, "selection_invalidated", "%d",
+	    data->selection_invalidated);
 
 	switch (data->selflag) {
 	case SEL_CHAR:
@@ -1187,14 +1209,16 @@ window_copy_get_screen(struct window_mode_entry *wme)
 }
 
 static void
-window_copy_size_changed(struct window_mode_entry *wme)
+window_copy_size_changed(struct window_mode_entry *wme, int clear_selection)
 {
 	struct window_copy_mode_data	*data = wme->data;
 	struct screen			*s = &data->screen;
 	struct screen_write_ctx		 ctx;
 	int				 search = (data->searchmark != NULL);
 
-	window_copy_clear_selection(wme);
+	/* masil: a reflowed selection is refreshed separately without clearing. */
+	if (clear_selection)
+		window_copy_clear_selection(wme);
 	window_copy_clear_marks(wme);
 
 	screen_write_start(&ctx, s);
@@ -1214,8 +1238,10 @@ window_copy_resize(struct window_mode_entry *wme, u_int sx, u_int sy)
 	struct window_copy_mode_data	*data = wme->data;
 	struct screen			*s = &data->screen;
 	struct grid			*gd = data->backing->grid;
-	u_int				 cx, cy, wx, wy;
-	int				 reflow;
+	u_int				 cx, cy, wx, wy, swx, swy, ewx, ewy;
+	u_int				 srwx, srwy, erwx, erwy, dwx, dwy;
+	int				 reflow, selection, keep_selection;
+	int				 reset_positions, drag_positions;
 
 	screen_resize(s, sx, sy, 0);
 	cx = data->cx;
@@ -1223,11 +1249,78 @@ window_copy_resize(struct window_mode_entry *wme, u_int sx, u_int sy)
 		data->oy = gd->hsize + data->cy;
 	cy = gd->hsize + data->cy - data->oy;
 	reflow = (gd->sx != sx);
-	if (reflow)
+	selection = (data->screen.sel != NULL ||
+	    data->lineflag != LINE_SEL_NONE);
+	keep_selection = selection && !data->rectflag;
+	reset_positions = (data->selflag != SEL_CHAR);
+	drag_positions = (data->selflag != SEL_CHAR);
+	if (keep_selection &&
+	    (!window_copy_position_valid(gd, data->selx, data->sely) ||
+	    !window_copy_position_valid(gd, data->endselx, data->endsely) ||
+	    (reset_positions &&
+	    (!window_copy_position_valid(gd, data->selrx, data->selry) ||
+	    !window_copy_position_valid(gd, data->endselrx,
+	    data->endselry)))))
+		keep_selection = 0;
+	if (keep_selection && drag_positions &&
+	    !window_copy_position_valid(gd, data->dx, data->dy))
+		window_copy_reset_drag_position(data);
+
+	/* masil: keep non-rectangle selection anchors attached to reflowed text. */
+	if (reflow) {
 		grid_wrap_position(gd, cx, cy, &wx, &wy);
+		if (keep_selection) {
+			grid_wrap_position(gd, data->selx, data->sely, &swx,
+			    &swy);
+			grid_wrap_position(gd, data->endselx, data->endsely, &ewx,
+			    &ewy);
+			if (reset_positions) {
+				grid_wrap_position(gd, data->selrx, data->selry,
+				    &srwx, &srwy);
+				grid_wrap_position(gd, data->endselrx,
+				    data->endselry, &erwx, &erwy);
+			}
+			if (drag_positions)
+				grid_wrap_position(gd, data->dx, data->dy, &dwx,
+				    &dwy);
+		}
+	}
 	screen_resize_cursor(data->backing, sx, sy, 1, 0, 0);
-	if (reflow)
+	if (reflow) {
 		grid_unwrap_position(gd, &cx, &cy, wx, wy);
+		if (keep_selection) {
+			grid_unwrap_position(gd, &data->selx, &data->sely, swx,
+			    swy);
+			grid_unwrap_position(gd, &data->endselx, &data->endsely,
+			    ewx, ewy);
+			if (reset_positions) {
+				grid_unwrap_position(gd, &data->selrx, &data->selry,
+				    srwx, srwy);
+				grid_unwrap_position(gd, &data->endselrx,
+				    &data->endselry, erwx, erwy);
+			}
+			if (drag_positions)
+				grid_unwrap_position(gd, &data->dx, &data->dy, dwx,
+				    dwy);
+			if (!window_copy_position_valid(gd, data->selx,
+			    data->sely) || !window_copy_position_valid(gd,
+			    data->endselx, data->endsely) ||
+			    (reset_positions &&
+			    (!window_copy_position_valid(gd, data->selrx,
+			    data->selry) || !window_copy_position_valid(gd,
+			    data->endselrx, data->endselry))))
+				keep_selection = 0;
+			else if (drag_positions &&
+			    !window_copy_position_valid(gd, data->dx, data->dy))
+				window_copy_reset_drag_position(data);
+			if (keep_selection && !reset_positions) {
+				data->selrx = data->selx;
+				data->selry = data->sely;
+				data->endselrx = data->endselx;
+				data->endselry = data->endsely;
+			}
+		}
+	}
 
 	data->cx = cx;
 	if (cy < gd->hsize) {
@@ -1238,7 +1331,16 @@ window_copy_resize(struct window_mode_entry *wme, u_int sx, u_int sy)
 		data->oy = 0;
 	}
 
-	window_copy_size_changed(wme);
+	/* masil: never copy a different range after an unsafe pane resize. */
+	if (selection && !keep_selection) {
+		window_copy_clear_selection(wme);
+		window_copy_invalidate_selection(wme,
+		    "Selection cleared: pane resized");
+	}
+	window_copy_size_changed(wme, 0);
+	/* masil: redraw the selection after replacing the resized copy screen. */
+	if (keep_selection)
+		window_copy_set_selection(wme, 0, 1);
 	window_copy_redraw_screen(wme);
 }
 
@@ -1365,7 +1467,11 @@ static enum window_copy_cmd_action
 window_copy_cmd_clear_selection(struct window_copy_cmd_state *cs)
 {
 	struct window_mode_entry	*wme = cs->wme;
+	struct window_copy_mode_data	*data = wme->data;
 
+	/* masil: clearing a selection acknowledges its invalidation. */
+	data->selection_invalidated = 0;
+	data->selection_invalidated_notified = 0;
 	window_copy_clear_selection(wme);
 	return (WINDOW_COPY_CMD_REDRAW);
 }
@@ -1700,6 +1806,9 @@ window_copy_cmd_scroll_to_mouse(struct window_copy_cmd_state *cs)
 	int				 scroll_exit = args_has(cs->wargs, 'e');
 	u_int				 tty_ox, tty_oy, tty_sx, tty_sy;
 
+	/* masil: scrollbar commands require both their mouse event and client. */
+	if (m == NULL || c == NULL)
+		return (WINDOW_COPY_CMD_NOTHING);
 	tty_window_offset(&c->tty, &tty_ox, &tty_oy, &tty_sx, &tty_sy);
 	window_copy_scroll(wp, c->tty.mouse_slider_mpos, m->y, tty_oy,
 	    scroll_exit);
@@ -3082,7 +3191,7 @@ window_copy_do_refresh(struct window_mode_entry *wme, int follow)
 	}
 
 	window_copy_sync_snapshot(data, wp->base.grid);
-	window_copy_size_changed(wme);
+	window_copy_size_changed(wme, 1);
 }
 
 static void
@@ -3167,14 +3276,20 @@ window_copy_cmd_refresh_now(struct window_copy_cmd_state *cs)
 	struct window_mode_entry		*wme = cs->wme;
 	struct window_copy_mode_data	*data = wme->data;
 	struct window_pane		*wp = wme->wp;
-	int				 follow;
+	int				 follow, selection;
 
 	if (!window_copy_refresh_allowed(wme))
 		return (WINDOW_COPY_CMD_NOTHING);
 
+	selection = (data->screen.sel != NULL ||
+	    data->lineflag != LINE_SEL_NONE);
 	follow = (data->oy == 0 &&
 	    data->cy == screen_size_y(&data->screen) - 1);
 	window_copy_do_refresh(wme, follow);
+	/* masil: manual refresh must not make a stale search match copyable. */
+	if (selection)
+		window_copy_invalidate_selection(wme,
+		    "Selection cleared: pane refreshed");
 	wp->flags &= ~PANE_UNSEENCHANGES;
 
 	return (WINDOW_COPY_CMD_REDRAW);
@@ -4683,6 +4798,9 @@ window_copy_search(struct window_mode_entry *wme, int direction, int regex)
 
 	if (data->timeout)
 		return (0);
+	/* masil: a new search supersedes an invalidated selection. */
+	data->selection_invalidated = 0;
+	data->selection_invalidated_notified = 0;
 
 	if (data->searchall || wp->searchstr == NULL ||
 	    wp->searchregex != regex) {
@@ -5744,11 +5862,18 @@ window_copy_start_selection(struct window_mode_entry *wme)
 {
 	struct window_copy_mode_data	*data = wme->data;
 
+	/* masil: a new selection supersedes an earlier invalidation. */
+	data->selection_invalidated = 0;
+	data->selection_invalidated_notified = 0;
 	data->selx = data->cx;
 	data->sely = screen_hsize(data->backing) + data->cy - data->oy;
 
 	data->endselx = data->selx;
 	data->endsely = data->sely;
+	data->selrx = data->selx;
+	data->selry = data->sely;
+	data->endselrx = data->selx;
+	data->endselry = data->sely;
 
 	data->cursordrag = CURSORDRAG_ENDSEL;
 
@@ -5981,6 +6106,17 @@ window_copy_get_selection(struct window_mode_entry *wme, size_t *len)
 	u_int				 i, xx, yy, sx, sy, ex, ey, ey_last;
 	u_int				 firstsx, lastex, restex, restsx, selx;
 	int				 keys;
+
+	/* masil: never silently substitute a search match for lost selection text. */
+	if (data->selection_invalidated) {
+		if (!data->selection_invalidated_notified) {
+			data->selection_invalidated_notified = 1;
+			window_copy_status_message(wp,
+			    "Selection was cleared; nothing copied");
+		}
+		*len = 0;
+		return (NULL);
+	}
 
 	if (data->screen.sel == NULL && data->lineflag == LINE_SEL_NONE) {
 		buf = window_copy_match_at_cursor(data);
@@ -6292,6 +6428,39 @@ window_copy_clear_selection(struct window_mode_entry *wme)
 	px = window_copy_cursor_limit(wme, py, data->rectflag);
 	if (data->cx > px)
 		window_copy_update_cursor(wme, px, data->cy);
+}
+
+static int
+window_copy_position_valid(struct grid *gd, u_int x, u_int y)
+{
+	/* masil: do not preserve coordinates outside the backing grid. */
+	return (x <= gd->sx && y < gd->hsize + gd->sy);
+}
+
+static void
+window_copy_status_message(struct window_pane *wp, const char *message)
+{
+	struct client	*c;
+
+	/* masil: every client viewing this pane must learn of invalidation. */
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->session == NULL || c->session->curw == NULL ||
+		    c->session->curw->window != wp->window)
+			continue;
+		status_message_set(c, -1, 1, 0, 0, "%s", message);
+	}
+}
+
+static void
+window_copy_invalidate_selection(struct window_mode_entry *wme,
+    const char *message)
+{
+	struct window_copy_mode_data	*data = wme->data;
+
+	/* masil: retain invalidation until fresh selection prevents match fallback. */
+	data->selection_invalidated = 1;
+	data->selection_invalidated_notified = 0;
+	window_copy_status_message(wme->wp, message);
 }
 
 static int
@@ -7108,6 +7277,9 @@ window_copy_start_drag(struct client *c, struct mouse_event *m)
 	c->tty.mouse_drag_release = window_copy_drag_release;
 
 	data = wme->data;
+	/* masil: a mouse drag starts a fresh selection attempt. */
+	data->selection_invalidated = 0;
+	data->selection_invalidated_notified = 0;
 	on_start = on_end = 0;
 	inside_selection = window_copy_mouse_in_selection(wme, x, y,
 	    &on_start, &on_end);
