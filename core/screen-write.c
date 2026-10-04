@@ -2469,6 +2469,9 @@ screen_write_collect_flush_line(struct screen_write_ctx *ctx, u_int y)
 	struct visible_ranges		*r;
 	struct visible_range		*ri;
 
+	if (TAILQ_EMPTY(&cl->items))
+		return (0);
+
 	if (wp != NULL) {
 		wsx = wp->window->sx;
 		wsy = wp->window->sy;
