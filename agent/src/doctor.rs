@@ -181,6 +181,15 @@ async fn diagnose(options: &Options) -> Vec<Check> {
 
     let (reachable, server) = server_check(options.socket.as_deref()).await;
     checks.push(reachable);
+    let terminals = match (options.socket.as_deref(), server.as_ref()) {
+        (Some(socket), Some(_)) => Some(server_terminals(socket).await),
+        _ => None,
+    };
+    checks.push(environment_check(
+        &|name| std::env::var(name).ok(),
+        options.socket.as_deref(),
+        terminals,
+    ));
     checks.push(identity_check(options.socket.as_deref(), server.as_ref()));
 
     let (resources, observer) = match (options.socket.as_deref(), server.as_ref()) {
@@ -448,6 +457,109 @@ fn platform_check() -> Check {
             "architecture": std::env::consts::ARCH,
             "kernel_release": release.as_deref().ok(),
             "error": release.err(),
+        }),
+    }
+}
+
+/// What the server knows of the terminals attached to it and its key
+/// reporting options, which decide what a terminal's keys arrive as (R-12).
+/// Inside a pane the environment names the pane, not the outer terminal.
+async fn server_terminals(socket: &Path) -> Value {
+    let context = native_ui::Context {
+        socket: socket.to_owned(),
+        client: None,
+    };
+    let keys = context.tmux(
+        [
+            OsString::from("display-message"),
+            OsString::from("-p"),
+            OsString::from("#{extended-keys}\t#{extended-keys-format}\t#{escape-time}"),
+        ],
+        None,
+    );
+    let clients = context.tmux(
+        [
+            OsString::from("list-clients"),
+            OsString::from("-F"),
+            OsString::from("#{client_termname}\t#{client_termtype}\t#{client_utf8}"),
+        ],
+        None,
+    );
+    let (keys, clients) = tokio::join!(keys, clients);
+    let keys = match keys {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut fields = text.trim_end().split('\t');
+            json!({
+                "extended_keys": fields.next(),
+                "extended_keys_format": fields.next(),
+                "escape_time_ms": fields.next().and_then(|value| value.parse::<u64>().ok()),
+            })
+        }
+        Err(error) => json!({"error": error}),
+    };
+    let clients = match clients {
+        Ok(output) => Value::Array(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .take(8)
+                .map(|line| {
+                    let mut fields = line.split('\t');
+                    let mut field = || fields.next().map(|v| v.chars().take(128).collect::<String>());
+                    json!({"termname": field(), "termtype": field(), "utf8": field().as_deref() == Some("1")})
+                })
+                .collect(),
+        ),
+        Err(error) => json!({"error": error}),
+    };
+    json!({"keys": keys, "clients": clients})
+}
+
+/// The terminal, locale and session path a report came from (R-12). SSH,
+/// WSL and nesting are reported as present or not; their values (addresses,
+/// sockets) stay out.
+fn environment_check(
+    var: &dyn Fn(&str) -> Option<String>,
+    socket: Option<&Path>,
+    terminals: Option<Value>,
+) -> Check {
+    let bounded = |name: &str| var(name).map(|value| value.chars().take(128).collect::<String>());
+    // TMUX names the server whose pane doctor runs in; that pane's TERM and
+    // TERM_PROGRAM are the server's, not the terminal around it.
+    let pane_socket = var("TMUX").and_then(|value| value.split(',').next().map(PathBuf::from));
+    let in_diagnosed_pane = pane_socket.as_deref().zip(socket).is_some_and(|(pane, socket)| {
+        pane == socket
+            || pane
+                .canonicalize()
+                .ok()
+                .zip(socket.canonicalize().ok())
+                .is_some_and(|(left, right)| left == right)
+    });
+    let wsl = var("WSL_DISTRO_NAME").is_some()
+        || std::fs::read_to_string("/proc/version")
+            .is_ok_and(|version| version.to_ascii_lowercase().contains("microsoft"));
+    Check {
+        id: "environment",
+        status: Status::Ok,
+        summary: "terminal and session environment recorded".into(),
+        detail: json!({
+            "term": bounded("TERM"),
+            "term_program": bounded("TERM_PROGRAM"),
+            "term_program_version": bounded("TERM_PROGRAM_VERSION"),
+            "colorterm": bounded("COLORTERM"),
+            "locale": {
+                "LANG": bounded("LANG"),
+                "LC_ALL": bounded("LC_ALL"),
+                "LC_CTYPE": bounded("LC_CTYPE"),
+            },
+            "ssh": var("SSH_CONNECTION").is_some() || var("SSH_TTY").is_some(),
+            "wsl": wsl,
+            "source": if in_diagnosed_pane { "masil_pane" } else { "process" },
+            "nested": {
+                "tmux_or_masil": var("TMUX").is_some() && !in_diagnosed_pane,
+                "screen": var("STY").is_some(),
+            },
+            "server": terminals,
         }),
     }
 }
@@ -1478,5 +1590,31 @@ mod tests {
                 skip: 1,
             }
         );
+    }
+
+    #[test]
+    fn environment_reports_presence_not_addresses() {
+        let vars = |name: &str| match name {
+            "TERM" => Some("xterm-256color".to_owned()),
+            "LANG" => Some("ko_KR.UTF-8".to_owned()),
+            "SSH_CONNECTION" => Some("10.0.0.1 52000 10.0.0.2 22".to_owned()),
+            "TMUX" => Some("/tmp/masil-501/default,1,0".to_owned()),
+            _ => None,
+        };
+        let check = environment_check(&vars, None, None);
+        let detail = check.detail.to_string();
+        assert_eq!(check.detail["term"], "xterm-256color");
+        assert_eq!(check.detail["locale"]["LANG"], "ko_KR.UTF-8");
+        assert_eq!(check.detail["ssh"], true);
+        assert_eq!(check.detail["nested"]["tmux_or_masil"], true);
+        assert!(
+            !detail.contains("10.0.0.1") && !detail.contains("/tmp/masil-501"),
+            "{detail}"
+        );
+        // Run from a pane of the diagnosed server: not nested, and the
+        // environment is the pane's.
+        let pane = environment_check(&vars, Some(Path::new("/tmp/masil-501/default")), None);
+        assert_eq!(pane.detail["source"], "masil_pane");
+        assert_eq!(pane.detail["nested"]["tmux_or_masil"], false);
     }
 }
