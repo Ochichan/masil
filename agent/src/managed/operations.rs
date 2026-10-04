@@ -34,7 +34,15 @@ const MIN_SQLITE: i32 = 3_051_003;
 pub(super) const LEASE_MS: u64 = 30_000;
 const RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_ABOVE: i64 = 2048;
+/// Records a store holds, not counting compacted ones.
 const CAPACITY: i64 = 4096;
+/// Compacted records (a live namespace's finished records past the
+/// retention period): the key, action, last stage and times only.
+const COMPACTED_CAPACITY: i64 = 65536;
+/// A prune for age runs at most this often; one for size at most once a
+/// minute, unless the store is nearly full.
+const PRUNE_EVERY_MS: u64 = 60 * 60 * 1000;
+const PRUNE_PRESSED_MS: u64 = 60 * 1000;
 const MAX_EVIDENCE: usize = 2048;
 
 /// States from which a new attempt may start: the previous attempt is proven
@@ -102,7 +110,18 @@ const FEATURES: &[(&str, &str)] = &[
     ("schedules", SCHEDULES_SCHEMA),
     ("remote_links", REMOTE_LINKS_SCHEMA),
     ("extensions", EXTENSIONS_SCHEMA),
+    ("operations_compaction", COMPACTION_SCHEMA),
 ];
+
+/// T1-e (RL-02): a live namespace (a run that still runs, this server's
+/// boot) never ends, so its finished records are compacted after the
+/// retention period instead of deleted: the receipts go, and a retry with
+/// the same key gets the recorded stage. Earlier binaries ignore the
+/// column; they count compacted records toward their capacity.
+const COMPACTION_SCHEMA: &str = "
+ALTER TABLE operations ADD COLUMN compacted_ms INTEGER;
+CREATE INDEX operations_compacted ON operations(compacted_ms);
+";
 
 /// Resident extensions this server's coordinator keeps (P9,
 /// docs/extensions.md); their state survives a coordinator that is
@@ -543,6 +562,9 @@ pub(super) struct Record {
     pub lease_until_ms: u64,
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// When its receipts were dropped (T1-e); the stage stays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compacted_ms: Option<u64>,
     pub receipts: Vec<ReceiptRow>,
 }
 
@@ -855,7 +877,17 @@ impl Store {
         if version == V1 {
             status["migrates_on_next_write"] = json!(true);
         }
-        status["unresolved"] = json!(store.list(true, CAPACITY as usize)?.len());
+        // A count, not records: a store no writer of this version opened
+        // yet lacks later columns.
+        let unresolved: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE state IN (?1, ?2)",
+                [DISPATCHING, UNKNOWN],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        status["unresolved"] = json!(unresolved);
         Ok(Some(status))
     }
 
@@ -1177,6 +1209,29 @@ impl Store {
 
     /// Admit a request and commit its dispatch intent in one transaction.
     /// `intent` holds what reconcile needs to judge this attempt later.
+    /// Room for one more record: under `CAPACITY` whole records and
+    /// `COMPACTED_CAPACITY` compacted ones.
+    fn check_capacity_in(tx: &Connection) -> Result<(), String> {
+        let (count, compacted) = Self::counts_in(tx)?;
+        if count >= CAPACITY {
+            return Err("operation_store_full: resolve or wait for older operations to expire before new durable requests".into());
+        }
+        if compacted >= COMPACTED_CAPACITY {
+            return Err("operation_store_full: a long-running agent or this server's boot holds 65,536 compacted results; they go when that run ends or the server restarts".into());
+        }
+        Ok(())
+    }
+
+    /// Whole and compacted records.
+    fn counts_in(conn: &Connection) -> Result<(i64, i64), String> {
+        conn.query_row(
+            "SELECT COUNT(*) - COUNT(compacted_ms), COUNT(compacted_ms) FROM operations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql)
+    }
+
     pub fn admit(
         &mut self,
         new: &NewOperation<'_>,
@@ -1206,12 +1261,7 @@ impl Store {
         let ticket = super::nonce()?;
         let op = match existing {
             None => {
-                let count: i64 = tx
-                    .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
-                    .map_err(sql)?;
-                if count >= CAPACITY {
-                    return Err("operation_store_full: resolve or wait for older operations to expire before new durable requests".into());
-                }
+                Self::check_capacity_in(&tx)?;
                 if live_bytes(&tx)? >= HIGH_WATER_BYTES {
                     return Err("store_full: the operation store holds 224 MiB of data; resolve or wait for older operations to expire".into());
                 }
@@ -1265,11 +1315,15 @@ impl Store {
                 if !retryable {
                     return Ok(Admission::Recorded(record));
                 }
+                // A compacted record made whole again counts toward capacity.
+                if record.compacted_ms.is_some() {
+                    Self::check_capacity_in(&tx)?;
+                }
                 let seq = Self::next_seq(&tx)?;
                 tx.execute(
                     "UPDATE operations SET state = ?2, digest = ?3, payload_bytes = ?4, target = ?5,
                        ticket = ?6, attempts = attempts + 1, lease_until_ms = ?7, owner_pid = ?8,
-                       updated_ms = ?9, store_seq = ?10 WHERE id = ?1",
+                       updated_ms = ?9, store_seq = ?10, compacted_ms = NULL WHERE id = ?1",
                     params![
                         record.op,
                         DISPATCHING,
@@ -1486,7 +1540,7 @@ impl Store {
         let record = conn
             .query_row(
                 "SELECT id, key, action, client_id, explicit, target, run, boot, digest, payload_bytes,
-                        state, ticket, attempts, lease_until_ms, created_ms, updated_ms
+                        state, ticket, attempts, lease_until_ms, created_ms, updated_ms, compacted_ms
                  FROM operations WHERE key = ?1",
                 [key],
                 |row| {
@@ -1507,6 +1561,7 @@ impl Store {
                         lease_until_ms: row.get::<_, i64>(13)? as u64,
                         created_ms: row.get::<_, i64>(14)? as u64,
                         updated_ms: row.get::<_, i64>(15)? as u64,
+                        compacted_ms: row.get::<_, Option<i64>>(16)?.map(|at| at as u64),
                         receipts: Vec::new(),
                     })
                 },
@@ -1582,20 +1637,39 @@ impl Store {
             .collect()
     }
 
+    /// Whether `prune` may free or compact something. A live namespace's
+    /// unknown outcomes and young records can stay past every limit, so
+    /// the checks are spaced out (`PRUNE_EVERY_MS`, `PRUNE_PRESSED_MS`)
+    /// instead of running a prune on every store open.
     pub fn needs_prune(&self, now: u64) -> Result<bool, String> {
-        let by_records: bool = self
+        let pruned: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) > ?1 OR COALESCE(MIN(updated_ms), ?2) < ?3 FROM operations",
-                params![
-                    PRUNE_ABOVE,
-                    now as i64,
-                    now.saturating_sub(RETENTION_MS) as i64
-                ],
+                "SELECT COALESCE((SELECT value FROM meta WHERE name = 'pruned_ms'), 0)",
+                [],
                 |row| row.get(0),
             )
             .map_err(sql)?;
-        Ok(by_records || live_bytes(&self.conn)? >= SOFT_BYTES)
+        // A prune recorded in the future (the clock went back) is stale.
+        let pruned = pruned.max(0) as u64;
+        let since = if pruned > now { u64::MAX } else { now - pruned };
+        let (count, compacted) = Self::counts_in(&self.conn)?;
+        let old: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM operations WHERE state != ?1 AND updated_ms < ?2)",
+                params![DISPATCHING, now.saturating_sub(RETENTION_MS) as i64],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        // Nearly full: a namespace that just ended frees room now.
+        if count >= CAPACITY - CAPACITY / 8
+            || compacted >= COMPACTED_CAPACITY - COMPACTED_CAPACITY / 8
+        {
+            return Ok(true);
+        }
+        let pressed = count > PRUNE_ABOVE || live_bytes(&self.conn)? >= SOFT_BYTES;
+        Ok((pressed && since >= PRUNE_PRESSED_MS) || (old && since >= PRUNE_EVERY_MS))
     }
 
     /// Refuses admission while the WAL holds more than the pressure limit
@@ -1642,8 +1716,9 @@ impl Store {
         let candidates = {
             let mut statement = tx
                 .prepare(
-                    "SELECT id, run, boot, explicit, state, updated_ms FROM operations
-                     WHERE state != ?1 ORDER BY updated_ms",
+                    "SELECT id, run, boot, compacted_ms IS NOT NULL, state, updated_ms,
+                            explicit = 0 AND client_id LIKE 'auto-%'
+                     FROM operations WHERE state != ?1 ORDER BY updated_ms",
                 )
                 .map_err(sql)?;
             statement
@@ -1655,6 +1730,7 @@ impl Store {
                         row.get::<_, bool>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)? as u64,
+                        row.get::<_, bool>(6)?,
                     ))
                 })
                 .map_err(sql)?
@@ -1662,26 +1738,49 @@ impl Store {
                 .map_err(sql)?
         };
         Self::check_reader_in(&tx)?;
-        let total = candidates.len() as i64;
+        let mut whole = candidates
+            .iter()
+            .filter(|(_, _, _, compacted, ..)| !compacted)
+            .count() as i64;
         let oversize = live_bytes(&tx)? >= SOFT_BYTES;
         let mut removed = 0usize;
-        for (id, run, op_boot, _explicit, state, updated) in candidates {
+        for (id, run, op_boot, compacted, state, updated, automatic) in candidates {
             let active = match &run {
                 Some(run) => live_runs.contains(run),
                 None => op_boot == boot,
             };
             let old = updated + RETENTION_MS <= now;
-            let over = total - (removed as i64) > PRUNE_ABOVE;
-            // A live namespace keeps everything: an automatic outcome_unknown
-            // record is what `operation resolve` needs to release its slot.
+            let over = whole > PRUNE_ABOVE;
+            // A live namespace keeps every key: an automatic outcome_unknown
+            // record is what `operation resolve` needs to release its slot,
+            // and a finished one past retention keeps its stage only.
             // Unknown outcomes also stay for the full retention period.
-            let deletable = !active && (old || ((over || oversize) && state != "outcome_unknown"));
+            // A key masil made up (`auto-…`) is never asked for again: in a
+            // live namespace its finished result goes rather than stays.
+            let deletable = (!active && (old || ((over || oversize) && state != UNKNOWN)))
+                || (active && old && automatic && state != UNKNOWN);
             if deletable {
                 tx.execute("DELETE FROM operations WHERE id = ?1", [id])
                     .map_err(sql)?;
                 removed += 1;
+                whole -= i64::from(!compacted);
+            } else if active && old && !compacted && state != UNKNOWN {
+                tx.execute("DELETE FROM receipts WHERE operation_id = ?1", [id])
+                    .map_err(sql)?;
+                tx.execute(
+                    "UPDATE operations SET compacted_ms = ?2 WHERE id = ?1",
+                    params![id, now as i64],
+                )
+                .map_err(sql)?;
+                whole -= 1;
             }
         }
+        tx.execute(
+            "INSERT INTO meta VALUES ('pruned_ms', ?1)
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+            [now as i64],
+        )
+        .map_err(sql)?;
         tx.commit().map_err(sql)?;
         Ok(removed)
     }
@@ -4638,6 +4737,145 @@ mod tests {
     }
 
     #[test]
+    fn a_live_namespace_compacts_its_finished_records_past_retention() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let named = |id: &'static str| NewOperation {
+            namespace: "run:live",
+            run: Some("live"),
+            id,
+            ..request("d")
+        };
+        for (id, state) in [("1", "delivered"), ("2", UNKNOWN), ("3", "not_applied")] {
+            let ticket = dispatch(store.admit(&named(id), json!({}), 100).unwrap());
+            store.finish(&ticket, state, "test", None, 100).unwrap();
+        }
+        let automatic = NewOperation {
+            explicit: false,
+            ..named("auto-1")
+        };
+        let ticket = dispatch(store.admit(&automatic, json!({}), 100).unwrap());
+        store
+            .finish(&ticket, "delivered", "test", None, 100)
+            .unwrap();
+        let live = HashSet::from(["live".to_owned()]);
+        let later = 100 + RETENTION_MS;
+        // A key masil made up is never asked for again: it goes.
+        assert_eq!(store.prune(&live, "b1", later).unwrap(), 1);
+        assert!(store.get("run:live/prompt/auto-1").unwrap().is_none());
+        let kept = store.get("run:live/prompt/1").unwrap().unwrap();
+        assert_eq!(
+            (kept.state.as_str(), kept.compacted_ms, kept.receipts.len()),
+            ("delivered", Some(later), 0)
+        );
+        // The same key gets the recorded stage, and is not done again.
+        assert!(matches!(
+            store.admit(&named("1"), json!({}), later + 1).unwrap(),
+            Admission::Recorded(record) if record.state == "delivered"
+        ));
+        // An unknown outcome keeps its receipts for `operation resolve`.
+        let unknown = store.get("run:live/prompt/2").unwrap().unwrap();
+        assert_eq!(unknown.compacted_ms, None);
+        assert!(!unknown.receipts.is_empty());
+        // A retry after a proven no-op is a whole record again.
+        dispatch(store.admit(&named("3"), json!({}), later + 1).unwrap());
+        assert_eq!(
+            store
+                .get("run:live/prompt/3")
+                .unwrap()
+                .unwrap()
+                .compacted_ms,
+            None
+        );
+        // Once the run ends, compacted records go like the rest (with the
+        // unknown outcome, past retention too).
+        assert_eq!(store.prune(&HashSet::new(), "b1", later + 2).unwrap(), 2);
+        assert!(store.get("run:live/prompt/1").unwrap().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compacted_records_have_their_own_capacity() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let fill = |store: &Store, tag: &str, count: i64, compacted: Option<i64>| {
+            store
+                .conn
+                .execute(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+                     INSERT INTO operations (key, namespace, action, client_id, explicit, target,
+                       run, boot, digest, payload_bytes, state, ticket, attempts, lease_until_ms,
+                       owner_pid, created_ms, updated_ms, store_seq, compacted_ms)
+                     SELECT 'run:live/prompt/f' || ?2 || '-' || i, 'run:live', 'prompt',
+                       'f' || i, 1, '%1', 'live', 'b1', 'd', 1, 'delivered', 't', 1, 0, 1, 1, 1,
+                       1, ?3 FROM n",
+                    params![count, tag, compacted],
+                )
+                .unwrap();
+        };
+        let full = |store: &mut Store| {
+            store
+                .admit(&request("d"), json!({}), 100)
+                .err()
+                .is_some_and(|error| error.starts_with("operation_store_full"))
+        };
+        fill(&store, "a", CAPACITY - 1, None);
+        // A compacted no-op made whole again needs room too.
+        let ticket = dispatch(store.admit(&request("d"), json!({}), 100).unwrap());
+        store
+            .finish(&ticket, "not_applied", "test", None, 100)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE operations SET compacted_ms = 1 WHERE key = 'run:r1/prompt/1'",
+                [],
+            )
+            .unwrap();
+        fill(&store, "b", 1, None);
+        assert!(full(&mut store));
+        store
+            .conn
+            .execute("DELETE FROM operations WHERE key = 'run:r1/prompt/1'", [])
+            .unwrap();
+        assert!(full(&mut store));
+        store
+            .conn
+            .execute("UPDATE operations SET compacted_ms = 1", [])
+            .unwrap();
+        assert!(!full(&mut store));
+        store
+            .conn
+            .execute("DELETE FROM operations WHERE key = 'run:r1/prompt/1'", [])
+            .unwrap();
+        fill(&store, "c", COMPACTED_CAPACITY - CAPACITY, Some(1));
+        assert!(full(&mut store));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn age_prunes_are_spaced_out() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let ticket = dispatch(store.admit(&request("d"), json!({}), 100).unwrap());
+        store.finish(&ticket, UNKNOWN, "test", None, 100).unwrap();
+        let later = 100 + RETENTION_MS;
+        assert!(!store.needs_prune(200).unwrap());
+        assert!(store.needs_prune(later + 1).unwrap());
+        // A live run's unknown outcome stays past every limit.
+        let live = HashSet::from(["r1".to_owned()]);
+        store.prune(&live, "b1", later).unwrap();
+        assert!(!store.needs_prune(later + PRUNE_EVERY_MS - 1).unwrap());
+        assert!(store.needs_prune(later + PRUNE_EVERY_MS).unwrap());
+        // A prune stamped ahead of a clock set back does not hold off the next.
+        store
+            .prune(&live, "b1", later + 100 * PRUNE_EVERY_MS)
+            .unwrap();
+        assert!(store.needs_prune(later + 1).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn unsafe_files_and_newer_schemas_are_refused() {
         let dir = temp();
         let path = dir.join("ops.sqlite3");
@@ -4688,13 +4926,23 @@ mod tests {
         conn.pragma_update(None, "user_version", 1).unwrap();
         drop(conn);
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-        let mut store = Store {
-            conn: Connection::open(path).unwrap(),
-            path: path.to_path_buf(),
-        };
-        let ticket = dispatch(store.admit(&request("d1"), json!({}), 100).unwrap());
-        store
-            .finish(&ticket, "delivered", "test", None, 101)
+        // Written as that binary did: its schema has no later columns.
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO operations (key, namespace, action, client_id, explicit, target, run,
+               boot, digest, payload_bytes, state, ticket, attempts, lease_until_ms, owner_pid,
+               created_ms, updated_ms, store_seq)
+             VALUES ('run:r1/prompt/1', 'run:r1', 'prompt', '1', 1, '%1', 'r1', 'b1', 'd1', 5,
+               'delivered', 't', 1, 30100, 1, 100, 101, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO receipts VALUES (last_insert_rowid(), 1, 'delivered', 'test', NULL, 101, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE meta SET value = 1 WHERE name = 'store_seq'", [])
             .unwrap();
     }
 
@@ -4713,6 +4961,7 @@ mod tests {
                 "extensions",
                 "inbox",
                 "notify",
+                "operations_compaction",
                 "prompt_queue",
                 "provider_secrets",
                 "remote_links",
@@ -4837,6 +5086,7 @@ mod tests {
                 "inbox",
                 "later",
                 "notify",
+                "operations_compaction",
                 "prompt_queue",
                 "provider_secrets",
                 "remote_links",
@@ -4872,6 +5122,7 @@ mod tests {
                 "gamma",
                 "inbox",
                 "notify",
+                "operations_compaction",
                 "prompt_queue",
                 "provider_secrets",
                 "remote_links",
