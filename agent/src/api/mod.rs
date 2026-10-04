@@ -113,6 +113,28 @@ pub(crate) async fn end_group(group: i32, child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
+/// Tasks that end with the connection, also when `serve` is dropped:
+/// its read calls, its subscription and its writer.
+struct Aborting(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for Aborting {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Set when the connection ends, also when `serve` is dropped: an act that
+/// is still waiting for the shared permit then never runs.
+struct Ended(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A token bucket.
 struct Rate {
     tokens: f64,
@@ -149,7 +171,9 @@ where
     let (events, mut queued_events) = mpsc::channel::<Value>(EVENTS);
     let close = Arc::new(Notify::new());
     let stalled = close.clone();
-    let writing = tokio::spawn(async move {
+    let ended = Ended(Arc::default());
+    // Ends with `serve`; at its normal end it first writes out the answers.
+    let mut writing = Aborting(vec![tokio::spawn(async move {
         let mut writer = writer;
         loop {
             let next = tokio::select! {
@@ -171,7 +195,7 @@ where
                 return;
             }
         }
-    });
+    })]);
     let permits = Arc::new(Semaphore::new(session.concurrent));
     let mut rate = Rate {
         tokens: session.rate.1,
@@ -180,13 +204,14 @@ where
         at: Instant::now(),
     };
     let mut greeted = false;
-    let mut subscription: Option<tokio::task::JoinHandle<()>> = None;
+    let mut subscription = Aborting(Vec::new());
     let mut acting: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let mut reading: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Reads end with the connection, also when `serve` itself is dropped.
+    let mut reading = Aborting(Vec::new());
     loop {
         let idle = session
             .idle
-            .filter(|_| subscription.as_ref().is_none_or(|task| task.is_finished()))
+            .filter(|_| subscription.0.iter().all(|task| task.is_finished()))
             .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
         let bytes = tokio::select! {
             read = incoming.recv() => match read {
@@ -197,7 +222,7 @@ where
             _ = tokio::time::sleep(idle) => break,
         };
         acting.retain(|task| !task.is_finished());
-        reading.retain(|task| !task.is_finished());
+        reading.0.retain(|task| !task.is_finished());
         let Ok(message) = serde_json::from_slice::<Value>(&bytes) else {
             let _ = responses
                 .send(failure(
@@ -283,7 +308,7 @@ where
                         .await;
                     continue;
                 };
-                if let Some(old) = subscription.take() {
+                for old in subscription.0.drain(..) {
                     old.abort();
                 }
                 let path = socket.clone();
@@ -295,7 +320,7 @@ where
                         .flatten()
                         .map_or(0, |(_, seq)| seq);
                 let after = params["after"].as_i64().unwrap_or(start);
-                subscription = Some(match &session.feed {
+                subscription.0.push(match &session.feed {
                     Some(feed) => tokio::spawn(fed_events(
                         feed.subscribe(),
                         socket,
@@ -317,7 +342,7 @@ where
                     .await;
             }
             "unsubscribe" => {
-                if let Some(old) = subscription.take() {
+                for old in subscription.0.drain(..) {
                     old.abort();
                 }
                 let _ = responses
@@ -351,16 +376,34 @@ where
                 let Ok(permit) = permits.clone().acquire_owned().await else {
                     break;
                 };
-                let shared = match &session.shared {
-                    Some(shared) => match shared.clone().acquire_owned().await {
-                        Ok(permit) => Some(permit),
-                        Err(_) => break,
-                    },
-                    None => None,
-                };
-                let (session, responses, verb) =
-                    (session.clone(), responses.clone(), verb.to_owned());
+                let (session, responses, verb, over) = (
+                    session.clone(),
+                    responses.clone(),
+                    verb.to_owned(),
+                    ended.0.clone(),
+                );
                 let task = tokio::spawn(async move {
+                    // Waited for here, not in the loop that reads the
+                    // connection; a call whose turn comes after its
+                    // extension ended does not run.
+                    let shared = match &session.shared {
+                        Some(shared) => match shared.clone().try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(tokio::sync::TryAcquireError::Closed) => return,
+                            // Its turn came after a wait: if the connection
+                            // ended meanwhile, it does not run.
+                            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                                let Ok(permit) = shared.clone().acquire_owned().await else {
+                                    return;
+                                };
+                                if over.load(std::sync::atomic::Ordering::SeqCst) {
+                                    return;
+                                }
+                                Some(permit)
+                            }
+                        },
+                        None => None,
+                    };
                     let reply = call(&session, &id, &verb, &args).await;
                     let _ = responses.send(reply).await;
                     drop((permit, shared));
@@ -368,25 +411,24 @@ where
                 if acts {
                     acting.push(task);
                 } else {
-                    reading.push(task);
+                    reading.0.push(task);
                 }
             }
         }
     }
-    if let Some(old) = subscription.take() {
-        old.abort();
-    }
-    // Reads stop with the connection; an act runs to its end and leaves its
-    // record.
-    for task in reading {
-        task.abort();
-    }
+    drop(subscription);
+    // Reads stop with the connection; an act that started runs to its end
+    // and leaves its record.
+    drop(reading);
+    drop(ended);
     for task in acting {
         let _ = task.await;
     }
     drop(responses);
     drop(events);
-    let _ = writing.await;
+    if let Some(task) = writing.0.pop() {
+        let _ = task.await;
+    }
 }
 
 fn check_token(session: &Session) -> Result<(), String> {
@@ -441,6 +483,8 @@ pub(crate) async fn call(session: &Session, id: &Value, verb: &str, args: &[Stri
     command
         .arg(verb)
         .args(args)
+        // The verbs that look at whom they serve (queue send) know.
+        .env("MASIL_API_CALL", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

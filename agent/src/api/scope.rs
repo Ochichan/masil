@@ -38,7 +38,7 @@ impl Scope {
 
 /// Characters a provider may drop before it looks for a command: spaces,
 /// and invisible format characters such as a byte order mark.
-fn invisible(c: char) -> bool {
+pub(crate) fn invisible(c: char) -> bool {
     c.is_whitespace()
         || matches!(
             c,

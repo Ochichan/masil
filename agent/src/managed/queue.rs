@@ -197,6 +197,26 @@ pub(super) fn compose(body: &str, attachments: &[Attachment]) -> String {
     }
 }
 
+/// An item's rules: the prompt path's for the text it would send, and some
+/// text before its paths (a body of only spaces would put a path first,
+/// which a provider can read as a `/` command).
+fn sendable_item(body: &str, attachments: &[Attachment]) -> Result<(), String> {
+    if body.chars().all(crate::api::scope::invisible) && !attachments.is_empty() {
+        return Err("invalid_argument: a queued prompt with paths needs text before them".into());
+    }
+    sendable(&compose(body, attachments))
+}
+
+/// Through the extension API (its calls carry `MASIL_API_CALL`), an item
+/// that begins like a command is not sent or copied: a person sends it.
+fn api_refusal(body: &str) -> Result<(), String> {
+    if std::env::var_os("MASIL_API_CALL").is_some() && crate::api::scope::begins_like_command(body)
+    {
+        return Err("api_forbidden: an item that begins with ! or / is sent by a person, not through the API".into());
+    }
+    Ok(())
+}
+
 /// The prompt path's rules, for the text an item would send.
 fn sendable(text: &str) -> Result<(), String> {
     if text.trim().is_empty()
@@ -436,7 +456,7 @@ impl Manager {
         for path in paths {
             attachments.push(check(path, base).await?);
         }
-        sendable(&compose(body, &attachments))?;
+        sendable_item(body, &attachments)?;
         let mut store = self.operation_store().await?;
         let item = store.queue_add(
             &agent.run,
@@ -477,6 +497,7 @@ impl Manager {
             .body
             .clone()
             .ok_or("queue_not_staged: that prompt's body was cleared a day after it was sent")?;
+        api_refusal(&body)?;
         drop(store);
         let paths = attachments_of(&item)
             .into_iter()
@@ -505,7 +526,7 @@ impl Manager {
         revision: Option<i64>,
     ) -> Result<Value, String> {
         let current = self.queue_current(id).await?;
-        sendable(&compose(body, &attachments_of(&current)))?;
+        sendable_item(body, &attachments_of(&current))?;
         // Checked against these paths: changed meanwhile, it is refused.
         self.queue_change(
             agent,
@@ -532,10 +553,7 @@ impl Manager {
             ));
         }
         attachments.push(check(path, base).await?);
-        sendable(&compose(
-            current.body.as_deref().unwrap_or_default(),
-            &attachments,
-        ))?;
+        sendable_item(current.body.as_deref().unwrap_or_default(), &attachments)?;
         self.queue_change(
             agent,
             id,
@@ -705,10 +723,11 @@ impl Manager {
                 Err(error) => return self.queue_refused(item.id, error).await,
             }
         }
-        let text = compose(&body, &attachments);
-        if let Err(error) = sendable(&text) {
+        api_refusal(&body)?;
+        if let Err(error) = sendable_item(&body, &attachments) {
             return self.queue_refused(item.id, error).await;
         }
+        let text = compose(&body, &attachments);
         match self
             .prompt_queued(agent, &text, item.id, item.revision)
             .await
@@ -764,6 +783,16 @@ mod tests {
         assert!(sendable("ok\tfine\nyes").is_ok());
         assert!(sendable("bad\u{1b}[2J").is_err());
         assert!(sendable(&"x".repeat(TEXT_BYTES + 1)).is_err());
+        let path = Attachment {
+            path: "/tmp/notes.txt".into(),
+            kind: "file".into(),
+            bytes: 1,
+            checked_ms: 0,
+        };
+        assert!(sendable_item("  ", std::slice::from_ref(&path)).is_err());
+        assert!(sendable_item("\u{FEFF}\u{200B}", std::slice::from_ref(&path)).is_err());
+        assert!(sendable_item("look", &[path]).is_ok());
+        assert!(sendable_item("", &[]).is_err());
     }
 
     #[test]

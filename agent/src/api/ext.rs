@@ -477,6 +477,11 @@ struct Resident {
     stop: Arc<Notify>,
     stopped: Arc<AtomicBool>,
     status: Arc<Mutex<Value>>,
+    /// Failures counted and when their window began.
+    counters: Arc<Mutex<(i64, i64)>>,
+    /// When the row was last switched on: a later one means `ext enable`
+    /// ran again.
+    changed_ms: i64,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -709,51 +714,87 @@ impl Residents {
                 Some((extension.name.clone(), (extension.clone(), row)))
             })
             .collect();
-        let mut running = self.running.lock().map_err(|_| "extensions unavailable")?;
-        // One that ended since the rows were read is started again only
-        // after they are read again (it may have recorded `failed`).
-        let mut ended = Vec::new();
-        running.retain(|name, resident| {
-            if resident.task.is_finished() {
-                ended.push(name.clone());
-            }
-            let keep = wanted
-                .get(name)
-                .is_some_and(|(extension, _)| *extension == resident.extension)
-                && !resident.stopped.load(Ordering::SeqCst)
-                && !resident.task.is_finished();
-            if !keep {
-                resident.end();
-            }
-            keep
-        });
-        for (name, (extension, row)) in wanted {
-            if running.contains_key(&name) || ended.contains(&name) {
-                continue;
-            }
-            let job = Keep {
-                extension: extension.clone(),
-                socket: socket.to_owned(),
-                directory: directory.to_owned(),
-                shared: shared.clone(),
-                feed: feed.clone(),
-                stop: Arc::new(Notify::new()),
-                stopped: Arc::new(AtomicBool::new(false)),
-                status: Arc::new(Mutex::new(json!({"state": "starting"}))),
-                log: log.clone(),
-            };
-            let resident = Resident {
-                extension,
-                stop: job.stop.clone(),
-                stopped: job.stopped.clone(),
-                status: job.status.clone(),
-                task: tokio::spawn(keep(
-                    job,
+        let afresh = {
+            let mut running = self.running.lock().map_err(|_| "extensions unavailable")?;
+            // One that ended since the rows were read is started again only
+            // after they are read again (it may have recorded `failed`).
+            let mut ended = Vec::new();
+            let mut afresh = Vec::new();
+            running.retain(|name, resident| {
+                if resident.task.is_finished() {
+                    ended.push(name.clone());
+                }
+                let keep = wanted
+                    .get(name)
+                    .is_some_and(|(extension, _)| *extension == resident.extension)
+                    && !resident.stopped.load(Ordering::SeqCst)
+                    && !resident.task.is_finished();
+                if !keep {
+                    resident.end();
+                } else if let Some(changed) = wanted
+                    .get(name)
+                    .and_then(|(_, row)| row["changed_ms"].as_i64())
+                    .filter(|changed| *changed > resident.changed_ms)
+                {
+                    // Enabled again while it runs: its failures count
+                    // afresh, and the row says what it is doing now.
+                    resident.changed_ms = changed;
+                    if let Ok(mut counters) = resident.counters.lock() {
+                        *counters = (0, 0);
+                    }
+                    let state = resident
+                        .status
+                        .lock()
+                        .ok()
+                        .and_then(|status| status["state"].as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "running".into());
+                    afresh.push((name.clone(), state));
+                }
+                keep
+            });
+            for (name, (extension, row)) in wanted {
+                if running.contains_key(&name) || ended.contains(&name) {
+                    continue;
+                }
+                let counters = Arc::new(Mutex::new((
                     row["restarts"].as_i64().unwrap_or(0),
                     row["window_ms"].as_i64().unwrap_or(0),
-                )),
-            };
-            running.insert(name, resident);
+                )));
+                let job = Keep {
+                    counters: counters.clone(),
+                    extension: extension.clone(),
+                    socket: socket.to_owned(),
+                    directory: directory.to_owned(),
+                    shared: shared.clone(),
+                    feed: feed.clone(),
+                    stop: Arc::new(Notify::new()),
+                    stopped: Arc::new(AtomicBool::new(false)),
+                    status: Arc::new(Mutex::new(json!({"state": "starting"}))),
+                    log: log.clone(),
+                };
+                let resident = Resident {
+                    extension,
+                    stop: job.stop.clone(),
+                    stopped: job.stopped.clone(),
+                    status: job.status.clone(),
+                    counters,
+                    changed_ms: row["changed_ms"].as_i64().unwrap_or(0),
+                    task: tokio::spawn(keep(job)),
+                };
+                running.insert(name, resident);
+            }
+            afresh
+        };
+        for (name, state) in afresh {
+            let (socket, extension) = (socket.to_owned(), name.clone());
+            let written = tokio::task::spawn_blocking(move || {
+                crate::managed::extension_state(&socket, &extension, &state, 0, 0)
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.to_string()));
+            if let Err(error) = written {
+                log(&format!("extension {name}: {error}"));
+            }
         }
         Ok(())
     }
@@ -762,9 +803,10 @@ impl Residents {
 /// One reader of the inbox for every extension: it reads when the watch
 /// counted the badge, and every 30 s otherwise.
 async fn watch_inbox(socket: PathBuf, inbox: Arc<Notify>, feed: broadcast::Sender<Value>) {
-    // The first read, before any extension runs, only finds the end. From
-    // then on every batch goes out, listened to or not: a subscriber reads
-    // what came before it itself and drops what it already has.
+    // The first read, before any extension runs, only finds the end; if it
+    // fails, reading starts from the beginning rather than skip anything.
+    // From then on every batch goes out, listened to or not: a subscriber
+    // reads what came before it itself and drops what it already has.
     let mut cursor: Option<i64> = None;
     let mut now = true;
     loop {
@@ -780,6 +822,7 @@ async fn watch_inbox(socket: PathBuf, inbox: Arc<Notify>, feed: broadcast::Sende
             .unwrap_or_else(|error| Err(error.to_string()));
         now = false;
         let Ok(Some((items, next))) = read else {
+            cursor.get_or_insert(0);
             continue;
         };
         if !items.is_empty() {
@@ -792,6 +835,7 @@ async fn watch_inbox(socket: PathBuf, inbox: Arc<Notify>, feed: broadcast::Sende
 
 /// What keeping one resident extension takes.
 struct Keep {
+    counters: Arc<Mutex<(i64, i64)>>,
     extension: Extension,
     socket: PathBuf,
     directory: PathBuf,
@@ -896,13 +940,20 @@ impl Keep {
 /// Keeps one resident extension: started, started again after it fails
 /// (1 s, doubling to 60 s between), given up after five failures in ten
 /// minutes. Ending with status 0 means it stopped on purpose.
-async fn keep(job: Keep, mut restarts: i64, mut window_ms: i64) {
+async fn keep(job: Keep) {
     let mut backoff = BACKOFF_FIRST;
+    let counted = || {
+        job.counters
+            .lock()
+            .map(|counters| *counters)
+            .unwrap_or((0, 0))
+    };
     loop {
         if job.stopped.load(Ordering::SeqCst) {
             return;
         }
         let began = Instant::now();
+        let (restarts, window_ms) = counted();
         let Some(ended) = job.once(restarts, window_ms).await else {
             job.show("stopped", Value::Null);
             return;
@@ -916,12 +967,17 @@ async fn keep(job: Keep, mut restarts: i64, mut window_ms: i64) {
             Ok(status) => status.to_string(),
             Err(error) => error.clone(),
         };
+        // Read again: an `ext enable` meanwhile starts the count over.
+        let (mut restarts, mut window_ms) = counted();
         let now = crate::observation::now_ms() as i64;
         if now - window_ms > FAILURE_WINDOW.as_millis() as i64 {
             window_ms = now;
             restarts = 0;
         }
         restarts += 1;
+        if let Ok(mut counters) = job.counters.lock() {
+            *counters = (restarts, window_ms);
+        }
         if restarts >= FAILURES {
             (job.log)(&format!(
                 "extension {}: failed {restarts} times in ten minutes ({why}); not started again",

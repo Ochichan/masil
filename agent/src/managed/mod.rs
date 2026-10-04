@@ -2163,6 +2163,7 @@ pub(crate) fn extension_rows(socket: &Path) -> Result<Vec<Value>, String> {
                 "state": row.state,
                 "restarts": row.restarts,
                 "window_ms": row.window_ms,
+                "changed_ms": row.changed_ms,
             })
         })
         .collect())

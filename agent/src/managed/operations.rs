@@ -127,6 +127,8 @@ pub(crate) struct ExtensionRow {
     pub(crate) state: String,
     pub(crate) restarts: i64,
     pub(crate) window_ms: i64,
+    /// When it was last switched on or off (`ext enable|disable`).
+    pub(crate) changed_ms: i64,
 }
 
 /// Connections this server's coordinator holds to endpoints (P8b,
@@ -1752,7 +1754,7 @@ impl Store {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT name, enabled, state, restarts, window_ms FROM extensions ORDER BY name",
+                "SELECT name, enabled, state, restarts, window_ms, changed_ms FROM extensions ORDER BY name",
             )
             .map_err(sql)?;
         statement
@@ -1763,6 +1765,7 @@ impl Store {
                     state: row.get(2)?,
                     restarts: row.get(3)?,
                     window_ms: row.get(4)?,
+                    changed_ms: row.get(5)?,
                 })
             })
             .map_err(sql)?

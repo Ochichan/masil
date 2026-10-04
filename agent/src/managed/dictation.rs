@@ -740,6 +740,11 @@ fn clean(text: &str) -> String {
         .to_owned()
 }
 
+/// Nothing a person would read: only spaces and invisible characters.
+fn blank(text: &str) -> bool {
+    text.chars().all(crate::api::scope::invisible)
+}
+
 #[derive(PartialEq)]
 enum Phase {
     Listening,
@@ -1044,7 +1049,7 @@ async fn dictate(
         return failed("dictation_failed: the text is not UTF-8".into());
     };
     let text = clean(&text);
-    if text.is_empty() {
+    if blank(&text) {
         return Ok(outcome("empty", "nothing was heard"));
     }
     // The run this dictation began for, alive or not, in this server's
@@ -1100,5 +1105,7 @@ mod tests {
         assert_eq!(clean("  hello\u{7}\nworld\t!  \n"), "hello \nworld\t!");
         assert_eq!(clean(" \n "), "");
         assert_eq!(clean("\u{1b}"), "");
+        assert!(blank("\u{FEFF} \u{200B}"));
+        assert!(!blank("ok"));
     }
 }
