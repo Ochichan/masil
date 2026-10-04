@@ -196,6 +196,7 @@ cmd_set_hook_monitor_exec(struct cmdq_item *item, struct args *args, int window)
 				value = newvalue;
 			}
 			options_set_string(oo, name, 0, "%s", value);
+			/* masil: monitor hooks retain stock client invalidation. */
 			options_push_changes(name);
 		}
 	}
@@ -234,8 +235,10 @@ cmd_set_option_exec(struct cmd *self, struct cmdq_item *item)
 	struct options_entry		*parent, *o, *po;
 	char				*name, *argument, *cause;
 	char				*expanded = NULL, *array_key = NULL;
+	char				*oldvalue = NULL, *newvalue = NULL;
 	const char			*value;
 	int				 window, already, error, ambiguous;
+	int				 user_option = 0;
 	int				 scope;
 
 	window = (cmd_get_entry(self) == &cmd_set_window_option_entry);
@@ -290,6 +293,11 @@ cmd_set_option_exec(struct cmd *self, struct cmdq_item *item)
 	}
 	o = options_get_only(oo, name);
 	parent = options_get(oo, name);
+	/* masil: only set-option skips unchanged non-hook user option updates. */
+	user_option = (cmd_get_entry(self) == &cmd_set_option_entry &&
+	    *name == '@' && !hooks_is_event(name));
+	if (user_option && o != NULL)
+		oldvalue = options_to_string(o, NULL, 0);
 
 	/* Check that array options and keys match up. */
 	if (array_key != NULL && (*name == '@' || !options_is_array(parent))) {
@@ -379,9 +387,24 @@ cmd_set_option_exec(struct cmd *self, struct cmdq_item *item)
 		}
 	}
 
-	options_push_changes(name);
+	/* masil: only set-option non-hook user options skip unchanged updates. */
+	if (!user_option || args_has(args, 'u') || args_has(args, 'U') ||
+	    oldvalue == NULL) {
+		options_push_changes(name);
+	} else {
+		o = options_get_only(oo, name);
+		if (o == NULL)
+			options_push_changes(name);
+		else {
+			newvalue = options_to_string(o, NULL, 0);
+			if (strcmp(oldvalue, newvalue) != 0)
+				options_push_changes(name);
+		}
+	}
 
 out:
+	free(newvalue);
+	free(oldvalue);
 	free(argument);
 	free(expanded);
 	free(name);
@@ -389,6 +412,8 @@ out:
 	return (CMD_RETURN_NORMAL);
 
 fail:
+	free(newvalue);
+	free(oldvalue);
 	free(argument);
 	free(expanded);
 	free(name);

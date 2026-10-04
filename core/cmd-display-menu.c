@@ -395,7 +395,7 @@ cmd_display_menu_exec(struct cmd *self, struct cmdq_item *item)
 		lines = options_get_number(o, "menu-border-lines");
 	menu_get_size(menu, lines, &sx, &sy);
 	if (!cmd_display_menu_get_menu_pos(tc, item, args,
-	    tc->session->curw->window, &px, &py, sx, sy))
+	    target->w, &px, &py, sx, sy))
 		goto out;
 
 	if (args_has(args, 'O') || cmd_display_menu_stays_open(tc))

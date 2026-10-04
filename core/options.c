@@ -1355,6 +1355,69 @@ options_from_string(struct options *oo, const struct options_table_entry *oe,
 	return (-1);
 }
 
+/* masil: only values or active modes make user options cause global work. */
+static int
+options_references(struct options *oo, const char *name)
+{
+	struct options_entry	*o;
+	char			*value;
+
+	if (oo == NULL)
+		return (1);
+	for (o = options_first(oo); o != NULL; o = options_next(o)) {
+		if (!options_is_string(o) && !options_is_array(o))
+			continue;
+		value = options_to_string(o, NULL, 0);
+		if (strstr(value, name) != NULL) {
+			free(value);
+			return (1);
+		}
+		free(value);
+	}
+	return (0);
+}
+
+static int
+options_user_option_referenced(const char *name)
+{
+	struct client			*loop;
+	struct session			*s;
+	struct window			*w;
+	struct window_pane		*wp;
+	struct window_mode_entry	*wme;
+
+	if (options_references(global_options, name) ||
+	    options_references(global_s_options, name) ||
+	    options_references(global_w_options, name))
+		return (1);
+	RB_FOREACH(s, sessions, &sessions) {
+		if (options_references(s->options, name))
+			return (1);
+	}
+	RB_FOREACH(w, windows, &windows) {
+		if (options_references(w->options, name))
+			return (1);
+	}
+	RB_FOREACH(wp, window_pane_tree, &all_window_panes) {
+		if (options_references(wp->options, name))
+			return (1);
+	}
+	TAILQ_FOREACH(loop, &clients, entry) {
+		if (loop->session == NULL || loop->session->curw == NULL)
+			continue;
+		w = loop->session->curw->window;
+		if (w == NULL)
+			return (1);
+		TAILQ_FOREACH(wp, &w->panes, entry) {
+			wme = TAILQ_FIRST(&wp->modes);
+			if (wme != NULL &&
+			    (wme->mode == NULL || wme->mode->update != NULL))
+				return (1);
+		}
+	}
+	return (0);
+}
+
 void
 options_push_changes(const char *name)
 {
@@ -1364,6 +1427,11 @@ options_push_changes(const char *name)
 	struct window_pane	*wp;
 
 	log_debug("%s: %s", __func__, name);
+	/* masil: direct core reads retain the existing push behaviour. */
+	if (*name == '@' && strcmp(name, "@masil-status-width") != 0 &&
+	    strcmp(name, "@masil-menu-stay-open") != 0 &&
+	    !options_user_option_referenced(name))
+		return;
 
 	if (strcmp(name, "theme") == 0 ||
 	    strncmp(name, "dark-theme-", 11) == 0 ||

@@ -567,7 +567,6 @@ chosen:
 		md->cb = NULL;
 		return (1);
 	}
-	/* A menu can be displayed on a different window from its target. */
 	if (md->have_target && !menu_target_valid(md)) {
 		status_message_set(c, -1, 1, 0, 0,
 		    "Menu target no longer exists");
@@ -635,7 +634,10 @@ menu_display(struct menu *menu, int flags, int starting_choice,
 	struct window		*w;
 	struct options		*o;
 
-	w = c->session->curw->window;
+	if (fs == NULL)
+		w = c->session->curw->window;
+	else
+		w = fs->w;
 	o = w->options;
 
 	if (lines == BOX_LINES_DEFAULT)

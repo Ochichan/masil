@@ -2356,6 +2356,18 @@ format_cb_masil_bracketed_paste(struct format_tree *ft)
 	return (format_printf("%d", !!(ft->wp->screen->mode & MODE_BRACKETPASTE)));
 }
 
+/* masil: stalled clients have output owed for five seconds. */
+static void *
+format_cb_masil_client_stalled(struct format_tree *ft)
+{
+	struct client	*c = ft->c;
+
+	if (c == NULL)
+		return (xstrdup("0"));
+	return (format_printf("%d", c->tty.masil_owed &&
+	    get_timer() - c->tty.masil_progress >= 5000));
+}
+
 /* Callback for masil_core_boot_id. */
 static void *
 format_cb_masil_core_boot_id(__unused struct format_tree *ft)
@@ -3859,6 +3871,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "masil_bracketed_paste", FORMAT_TABLE_STRING,
 	  format_cb_masil_bracketed_paste
+	},
+	{ "masil_client_stalled", FORMAT_TABLE_STRING,
+	  format_cb_masil_client_stalled
 	},
 	{ "masil_core_boot_id", FORMAT_TABLE_STRING,
 	  format_cb_masil_core_boot_id

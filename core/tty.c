@@ -80,6 +80,8 @@ static void	tty_write_one(void (*)(struct tty *, const struct tty_ctx *),
 #define TTY_BLOCK_INTERVAL (100000 /* 100 milliseconds */)
 #define TTY_BLOCK_START(tty) (1 + ((tty)->sx * (tty)->sy) * 8)
 #define TTY_BLOCK_STOP(tty) (1 + ((tty)->sx * (tty)->sy) / 8)
+/* masil: a stalled tty never retains more than 32 MiB of output. */
+#define MASIL_TTY_BLOCK_HARD (32 * 1024 * 1024)
 
 #define TTY_QUERY_TIMEOUT 5
 #define TTY_REQUEST_LIMIT 30
@@ -226,7 +228,7 @@ tty_block_maybe(struct tty *tty)
 	else if (tty->flags & TTY_NOBLOCK)
 		return (0);
 
-	if (size < TTY_BLOCK_START(tty))
+	if (size < TTY_BLOCK_START(tty) && size < MASIL_TTY_BLOCK_HARD)
 		return (0);
 
 	if (tty->flags & TTY_BLOCK)
@@ -254,6 +256,12 @@ tty_write_callback(__unused int fd, __unused short events, void *data)
 	nwrite = evbuffer_write(tty->out, c->fd);
 	if (nwrite == -1)
 		return;
+	/* masil: progress advances only after bytes leave the output buffer. */
+	if (nwrite > 0) {
+		tty->masil_progress = get_timer();
+		if (EVBUFFER_LENGTH(tty->out) == 0)
+			tty->masil_owed = 0;
+	}
 	log_debug("%s: wrote %d bytes (of %zu)", c->name, nwrite, size);
 
 	if (c->redraw > 0) {
@@ -339,6 +347,8 @@ tty_start_tty(struct tty *tty)
 	struct termios	 tio;
 	u_int		 i;
 
+	/* masil: each tty start begins a fresh output-progress interval. */
+	tty->masil_progress = get_timer();
 	setblocking(c->fd, 0);
 	event_add(&tty->event_in, NULL);
 
@@ -641,15 +651,53 @@ static void
 tty_add(struct tty *tty, const char *buf, size_t len)
 {
 	struct client	*c = tty->client;
+	size_t		 size;
+	int		 block = 0;
 
 	if (tty->flags & TTY_BLOCK) {
 		tty->discarded += len;
+		if (len != 0)
+			tty->masil_owed = 1;
 		return;
 	}
 
+	size = EVBUFFER_LENGTH(tty->out);
 	evbuffer_add(tty->out, buf, len);
+	/*
+	 * masil: fresh output does not inherit idle time from an empty tty. A
+	 * tty that still owes output (its buffer was emptied by discarding, not
+	 * by writing) keeps its old progress time, or it would never stall.
+	 */
+	if (size == 0 && len != 0 && !tty->masil_owed)
+		tty->masil_progress = get_timer();
+	if (len != 0)
+		tty->masil_owed = 1;
 	log_debug("%s: %.*s", c->name, (int)len, buf);
 	c->written += len;
+
+	/*
+	 * masil: only a stalled tty outside a generated frame is blocked here.
+	 * The 1 s no-progress rule waits while a queued frame is still being
+	 * written; the hard cap always applies. TTY_NOBLOCK only keeps a raw
+	 * sequence whole, which no longer matters for a tty that is not
+	 * writing, so it is dropped before blocking.
+	 */
+	if (~c->flags & CLIENT_MASIL_REDRAWING) {
+		size = EVBUFFER_LENGTH(tty->out);
+		if (size >= MASIL_TTY_BLOCK_HARD)
+			block = 1;
+		else if (c->redraw == 0 && tty->masil_owed &&
+		    size >= TTY_BLOCK_START(tty) &&
+		    get_timer() - tty->masil_progress >= 1000)
+			block = 1;
+		if (block) {
+			tty->flags &= ~TTY_NOBLOCK;
+			if (tty_block_maybe(tty)) {
+				c->redraw = 0;
+				return;
+			}
+		}
+	}
 
 	if (tty_log_fd != -1)
 		write(tty_log_fd, buf, len);

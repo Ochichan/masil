@@ -2463,8 +2463,10 @@ server_client_check_redraw(struct client *c)
 	struct window		*w = s->curw->window;
 	struct window_pane	*wp;
 	int			 needed, tflags, mode = tty->mode;
+	int			 delayed, pending;
 	struct timeval		 tv = { .tv_usec = 1000 };
 	static struct event	 ev;
+	static int		 ev_delayed;
 	size_t			 n;
 
 	if (c->flags & (CLIENT_CONTROL|CLIENT_SUSPENDED))
@@ -2495,15 +2497,27 @@ server_client_check_redraw(struct client *c)
 	 */
 	n = EVBUFFER_LENGTH(tty->out);
 	if (n != 0 || (tty->flags & TTY_BLOCK)) {
+		/* masil: a tty without output progress backs deferred redraws off. */
+		delayed = 0;
+		if (n != 0) {
+			if (get_timer() - tty->masil_progress >= 100) {
+				tv.tv_usec = 100000;
+				delayed = 1;
+			}
+		}
 		if (n != 0)
 			log_debug("%s: redraw deferred (%zu left)", c->name, n);
 		else
 			log_debug("%s: redraw deferred (blocked)", c->name);
 		if (!evtimer_initialized(&ev))
 			evtimer_set(&ev, server_client_redraw_timer, NULL);
-		if (!evtimer_pending(&ev, NULL)) {
+		pending = evtimer_pending(&ev, NULL);
+		if (!pending || (n != 0 && !delayed && ev_delayed)) {
+			if (pending)
+				evtimer_del(&ev);
 			log_debug("redraw timer started");
 			evtimer_add(&ev, &tv);
+			ev_delayed = delayed;
 		}
 		TAILQ_FOREACH(wp, &w->panes, entry) {
 			if (wp->flags & PANE_REDRAW) {
@@ -2515,6 +2529,9 @@ server_client_check_redraw(struct client *c)
 		}
 		return;
 	}
+
+	/* masil: suppress the tty stall guard while this frame is generated. */
+	c->flags |= CLIENT_MASIL_REDRAWING;
 
 	/* Unfreeze the tty and turn off the cursor. */
 	log_debug("%s: redraw needed", c->name);
@@ -2562,6 +2579,7 @@ server_client_check_redraw(struct client *c)
 	 * All the redraw flags can now be cleared. Also record how many bytes
 	 * were written.
 	 */
+	c->flags &= ~CLIENT_MASIL_REDRAWING;
 	c->flags &= ~(CLIENT_ALLREDRAWFLAGS|CLIENT_REDRAWSCROLLBARS|
 	    CLIENT_STATUSFORCE);
 	c->redraw = EVBUFFER_LENGTH(tty->out);

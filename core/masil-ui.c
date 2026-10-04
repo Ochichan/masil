@@ -4,6 +4,7 @@
  */
 
 #include <sys/types.h>
+#include <sys/stat.h>
 
 #include <limits.h>
 #include <stdlib.h>
@@ -21,6 +22,16 @@ static const char masil_ui_layer[] =
 
 /* Cleared by -f; the layer and saved choices are then not loaded. */
 int	masil_ui_enabled = 1;
+
+/* masil: only executable regular files are exposed as the layer agent. */
+static int
+masil_ui_agent_exists(const char *path)
+{
+	struct stat	 sb;
+
+	return (stat(path, &sb) == 0 && S_ISREG(sb.st_mode) &&
+	    access(path, X_OK) == 0);
+}
 
 /* Find masil-agent beside the running executable. */
 static char *
@@ -45,11 +56,39 @@ masil_ui_agent_path(void)
 		return (NULL);
 	*slash = '\0';
 	xasprintf(&path, "%s/masil-agent", exe);
-	if (access(path, X_OK) != 0) {
+	if (!masil_ui_agent_exists(path)) {
 		free(path);
 		return (NULL);
 	}
 	return (path);
+}
+
+/* masil: a PATH-discovered agent is recorded as an absolute executable path. */
+static char *
+masil_ui_agent_path_from_path(void)
+{
+	const char	*env;
+	char		*copy, *entry, *next, *path;
+	char		 resolved[PATH_MAX];
+
+	env = getenv("PATH");
+	if (env == NULL)
+		return (NULL);
+	copy = next = xstrdup(env);
+	while ((entry = strsep(&next, ":")) != NULL) {
+		if (*entry == '\0')
+			entry = ".";
+		xasprintf(&path, "%s/masil-agent", entry);
+		if (masil_ui_agent_exists(path) &&
+		    realpath(path, resolved) != NULL) {
+			free(path);
+			free(copy);
+			return (xstrdup(resolved));
+		}
+		free(path);
+	}
+	free(copy);
+	return (NULL);
 }
 
 /*
@@ -82,8 +121,11 @@ masil_ui_load(struct client *c, int flags)
 		return;
 
 	agent = masil_ui_agent_path();
+	if (agent == NULL)
+		agent = masil_ui_agent_path_from_path();
+	/* masil: a missing agent is explicit rather than shell-resolved later. */
 	options_set_string(global_s_options, "@masil-agent", 0, "%s",
-	    agent != NULL ? agent : "masil-agent");
+	    agent != NULL ? agent : "");
 	free(agent);
 
 	settings = masil_ui_settings_path();
