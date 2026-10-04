@@ -41,6 +41,7 @@ pub(crate) const BADGE_OPTION: &str = "@masil-inbox-unseen";
 /// The features the running coordinator serves, for session autosave to
 /// bring one back after it ends; unset when there are none.
 const WANTED_OPTION: &str = "@masil-coordinator-wanted";
+const BOOT_OPTION: &str = "@masil-coordinator-boot";
 /// Features, the executable and the store are checked this often.
 const SUPERVISE_EVERY: Duration = Duration::from_secs(30);
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
@@ -590,7 +591,12 @@ pub(crate) fn check_state(socket: &Path) -> Result<ServerInfo, String> {
 /// an older generation is stopped and replaced; a stuck one is nudged to
 /// rebind its socket, then terminated.
 pub(crate) fn ensure(socket: &Path) -> Result<Value, String> {
+    ensure_with_autosave(socket, true)
+}
+
+fn ensure_with_autosave(socket: &Path, start_autosave: bool) -> Result<Value, String> {
     let server = check_state(socket)?;
+    add_boot_setting_warn(socket, &server.state, start_autosave);
     let paths = paths(socket, &server.state)?;
     private_directory(
         paths
@@ -740,6 +746,7 @@ pub(crate) fn spawn_detached(socket: &Path) {
     let Ok(server) = check_state(socket) else {
         return;
     };
+    add_boot_setting_warn(socket, &server.state, true);
     let Ok(paths) = paths(socket, &server.state) else {
         return;
     };
@@ -755,14 +762,116 @@ pub(crate) fn spawn_detached(socket: &Path) {
     }
 }
 
-/// Asks a running coordinator to read its features and detection manifests
-/// again. Never starts one; failures are ignored.
+/// Updates the boot marker, then asks a running coordinator to read its
+/// features and detection manifests again. Never starts one.
 pub(crate) fn reload(socket: &Path) {
-    let Ok(state) = crate::managed::state_base() else {
+    let Ok(server) = check_state(socket) else {
         return;
     };
-    if let Ok(paths) = paths(socket, &state) {
+    sync_boot_setting_warn(socket, &server.state);
+    if let Ok(paths) = paths(socket, &server.state) {
         let _ = request(&paths.listen, "reload", HELLO_TIMEOUT);
+    }
+}
+
+fn sync_boot_setting_warn(socket: &Path, state: &Path) {
+    if let Err(error) = sync_boot_setting(socket, state, true, true) {
+        eprintln!("masil-agent: could not update {BOOT_OPTION}: {error}");
+    }
+}
+
+fn add_boot_setting_warn(socket: &Path, state: &Path, start_autosave: bool) {
+    if let Err(error) = sync_boot_setting(socket, state, false, start_autosave) {
+        eprintln!("masil-agent: could not update {BOOT_OPTION}: {error}");
+    }
+}
+
+/// Reconciles this socket's marker entry with its features. Start and revive
+/// paths never remove an entry, while feature changes do. Callers that are
+/// not themselves autosave also launch a saver when features are enabled.
+fn sync_boot_setting(
+    socket: &Path,
+    state: &Path,
+    remove_when_disabled: bool,
+    start_autosave: bool,
+) -> Result<(), String> {
+    let socket = socket
+        .canonicalize()
+        .map_err(|error| format!("server_unreachable: native socket: {error}"))?;
+    let socket_text = socket
+        .to_str()
+        .ok_or("invalid_argument: the server socket path is not UTF-8")?;
+    let enabled = !crate::managed::coordinator_features(state, &socket)?.is_empty();
+    if !enabled && !remove_when_disabled {
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    let mut marker = None;
+    match crate::ui::settings::store::settings_path() {
+        Some(path) => match crate::ui::settings::store::update_socket_marker(
+            &path,
+            BOOT_OPTION,
+            socket_text,
+            enabled,
+        ) {
+            Ok(value) => marker = Some(value),
+            Err(error) => {
+                errors.push(error);
+            }
+        },
+        None => errors.push("no configuration directory".to_owned()),
+    }
+    let marker = match marker {
+        Some(marker) => Some(marker),
+        None => match masil(
+            &socket,
+            &["display-message", "-p", "#{@masil-coordinator-boot}"],
+        ) {
+            Ok(current) => {
+                let current = current.trim_end_matches(['\r', '\n']);
+                let current = (!current.is_empty()).then_some(current);
+                match crate::ui::settings::store::changed_socket_marker(
+                    current,
+                    socket_text,
+                    enabled,
+                ) {
+                    Ok(value) => {
+                        let changed = value.as_deref() != current;
+                        Some((value, changed))
+                    }
+                    Err(error) => {
+                        errors.push(error);
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        },
+    };
+    let marker_changed = marker.as_ref().is_some_and(|(_, changed)| *changed);
+    if let Some((marker, true)) = marker {
+        let live = match marker {
+            Some(value) => masil(&socket, &["set-option", "-gq", BOOT_OPTION, value.as_str()]),
+            None => masil(&socket, &["set-option", "-gqu", BOOT_OPTION]),
+        };
+        if let Err(error) = live {
+            errors.push(error);
+        }
+    }
+    if start_autosave
+        && enabled
+        && marker_changed
+        && let Err(error) = crate::session::start_autosave(socket_text)
+    {
+        errors.push(format!("could not start session autosave: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -845,7 +954,7 @@ pub(crate) fn restart_if_enabled(socket: &Path) {
         .and_then(|base| crate::managed::coordinator_features(&base, socket))
         .is_ok_and(|features| !features.is_empty());
     if enabled {
-        let _ = ensure(socket);
+        let _ = ensure_with_autosave(socket, false);
     }
 }
 
@@ -1148,6 +1257,7 @@ async fn supervise(
 ) {
     let mut announced: Option<Vec<String>> = None;
     loop {
+        let mut features_changed = false;
         let (socket_for_read, state_for_read) = (socket.clone(), state.clone());
         // A failed read keeps the last list.
         if let Ok(Ok(features)) = tokio::task::spawn_blocking(move || {
@@ -1164,6 +1274,14 @@ async fn supervise(
                 *last = Instant::now();
             }
             *current = features;
+            features_changed = true;
+        }
+        if features_changed {
+            let (socket_for_sync, state_for_sync) = (socket.clone(), state.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                sync_boot_setting_warn(&socket_for_sync, &state_for_sync)
+            })
+            .await;
         }
         // The inbox and `--answers` runs both need the panes watched.
         let wanted = shared

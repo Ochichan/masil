@@ -12,6 +12,7 @@ pub(crate) const LAYER: &str = include_str!("../../../../core/masil-ui-layer.con
 const HEADER: &str =
     "# masil settings, version 1. Written by `masil-agent settings`; other lines are kept.";
 const MAX_BYTES: u64 = 64 * 1024;
+const INTERNAL_MARKERS: &[&str] = &["@masil-autosave-used", "@masil-coordinator-boot"];
 
 /// The same rule as the core: an absolute XDG_CONFIG_HOME, else ~/.config.
 pub(crate) fn settings_path() -> Option<PathBuf> {
@@ -150,18 +151,13 @@ impl Saved {
     }
 
     fn managed(line: &str) -> Option<(&str, &str)> {
-        let mut words = line.split_whitespace();
-        match (words.next(), words.next(), words.next(), words.next()) {
-            (Some("set"), Some("-g"), Some(key), Some(value))
-                if key.starts_with("@masil-") && words.next().is_none() =>
-            {
-                Some((key, value))
-            }
-            _ => None,
-        }
+        let rest = line.strip_prefix("set -g ")?;
+        let boundary = rest.find(char::is_whitespace)?;
+        let key = &rest[..boundary];
+        let value = rest[boundary..].trim_start();
+        (key.starts_with("@masil-") && tmux_word(value).is_some()).then_some((key, value))
     }
 
-    #[cfg(test)]
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
         self.lines
             .iter()
@@ -169,6 +165,10 @@ impl Saved {
             .filter_map(|line| Self::managed(line))
             .find(|(candidate, _)| *candidate == key)
             .map(|(_, value)| value)
+    }
+
+    pub(crate) fn get_value(&self, key: &str) -> Option<String> {
+        tmux_word(self.get(key)?)
     }
 
     /// Replaces the key's line in place, or appends it.
@@ -190,8 +190,20 @@ impl Saved {
         }
     }
 
+    fn set_quoted(&mut self, key: &str, value: &str) {
+        self.set(key, &crate::native_ui::tmux_quote(value));
+    }
+
+    /// Removes every managed line for `key`, leaving all other lines alone.
+    pub(crate) fn remove(&mut self, key: &str) {
+        self.lines
+            .retain(|line| Self::managed(line).is_none_or(|(candidate, _)| candidate != key));
+    }
+
     pub(crate) fn remove_all_managed(&mut self) {
-        self.lines.retain(|line| Self::managed(line).is_none());
+        self.lines.retain(|line| {
+            Self::managed(line).is_none_or(|(key, _)| INTERNAL_MARKERS.contains(&key))
+        });
     }
 
     pub(crate) fn render(&self) -> String {
@@ -202,6 +214,115 @@ impl Saved {
             text.push('\n');
         }
         text
+    }
+}
+
+/// Decodes the one tmux word used as a managed setting value. This supports
+/// the single-quoted form produced by `tmux_quote`, including its quoted
+/// apostrophe sequence, as well as existing plain and double-quoted values.
+fn tmux_word(value: &str) -> Option<String> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    if value.is_empty() {
+        return None;
+    }
+    let mut output = String::new();
+    let mut quote = None;
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        match (quote, character) {
+            (None, '\'') => quote = Some(Quote::Single),
+            (None, '"') => quote = Some(Quote::Double),
+            (None, '\\') => output.push(characters.next()?),
+            (None, character) if character.is_whitespace() => return None,
+            (None, character) => output.push(character),
+            (Some(Quote::Single), '\'') => quote = None,
+            (Some(Quote::Single), character) => output.push(character),
+            (Some(Quote::Double), '"') => quote = None,
+            (Some(Quote::Double), '\\') => output.push(characters.next()?),
+            (Some(Quote::Double), character) => output.push(character),
+        }
+    }
+    quote.is_none().then_some(output)
+}
+
+fn socket_marker_entries(value: &str) -> Option<Vec<&str>> {
+    if matches!(value, "" | "on" | "off") {
+        return Some(Vec::new());
+    }
+    let inner = value.strip_prefix('|')?.strip_suffix('|')?;
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let entries = inner.split('|').collect::<Vec<_>>();
+    entries
+        .iter()
+        .all(|entry| !entry.is_empty())
+        .then_some(entries)
+}
+
+pub(crate) fn socket_marker_contains(value: &str, socket: &str) -> bool {
+    socket_marker_entries(value).is_some_and(|entries| {
+        entries
+            .into_iter()
+            .any(|entry| same_socket_path(Path::new(entry), Path::new(socket)))
+    })
+}
+
+fn same_socket_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn canonical_socket_text(socket: &str) -> String {
+    Path::new(socket)
+        .canonicalize()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| socket.to_owned())
+}
+
+pub(crate) fn changed_socket_marker(
+    current: Option<&str>,
+    socket: &str,
+    enabled: bool,
+) -> Result<Option<String>, String> {
+    if !Path::new(socket).is_absolute() {
+        return Err("coordinator boot marker requires an absolute socket path".into());
+    }
+    if socket.contains('|') || socket.contains(['\n', '\r']) {
+        return Err("coordinator boot marker socket contains an unsupported character".into());
+    }
+    let mut entries = match current {
+        Some(value) => socket_marker_entries(value)
+            .ok_or("invalid coordinator boot marker")?
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    let mut unique = Vec::with_capacity(entries.len() + usize::from(enabled));
+    for entry in entries.drain(..) {
+        if enabled || !same_socket_path(Path::new(&entry), Path::new(socket)) {
+            let entry = canonical_socket_text(&entry);
+            if !unique.contains(&entry) {
+                unique.push(entry);
+            }
+        }
+    }
+    if enabled && !unique.iter().any(|entry| entry == socket) {
+        unique.push(socket.to_owned());
+    }
+    if unique.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!("|{}|", unique.join("|"))))
     }
 }
 
@@ -265,6 +386,54 @@ pub(crate) fn save(path: &Path, saved: &Saved) -> Result<(), String> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Adds or removes an internal on/off marker without disturbing user lines.
+/// Returns without rewriting the file when it already has the wanted state.
+pub(crate) fn update_marker(path: &Path, key: &str, enabled: bool) -> Result<(), String> {
+    let _lock = Lock::take(path)?;
+    let mut saved = load(path)?;
+    if enabled {
+        if saved.get(key) == Some("on") {
+            return Ok(());
+        }
+        saved.set(key, "on");
+    } else {
+        if saved.get(key).is_none() {
+            return Ok(());
+        }
+        saved.remove(key);
+    }
+    save(path, &saved)
+}
+
+/// Adds or removes one absolute socket from an internal marker list. An
+/// unchanged list returns before taking the settings lock. A change is
+/// checked again under the lock before the atomic replacement.
+pub(crate) fn update_socket_marker(
+    path: &Path,
+    key: &str,
+    socket: &str,
+    enabled: bool,
+) -> Result<(Option<String>, bool), String> {
+    let current = load(path)?.get_value(key);
+    let changed = changed_socket_marker(current.as_deref(), socket, enabled)?;
+    if changed == current {
+        return Ok((changed, false));
+    }
+    let _lock = Lock::take(path)?;
+    let mut saved = load(path)?;
+    let current = saved.get_value(key);
+    let changed = changed_socket_marker(current.as_deref(), socket, enabled)?;
+    if changed == current {
+        return Ok((changed, false));
+    }
+    match &changed {
+        Some(value) => saved.set_quoted(key, value),
+        None => saved.remove(key),
+    }
+    save(path, &saved)?;
+    Ok((changed, true))
 }
 
 /// Text of one `## masil:section NAME` block of the layer.
@@ -350,6 +519,137 @@ mod tests {
         assert_eq!(
             saved.render(),
             format!("{HEADER}\n# mine\nbind x kill-pane\n")
+        );
+    }
+
+    #[test]
+    fn marker_lines_are_added_and_removed_without_touching_other_lines() {
+        let directory = std::env::temp_dir().join(format!(
+            "masil-marker-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("settings.conf");
+        fs::write(
+            &path,
+            "# mine\nset -g @masil-theme light\nbind x kill-pane\n",
+        )
+        .unwrap();
+
+        let first = "/tmp/masil socket/one";
+        let second = "/tmp/masil/socket'two";
+        assert_eq!(
+            update_socket_marker(&path, "@masil-coordinator-boot", first, true).unwrap(),
+            (Some(format!("|{first}|")), true)
+        );
+        fs::remove_file(directory.join(".settings.lock")).unwrap();
+        assert_eq!(
+            update_socket_marker(&path, "@masil-coordinator-boot", first, true).unwrap(),
+            (Some(format!("|{first}|")), false)
+        );
+        assert!(!directory.join(".settings.lock").exists());
+        assert_eq!(
+            update_socket_marker(&path, "@masil-coordinator-boot", second, true).unwrap(),
+            (Some(format!("|{first}|{second}|")), true)
+        );
+        let saved = load(&path).unwrap();
+        assert_eq!(
+            saved.get_value("@masil-coordinator-boot"),
+            Some(format!("|{first}|{second}|"))
+        );
+        assert!(
+            saved
+                .get("@masil-coordinator-boot")
+                .is_some_and(|value| value.starts_with('\'') && value.ends_with('\''))
+        );
+
+        assert_eq!(
+            update_socket_marker(&path, "@masil-coordinator-boot", first, false).unwrap(),
+            (Some(format!("|{second}|")), true)
+        );
+        assert_eq!(
+            update_socket_marker(&path, "@masil-coordinator-boot", second, false).unwrap(),
+            (None, true)
+        );
+        assert_eq!(
+            load(&path).unwrap().render(),
+            format!("{HEADER}\n# mine\nset -g @masil-theme light\nbind x kill-pane\n")
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn socket_markers_compare_canonical_paths() {
+        let directory = std::env::temp_dir().join(format!(
+            "masil-marker-paths-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let real = directory.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let socket = real.join("socket[one]*?");
+        fs::write(&socket, "").unwrap();
+        let alias = directory.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let aliased = alias.join("socket[one]*?");
+        let canonical = socket.canonicalize().unwrap();
+        let marker = format!("|{}|", aliased.display());
+        assert!(socket_marker_contains(&marker, canonical.to_str().unwrap()));
+        assert_eq!(
+            changed_socket_marker(Some(&marker), canonical.to_str().unwrap(), true).unwrap(),
+            Some(format!("|{}|", canonical.display()))
+        );
+
+        let current = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let root_depth = current.components().count().saturating_sub(1);
+        let mut relative = PathBuf::new();
+        for _ in 0..root_depth {
+            relative.push("..");
+        }
+        relative.push(canonical.strip_prefix("/").unwrap());
+        let marker = format!("|{}|", relative.display());
+        assert!(socket_marker_contains(&marker, canonical.to_str().unwrap()));
+        assert_eq!(
+            changed_socket_marker(Some(&marker), canonical.to_str().unwrap(), true).unwrap(),
+            Some(format!("|{}|", canonical.display()))
+        );
+
+        if let (Ok(tmp), Ok(private_tmp)) = (
+            Path::new("/tmp").canonicalize(),
+            Path::new("/private/tmp").canonicalize(),
+        ) && tmp == private_tmp
+        {
+            let name = format!("masil-marker-alias-{}", std::process::id());
+            let tmp_socket = Path::new("/tmp").join(&name);
+            fs::write(&tmp_socket, "").unwrap();
+            let private_socket = Path::new("/private/tmp").join(&name);
+            let marker = format!("|{}|", tmp_socket.display());
+            assert!(socket_marker_contains(
+                &marker,
+                private_socket.to_str().unwrap()
+            ));
+            fs::remove_file(tmp_socket).unwrap();
+        }
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn reset_keeps_internal_markers() {
+        let mut saved = Saved::parse(
+            "set -g @masil-theme dark\nset -g @masil-autosave-used on\nset -g @masil-coordinator-boot '|/tmp/one|'\n",
+        );
+        saved.remove_all_managed();
+        assert_eq!(saved.get("@masil-theme"), None);
+        assert_eq!(
+            saved.get_value("@masil-autosave-used").as_deref(),
+            Some("on")
+        );
+        assert_eq!(
+            saved.get_value("@masil-coordinator-boot").as_deref(),
+            Some("|/tmp/one|")
         );
     }
 
@@ -443,6 +743,11 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert_eq!(load(&path).unwrap().get("@masil-theme"), Some("light"));
+        update_marker(&path, "@masil-autosave-used", true).unwrap();
+        assert_eq!(load(&path).unwrap().get("@masil-autosave-used"), Some("on"));
+        update_marker(&path, "@masil-autosave-used", false).unwrap();
+        assert_eq!(load(&path).unwrap().get("@masil-autosave-used"), None);
         assert_eq!(load(&path).unwrap().get("@masil-theme"), Some("light"));
         let link = directory.join("link.conf");
         std::os::unix::fs::symlink(&path, &link).unwrap();

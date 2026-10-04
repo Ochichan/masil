@@ -116,6 +116,10 @@ impl Server {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 let _ = child.kill();
                 let _ = child.wait();
+                // The pipes close with the child, so the readers end; a
+                // caller that forks next must not leave them running.
+                let _ = out.join();
+                let _ = err.join();
                 return Err(format!("{NO_ANSWER}: {}", args.join(" ")));
             }
             std::thread::sleep(Duration::from_millis(10));

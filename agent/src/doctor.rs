@@ -339,7 +339,7 @@ fn coordinator_check(socket: Option<&Path>) -> Check {
         ),
         "enabled_but_not_running" => (
             Status::Warn,
-            "a feature needs the coordinator but none runs; run `masil-agent agent coordinator start`. Autosave brings it back within 30 seconds; a server started with -f or with the UI layer off has no autosave".to_owned(),
+            coordinator_revival_message(socket),
         ),
         "stale" => (
             Status::Warn,
@@ -389,6 +389,30 @@ fn coordinator_check(socket: Option<&Path>) -> Check {
         summary,
         detail: report,
     }
+}
+
+fn coordinator_revival_message(socket: &Path) -> String {
+    if crate::session::autosave_running(socket) {
+        "a feature needs the coordinator but none runs; autosave is running for this socket and will revive it within 30 seconds".to_owned()
+    } else if coordinator_boot_marked(socket) {
+        "a feature needs the coordinator but none runs; autosave will start with the next server start or after `masil-agent session save`".to_owned()
+    } else {
+        "a feature needs the coordinator but none runs; run `masil-agent agent coordinator start`"
+            .to_owned()
+    }
+}
+
+fn coordinator_boot_marked(socket: &Path) -> bool {
+    let Ok(socket) = socket.canonicalize() else {
+        return false;
+    };
+    let Some(socket) = socket.to_str() else {
+        return false;
+    };
+    crate::ui::settings::store::settings_path()
+        .and_then(|path| crate::ui::settings::store::load(&path).ok())
+        .and_then(|saved| saved.get_value("@masil-coordinator-boot"))
+        .is_some_and(|value| crate::ui::settings::store::socket_marker_contains(&value, socket))
 }
 
 fn binary_check() -> Check {

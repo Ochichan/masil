@@ -15,7 +15,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
@@ -107,21 +109,23 @@ struct Options {
     socket: String,
     client: Option<String>,
     auto: bool,
+    boot: bool,
     words: Vec<String>,
 }
 
 fn usage() -> String {
     "usage: masil-agent session [--socket MASIL_SOCKET] [--client CLIENT] \
-     save [--auto]|list|preview [NAME]|restore [NAME]|menu [PAGE]|autosave"
+     save [--auto]|list|preview [NAME]|restore [NAME]|menu [PAGE]|autosave [--boot]"
         .into()
 }
 
 pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     let options = parse(args)?;
-    // The saver leaves the tmux job at once: a server waits for its jobs
-    // before it exits.
-    if options.words == ["autosave"] && !detach()? {
-        return Ok(0);
+    if options.words == ["autosave"] {
+        return autosave(&options.socket, options.boot);
+    }
+    if options.boot {
+        return Err(usage());
     }
     let server = Server::locate(Some(&options.socket))?;
     // From a key or menu, results go to the client's status line; run-shell
@@ -159,6 +163,9 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
                 Kind::Manual
             };
             let result = save(server, &options.socket, kind);
+            if kind == Kind::Manual && matches!(&result, Ok(Some(_))) {
+                after_manual_save(server, &options.socket);
+            }
             let message = match &result {
                 Ok(Some((_, snapshot))) => {
                     let (sessions, panes) = counts(snapshot);
@@ -314,7 +321,6 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
             menu(server, &options.socket, client, korean, page)?;
             Ok((0, None))
         }
-        ["autosave"] => autosave(server, &options.socket).map(|code| (code, None)),
         _ => Err(usage()),
     }
 }
@@ -344,6 +350,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut socket = None;
     let mut client = None;
     let mut auto = false;
+    let mut boot = false;
     let mut words = Vec::new();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -351,6 +358,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--socket" => socket = Some(args.next().ok_or_else(usage)?.clone()),
             "--client" => client = Some(args.next().ok_or_else(usage)?.clone()),
             "--auto" => auto = true,
+            "--boot" => boot = true,
             _ => words.push(arg.clone()),
         }
     }
@@ -371,6 +379,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         socket,
         client,
         auto,
+        boot,
         words,
     })
 }
@@ -1900,8 +1909,9 @@ fn menu(
 /// Continues in a detached child with no terminal and closed standard
 /// streams. Returns false in the parent.
 fn detach() -> Result<bool, String> {
-    // SAFETY: nothing has started threads yet; the child only continues the
-    // single-threaded saver.
+    // SAFETY: no other threads are running; the child only continues the
+    // single-threaded saver. A --boot check joins its command-reader threads
+    // before reaching this fork.
     match unsafe { libc::fork() } {
         -1 => return Err(std::io::Error::last_os_error().to_string()),
         0 => {}
@@ -1950,15 +1960,150 @@ fn autosave_lock(dir: &Path, socket: &str) -> Result<Option<File>, String> {
     Ok(Some(file))
 }
 
+fn autosave_process(argv: &[String], socket: &Path) -> bool {
+    let candidate = match argv {
+        [_, session, autosave, socket_flag, candidate]
+            if session == "session" && autosave == "autosave" && socket_flag == "--socket" =>
+        {
+            candidate
+        }
+        [_, session, autosave, boot, socket_flag, candidate]
+            if session == "session"
+                && autosave == "autosave"
+                && boot == "--boot"
+                && socket_flag == "--socket" =>
+        {
+            candidate
+        }
+        _ => return false,
+    };
+    same_path(Path::new(candidate), socket)
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// Whether this socket has an autosave process, without touching its lock.
+pub(crate) fn autosave_running(socket: &Path) -> bool {
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    crate::process::all().into_iter().any(|pid| {
+        pid != std::process::id() as i32
+            && crate::process::argv(pid).is_some_and(|argv| {
+                argv.first()
+                    .is_some_and(|path| same_path(Path::new(path), &executable))
+                    && autosave_process(&argv, socket)
+            })
+    })
+}
+
+fn after_manual_save(server: &Server, socket: &str) {
+    match crate::ui::settings::store::settings_path() {
+        Some(path) => {
+            if let Err(error) =
+                crate::ui::settings::store::update_marker(&path, "@masil-autosave-used", true)
+            {
+                eprintln!("masil-agent: could not remember autosave use: {error}");
+            }
+        }
+        None => {
+            eprintln!("masil-agent: could not remember autosave use: no configuration directory")
+        }
+    }
+    if let Err(error) = masil(server, &["set-option", "-gq", "@masil-autosave-used", "on"]) {
+        eprintln!("masil-agent: could not set @masil-autosave-used: {error}");
+    }
+    if let Err(error) = start_autosave(socket) {
+        eprintln!("masil-agent: could not start session autosave: {error}");
+    }
+}
+
+pub(crate) fn start_autosave(socket: &str) -> Result<(), String> {
+    let socket = Path::new(socket)
+        .canonicalize()
+        .map_err(|error| format!("resolving server socket: {error}"))?;
+    let socket = socket.to_str().ok_or("server socket path is not UTF-8")?;
+    let mut command = Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
+    command
+        .args(["session", "autosave", "--socket", socket])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    spawn_reaped(&mut command)
+}
+
+fn spawn_reaped(command: &mut Command) -> Result<(), String> {
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    std::thread::Builder::new()
+        .name("masil-autosave-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .map(drop)
+        .map_err(|error| error.to_string())
+}
+
+fn boot_autosave_needed(used: Option<&str>, marker: Option<&str>, socket: &Path) -> bool {
+    used == Some("on")
+        || marker.is_some_and(|value| {
+            socket.to_str().is_some_and(|socket| {
+                crate::ui::settings::store::socket_marker_contains(value, socket)
+            })
+        })
+}
+
+fn boot_autosave_enabled(server: &Server, socket: &Path) -> bool {
+    let live_used = server.global("@masil-autosave-used", Scope::Session);
+    let live_marker = server.global("@masil-coordinator-boot", Scope::Session);
+    if boot_autosave_needed(live_used.as_deref(), live_marker.as_deref(), socket) {
+        return true;
+    }
+    let Some(path) = crate::ui::settings::store::settings_path() else {
+        return false;
+    };
+    let Ok(saved) = crate::ui::settings::store::load(&path) else {
+        return false;
+    };
+    let saved_used = saved.get_value("@masil-autosave-used");
+    let saved_marker = saved.get_value("@masil-coordinator-boot");
+    boot_autosave_needed(
+        live_used.as_deref().or(saved_used.as_deref()),
+        live_marker.as_deref().or(saved_marker.as_deref()),
+        socket,
+    )
+}
+
 /// Saves automatically every @masil-autosave minutes while this server lives.
 /// One saver runs per socket; it stops when no server answers there or the
 /// masil UI layer is turned off, and waits while @masil-autosave is off or 0.
-fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
+fn autosave(raw_socket: &str, boot: bool) -> Result<i32, String> {
+    // The canonical path names this server for the lock, the boot marker and
+    // the coordinator; connecting keeps the path the server was given, which
+    // can be shorter than its canonical form (sun_path is small).
+    let socket = Path::new(raw_socket)
+        .canonicalize()
+        .map_err(|error| format!("resolving server socket: {error}"))?;
+    let socket_text = socket.to_str().ok_or("server socket path is not UTF-8")?;
+    let server = Server::locate(Some(raw_socket))?;
+    if boot && !boot_autosave_enabled(&server, &socket) {
+        return Ok(0);
+    }
+    // The saver leaves the tmux job at once: a server waits for its jobs
+    // before it exits.
+    if !detach()? {
+        return Ok(0);
+    }
     // Before the saver lock: when the server restarts on this socket within
     // one check, the earlier saver keeps the lock and this one exits.
-    crate::coordinator::restart_if_enabled(Path::new(socket));
+    crate::coordinator::restart_if_enabled(&socket);
     let dir = snapshot_dir()?;
-    let Some(_lock) = autosave_lock(&dir, socket)? else {
+    let Some(_lock) = autosave_lock(&dir, socket_text)? else {
         return Ok(0);
     };
     let mut last = std::time::Instant::now();
@@ -1968,7 +2113,7 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
         // A server restarted on the same socket is saved by this saver; its
         // own saver found the lock taken.
         let Ok(state) = masil(
-            server,
+            &server,
             &[
                 "display-message",
                 "-p",
@@ -1976,7 +2121,7 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
             ],
         ) else {
             // A slow reply is no reason to stop; a socket nobody listens on is.
-            if UnixStream::connect(socket).is_err() {
+            if UnixStream::connect(raw_socket).is_err() {
                 return Ok(0);
             }
             continue;
@@ -1988,13 +2133,13 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
         // A server restarted on this socket: start its coordinator if a
         // feature needs one.
         if boot.as_deref().is_some_and(|boot| boot != *current) {
-            crate::coordinator::restart_if_enabled(Path::new(socket));
+            crate::coordinator::restart_if_enabled(&socket);
         } else if *inbox == "on" || *answers == "on" || !wanted.is_empty() {
             // The inbox, `--answers` runs, notifications and schedules need
             // a coordinator: bring back one that ended or runs a replaced
             // executable. A current one answers at once; with none of them
             // left on, nothing starts.
-            crate::coordinator::revive(Path::new(socket));
+            crate::coordinator::revive(&socket);
         }
         boot = Some((*current).to_owned());
         // The core sets @masil-agent only when it loads the layer.
@@ -2007,7 +2152,7 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
             value => value.parse::<u64>().unwrap_or(0),
         };
         if minutes > 0 && last.elapsed() >= Duration::from_secs(minutes * 60) {
-            let _ = save(server, socket, Kind::Auto);
+            let _ = save(&server, socket_text, Kind::Auto);
             last = std::time::Instant::now();
         }
     }
@@ -2016,6 +2161,62 @@ fn autosave(server: &Server, socket: &str) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autosave_process_matches_only_the_requested_socket() {
+        let argv = vec![
+            "/opt/masil-agent".into(),
+            "session".into(),
+            "autosave".into(),
+            "--socket".into(),
+            "/tmp/masil socket".into(),
+        ];
+        assert!(autosave_process(&argv, Path::new("/tmp/masil socket")));
+        assert!(!autosave_process(&argv, Path::new("/tmp/other")));
+        let mut extra = argv;
+        extra.push("ignored".into());
+        assert!(!autosave_process(&extra, Path::new("/tmp/masil socket")));
+
+        let boot = vec![
+            "/opt/masil-agent".into(),
+            "session".into(),
+            "autosave".into(),
+            "--boot".into(),
+            "--socket".into(),
+            "/tmp/masil socket".into(),
+        ];
+        assert!(autosave_process(&boot, Path::new("/tmp/masil socket")));
+    }
+
+    #[test]
+    fn boot_autosave_decision_is_pure() {
+        let socket = Path::new("/tmp/masil socket");
+        assert!(boot_autosave_needed(Some("on"), None, socket));
+        assert!(boot_autosave_needed(
+            Some("off"),
+            Some("|/tmp/masil socket|"),
+            socket
+        ));
+        assert!(!boot_autosave_needed(
+            Some("off"),
+            Some("|/tmp/other|"),
+            socket
+        ));
+        assert!(!boot_autosave_needed(None, None, socket));
+    }
+
+    #[test]
+    fn boot_flag_is_parsed_for_autosave() {
+        let options = parse(&[
+            "autosave".into(),
+            "--boot".into(),
+            "--socket".into(),
+            "/tmp/socket".into(),
+        ])
+        .unwrap();
+        assert!(options.boot);
+        assert_eq!(options.words, ["autosave"]);
+    }
 
     #[test]
     fn stamps_are_utc_and_sortable() {
