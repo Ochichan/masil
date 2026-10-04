@@ -1995,6 +1995,17 @@ fn map_open_code(
         | "questionrejected"
         | "questionv2rejected"
         | "sessioncompacted" => Some("working"),
+        // An interrupt ends the turn with an abort error: that is not a
+        // request for the person.
+        "sessionerror"
+            if properties
+                .get("error")
+                .and_then(|error| error.get("name"))
+                .and_then(Value::as_str)
+                == Some("MessageAbortedError") =>
+        {
+            Some("idle")
+        }
         "permissionasked" | "permissionv2asked" | "questionasked" | "questionv2asked"
         | "sessionerror" => Some("blocked"),
         "sessionidle" => Some("idle"),

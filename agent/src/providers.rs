@@ -615,7 +615,19 @@ fn option_takes_value(arg: &str) -> bool {
 }
 
 pub(crate) fn is_runtime(value: &str) -> bool {
-    matches!(value, "node" | "nodejs" | "bun" | "uv") || is_python_runtime(value)
+    matches!(value, "node" | "nodejs" | "bun" | "uv")
+        || is_python_runtime(value)
+        || is_version_name(value)
+}
+
+/// A program file named after its version, as native installers keep them
+/// (Claude Code runs `~/.local/share/claude/versions/2.1.289`): the
+/// process name says nothing, its argv does.
+fn is_version_name(value: &str) -> bool {
+    value.contains('.')
+        && value
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn is_python_runtime(value: &str) -> bool {
@@ -643,7 +655,7 @@ fn normalize_name(value: &str) -> String {
     basename
 }
 
-fn split_command(command: &str) -> Option<Vec<String>> {
+pub(crate) fn split_command(command: &str) -> Option<Vec<String>> {
     if command.is_empty() || command.len() > 8192 || command.chars().any(char::is_control) {
         return None;
     }
@@ -708,6 +720,9 @@ mod tests {
     fn catalog_matches_reference_provider_set() {
         assert_eq!(all().len(), 24);
         assert_eq!(find("claude-code").map(|p| p.id), Some("claude"));
+        assert!(is_runtime("2.1.289"));
+        assert!(!is_runtime("2"));
+        assert!(!is_runtime("claude"));
         assert_eq!(find("qodercn").map(|p| p.id), Some("qodercli"));
         assert_eq!(find("muse-cli").map(|p| p.id), Some("muse"));
     }

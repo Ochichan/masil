@@ -182,6 +182,10 @@ struct RunEvidence {
     /// The SHA-256 of the run's token (tokens.rs); hooks must show it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    /// When the provider last said a turn was interrupted (an OpenCode
+    /// abort error, a Kimi or MastraCode `Interrupt` hook).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interrupted_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +207,10 @@ struct ReportSource {
     permissions: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     questions: Option<u32>,
+    /// A callback's event (such as `Stop` or `session.error`): what an
+    /// interrupt's outcome is judged by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
 }
 
 /// A process by its ID and start time, which together do not repeat.
@@ -872,6 +880,7 @@ impl Manager {
             let capabilities = capability_view(
                 provider.id,
                 self.engine.has_manifest(provider.id),
+                !self.engine.interrupt_keys(provider.id).is_empty(),
                 run_evidence.as_ref(),
                 process,
                 report_authority,
@@ -1087,6 +1096,40 @@ impl Manager {
 
     /// `Rejected` proves the guard failed before any command ran. An `Err`
     /// leaves the outcome open: part of the group may have run.
+    /// Input that follows earlier input of the same operation (the second
+    /// interrupt key): the same run (boot, pty, foreground group) suffices;
+    /// metadata and tracked state may change in between (a hook's report).
+    async fn guarded_followup_input(
+        &self,
+        agent: &Agent,
+        commands: Vec<Vec<String>>,
+        condition: &str,
+    ) -> Result<Guarded, String> {
+        let guard = and(&[
+            format!("#{{==:#{{masil_core_boot_id}},{}}}", agent.boot),
+            format!("#{{==:#{{masil_pty_generation}},{}}}", agent.generation),
+            format!(
+                "#{{==:#{{masil_foreground_pgid}},{}}}",
+                agent.foreground_group
+            ),
+            "#{==:#{pane_dead},0}".into(),
+            "#{==:#{pane_input_off},0}".into(),
+            condition.into(),
+        ]);
+        let out = self
+            .native
+            .guarded_group(&agent.pane_id, &guard, &commands, "masil-agent-stale")
+            .await
+            .map_err(group_error)?;
+        if String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line == "masil-agent-stale")
+        {
+            return Ok(Guarded::Rejected);
+        }
+        Ok(Guarded::Applied)
+    }
+
     async fn guarded_input_outcome(
         &self,
         agent: &Agent,
@@ -1819,6 +1862,17 @@ impl Manager {
                 .is_some_and(ReportSource::observed)
         });
         if let Some(state) = state {
+            if state == "idle"
+                && matches!(
+                    origin,
+                    ReportOrigin::Callback {
+                        event: "session.error" | "Interrupt",
+                        ..
+                    }
+                )
+            {
+                evidence.interrupted_at = Some(now);
+            }
             metadata.report = Some(Report {
                 sequence,
                 state: state.into(),
@@ -1836,6 +1890,10 @@ impl Manager {
                 live: false,
                 permissions: None,
                 questions: None,
+                event: match origin {
+                    ReportOrigin::Callback { event, .. } => Some(event.chars().take(64).collect()),
+                    ReportOrigin::Run => None,
+                },
             });
         }
         if let ReportOrigin::Callback { event, .. } = origin {
@@ -1901,6 +1959,7 @@ impl Manager {
             live: api.live,
             permissions: Some(api.permissions),
             questions: Some(api.questions),
+            event: None,
         };
         let unchanged = metadata
             .report
@@ -2251,7 +2310,7 @@ fn provider_contract(engine: &Engine, id: &str) -> Result<Value, String> {
         "provider": provider.id,
         "command": provider.command,
         "aliases": provider.aliases,
-        "contract": 1,
+        "contract": 2,
         "detection": if engine.has_manifest(provider.id) { "screen_manifest" } else { "none" },
         "resume": resume,
         "integration": integration,
@@ -2268,7 +2327,7 @@ fn provider_contract(engine: &Engine, id: &str) -> Result<Value, String> {
         },
         "prompt_submit": "guarded_paste",
         "provider_ack": false,
-        "interrupt": "key_delivery",
+        "interrupt": if engine.interrupt_keys(provider.id).is_empty() { "unverified" } else { "measured_keys" },
         "approval_response": false,
         "question_response": false,
         "turn_identity": false,
@@ -2459,6 +2518,7 @@ fn binding_view(metadata: Option<&Metadata>, evidence: Option<&RunEvidence>) -> 
 fn capability_view(
     provider: &str,
     has_manifest: bool,
+    measured_interrupt: bool,
     evidence: Option<&RunEvidence>,
     process: &str,
     report_authority: Option<&str>,
@@ -2496,7 +2556,7 @@ fn capability_view(
         && ((answers && observed)
             || (provider == "claude" && seen.is_some_and(|seen| seen.prompt)));
     CapabilityView {
-        contract: 1,
+        contract: 2,
         state_authority: state_authority.into(),
         session_identity: session_identity.into(),
         prompt_submit: if running {
@@ -2506,10 +2566,10 @@ fn capability_view(
         }
         .into(),
         provider_ack: prompts,
-        interrupt: if running {
-            "key_delivery"
-        } else {
-            "unavailable"
+        interrupt: match (running, measured_interrupt) {
+            (true, true) => "measured_keys",
+            (true, false) => "unverified",
+            (false, _) => "unavailable",
         }
         .into(),
         approval_response: answers,
@@ -2774,6 +2834,15 @@ fn parse_capture_frames(output: &[u8], frames: &[(String, String, String)]) -> O
     (cursor == output.len()).then_some(screens)
 }
 
+/// A foreground process from its `ps` args: a runtime's script, or a
+/// version-named executable's argv (`claude --resume ID` run from
+/// `versions/2.1.289`).
+fn identify_args(args: &str) -> Option<&'static providers::Provider> {
+    providers::identify(args).or_else(|| {
+        providers::split_command(args).and_then(|argv| providers::identify_process(&argv))
+    })
+}
+
 async fn identify_foregrounds(
     inventory: &[Vec<String>],
 ) -> HashMap<String, &'static providers::Provider> {
@@ -2906,7 +2975,7 @@ fn parse_ps_inventory(
         }
         let key = (tty.to_owned(), group);
         if expected.contains(&key)
-            && let Some(provider) = providers::identify(args)
+            && let Some(provider) = identify_args(args)
         {
             found.entry(key).or_insert(provider);
         }
@@ -2960,7 +3029,7 @@ async fn identify_foreground(
             if pgid.parse::<i32>().ok()? != group {
                 return None;
             }
-            providers::identify(args.trim())
+            identify_args(args.trim())
         })
         .next()
 }
@@ -3288,7 +3357,7 @@ mod tests {
     #[test]
     fn capabilities_follow_evidence_not_provider_names() {
         let none = binding_view(None, None);
-        let screen = capability_view("claude", true, None, "running", None, &none);
+        let screen = capability_view("claude", true, true, None, "running", None, &none);
         assert_eq!(screen.state_authority, "screen_detection");
         assert_eq!(screen.session_identity, "none");
         assert_eq!(screen.integration, "native_session_only");
@@ -3317,6 +3386,7 @@ mod tests {
         let native = capability_view(
             "pi",
             true,
+            false,
             Some(&evidence),
             "running",
             Some(REPORT_SOURCE_CALLBACK),
@@ -3326,7 +3396,7 @@ mod tests {
         assert_eq!(native.session_identity, "native_callback");
         assert!(native.lifecycle_seen && native.callbacks_seen && native.resume);
 
-        let exited = capability_view("pi", true, Some(&evidence), "exited", None, &binding);
+        let exited = capability_view("pi", true, false, Some(&evidence), "exited", None, &binding);
         assert_eq!(exited.state_authority, "process_only");
         assert_eq!(exited.prompt_submit, "unavailable");
         assert_eq!(exited.interrupt, "unavailable");
@@ -3340,7 +3410,18 @@ mod tests {
             callback("session_start"),
         );
         let conflict = view(&metadata, &evidence);
-        assert!(!capability_view("pi", true, Some(&evidence), "running", None, &conflict).resume);
+        assert!(
+            !capability_view(
+                "pi",
+                true,
+                false,
+                Some(&evidence),
+                "running",
+                None,
+                &conflict
+            )
+            .resume
+        );
     }
 
     #[test]
@@ -3374,6 +3455,7 @@ mod tests {
             live: false,
             permissions: None,
             questions: None,
+            event: Some("e".repeat(64)),
         });
         assert_eq!(
             decode::<RunEvidence>(&encode(&evidence).unwrap()),

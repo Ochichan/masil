@@ -185,8 +185,28 @@ pub(crate) fn needed(verb: &str, args: &[String]) -> Option<Scope> {
             _ => return None,
         },
         "close" | "resume" | "rename" | "attach" => Act,
-        // C-c on an approval or question screen declines it.
-        "interrupt" => Admin,
+        // A key on an approval or question screen declines it. Overrides
+        // of the screen check and of the keys are a person's (CLI only).
+        "interrupt" => {
+            let mut index = 1;
+            while index < args.len() {
+                let value = args.get(index + 1).filter(|value| !value.starts_with('-'));
+                match (args[index].as_str(), value) {
+                    ("--run" | "--operation", Some(_)) => index += 2,
+                    // Within the API's own time limit for a call.
+                    ("--confirm-seconds", Some(seconds))
+                        if seconds.parse::<u64>().is_ok_and(|seconds| seconds <= 30) =>
+                    {
+                        index += 2
+                    }
+                    _ => return None,
+                }
+            }
+            match word(0) {
+                Some(target) if !target.starts_with('-') => Admin,
+                _ => return None,
+            }
+        }
         // Starting one turns on this machine's microphone: no scope.
         "dictate" => match args {
             [status] if status == "--status" => Read,
@@ -320,6 +340,13 @@ mod tests {
             ("focus", &["builder"][..]),
             ("put", &["file"][..]),
             ("dictate", &["builder"][..]),
+            ("interrupt", &["builder", "--any-state"][..]),
+            ("interrupt", &["builder", "--key", "C-c"][..]),
+            (
+                "interrupt",
+                &["builder", "--run", "r", "--operation", "--any-state"][..],
+            ),
+            ("interrupt", &["builder", "--confirm-seconds", "60"][..]),
             ("dictate", &["--toggle", "builder"][..]),
         ] {
             assert_eq!(needed(verb, &args(words)), None, "{verb} {words:?}");
@@ -347,6 +374,11 @@ mod tests {
         check("prompt", &["builder", "fix the build"], Scope::Act);
         check("prompt", &["builder", "line one\n\tline two"], Scope::Act);
         check("interrupt", &["builder"], Scope::Admin);
+        check(
+            "interrupt",
+            &["builder", "--run", "r", "--operation", "k"],
+            Scope::Admin,
+        );
         check("dictate", &["--status"], Scope::Read);
         check("dictate", &["--stop"], Scope::Act);
         check("dictate", &["--cancel"], Scope::Act);

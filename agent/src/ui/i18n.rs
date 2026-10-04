@@ -574,7 +574,10 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                 Key("s", "Resume a reported native session in a new pane"),
                 Key("d", "Prepare a draft in the tmux buffer only"),
                 Key("p", "Send a prompt and Enter to a verified idle agent"),
-                Key("x / Ctrl-C", "Confirm delivery of C-c to the agent"),
+                Key(
+                    "x / Ctrl-C",
+                    "Interrupt the agent's turn with its own key (Esc for Claude and Codex)",
+                ),
                 Key("X", "Confirm closing the selected pane"),
                 Key(
                     "y",
@@ -631,7 +634,10 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                 Key("s", "보고된 네이티브 세션을 새 창에서 재개"),
                 Key("d", "tmux 버퍼에만 초안 준비"),
                 Key("p", "검증된 대기 에이전트에 프롬프트와 Enter 전달"),
-                Key("x / Ctrl-C", "확인 후 에이전트에 C-c 전달"),
+                Key(
+                    "x / Ctrl-C",
+                    "에이전트의 turn을 그 provider의 key로 끊기(Claude, Codex는 Esc)",
+                ),
                 Key("X", "확인 후 선택한 창 닫기"),
                 Key(
                     "y",

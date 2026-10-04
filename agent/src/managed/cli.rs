@@ -783,7 +783,77 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             manager.focus(&agent).await?;
             print(&json!({"stage":"selected","pane_id":agent.pane_id,"run":agent.run}))?;
         }
-        "interrupt" | "close" if !args.is_empty() => {
+        "interrupt" if !args.is_empty() => {
+            let mut asked = super::durable::InterruptRequest::default();
+            let mut confirm = 5;
+            let mut rest = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--any-state" => {
+                        asked.any_state = true;
+                        i += 1;
+                    }
+                    "--key" => {
+                        let key = value(args, i)?;
+                        if !matches!(key, "Escape" | "C-c" | "C-d" | "C-g" | "q") {
+                            return Err("usage: --key is Escape, C-c, C-d, C-g or q".into());
+                        }
+                        let keys = asked.keys.get_or_insert_with(Vec::new);
+                        if keys.len() == 4 {
+                            return Err("usage: at most 4 --key".into());
+                        }
+                        keys.push(key.to_owned());
+                        i += 2;
+                    }
+                    "--confirm-seconds" => {
+                        confirm = value(args, i)?
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|seconds| *seconds <= 60)
+                            .ok_or("usage: --confirm-seconds is 0-60")?;
+                        i += 2;
+                    }
+                    // A flag's value is never read as a flag.
+                    "--run" | "--operation" => {
+                        rest.push(args[i].clone());
+                        rest.push(value(args, i)?.to_owned());
+                        i += 2;
+                    }
+                    _ => {
+                        rest.push(args[i].clone());
+                        i += 1;
+                    }
+                }
+            }
+            // What a person may override, neither an agent nor the API may.
+            if (asked.any_state || asked.keys.is_some())
+                && (std::env::var_os("MASIL_API_CALL").is_some()
+                    || !matches!(super::answer::agent_ancestor(), Ok(false)))
+            {
+                return Err("interrupt_refused: --any-state and --key are a person's; this command came through the extension API, runs inside an agent, or its ancestry could not be read".into());
+            }
+            let (run, operation) = run_operation(&rest)?;
+            let key = client_key(run, operation, "--run RUN")?;
+            let agent = match manager.get(&args[0]).await {
+                Ok(agent) => agent,
+                Err(error) => return Err(keyed_error(error, command, key)),
+            };
+            if key.is_some_and(|key| key.pin != agent.run) {
+                return Err(keyed_error(
+                    "identity_mismatch: interrupt target run changed; this operation cannot be replayed".into(),
+                    command,
+                    key,
+                ));
+            }
+            let asked_at = crate::observation::now_ms();
+            let outcome = manager.interrupt_with(&agent, key, &asked).await?;
+            let outcome = manager
+                .confirm_interrupt(&agent, outcome, confirm, asked_at)
+                .await;
+            return print_record(&manager, &outcome, false).await;
+        }
+        "close" if !args.is_empty() => {
             let (run, operation) = run_operation(&args[1..])?;
             let key = client_key(run, operation, "--run RUN")?;
             let agent = match manager.get(&args[0]).await {
@@ -799,9 +869,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     key,
                 ));
             }
-            let outcome = if command == "interrupt" {
-                manager.interrupt(&agent, key).await?
-            } else {
+            let outcome = {
                 match manager.close_with_operation(&agent, key).await {
                     // A report written meanwhile (a hook, the coordinator)
                     // changes what the guard compares. Once more, for the

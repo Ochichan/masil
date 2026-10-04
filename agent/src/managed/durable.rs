@@ -47,6 +47,24 @@ enum Effect {
     Close,
 }
 
+/// What a person asked of an interrupt beyond its agent (the CLI; the
+/// desk, endpoints and the API ask for neither).
+#[derive(Clone, Default)]
+pub(crate) struct InterruptRequest {
+    /// Send even without an interruptible turn on the screen.
+    pub(crate) any_state: bool,
+    /// These keys instead of the provider's measured ones.
+    pub(crate) keys: Option<Vec<String>>,
+}
+
+/// How an interrupt reaches the provider.
+enum Via {
+    /// Keys into the pane, in order.
+    Keys(Vec<String>),
+    /// OpenCode's own abort, over its answer channel.
+    Abort,
+}
+
 impl Effect {
     fn action(self) -> &'static str {
         match self {
@@ -163,10 +181,237 @@ impl Manager {
         agent: &Agent,
         key: Option<ClientKey<'_>>,
     ) -> Result<Value, String> {
+        let receipt = self
+            .interrupt_with(agent, key, &InterruptRequest::default())
+            .await?;
+        Ok(self.confirm_interrupt(agent, receipt, 0, 0).await)
+    }
+
+    /// Interrupts the agent's turn: with the provider's measured keys, or
+    /// OpenCode's abort, and only while its screen shows a turn those end.
+    pub async fn interrupt_with(
+        &self,
+        agent: &Agent,
+        key: Option<ClientKey<'_>>,
+        request: &InterruptRequest,
+    ) -> Result<Value, String> {
         if agent.process != "running" {
             return Err("identity_mismatch: agent is not verified in the foreground".into());
         }
-        self.effect(agent, Effect::Interrupt, key).await
+        self.effect(agent, Effect::Interrupt, key, Some(request))
+            .await
+    }
+
+    /// Whether and how this agent's turn can be interrupted now, judged on
+    /// a fresh look at its screen; the agent as seen then.
+    async fn interrupt_plan(
+        &self,
+        store: &mut Store,
+        agent: &Agent,
+        request: &InterruptRequest,
+    ) -> Result<(Agent, Via), String> {
+        let current = self.get(&agent.pane_id).await?;
+        if current.run != agent.run {
+            return Err("identity_mismatch: interrupt target run changed".into());
+        }
+        let evidence = serde_json::to_value(&*current.evidence).map_err(|e| e.to_string())?;
+        // A report's state is judged by the screen under it.
+        let screen = if evidence["source"] == "run_report" {
+            &evidence["screen"]
+        } else {
+            &evidence
+        };
+        // How first: without a way, nothing about the screen matters.
+        let via = if request.keys.is_none() && self.abort_possible(&current) {
+            Via::Abort
+        } else {
+            let keys = request
+                .keys
+                .clone()
+                .unwrap_or_else(|| self.engine.interrupt_keys(&current.provider));
+            if keys.is_empty() {
+                let source = screen["manifest_source"].as_str().unwrap_or_default();
+                return Err(match source.strip_prefix("override:") {
+                    Some(path) => format!(
+                        "interrupt_unverified: the detection override {path} names no interrupt_keys; nothing was sent (a person can pass --key)"
+                    ),
+                    None => format!(
+                        "interrupt_unverified: masil has not measured how {} interrupts a turn; nothing was sent (a person can pass --key)",
+                        current.provider
+                    ),
+                });
+            }
+            Via::Keys(keys)
+        };
+        if !request.any_state {
+            let refused = |why: &str| {
+                Err(format!(
+                    "interrupt_not_working: {why}; nothing was sent (a person can pass --any-state)"
+                ))
+            };
+            if screen["skip_state_update"] == true {
+                return refused("the screen hides the turn (a transcript or another view)");
+            }
+            if current.state == "blocked"
+                || screen["blocked_rule_matched"] == true
+                || current.evidence.visible_blocker()
+            {
+                return refused("a request is waiting; the keys would answer it");
+            }
+            if screen["interruptible"] != true {
+                return refused("the screen shows no turn that these keys interrupt");
+            }
+            if store.open_requests(&current.run)? > 0 {
+                return refused("the agent waits on a request; the keys would answer it");
+            }
+        }
+        Ok((current, via))
+    }
+
+    /// What followed a fresh interrupt key, watched for up to `seconds`:
+    /// the receipt with `stopped`, and the record's stage moved when the
+    /// evidence says what happened. Watching never sends anything.
+    pub(crate) async fn confirm_interrupt(
+        &self,
+        agent: &Agent,
+        mut receipt: Value,
+        seconds: u64,
+        asked_at: u64,
+    ) -> Value {
+        let stopped = |stage: &str| match stage {
+            "provider_stopped" => "confirmed",
+            "turn_end_observed" => "turn_ended",
+            "completed_before_interrupt" => "completed_first",
+            "provider_exited" => "provider_exited",
+            _ => "not_checked",
+        };
+        let stage = receipt["stage"].as_str().unwrap_or_default().to_owned();
+        if seconds == 0 || stage != "interrupt_key_delivered" {
+            receipt["stopped"] = json!(stopped(&stage));
+            return receipt;
+        }
+        let Some(key) = receipt["operation_key"].as_str().map(str::to_owned) else {
+            receipt["stopped"] = json!("not_checked");
+            return receipt;
+        };
+        // Only a delivery made just now: a retry's receipt is as recorded.
+        let record = match self
+            .operation_store()
+            .await
+            .and_then(|store| store.get(&key))
+        {
+            Ok(Some(record)) if now_ms().saturating_sub(record.updated_ms) <= 3_000 => record,
+            _ => {
+                receipt["stopped"] = json!("not_checked");
+                return receipt;
+            }
+        };
+        // From just before the request: a callback may land before the
+        // receipt is written.
+        let delivered = asked_at;
+        // Only where the manifest cannot tell idle: elsewhere an unmatched
+        // screen may be a dialog.
+        let without_idle_rule = !self.engine.has_idle_rule(&agent.provider);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        // A working screen gone twice in a row: some providers' manifests
+        // have no idle rule (the screen then reads unknown).
+        let mut gone = 0;
+        let verdict = loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            match self.get(&agent.pane_id).await {
+                Ok(current) if current.run == agent.run => {
+                    if current.state == "exited" {
+                        break Some(("provider_exited", json!({"observed": "exited"})));
+                    }
+                    // The provider said so, after the key.
+                    if current
+                        .run_evidence
+                        .as_ref()
+                        .and_then(|evidence| evidence.interrupted_at)
+                        .is_some_and(|at| at >= delivered)
+                    {
+                        break Some((
+                            "provider_stopped",
+                            json!({"observed": "provider_said_interrupted"}),
+                        ));
+                    }
+                    let evidence = serde_json::to_value(&*current.evidence).unwrap_or_default();
+                    if current.state == "idle" {
+                        if evidence["source"] == "run_report" {
+                            // Only a report written after the key counts.
+                            if evidence["observed_at_ms"]
+                                .as_u64()
+                                .is_some_and(|at| at >= delivered)
+                            {
+                                let event = current
+                                    .run_evidence
+                                    .as_ref()
+                                    .and_then(|evidence| evidence.report.as_ref())
+                                    .and_then(|source| source.event.clone());
+                                break Some(match event.as_deref() {
+                                    Some("Stop") => {
+                                        ("completed_before_interrupt", json!({"event": event}))
+                                    }
+                                    _ => ("turn_end_observed", json!({"event": event})),
+                                });
+                            }
+                        } else if evidence["visible_idle"] == true {
+                            break Some((
+                                "turn_end_observed",
+                                json!({"rule": evidence["matched_rule"]["id"]}),
+                            ));
+                        }
+                    }
+                    let screen = if evidence["source"] == "run_report" {
+                        &evidence["screen"]
+                    } else {
+                        &evidence
+                    };
+                    gone = if without_idle_rule
+                        && current.state != "blocked"
+                        && current.state != "working"
+                        && screen["interruptible"] != true
+                    {
+                        gone + 1
+                    } else {
+                        0
+                    };
+                    if gone >= 2 {
+                        break Some((
+                            "turn_end_observed",
+                            json!({"observed": "working_screen_gone"}),
+                        ));
+                    }
+                }
+                // Its run is gone: the keys ended the agent.
+                Ok(_) => break Some(("provider_exited", json!({"observed": "run_replaced"}))),
+                Err(error) if super::failure::classify(&error).1 == "target_absent" => {
+                    break Some(("provider_exited", json!({"observed": "target_absent"})));
+                }
+                Err(_) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+        };
+        match verdict {
+            Some((stage, evidence)) => {
+                let moved = self.operation_store().await.and_then(|mut store| {
+                    store.confirm_interrupt(&record, stage, &evidence, now_ms())
+                });
+                if matches!(moved, Ok(true)) {
+                    receipt["stage"] = json!(stage);
+                }
+                receipt["stopped"] = json!(stopped(stage));
+                receipt["evidence"] = evidence;
+            }
+            None => receipt["stopped"] = json!("unconfirmed"),
+        }
+        receipt
+    }
+
+    fn abort_possible(&self, agent: &Agent) -> bool {
+        super::answer::requested(agent) && agent.session_id.is_some()
     }
 
     /// Close the agent's pane once per operation key.
@@ -175,7 +420,7 @@ impl Manager {
         agent: &Agent,
         key: Option<ClientKey<'_>>,
     ) -> Result<Value, String> {
-        let outcome = self.effect(agent, Effect::Close, key).await?;
+        let outcome = self.effect(agent, Effect::Close, key, None).await?;
         let stage = outcome["stage"].as_str().unwrap_or_default();
         if !matches!(
             stage,
@@ -191,6 +436,7 @@ impl Manager {
         agent: &Agent,
         effect: Effect,
         key: Option<ClientKey<'_>>,
+        asked: Option<&InterruptRequest>,
     ) -> Result<Value, String> {
         if let Some(key) = key {
             if !operations::valid_id(key.id) {
@@ -247,10 +493,126 @@ impl Manager {
                     );
                 }
             };
+            // Judged only when it would be sent: a retry of a recorded key
+            // gets its receipt above whatever the agent does now.
+            let (agent, via) = match asked {
+                Some(asked) => match self.interrupt_plan(&mut store, agent, asked).await {
+                    Ok((current, via)) => (current, Some(via)),
+                    Err(error) => {
+                        let _ = store.finish(
+                            &ticket,
+                            "rejected_before_effect",
+                            "guard",
+                            Some(&json!({"reason": error})),
+                            now_ms(),
+                        );
+                        return Err(error);
+                    }
+                },
+                None => (agent.clone(), None),
+            };
+            let keys = match via {
+                Some(Via::Keys(keys)) => keys,
+                Some(Via::Abort) => {
+                    if let Some(outcome) = self
+                        .abort_effect(&mut store, &agent, &ticket, (&raw, &fence))
+                        .await
+                    {
+                        return outcome;
+                    }
+                    // No channel after all: the measured keys.
+                    let keys = self.engine.interrupt_keys(&agent.provider);
+                    if keys.is_empty() {
+                        let _ = store.finish(
+                            &ticket,
+                            "rejected_before_effect",
+                            "guard",
+                            None,
+                            now_ms(),
+                        );
+                        return Err(
+                            "interrupt_unverified: no answer channel and no measured keys".into(),
+                        );
+                    }
+                    keys
+                }
+                None => vec!["C-c".to_owned()],
+            };
             return self
-                .dispatch_effect(&mut store, agent, effect, &ticket, &raw, &fence)
+                .dispatch_effect(&mut store, &agent, effect, &ticket, (&raw, &fence), &keys)
                 .await;
         }
+    }
+
+    /// OpenCode's own abort for an interrupt; its answer is the evidence.
+    /// None when the answer channel cannot be reached.
+    async fn abort_effect(
+        &self,
+        store: &mut Store,
+        agent: &Agent,
+        ticket: &Ticket,
+        (raw, fence): (&str, &str),
+    ) -> Option<Result<Value, String>> {
+        let (endpoint, session) = self.abort_channel(agent).await?;
+        // Its ticket goes into the effects ledger before the request: a
+        // process that dies mid-request leaves a pending entry, which
+        // reconcile reads as unknown, never as not applied.
+        let mut effects = Self::effects_for(&agent.run, raw);
+        if effects.entries.len() == MAX_EFFECTS {
+            effects.entries.remove(0);
+        }
+        effects.entries.push(EffectEntry {
+            key: ticket.key.clone(),
+            ticket: ticket.ticket.clone(),
+            stage: "pending".into(),
+        });
+        let pending = match encode(&effects) {
+            Ok(pending) => pending,
+            Err(error) => return Some(Err(error)),
+        };
+        match self
+            .compare_and_set(
+                &agent.pane_id,
+                &[(EFFECTS, raw), (EFFECTS_FENCE, fence)],
+                &[(EFFECTS, pending)],
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = store.finish(ticket, "rejected_before_effect", "guard", None, now_ms());
+                return Some(Err(
+                    "rejected_before_effect: interrupt was not applied: operation effects changed first".into(),
+                ));
+            }
+            Err(error) => return Some(Err(error)),
+        }
+        let answered = endpoint.abort(&session).await;
+        let now = now_ms();
+        let (stage, evidence) = match &answered {
+            Ok(()) => ("provider_stopped", json!({"via": "opencode_abort"})),
+            Err(error) if error.starts_with("not_applied") => (
+                "not_applied",
+                json!({"via": "opencode_abort", "error": error}),
+            ),
+            Err(error) => (
+                "outcome_unknown",
+                json!({"via": "opencode_abort", "error": error}),
+            ),
+        };
+        let recorded = store
+            .finish(ticket, stage, "opencode_abort", Some(&evidence), now)
+            .map(|record| effect_receipt(&record))
+            .map_err(|error| {
+                String::from(AfterEffect::new(format!(
+                    "interrupt receipt could not be committed: {error}; query `agent operation {}`",
+                    ticket.key
+                )))
+            });
+        Some(match answered {
+            Ok(()) => recorded,
+            Err(error) => recorded.and(Err(error)),
+        })
     }
 
     /// The effects option, its fence and the server's recorded store instance.
@@ -278,8 +640,8 @@ impl Manager {
         agent: &Agent,
         effect: Effect,
         ticket: &Ticket,
-        raw: &str,
-        fence: &str,
+        (raw, fence): (&str, &str),
+        keys: &[String],
     ) -> Result<Value, String> {
         let mut effects = Self::effects_for(&agent.run, raw);
         if effects.entries.len() == MAX_EFFECTS {
@@ -291,22 +653,29 @@ impl Manager {
             stage: "pending".into(),
         });
         let pending = encode(&effects)?;
-        let mut commands = vec![Self::option(agent, EFFECTS, pending)];
+        let mut commands = vec![Self::option(agent, EFFECTS, pending.clone())];
+        let send = |key: &str| {
+            vec![
+                "send-keys".to_owned(),
+                "-t".to_owned(),
+                agent.pane_id.clone(),
+                "--".to_owned(),
+                key.to_owned(),
+            ]
+        };
+        let (first, later) = keys.split_first().ok_or("no interrupt key")?;
         match effect {
             Effect::Interrupt => {
-                effects
-                    .entries
-                    .last_mut()
-                    .ok_or("missing effect entry")?
-                    .stage = "delivered".into();
-                commands.push(vec![
-                    "send-keys".into(),
-                    "-t".into(),
-                    agent.pane_id.clone(),
-                    "--".into(),
-                    "C-c".into(),
-                ]);
-                commands.push(Self::option(agent, EFFECTS, encode(&effects)?));
+                commands.push(send(first));
+                // With more keys to come the entry stays pending.
+                if later.is_empty() {
+                    effects
+                        .entries
+                        .last_mut()
+                        .ok_or("missing effect entry")?
+                        .stage = "delivered".into();
+                    commands.push(Self::option(agent, EFFECTS, encode(&effects)?));
+                }
             }
             // The pane and its options disappear with the kill.
             Effect::Close => {
@@ -345,6 +714,57 @@ impl Manager {
                         }
                     })
             }
+        };
+        // The keys after the first, each in its own group a moment later
+        // (a TUI reads two at once as one Alt key): applied while the
+        // pending entry is still the one the first group wrote.
+        let result = match result {
+            Ok(Guarded::Applied) if effect == Effect::Interrupt && !later.is_empty() => {
+                let mut outcome = Ok(Guarded::Applied);
+                let mut current = pending.clone();
+                for (index, key) in later.iter().enumerate() {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let mut commands = vec![send(key)];
+                    if index + 1 == later.len() {
+                        effects
+                            .entries
+                            .last_mut()
+                            .ok_or("missing effect entry")?
+                            .stage = "delivered".into();
+                        commands.push(Self::option(agent, EFFECTS, encode(&effects)?));
+                    }
+                    let cas = [
+                        format!("#{{==:#{{{EFFECTS}}},{current}}}"),
+                        format!("#{{==:#{{{EFFECTS_FENCE}}},{fence}}}"),
+                    ];
+                    match self
+                        .guarded_followup_input(agent, commands, &and(&cas))
+                        .await
+                    {
+                        Ok(Guarded::Applied) => current = encode(&effects)?,
+                        Ok(Guarded::Rejected) => {
+                            let _ = store.finish(
+                                ticket,
+                                "interrupt_partial",
+                                "guard",
+                                Some(&json!({"keys_sent": index + 1, "keys": keys})),
+                                now_ms(),
+                            );
+                            return Err(format!(
+                                "interrupt_partial: {} of {} keys reached the pane before it changed; look at the agent",
+                                index + 1,
+                                keys.len()
+                            ));
+                        }
+                        Err(error) => {
+                            outcome = Err(error);
+                            break;
+                        }
+                    }
+                }
+                outcome
+            }
+            other => other,
         };
         let now = now_ms();
         match result {

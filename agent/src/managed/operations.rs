@@ -3661,6 +3661,52 @@ impl Store {
             .map_err(sql)
     }
 
+    /// What followed a delivered interrupt key (`provider_stopped`,
+    /// `turn_end_observed`, `completed_before_interrupt`, `provider_exited`).
+    /// False when the record is no longer `interrupt_key_delivered`.
+    pub fn confirm_interrupt(
+        &mut self,
+        record: &Record,
+        stage: &str,
+        evidence: &Value,
+        now: u64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let seq = Self::next_seq(&tx)?;
+        let changed = tx
+            .execute(
+                "UPDATE operations SET state = ?3, updated_ms = ?4, store_seq = ?5
+                 WHERE id = ?1 AND ticket = ?2 AND state = 'interrupt_key_delivered'",
+                params![record.op, record.ticket, stage, now as i64, seq],
+            )
+            .map_err(sql)?;
+        if changed == 1 {
+            Self::append(&tx, record.op, stage, "observation", Some(evidence), now)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(changed == 1)
+    }
+
+    /// A run's approval and question requests nobody has answered yet.
+    pub fn open_requests(&self, run: &str) -> Result<i64, String> {
+        if !Self::inbox_table_in(&self.conn)? {
+            return Ok(0);
+        }
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM inbox_events
+                 WHERE run = ?1 AND resolved_ms IS NULL
+                   AND kind IN ('approval_requested', 'question_asked')",
+                [run],
+                |row| row.get(0),
+            )
+            .map_err(sql)
+    }
+
     /// Records that the provider took a delivered prompt in as a turn of
     /// its own. False when the record is no longer `delivered`.
     pub fn accept_prompt(

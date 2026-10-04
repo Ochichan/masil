@@ -340,6 +340,29 @@ pub(super) struct Endpoint {
 }
 
 impl Endpoint {
+    /// Ends the session's current turn: a positive answer that it stopped.
+    pub(super) async fn abort(&self, session: &str) -> Result<(), String> {
+        match self
+            .send(
+                Method::POST,
+                &format!("/session/{session}/abort"),
+                None,
+                true,
+            )
+            .await
+        {
+            Ok((status, _)) if status.is_success() => Ok(()),
+            // A server error may have come after the abort took.
+            Ok((status, _)) if status.is_server_error() => Err(format!(
+                "outcome_unknown: OpenCode answered {status} to the abort"
+            )),
+            Ok((status, _)) => Err(format!(
+                "not_applied: OpenCode answered {status} to the abort"
+            )),
+            Err(error) => Err(format!("outcome_unknown: the abort got no answer: {error}")),
+        }
+    }
+
     /// `GET /event`: the server's event stream, open until either side
     /// ends it. Only connecting has a time limit.
     pub(super) async fn events(&self) -> Result<reqwest::Response, String> {
@@ -558,6 +581,25 @@ pub(super) fn requested(agent: &Agent) -> bool {
 }
 
 impl Manager {
+    /// The run's OpenCode server and bound session, for ending its turn
+    /// (`POST /session/ID/abort`). None when the run has no answer channel
+    /// or no bound session, or the server cannot be reached; the interrupt
+    /// keys are used then.
+    pub(super) async fn abort_channel(&self, agent: &Agent) -> Option<(Endpoint, String)> {
+        if !requested(agent) {
+            return None;
+        }
+        let session = agent.session_id.as_deref().filter(|session| {
+            !session.is_empty()
+                && session.len() <= 128
+                && session
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })?;
+        let endpoint = self.answer_endpoint(agent).await.ok()?;
+        Some((endpoint, session.to_owned()))
+    }
+
     /// The run's server password; secrets of runs that ended are dropped
     /// on the way.
     async fn answer_secret(&self, run: &str) -> Result<Option<String>, String> {

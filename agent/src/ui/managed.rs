@@ -939,7 +939,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             }
                         } else if !app.inbox.open && matches!(&event, Event::Key(key) if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
                             if let Some(agent) = selected_agent(&app, &agents).filter(|agent| !agent.stale) {
-                                dialog = Some(Dialog::confirm(app.language, DialogKind::Interrupt(agent.clone()), word(app.language, "Interrupt agent?", "에이전트를 중단할까요?"), word(app.language, "Delivers C-c to the verified foreground process. Provider handling is not asserted.", "검증된 포그라운드 프로세스에 C-c를 전달합니다. 제공자의 처리 여부는 확인되지 않습니다."), word(app.language, "Interrupt", "중단")));
+                                dialog = Some(Dialog::confirm(app.language, DialogKind::Interrupt(agent.clone()), word(app.language, "Interrupt agent?", "에이전트를 중단할까요?"), word(app.language, "Sends the provider's interrupt key (Esc for Claude and Codex) while its screen shows a turn. Whether the provider stopped is not asserted.", "화면에 turn이 보일 때 provider의 끊기 key(Claude, Codex는 Esc)를 보냅니다. provider가 멈췄는지는 확인하지 않습니다."), word(app.language, "Interrupt", "중단")));
                                 app.dirty = true;
                             }
                             Vec::new()
@@ -1395,8 +1395,8 @@ fn dispatch_effect(
                     word(app.language, "Interrupt agent?", "에이전트를 중단할까요?"),
                     word(
                         app.language,
-                        "Delivers C-c to the verified foreground process. Provider handling is not asserted.",
-                        "검증된 포그라운드 프로세스에 C-c를 전달합니다. 제공자의 처리 여부는 확인되지 않습니다.",
+                        "Sends the provider's interrupt key (Esc for Claude and Codex) while its screen shows a turn. Whether the provider stopped is not asserted.",
+                        "화면에 turn이 보일 때 provider의 끊기 key(Claude, Codex는 Esc)를 보냅니다. provider가 멈췄는지는 확인하지 않습니다.",
                     ),
                     word(app.language, "Interrupt", "중단"),
                 ));
@@ -2128,9 +2128,9 @@ fn submit_dialog(
                 let result = fleet.interrupt(&agent).await.map(|_| {
                     ActionResult::Receipt(message(
                         language,
-                        "C-c delivered to the selected pane; provider handling is unverified"
+                        "The interrupt key reached the selected pane; whether the provider stopped is unverified"
                             .into(),
-                        "선택한 창에 C-c를 전달했습니다. 제공자의 처리 여부는 확인되지 않습니다"
+                        "선택한 창에 끊기 key를 보냈습니다. 제공자가 멈췄는지는 확인되지 않습니다"
                             .into(),
                     ))
                 });

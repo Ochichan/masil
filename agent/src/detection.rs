@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::providers;
 
-const ENGINE_VERSION: u32 = 3;
+const ENGINE_VERSION: u32 = 4;
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 const MAX_SCREEN_BYTES: usize = 1024 * 1024;
 const MAX_REGION_CACHE_BYTES: usize = MAX_SCREEN_BYTES;
@@ -98,6 +98,45 @@ impl Engine {
             engine.manifests.insert(*id, ManifestEntry::Loaded(loaded));
         }
         Ok(engine)
+    }
+
+    /// The keys that interrupt this provider's turn; empty when masil has
+    /// not measured them.
+    pub fn interrupt_keys(&self, provider: &str) -> Vec<String> {
+        providers::find(provider)
+            .and_then(|provider| self.manifests.get(provider.id))
+            .and_then(|manifest| manifest.loaded().ok())
+            .map(|loaded| loaded.manifest.interrupt_keys.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether this provider's manifest can tell an idle screen.
+    pub fn has_idle_rule(&self, provider: &str) -> bool {
+        providers::find(provider)
+            .and_then(|provider| self.manifests.get(provider.id))
+            .and_then(|manifest| manifest.loaded().ok())
+            .is_some_and(|loaded| {
+                loaded
+                    .manifest
+                    .rules
+                    .iter()
+                    .any(|rule| rule.state == State::Idle)
+            })
+    }
+
+    /// Whether this provider's rule of that id marks a turn the interrupt
+    /// keys end.
+    pub fn interruptible_rule(&self, provider: &str, rule: &str) -> bool {
+        providers::find(provider)
+            .and_then(|provider| self.manifests.get(provider.id))
+            .and_then(|manifest| manifest.loaded().ok())
+            .is_some_and(|loaded| {
+                loaded
+                    .manifest
+                    .rules
+                    .iter()
+                    .any(|candidate| candidate.id == rule && candidate.interruptible)
+            })
     }
 
     /// Whether screen detection has rules for this provider.
@@ -195,6 +234,11 @@ impl Engine {
             );
         };
         let state = rule.state;
+        // Any blocker on the screen, whichever rule won: a key meant for a
+        // turn would answer it.
+        let blocked_rule_matched = explanations
+            .iter()
+            .any(|rule| rule["matched"] == true && rule["state"] == "blocked");
         let matched_rule = json!({
             "id": rule.id,
             "priority": rule.priority,
@@ -213,6 +257,9 @@ impl Engine {
             "visible_blocker": rule.visible_blocker && state == State::Blocked,
             "visible_working": rule.visible_working && state == State::Working,
             "skip_state_update": rule.skip_state_update,
+            "interruptible": rule.interruptible && state == State::Working,
+            "blocked_rule_matched": blocked_rule_matched,
+            "interrupt_keys": loaded.manifest.interrupt_keys,
             "skipped_update_reason": rule.skip_state_update.then(|| format!("matched_rule:{}", rule.id)),
             "fallback_reason": Value::Null,
             "warning": Value::Null,
@@ -311,6 +358,10 @@ struct AgentManifest {
     _updated_at: Option<String>,
     #[serde(default)]
     aliases: Vec<String>,
+    /// The keys that interrupt a turn, sent in order (engine 4). None
+    /// means masil does not know how to interrupt this provider.
+    #[serde(default)]
+    interrupt_keys: Vec<String>,
     #[serde(default)]
     rules: Vec<ManifestRule>,
 }
@@ -333,6 +384,9 @@ struct ManifestRule {
     visible_working: bool,
     #[serde(default)]
     skip_state_update: bool,
+    /// A working screen on which the interrupt keys end the turn (engine 4).
+    #[serde(default)]
+    interruptible: bool,
     #[serde(default)]
     all: Vec<ManifestGate>,
     #[serde(default)]
@@ -439,6 +493,23 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, Stri
             manifest.min_engine_version.unwrap_or_default()
         ));
     }
+    let interrupting =
+        !manifest.interrupt_keys.is_empty() || manifest.rules.iter().any(|rule| rule.interruptible);
+    if interrupting
+        && manifest
+            .min_engine_version
+            .is_none_or(|version| version < 4)
+    {
+        return Err("interrupt_keys and interruptible need min_engine_version = 4".into());
+    }
+    if manifest.interrupt_keys.len() > 4
+        || manifest
+            .interrupt_keys
+            .iter()
+            .any(|key| !matches!(key.as_str(), "Escape" | "C-c" | "C-d" | "C-g" | "q"))
+    {
+        return Err("interrupt_keys has at most 4 of Escape, C-c, C-d, C-g, q".into());
+    }
     if manifest.rules.is_empty() {
         return Err("manifest must contain at least one rule".into());
     }
@@ -453,6 +524,12 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, Stri
     for rule in &manifest.rules {
         if rule.id.trim().is_empty() {
             return Err("manifest rule id must not be empty".into());
+        }
+        if rule.interruptible && rule.state != State::Working {
+            return Err(format!(
+                "rule {} is interruptible without state = \"working\"",
+                rule.id
+            ));
         }
         if rule.skip_state_update {
             if rule.state != State::Unknown {
@@ -1422,7 +1499,7 @@ contains = ["running"]
 
         let unsupported = r#"
 id = "codex"
-min_engine_version = 4
+min_engine_version = 5
 [[rules]]
 id = "future"
 state = "idle"

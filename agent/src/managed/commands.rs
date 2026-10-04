@@ -152,14 +152,14 @@ pub(crate) const VERBS: &[Verb] = &[
     },
     Verb {
         name: "interrupt",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] interrupt|close TARGET [--run RUN --operation ID]",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] interrupt TARGET [--run RUN --operation ID] [--confirm-seconds N] [--any-state] [--key KEY]...",
         mutating: true,
         target_stage: Some("interrupt_key_delivered"),
         remote: true,
     },
     Verb {
         name: "close",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] interrupt|close TARGET [--run RUN --operation ID]",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] close TARGET [--run RUN --operation ID]",
         mutating: true,
         target_stage: Some("pane_closed"),
         remote: true,

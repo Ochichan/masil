@@ -80,6 +80,9 @@ const CODES: &[(&str, Class)] = &[
     ("api_forbidden", Class::Refused),
     ("api_token", Class::Refused),
     ("extension_limit", Class::Refused),
+    ("interrupt_not_working", Class::Refused),
+    ("interrupt_unverified", Class::Refused),
+    ("interrupt_refused", Class::Refused),
     ("dictation_off", Class::Refused),
     ("dictation_remote", Class::Refused),
     ("dictation_refused", Class::Refused),
@@ -118,9 +121,11 @@ const CODES: &[(&str, Class)] = &[
     ("job_failed", Class::Failed),
     ("job_cancelled", Class::Failed),
     ("transfer_corrupt", Class::Failed),
+    ("provider_exited", Class::Failed),
     ("dictation_failed", Class::Failed),
     ("dictation_timeout", Class::Failed),
     ("wait_timeout", Class::Unknown),
+    ("interrupt_partial", Class::Unknown),
     ("api_timeout", Class::Unknown),
     ("outcome_unknown", Class::Unknown),
     ("observation_lost", Class::Unknown),
@@ -204,11 +209,18 @@ pub(crate) fn recorded_exit_code(stage: &str, query: bool) -> i32 {
         | "delivered"
         | "user_confirmed_delivered"
         | "interrupt_key_delivered"
+        | "provider_stopped"
+        | "turn_end_observed"
+        | "completed_before_interrupt"
         | "native_accepted"
         | "pane_closed" => 0,
         "expired" | "cwd_rejected" => Class::Refused.exit_code(),
         // An attempt still in flight has no known outcome yet.
-        "outcome_unknown" | "dispatching" | "pending" => Class::Unknown.exit_code(),
+        "outcome_unknown" | "dispatching" | "pending" | "interrupt_partial" => {
+            Class::Unknown.exit_code()
+        }
+        // The interrupt ended the agent itself.
+        "provider_exited" => Class::Failed.exit_code(),
         "rejected_before_effect"
         | "not_applied"
         | "target_absent"

@@ -313,14 +313,42 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
             };
             match endpoint.call(&request).await {
                 // An endpoint older than durable remote interrupts still
-                // takes the key press.
+                // takes the key press: the provider's measured keys, while
+                // it is listed as working (it cannot check its own screen).
                 Err(error) if unkeyed && error.starts_with("remote_unsupported") => {
+                    // Its own evidence, judged by this side's rules: a
+                    // request anywhere on the screen, or a turn these keys
+                    // do not end, and nothing is sent.
+                    let engine = crate::detection::Engine::load()?;
+                    let evidence = serde_json::to_value(&*agent.evidence).unwrap_or_default();
+                    let screen = if evidence["source"] == "run_report" {
+                        &evidence["screen"]
+                    } else {
+                        &evidence
+                    };
+                    let blocked = screen["explanations"].as_array().is_some_and(|rules| {
+                        rules
+                            .iter()
+                            .any(|rule| rule["matched"] == true && rule["state"] == "blocked")
+                    });
+                    let rule = screen["matched_rule"]["id"].as_str().unwrap_or_default();
+                    if agent.state != "working"
+                        || blocked
+                        || !engine.interruptible_rule(&agent.provider, rule)
+                    {
+                        return Err("interrupt_not_working: the endpoint's screen shows no turn these keys end; nothing was sent".into());
+                    }
+                    let keys = engine.interrupt_keys(&agent.provider);
+                    if keys.is_empty() {
+                        return Err(format!(
+                            "interrupt_unverified: masil has not measured how {} interrupts a turn; nothing was sent",
+                            agent.provider
+                        ));
+                    }
                     let mut sent = endpoint
                         .call(&Request::Action {
                             expected: Expected::from(&agent),
-                            action: Action::Keys {
-                                keys: vec!["C-c".into()],
-                            },
+                            action: Action::Keys { keys },
                         })
                         .await?;
                     sent["durable"] = json!(false);
