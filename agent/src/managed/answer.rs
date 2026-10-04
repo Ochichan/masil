@@ -265,7 +265,9 @@ fn listening(pid: i32) -> Vec<u16> {
     }
 }
 
-/// `lsof -Fn` lines name sockets as `n127.0.0.1:PORT`.
+/// `lsof -Fn` lines name sockets as `n127.0.0.1:PORT` (macOS; tested on
+/// every system).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_lsof(text: &str) -> Vec<u16> {
     text.lines()
         .filter_map(|line| line.strip_prefix("n127.0.0.1:"))
