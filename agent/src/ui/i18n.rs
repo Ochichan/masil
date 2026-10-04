@@ -103,6 +103,7 @@ pub(crate) enum Text {
     ConfiguredUnverified,
     BindingInvalidated,
     BindingReported,
+    BindingReportedOrigin,
     BindingRequested,
     BindingConflict,
     BindingNone,
@@ -219,6 +220,9 @@ pub(crate) fn tr(language: Language, key: Text) -> &'static str {
         (En, BindingReported) => {
             "Session reported by a callback in this run; TUI view not verified"
         }
+        (En, BindingReportedOrigin) => {
+            "Session reported by this pane's provider process; TUI view not verified"
+        }
         (En, BindingRequested) => "Resume requested; no callback has reported the session",
         (En, BindingConflict) => "Conflicting session reports; resume disabled",
         (En, BindingNone) => "No session reported",
@@ -328,6 +332,9 @@ pub(crate) fn tr(language: Language, key: Text) -> &'static str {
         (Ko, ConfiguredUnverified) => "설정된 창; 포그라운드 에이전트는 확인되지 않음",
         (Ko, BindingInvalidated) => "창 연결이 무효화됨; 이동할 수 없음",
         (Ko, BindingReported) => "이 실행의 콜백이 세션을 보고함; TUI 화면은 확인되지 않음",
+        (Ko, BindingReportedOrigin) => {
+            "이 창의 provider 프로세스가 세션을 보고함; TUI 화면은 확인되지 않음"
+        }
         (Ko, BindingRequested) => "재개를 요청함; 세션을 보고한 콜백 없음",
         (Ko, BindingConflict) => "세션 보고가 서로 다름; 재개 비활성화",
         (Ko, BindingNone) => "보고된 세션 없음",

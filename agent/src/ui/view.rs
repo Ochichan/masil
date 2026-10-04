@@ -1313,6 +1313,7 @@ impl App {
             "explicit_unverified" => (Text::ConfiguredUnverified, Tone::Warn),
             "invalidated" => (Text::BindingInvalidated, Tone::Bad),
             "managed_reported" => (Text::BindingReported, Tone::Normal),
+            "managed_reported_origin" => (Text::BindingReportedOrigin, Tone::Normal),
             "managed_requested" => (Text::BindingRequested, Tone::Warn),
             "managed_conflict" => (Text::BindingConflict, Tone::Bad),
             "managed_none" => (Text::BindingNone, Tone::Muted),

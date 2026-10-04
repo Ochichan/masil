@@ -754,8 +754,8 @@ fn ancestry(pane_pid: i32) -> Option<Vec<Ancestor>> {
 ///   nested `claude -p`, starts another.
 ///
 /// With no provider identified on the path the callback is accepted, as
-/// before this check.
-fn provenance(chain: Option<&[Ancestor]>, provider: &str, foreground: i32) -> Result<(), String> {
+/// before this check. True when the path holds this provider's one run.
+fn provenance(chain: Option<&[Ancestor]>, provider: &str, foreground: i32) -> Result<bool, String> {
     let refuse = |why: &str| {
         Err(format!(
             "identity_mismatch: callback did not come from this pane's provider process ({why})"
@@ -787,9 +787,9 @@ fn provenance(chain: Option<&[Ancestor]>, provider: &str, foreground: i32) -> Re
         previous = Some(process);
     }
     match runs.as_slice() {
-        [] => Ok(()),
+        [] => Ok(false),
         [only] if *only != provider => refuse("another provider's process"),
-        [_] => Ok(()),
+        [_] => Ok(true),
         _ => refuse("a nested provider"),
     }
 }
@@ -858,21 +858,32 @@ async fn hook(
     // nested provider carries another pane's environment; the process tree
     // decides. A managed pane's process is its foreground group leader.
     let foreground = agent.foreground_group;
-    if let Err(error) = provenance(ancestry(foreground).as_deref(), target.id, foreground) {
-        log_refusal(target.id, &pane, &error);
-        return Err(error);
-    }
+    let matched = match provenance(ancestry(foreground).as_deref(), target.id, foreground) {
+        Ok(matched) => matched,
+        Err(error) => {
+            log_refusal(target.id, &pane, &error);
+            return Err(error);
+        }
+    };
     // And the run's token, for a run launched with one.
-    if let Some(expected) = agent
+    let expected = agent
         .run_evidence
         .as_ref()
         .filter(|evidence| evidence.run == run)
-        .and_then(|evidence| evidence.token.as_deref())
+        .and_then(|evidence| evidence.token.as_deref());
+    if let Some(expected) = expected
         && let Err(error) = super::tokens::check(&manager.native.socket, expected)
     {
         log_refusal(target.id, &pane, &error);
         return Err(error);
     }
+    // Where the report came from, not what the TUI shows; it authorizes
+    // nothing.
+    let source = matched.then_some(if expected.is_some() {
+        super::ORIGIN_TREE_TOKEN
+    } else {
+        super::ORIGIN_TREE
+    });
     if mapped.event_only {
         if let (Some(callback_session), Some(bound_session)) =
             (mapped.session.as_deref(), agent.session_id.as_deref())
@@ -931,6 +942,7 @@ async fn hook(
         event: &mapped.event,
         frontend: mapped.root_binding,
         switch: mapped.session_switch || mapped.allow_root_switch,
+        origin: source,
     };
     let mut agent = agent;
     let mut retried = false;
@@ -2189,20 +2201,21 @@ mod tests {
     fn callbacks_from_the_panes_own_provider_are_accepted() {
         // hook <- sh (own session) <- claude <- zsh (pane).
         let claude = [shell(40), process(20, Some("claude")), process(20, None)];
-        assert!(provenance(Some(&claude), "claude", 20).is_ok());
+        assert_eq!(provenance(Some(&claude), "claude", 20), Ok(true));
         // Codex embedded: hook <- sh -lc <- native codex <- node codex (pane).
         let codex = [shell(41), process(21, Some("codex")), launcher(21, "codex")];
-        assert!(provenance(Some(&codex), "codex", 21).is_ok());
+        assert_eq!(provenance(Some(&codex), "codex", 21), Ok(true));
         // A shim that waits for its tool joins the tool's run.
         let shim = [
             shell(42),
             process(23, Some("codex")),
             process(23, Some("codex")),
         ];
-        assert!(provenance(Some(&shim), "codex", 23).is_ok());
-        // Nothing identified on the path: accepted as before the check.
+        assert_eq!(provenance(Some(&shim), "codex", 23), Ok(true));
+        // Nothing identified on the path: accepted as before the check, with
+        // no origin to show.
         let unknown = [process(22, None), process(22, None)];
-        assert!(provenance(Some(&unknown), "pi", 22).is_ok());
+        assert_eq!(provenance(Some(&unknown), "pi", 22), Ok(false));
     }
 
     #[test]

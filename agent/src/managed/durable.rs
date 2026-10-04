@@ -156,11 +156,16 @@ impl Manager {
             .iter()
             .flat_map(|fields| {
                 let synthetic = format!("{}-{}-{}-{}", fields[5], fields[0], fields[6], fields[13]);
+                // A reused group ID's run carries its leader's start time.
+                let recorded = super::epoch_records(&fields[17])
+                    .map(|(run, _)| run.to_owned())
+                    .collect::<Vec<_>>();
                 decode::<super::Metadata>(&fields[11])
                     .map(|meta| meta.run)
                     .into_iter()
                     .chain(decode::<super::Tracked>(&fields[12]).map(|tracked| tracked.run))
                     .chain([synthetic])
+                    .chain(recorded)
             })
             .collect();
         Ok((runs, boot))

@@ -45,7 +45,7 @@ const META: &str = "@masil-managed-agent";
 const TRACKED: &str = "@masil-managed-observation";
 const EVIDENCE: &str = "@masil-agent-run-evidence";
 const STORE_OPTION: &str = "@masil-operation-store";
-const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}\t#{q:@masil-agent-run-evidence}";
+const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}\t#{q:@masil-agent-run-evidence}\t#{q:@masil-agent-epoch}";
 const CAPTURE_BATCH_SIZE: usize = 12;
 const MAX_PS_TTY_ARGUMENT: usize = 4096;
 const TRACKED_REJECTED: &str = "masil-agent-stale";
@@ -186,6 +186,10 @@ struct RunEvidence {
     /// abort error, a Kimi or MastraCode `Interrupt` hook).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     interrupted_at: Option<u64>,
+    /// What the first session report said of `start --session`:
+    /// `verified` (the same session) or `mismatch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,7 +270,16 @@ struct Binding {
     /// pane inherits the run identity and can report its own session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conflict: Option<Contradiction>,
+    /// Where the report that set or confirmed it came from (`ORIGIN_*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
 }
+
+/// The callback came from the pane's provider process tree, and the run's
+/// token matched.
+const ORIGIN_TREE_TOKEN: &str = "provider_process_tree";
+/// From the pane's provider process tree, in a run launched without a token.
+const ORIGIN_TREE: &str = "provider_process_tree_without_token";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Contradiction {
@@ -334,6 +347,8 @@ pub(crate) enum ReportOrigin<'a> {
         frontend: bool,
         /// The provider announced a deliberate session change.
         switch: bool,
+        /// `ORIGIN_*` when the process tree showed this pane's provider.
+        origin: Option<&'static str>,
     },
 }
 
@@ -375,6 +390,20 @@ pub(crate) struct BindingView {
     pub event: Option<String>,
     pub sequence: u64,
     pub observed_at_ms: u64,
+    /// For a `reported` binding: where the report came from (`ORIGIN_*`).
+    /// It says nothing about what the TUI shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// For a run started with `--session`: `verified`, `mismatch`,
+    /// `awaiting`, `awaiting_prompt` (OpenCode and Kilo report it with the
+    /// first prompt) or `unconfirmed` (no report by the deadline or before
+    /// the run ended). Only the first two are stored, so a late matching
+    /// report still verifies it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    /// While `awaiting`: when it becomes `unconfirmed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_deadline_ms: Option<u64>,
 }
 
 /// Evidence-based capability contract for one agent run. Values from an
@@ -446,6 +475,10 @@ pub(crate) struct Agent {
     pub permission_count: u32,
     #[serde(default)]
     pub question_count: u32,
+    /// The foreground process group and its leader's start time: another
+    /// process under a reused group ID has another epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_epoch: Option<String>,
     #[serde(skip)]
     metadata: Option<Metadata>,
     #[serde(skip)]
@@ -709,6 +742,7 @@ impl Manager {
         let mut tracked_groups = Vec::new();
         let mut tracked_updates = Vec::new();
         let mut inbox_effects: Vec<(String, Vec<inbox::Effect>)> = Vec::new();
+        let mut epoch_groups: Vec<native_ui::GuardedGroup> = Vec::new();
         let mut seen_panes = HashSet::new();
         for fields in inventory {
             // A linked window can occur in more than one session.
@@ -814,13 +848,24 @@ impl Manager {
             if dead {
                 state = "exited".into();
             }
-            let run = metadata.as_ref().map(|m| m.run.clone()).unwrap_or_else(|| {
-                format!(
+            let process_epoch = (foreground_group > 1)
+                .then(|| crate::process::info(foreground_group))
+                .flatten()
+                .map(|info| format!("{foreground_group}:{}", info.started));
+            let previous = decode::<Tracked>(&fields[12]).unwrap_or_default();
+            let (synthetic, epoch_record) = unmanaged_run(
+                &format!(
                     "{}-{}-{}-{foreground_group}",
                     fields[5], fields[0], fields[6]
-                )
-            });
-            let previous = decode::<Tracked>(&fields[12]).unwrap_or_default();
+                ),
+                process_epoch.as_deref(),
+                &fields[17],
+            );
+            let epoch_record = epoch_record.filter(|_| metadata.is_none());
+            let run = metadata
+                .as_ref()
+                .map(|m| m.run.clone())
+                .unwrap_or(synthetic);
             if evidence.skip_state_update() && previous.run == run {
                 state = previous.state.clone();
             }
@@ -876,7 +921,13 @@ impl Manager {
             } else {
                 "unknown"
             };
-            let binding = binding_view(metadata.as_ref(), run_evidence.as_ref());
+            let mut binding = binding_view(metadata.as_ref(), run_evidence.as_ref());
+            (binding.resume, binding.resume_deadline_ms) = resume_view(
+                provider.id,
+                run_evidence.as_ref(),
+                process == "exited",
+                now_ms(),
+            );
             let capabilities = capability_view(
                 provider.id,
                 self.engine.has_manifest(provider.id),
@@ -916,6 +967,7 @@ impl Manager {
                 foreground_command: fields[7].clone(),
                 tracked,
                 tracked_encoded: fields[12].clone(),
+                process_epoch,
                 foreground_group,
                 output_generation,
                 permission_count: counts.0,
@@ -923,23 +975,39 @@ impl Manager {
                 title: fields[9].clone(),
                 progress: fields[15].clone(),
             };
+            let epoch_write = epoch_record.map(|record| Self::option(&agent, EPOCH, record));
             if changed {
                 let encoded = encode(&agent.tracked)?;
                 tracked_groups.push((
                     agent.pane_id.clone(),
                     identity_guard(&agent),
-                    vec![Self::option(&agent, TRACKED, encoded.clone())],
+                    std::iter::once(Self::option(&agent, TRACKED, encoded.clone()))
+                        .chain(epoch_write)
+                        .collect(),
                     // A group index: display-message runs strftime, which
                     // would eat the `%` of a pane ID.
                     format!("{TRACKED_REJECTED} {}", tracked_groups.len()),
                 ));
                 tracked_updates.push((agents.len(), encoded));
+            } else if let Some(write) = epoch_write {
+                // Its own small guard: a lost write is written next time.
+                epoch_groups.push((
+                    agent.pane_id.clone(),
+                    and(&[
+                        format!("#{{==:#{{masil_core_boot_id}},{}}}", agent.boot),
+                        format!("#{{==:#{{masil_pty_generation}},{}}}", agent.generation),
+                        format!("#{{==:#{{masil_foreground_pgid}},{foreground_group}}}"),
+                    ]),
+                    vec![write],
+                    "masil-agent-epoch-stale".into(),
+                ));
             }
             agents.push(agent);
         }
         let uncommitted = self
             .write_tracked_updates(&mut agents, &tracked_groups, &tracked_updates)
             .await?;
+        self.write_epoch_records(&epoch_groups).await;
         // Only the panes whose tracked revision committed: a lost CAS
         // records nothing, and the next poll sees that change again.
         self.inbox_apply(
@@ -954,6 +1022,33 @@ impl Manager {
             resident.remember(&agents, target.is_none());
         }
         Ok((agents, uncommitted))
+    }
+
+    /// Records which process each unmanaged run is (`EPOCH`). Best effort:
+    /// a record not written is written by the next poll.
+    async fn write_epoch_records(&self, groups: &[native_ui::GuardedGroup]) {
+        let mut start = 0;
+        while start < groups.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < groups.len() {
+                let size = native_ui::guarded_group_script_bytes(&groups[end]);
+                if end > start && bytes + size > native_ui::MAX_SCRIPT {
+                    break;
+                }
+                bytes += size;
+                end += 1;
+            }
+            if self
+                .native
+                .guarded_groups(&groups[start..end])
+                .await
+                .is_err()
+            {
+                return;
+            }
+            start = end;
+        }
     }
 
     /// Writes each pane's tracked revision under its own guard and returns
@@ -1604,6 +1699,7 @@ impl Manager {
             event: None,
             requested: None,
             conflict: None,
+            origin: None,
         });
         let evidence = if binding.is_some() || answers || token.is_some() {
             Some(
@@ -2257,6 +2353,7 @@ impl Agent {
     /// keep the configured-but-unverified wording.
     fn binding_label(&self) -> &'static str {
         match self.binding.state.as_str() {
+            "reported" if self.binding.origin.is_some() => "managed_reported_origin",
             "reported" => "managed_reported",
             "requested" => "managed_requested",
             "conflict" => "managed_conflict",
@@ -2388,12 +2485,13 @@ fn apply_binding(
     now: u64,
     origin: ReportOrigin<'_>,
 ) -> BindingOutcome {
-    let (source, event, switch) = match origin {
-        ReportOrigin::Run => (BindingSource::RunReport, None, false),
+    let (source, event, switch, origin) = match origin {
+        ReportOrigin::Run => (BindingSource::RunReport, None, false, None),
         ReportOrigin::Callback {
             event,
             frontend,
             switch,
+            origin,
         } => (
             if frontend {
                 BindingSource::FrontendCallback
@@ -2402,6 +2500,7 @@ fn apply_binding(
             },
             bounded_event(event),
             switch,
+            origin.map(str::to_owned),
         ),
     };
     let fresh = |requested: Option<String>| Binding {
@@ -2412,6 +2511,7 @@ fn apply_binding(
         event: event.clone(),
         requested,
         conflict: None,
+        origin: origin.clone(),
     };
     let current = metadata.session.clone();
     // Evidence only describes the session it was recorded for.
@@ -2423,6 +2523,7 @@ fn apply_binding(
         (None, _) => (fresh(None), BindingOutcome::Established),
         (Some(current), Some(mut binding)) if current == session => {
             if binding.source == BindingSource::Requested {
+                evidence.resume = Some("verified".into());
                 // A report confirms the request; the conflict record stays.
                 let conflict = binding.conflict.take();
                 (
@@ -2438,6 +2539,7 @@ fn apply_binding(
                     binding.sequence = sequence;
                     binding.at = now;
                     binding.event = event.clone();
+                    binding.origin = origin.clone();
                 }
                 (binding, BindingOutcome::Confirmed)
             }
@@ -2450,7 +2552,10 @@ fn apply_binding(
                 conflict: None,
                 ..
             }),
-        ) => (fresh(Some(current.into())), BindingOutcome::ReplacedRequest),
+        ) => {
+            evidence.resume = Some("mismatch".into());
+            (fresh(Some(current.into())), BindingOutcome::ReplacedRequest)
+        }
         (Some(_), _) if switch => (fresh(None), BindingOutcome::Switched),
         (Some(current), bound) => {
             let mut binding = bound.unwrap_or_else(|| Binding {
@@ -2461,6 +2566,7 @@ fn apply_binding(
                 event: None,
                 requested: None,
                 conflict: None,
+                origin: None,
             });
             binding.conflict = Some(Contradiction {
                 session: session.into(),
@@ -2475,6 +2581,40 @@ fn apply_binding(
     metadata.session = Some(binding.session.clone());
     evidence.binding = Some(binding);
     outcome
+}
+
+/// How long a resumed run has to report the session it was asked for.
+const RESUME_DEADLINE_MS: u64 = 120_000;
+
+/// Whether a run started with `--session` reported that session, and the
+/// deadline while it has not. `ended`: the process exited (a stopped run,
+/// or one not verified yet, has not).
+fn resume_view(
+    provider: &str,
+    evidence: Option<&RunEvidence>,
+    ended: bool,
+    now: u64,
+) -> (Option<String>, Option<u64>) {
+    let Some(evidence) = evidence else {
+        return (None, None);
+    };
+    if let Some(verdict) = &evidence.resume {
+        return (Some(verdict.clone()), None);
+    }
+    let Some(requested) = evidence
+        .binding
+        .as_ref()
+        .filter(|binding| binding.source == BindingSource::Requested)
+    else {
+        return (None, None);
+    };
+    let deadline = requested.at.saturating_add(RESUME_DEADLINE_MS);
+    match (ended, provider) {
+        (true, _) => (Some("unconfirmed".into()), None),
+        (false, "opencode" | "kilo") => (Some("awaiting_prompt".into()), None),
+        (false, _) if now >= deadline => (Some("unconfirmed".into()), None),
+        (false, _) => (Some("awaiting".into()), Some(deadline)),
+    }
 }
 
 fn binding_view(metadata: Option<&Metadata>, evidence: Option<&RunEvidence>) -> BindingView {
@@ -2512,6 +2652,9 @@ fn binding_view(metadata: Option<&Metadata>, evidence: Option<&RunEvidence>) -> 
         event: binding.event.clone(),
         sequence: binding.sequence,
         observed_at_ms: binding.at,
+        origin: binding.origin.clone().filter(|_| state == "reported"),
+        resume: None,
+        resume_deadline_ms: None,
     }
 }
 
@@ -2767,7 +2910,7 @@ fn records(text: &str) -> Result<Vec<Vec<String>>, String> {
 
 fn validate_inventory(inventory: &[Vec<String>]) -> Result<(), String> {
     for fields in inventory {
-        if fields.len() != 17 || crate::pane_id(&fields[0]).is_err() {
+        if fields.len() != 18 || crate::pane_id(&fields[0]).is_err() {
             return Err("invalid native pane inventory".into());
         }
         if [&fields[11], &fields[12], &fields[16]]
@@ -2832,6 +2975,79 @@ fn parse_capture_frames(output: &[u8], frames: &[(String, String, String)]) -> O
         cursor += offset + end.len();
     }
     (cursor == output.len()).then_some(screens)
+}
+
+/// The pane option that records which process each recent unmanaged run
+/// of the pane is: `{run} {group}:{leader start time}` entries joined by
+/// `;`, the current one first. Binaries before 2026-10-04 neither read nor
+/// write it.
+const EPOCH: &str = "@masil-agent-epoch";
+/// Runs remembered per pane: jobs a person switches between (Ctrl-Z, `fg`).
+const EPOCH_RECORDS: usize = 4;
+
+/// The run of an agent masil did not start, and the `EPOCH` value to write
+/// when it differs. The name is `base` (`{boot}-{pane}-{generation}-{group}`,
+/// as earlier binaries name it, so the two agree). Only when the recorded
+/// process of that name is not the one leading the group now, because the
+/// group ID was reused, does the run get the new leader's start time:
+/// `{base}-{started}`. An unreadable start time keeps the recorded run.
+fn unmanaged_run(base: &str, epoch: Option<&str>, recorded: &str) -> (String, Option<String>) {
+    let entries = epoch_records(recorded).collect::<Vec<_>>();
+    let mine = entries.iter().find(|(run, _)| run_of(base, run));
+    let run = match (epoch, mine) {
+        (_, None) => base.to_owned(),
+        (None, Some((run, _))) => (*run).to_owned(),
+        (Some(epoch), Some((run, recorded))) if epoch == *recorded => (*run).to_owned(),
+        (Some(epoch), Some(_)) => {
+            let started = epoch.split_once(':').map_or("0", |(_, started)| started);
+            format!("{base}-{started}")
+        }
+    };
+    let Some(epoch) = epoch else {
+        return (run, None);
+    };
+    let record = std::iter::once(format!("{run} {epoch}"))
+        .chain(
+            entries
+                .iter()
+                .filter(|(other, _)| !run_of(base, other))
+                .map(|(other, epoch)| format!("{other} {epoch}")),
+        )
+        .take(EPOCH_RECORDS)
+        .collect::<Vec<_>>()
+        .join(";");
+    (run, (record != recorded).then_some(record))
+}
+
+/// The well-formed entries of an `EPOCH` value; anything else is ignored,
+/// since any process on the server can set the option.
+pub(super) fn epoch_records(recorded: &str) -> impl Iterator<Item = (&str, &str)> {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    (recorded.len() <= 2048)
+        .then_some(recorded)
+        .into_iter()
+        .flat_map(|recorded| recorded.split(';'))
+        .filter_map(|entry| entry.split_once(' '))
+        .filter(move |(run, epoch)| {
+            run.len() <= 128
+                && !run.is_empty()
+                && !run.chars().any(|c| c.is_control() || c == ' ')
+                && epoch
+                    .split_once(':')
+                    .is_some_and(|(group, started)| digits(group) && digits(started))
+        })
+}
+
+/// Whether `run` is a run of the pane process group named by `base`: the
+/// name itself, or it with a leader's start time.
+fn run_of(base: &str, run: &str) -> bool {
+    run == base
+        || run
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|started| {
+                !started.is_empty() && started.bytes().all(|b| b.is_ascii_digit())
+            })
 }
 
 /// A foreground process from its `ps` args: a runtime's script, or a
@@ -3037,6 +3253,65 @@ async fn identify_foreground(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn an_unmanaged_run_keeps_its_name_until_its_group_id_is_reused() {
+        let base = "b1-%3-2-40";
+        // First seen: the name earlier binaries use, and a record.
+        assert_eq!(
+            unmanaged_run(base, Some("40:17"), ""),
+            (base.into(), Some("b1-%3-2-40 40:17".into()))
+        );
+        // The same leader: nothing to write.
+        assert_eq!(
+            unmanaged_run(base, Some("40:17"), "b1-%3-2-40 40:17"),
+            (base.into(), None)
+        );
+        // Another process under the same group ID is another run.
+        assert_eq!(
+            unmanaged_run(base, Some("40:99"), "b1-%3-2-40 40:17"),
+            ("b1-%3-2-40-99".into(), Some("b1-%3-2-40-99 40:99".into()))
+        );
+        assert_eq!(
+            unmanaged_run(base, Some("40:99"), "b1-%3-2-40-99 40:99"),
+            ("b1-%3-2-40-99".into(), None)
+        );
+        // An unreadable start time keeps the recorded run.
+        assert_eq!(
+            unmanaged_run(base, None, "b1-%3-2-40-99 40:99"),
+            ("b1-%3-2-40-99".into(), None)
+        );
+        assert_eq!(unmanaged_run(base, None, ""), (base.into(), None));
+        // Another group's run (400 is not 40) is kept behind this one: a
+        // job brought back with `fg` is still its run.
+        let both = "b1-%3-2-40 40:17;b1-%3-2-400-5 400:5";
+        assert_eq!(
+            unmanaged_run(base, Some("40:17"), "b1-%3-2-400-5 400:5"),
+            (base.into(), Some(both.into()))
+        );
+        assert_eq!(
+            unmanaged_run("b1-%3-2-400", Some("400:5"), both),
+            (
+                "b1-%3-2-400-5".into(),
+                Some("b1-%3-2-400-5 400:5;b1-%3-2-40 40:17".into())
+            )
+        );
+        // Malformed entries, or a name that is not this group's run with a
+        // start time, are not taken.
+        for forged in [
+            format!("{base}-{} 40:17", "x".repeat(300)),
+            format!("{base}-abc 40:17"),
+            format!("{base}-12 40:x"),
+        ] {
+            assert_eq!(unmanaged_run(base, None, &forged).0, base);
+        }
+        let many = (0..6)
+            .map(|index| format!("b1-%{index}-2-7 7:{index}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let (_, record) = unmanaged_run(base, Some("40:17"), &many);
+        assert_eq!(record.unwrap().split(';').count(), EPOCH_RECORDS);
+    }
+
+    #[test]
     fn a_new_turn_resolves_the_last_turn_end() {
         let tracked = |state: &str, revision| Tracked {
             run: "r1".into(),
@@ -3140,6 +3415,7 @@ mod tests {
                     event: None,
                     requested: None,
                     conflict: None,
+                    origin: None,
                 }),
                 ..RunEvidence::default()
             },
@@ -3151,6 +3427,7 @@ mod tests {
             event,
             frontend: false,
             switch: false,
+            origin: None,
         }
     }
 
@@ -3159,6 +3436,7 @@ mod tests {
             event,
             frontend: false,
             switch: true,
+            origin: None,
         }
     }
 
@@ -3187,6 +3465,120 @@ mod tests {
             (7, Some("SessionStart"))
         );
         assert_eq!(view.requested_session, None);
+    }
+
+    #[test]
+    fn a_callback_from_the_provider_tree_shows_its_origin_while_reported() {
+        let (mut metadata, mut evidence) = requested("ses-a");
+        let tree = ReportOrigin::Callback {
+            event: "SessionStart",
+            frontend: false,
+            switch: false,
+            origin: Some(ORIGIN_TREE_TOKEN),
+        };
+        apply_binding(&mut metadata, &mut evidence, "ses-a", 7, 10, tree);
+        assert_eq!(
+            view(&metadata, &evidence).origin.as_deref(),
+            Some("provider_process_tree")
+        );
+        // A later report of a lower rank keeps it.
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-a",
+            8,
+            11,
+            ReportOrigin::Run,
+        );
+        assert_eq!(
+            view(&metadata, &evidence).origin.as_deref(),
+            Some("provider_process_tree")
+        );
+        // A contradiction is not `reported`: no origin is shown.
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-b",
+            9,
+            12,
+            callback("SessionStart"),
+        );
+        let shown = view(&metadata, &evidence);
+        assert_eq!((shown.state.as_str(), shown.origin), ("conflict", None));
+        // A switch is decided by its own report: here, none.
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-c",
+            10,
+            13,
+            switch("SessionStart"),
+        );
+        let shown = view(&metadata, &evidence);
+        assert_eq!((shown.state.as_str(), shown.origin), ("reported", None));
+    }
+
+    #[test]
+    fn a_resume_is_verified_or_mismatched_by_the_first_report_and_otherwise_waits() {
+        let (mut metadata, mut evidence) = requested("ses-a");
+        // requested() records the request at 1 ms.
+        assert_eq!(
+            resume_view("codex", Some(&evidence), false, 2),
+            (Some("awaiting".into()), Some(1 + RESUME_DEADLINE_MS))
+        );
+        assert_eq!(
+            resume_view("codex", Some(&evidence), false, 1 + RESUME_DEADLINE_MS).0,
+            Some("unconfirmed".into())
+        );
+        assert_eq!(
+            resume_view("codex", Some(&evidence), true, 2).0,
+            Some("unconfirmed".into())
+        );
+        assert_eq!(
+            resume_view("opencode", Some(&evidence), false, 1 + RESUME_DEADLINE_MS).0,
+            Some("awaiting_prompt".into())
+        );
+        // A report after the deadline still verifies it.
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-a",
+            7,
+            200_000,
+            callback("SessionStart"),
+        );
+        assert_eq!(
+            resume_view("codex", Some(&evidence), true, 300_000),
+            (Some("verified".into()), None)
+        );
+        let (mut metadata, mut evidence) = requested("ses-a");
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-b",
+            7,
+            10,
+            callback("SessionStart"),
+        );
+        assert_eq!(
+            resume_view("codex", Some(&evidence), false, 11).0,
+            Some("mismatch".into())
+        );
+        // A run started without `--session` has nothing to show.
+        let mut metadata = Metadata::default();
+        let mut evidence = RunEvidence::default();
+        apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-a",
+            7,
+            10,
+            callback("SessionStart"),
+        );
+        assert_eq!(
+            resume_view("codex", Some(&evidence), false, 11),
+            (None, None)
+        );
     }
 
     #[test]
@@ -3293,6 +3685,7 @@ mod tests {
             event: "chat.message",
             frontend: true,
             switch: false,
+            origin: None,
         };
         apply_binding(&mut metadata, &mut evidence, "root", 3, 10, frontend);
         apply_binding(
@@ -3660,6 +4053,7 @@ mod tests {
             tracked: Tracked::default(),
             tracked_encoded: String::new(),
             foreground_group: 0,
+            process_epoch: None,
             output_generation: 0,
             permission_count: 0,
             question_count: 0,
