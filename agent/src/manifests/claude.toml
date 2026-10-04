@@ -1,7 +1,7 @@
 id = "claude"
-version = "2026.09.11.1"
-min_engine_version = 4
-updated_at = "2026-09-11T00:00:00Z"
+version = "2026.10.04.1"
+min_engine_version = 5
+updated_at = "2026-10-04T12:00:00Z"
 # Measured 2026-10-04 on 2.1.288: Esc ends the turn and keeps the session.
 interrupt_keys = ["Escape"]
 aliases = ["claude-code"]
@@ -137,6 +137,23 @@ not = [
   { contains = ["tab/arrow keys"] },
   { contains = ["arrow keys to navigate"] },
   { contains = ["↑/↓ to navigate"] },
+]
+
+[[rules]]
+id = "turn_end_marker"
+state = "idle"
+# Below every picker and blocker rule: a dialog under an old marker is not
+# idle. Its digest still reaches `ends_turn` when another idle rule wins.
+priority = 200
+region = "last_non_empty_above_prompt_box"
+visible_idle = true
+ends_turn = true
+# Measured 2026-10-04 on 2.1.289: a finished turn leaves "✻ Worked for 17s ·
+# done …" above the prompt box and an interrupted one "⎿  Interrupted · What
+# should Claude do instead?". While text streams neither is there.
+any = [
+  { regex = ['^\s*✻ \S+ for [0-9]+[smh]'] },
+  { contains = ["interrupted · what should claude do instead"] },
 ]
 
 [[rules]]

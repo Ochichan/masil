@@ -1,8 +1,10 @@
 id = "agy"
-version = "2026.06.24.1"
-min_engine_version = 1
-updated_at = "2026-06-24T00:00:00Z"
+version = "2026.10.04.1"
+min_engine_version = 4
+updated_at = "2026-10-04T12:00:00Z"
 aliases = ["antigravity", "antigravity-cli"]
+# Measured 2026-10-04 on 1.1.27: Escape ends the turn and keeps the session.
+interrupt_keys = ["Escape"]
 
 [[rules]]
 id = "permission_prompt"
@@ -22,6 +24,7 @@ state = "working"
 priority = 100
 region = "whole_recent"
 visible_working = true
+interruptible = true
 line_regex = ['^\s*[\u2800-\u28FF]+\s+\p{Alphabetic}+\w*ing\b']
 
 [[rules]]
@@ -31,3 +34,22 @@ priority = 90
 region = "bottom_non_empty_lines(5)"
 visible_working = true
 line_regex = ['(?i)·\s*[1-9][0-9]*\s+task']
+
+[[rules]]
+id = "project_trust"
+state = "blocked"
+priority = 950
+region = "whole_recent"
+visible_blocker = true
+# Measured 2026-10-04 on 1.1.27.
+contains = ["do you trust the contents of this project?", "yes, i trust this folder"]
+
+[[rules]]
+id = "composer_idle"
+state = "idle"
+priority = 50
+region = "bottom_non_empty_lines(3)"
+visible_idle = true
+# Measured 2026-10-04 on 1.1.27: the composer and the shortcuts hint while
+# waiting; while working the hint reads "esc to cancel".
+line_regex = ['^>(?: |$)', '^\? for shortcuts']

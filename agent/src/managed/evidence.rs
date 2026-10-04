@@ -7,6 +7,19 @@ pub(crate) struct Evidence {
     state: Box<str>,
     visible_blocker: bool,
     skip_state_update: bool,
+    visible_idle: bool,
+    /// The screen's turn-end marker digest when an idle rule won.
+    ends_turn: Option<Box<str>>,
+    /// The digest of any turn-end marker on screen, whichever rule won.
+    turn_end_marker: Option<Box<str>>,
+}
+
+fn digest(value: &Value, key: &str) -> Option<Box<str>> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| text.len() <= 64)
+        .map(Into::into)
 }
 
 impl Evidence {
@@ -18,6 +31,9 @@ impl Evidence {
             .into();
         let visible_blocker = matches!(value.get("visible_blocker"), Some(Value::Bool(true)));
         let skip_state_update = matches!(value.get("skip_state_update"), Some(Value::Bool(true)));
+        let visible_idle = matches!(value.get("visible_idle"), Some(Value::Bool(true)));
+        let ends_turn = digest(&value, "ends_turn");
+        let turn_end_marker = digest(&value, "turn_end_marker");
         let raw = serde_json::value::to_raw_value(&value)
             .expect("serializing a serde_json::Value cannot fail");
         Self {
@@ -25,6 +41,9 @@ impl Evidence {
             state,
             visible_blocker,
             skip_state_update,
+            visible_idle,
+            ends_turn,
+            turn_end_marker,
         }
     }
 
@@ -56,6 +75,10 @@ impl Evidence {
             state: state.into(),
             visible_blocker: false,
             skip_state_update: false,
+            visible_idle: false,
+            ends_turn: None,
+            // What the screen under the report shows.
+            turn_end_marker: original.turn_end_marker.clone(),
         }
     }
 
@@ -69,6 +92,18 @@ impl Evidence {
 
     pub(crate) fn skip_state_update(&self) -> bool {
         self.skip_state_update
+    }
+
+    pub(crate) fn visible_idle(&self) -> bool {
+        self.visible_idle
+    }
+
+    pub(crate) fn ends_turn(&self) -> Option<&str> {
+        self.ends_turn.as_deref()
+    }
+
+    pub(crate) fn turn_end_marker(&self) -> Option<&str> {
+        self.turn_end_marker.as_deref()
     }
 }
 

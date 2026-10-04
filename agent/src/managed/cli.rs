@@ -364,17 +364,25 @@ pub(super) async fn launch(
         outcome["answer_channel"] = json!(channel);
     }
     let socket = manager.native.socket.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let problem = tokio::task::spawn_blocking(move || {
         let enabled = super::state_base()
             .and_then(|base| super::coordinator_features(&base, &socket))
             .is_ok_and(|features| !features.is_empty());
-        if enabled {
-            crate::coordinator::spawn_detached(&socket);
-            // A running one looks at the new pane now.
-            crate::coordinator::poke(&socket);
+        if !enabled {
+            return None;
         }
+        crate::coordinator::spawn_detached(&socket);
+        // A running one looks at the new pane now.
+        crate::coordinator::poke(&socket);
+        crate::coordinator::listen_problem(&socket)
     })
-    .await;
+    .await
+    .ok()
+    .flatten();
+    // An `--answers` run is only observed by a coordinator.
+    if let Some(problem) = problem.filter(|_| answers) {
+        outcome["warning"] = json!(format!("coordinator_unavailable: {problem}"));
+    }
     Ok(outcome)
 }
 

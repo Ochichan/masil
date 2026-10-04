@@ -95,6 +95,20 @@ fn sun_path_limit() -> usize {
     address.sun_path.len()
 }
 
+/// Why a coordinator for this server could not listen, found without
+/// starting one: a socket path that does not fit, or a server directory that
+/// is not private. Callers that start it without waiting (D1) report this.
+pub(crate) fn listen_problem(socket: &Path) -> Option<String> {
+    let state = crate::managed::state_base().ok()?;
+    let paths = match paths(socket, &state) {
+        Ok(paths) => paths,
+        Err(error) => return Some(error),
+    };
+    crate::ipc::private_parent(&paths.listen, "coordinator")
+        .err()
+        .map(|error| format!("{error}; see {}", paths.log.display()))
+}
+
 pub(crate) fn paths(socket: &Path, state: &Path) -> Result<Paths, String> {
     let server = socket
         .canonicalize()

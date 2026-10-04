@@ -51,6 +51,7 @@ const CODES: &[(&str, Class)] = &[
     ("answer_unsafe", Class::Refused),
     ("answer_channel_none", Class::Refused),
     ("answer_refused", Class::Refused),
+    ("prompt_unsupported", Class::Refused),
     ("queue_stale", Class::Refused),
     ("queue_held", Class::Refused),
     ("queue_not_staged", Class::Refused),

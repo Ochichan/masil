@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.09.23.1"
+version = "2026.10.04.1"
 min_engine_version = 4
-updated_at = "2026-09-23T22:12:00Z"
+updated_at = "2026-10-04T12:00:00Z"
 # Measured 2026-10-04 on 0.160.0: Esc ends the turn; C-c opens a menu or exits.
 interrupt_keys = ["Escape"]
 
@@ -107,3 +107,12 @@ any = [{ contains = [" to interrupt)"] }, { contains = ["s)"] }]
 regex = ['(?m)^(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* \((?:[0-9]+[hm] )*[0-9]+s(?: • [^\r\n]+? to interrupt)?\)(?: · [^\r\n]*)?(?:\r?\n(?:[^•◦›■✗✓─\r\n][^\r\n]*|•[ \t]+(?:Queued\s+follow-up\s+inputs|Messages\s+to\s+be\s+submitted\s+after\s+next\s+tool\s+call(?:\s+\(press\s+[^\r\n]+?\s+to\s+interrupt\s+and\s+send\s+immediately\))?|Messages\s+to\s+be\s+submitted\s+at\s+end\s+of\s+turn)|›[⠁⠂⠄⠈⠐⠠⡀⢀][^\r\n]*)?)*\s*\z']
 # A failed reconnect keeps its final elapsed timer but is no longer working.
 not = [{ line_regex = ['^(?:[•◦][ \t]+)?Reconnect failed — check the endpoint, then relaunch \([0-9hms ]+\)$'] }]
+
+[[rules]]
+id = "composer_idle"
+state = "idle"
+priority = 200
+region = "bottom_non_empty_lines(4)"
+visible_idle = true
+# Measured 2026-10-04 on 0.160.0: the composer and its footer stay while waiting.
+line_regex = ['^›(?: |$)', '\sContext [0-9]+% (?:used|left)\b']

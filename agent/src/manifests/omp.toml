@@ -1,0 +1,24 @@
+id = "omp"
+version = "2026.10.04.1"
+min_engine_version = 4
+updated_at = "2026-10-04T12:00:00Z"
+# Measured 2026-10-04 on 18.4.4: Escape stops the turn and keeps the session.
+interrupt_keys = ["Escape"]
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1100
+region = "osc_title"
+visible_working = true
+# The title starts with π and a braille spinner while a turn runs. A title
+# spinner can also turn under an approval, so it does not allow an interrupt.
+regex = ['^π [\x{2800}-\x{28FF}] ']
+
+[[rules]]
+id = "working_line"
+state = "working"
+priority = 1000
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+line_regex = ['Working…\s*$', '^\s*[\x{2800}-\x{28FF}] [0-9]+[smh] ·']

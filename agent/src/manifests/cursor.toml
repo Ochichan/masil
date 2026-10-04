@@ -1,8 +1,10 @@
 id = "cursor"
-version = "2026.08.03.1"
+version = "2026.10.04.1"
 min_engine_version = 1
-updated_at = "2026-08-03T01:08:04Z"
+updated_at = "2026-10-04T12:00:00Z"
 aliases = ["cursor-agent"]
+# Measured 2026-10-04 on 2026.09.18: one C-c while working ends the turn,
+# but a C-c that lands after the turn ended exits, so no interrupt key here.
 
 [[rules]]
 id = "write_file_approval"
@@ -55,3 +57,34 @@ priority = 90
 region = "bottom_non_empty_lines(8)"
 visible_working = true
 line_regex = ['^\s*(⬡|⬢|[\u2800-\u28FF]+)\s+\p{Alphabetic}+\w*ing\b']
+
+[[rules]]
+id = "workspace_trust"
+state = "blocked"
+priority = 950
+region = "whole_recent"
+visible_blocker = true
+# Measured 2026-10-04 on 2026.09.18. The box stays on screen after the
+# answer, so only the live dialog with its key hint counts.
+contains = ["workspace trust required", "trust this workspace", "use arrow keys to navigate"]
+not = [{ contains = ["trusting workspace"] }]
+
+[[rules]]
+id = "instruction_input"
+state = "blocked"
+priority = 200
+region = "bottom_non_empty_lines(4)"
+visible_blocker = true
+# After a skipped approval the agent waits for the person's instruction.
+contains = ["tell the agent what to do instead"]
+
+[[rules]]
+id = "composer_idle"
+state = "idle"
+priority = 50
+region = "bottom_non_empty_lines(4)"
+visible_idle = true
+# Measured 2026-10-04 on 2026.09.18: the composer line starts with an arrow.
+line_regex = ['^\s+→ \S']
+# "Add a follow-up" is the composer while a turn runs.
+not = [{ contains = ["add a follow-up"] }]

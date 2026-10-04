@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::providers;
 
-const ENGINE_VERSION: u32 = 4;
+const ENGINE_VERSION: u32 = 5;
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 const MAX_SCREEN_BYTES: usize = 1024 * 1024;
 const MAX_REGION_CACHE_BYTES: usize = MAX_SCREEN_BYTES;
@@ -44,6 +44,7 @@ const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
     ("letta", include_str!("manifests/letta.toml")),
     ("maki", include_str!("manifests/maki.toml")),
     ("muse", include_str!("manifests/muse.toml")),
+    ("omp", include_str!("manifests/omp.toml")),
     ("opencode", include_str!("manifests/opencode.toml")),
     ("pi", include_str!("manifests/pi.toml")),
     ("qodercli", include_str!("manifests/qodercli.toml")),
@@ -57,7 +58,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Registers the 22 bundled manifests and loads any local masil overrides.
+    /// Registers the 23 bundled manifests and loads any local masil overrides.
     ///
     /// Overrides live in `$XDG_CONFIG_HOME/masil/agent-detection`, falling
     /// back to `~/.config/masil/agent-detection`. A present invalid override
@@ -182,6 +183,7 @@ impl Engine {
             osc_progress: progress,
         };
         let mut matched: Option<(&ManifestRule, &str)> = None;
+        let mut turn_end: Option<String> = None;
         let mut explanations = Vec::with_capacity(loaded.manifest.rules.len());
         let mut regions = HashMap::new();
         let mut region_cache_bytes = 0;
@@ -210,6 +212,9 @@ impl Engine {
                     "region_preview": region_text.preview,
                 },
             }));
+            if rule_matched && rule.ends_turn && turn_end.is_none() {
+                turn_end = Some(marker_digest(region_text.text));
+            }
             if rule_matched
                 && matched
                     .as_ref()
@@ -259,6 +264,10 @@ impl Engine {
             "skip_state_update": rule.skip_state_update,
             "interruptible": rule.interruptible && state == State::Working,
             "blocked_rule_matched": blocked_rule_matched,
+            // Only an idle winner says the turn ended; a menu or blocker over
+            // an old marker does not.
+            "ends_turn": turn_end.as_ref().filter(|_| rule.visible_idle && state == State::Idle),
+            "turn_end_marker": turn_end,
             "interrupt_keys": loaded.manifest.interrupt_keys,
             "skipped_update_reason": rule.skip_state_update.then(|| format!("matched_rule:{}", rule.id)),
             "fallback_reason": Value::Null,
@@ -387,6 +396,11 @@ struct ManifestRule {
     /// A working screen on which the interrupt keys end the turn (engine 4).
     #[serde(default)]
     interruptible: bool,
+    /// The region shows that a turn ended (engine 5). A turn a provider hook
+    /// reported as running yields to it once its text differs from the one
+    /// on screen when the turn began.
+    #[serde(default)]
+    ends_turn: bool,
     #[serde(default)]
     all: Vec<ManifestGate>,
     #[serde(default)]
@@ -399,6 +413,16 @@ struct ManifestRule {
     regex: Vec<String>,
     #[serde(default)]
     line_regex: Vec<String>,
+}
+
+/// A short digest of a turn-end marker's text, to tell a new marker from
+/// the one already on screen.
+pub(crate) fn marker_digest(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.trim().as_bytes())[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn default_region() -> String {
@@ -501,6 +525,13 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, Stri
             .is_none_or(|version| version < 4)
     {
         return Err("interrupt_keys and interruptible need min_engine_version = 4".into());
+    }
+    if manifest.rules.iter().any(|rule| rule.ends_turn)
+        && manifest
+            .min_engine_version
+            .is_none_or(|version| version < 5)
+    {
+        return Err("ends_turn needs min_engine_version = 5".into());
     }
     if manifest.interrupt_keys.len() > 4
         || manifest
@@ -1114,6 +1145,7 @@ fn unknown_explanation(
         "manifest_version": manifest.and_then(|loaded| loaded.manifest.version.clone()),
         "matched_rule": Value::Null,
         "visible_idle": false,
+        "ends_turn": Value::Null,
         "visible_blocker": false,
         "visible_working": false,
         "skip_state_update": false,
@@ -1499,13 +1531,25 @@ contains = ["running"]
 
         let unsupported = r#"
 id = "codex"
-min_engine_version = 5
+min_engine_version = 6
 [[rules]]
 id = "future"
 state = "idle"
 contains = ["x"]
 "#;
         assert!(load_manifest(unsupported, ManifestSource::Bundled).is_err());
+
+        let early_ends_turn = r#"
+id = "codex"
+min_engine_version = 4
+[[rules]]
+id = "done"
+state = "idle"
+ends_turn = true
+contains = ["x"]
+"#;
+        let error = load_manifest(early_ends_turn, ManifestSource::Bundled).unwrap_err();
+        assert!(error.contains("ends_turn needs min_engine_version = 5"), "{error}");
 
         let invalid_version = r#"
 id = "codex"
@@ -1527,5 +1571,162 @@ contains = ["x"]
             engine.explain("codex", &oversized, "")["fallback_reason"],
             "input_limit_exceeded"
         );
+    }
+
+    /// Screens measured on 2026-10-04 (T2 live table), cut to the lines the
+    /// rules read. Each case is (provider, screen, title, state, rule).
+    #[test]
+    fn live_screens_measured_2026_10_04() {
+        let rule = "─".repeat(60);
+        let cases: Vec<(&str, String, &str, &str, &str)> = vec![
+            (
+                "codex",
+                "› Reply with just the word PINEAPPLE.\n\n• PINEAPPLE\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 0% used · weekly 60% left\n  ? for shortcuts\n".into(),
+                "codex | GPT-6.1-Sol",
+                "idle",
+                "composer_idle",
+            ),
+            (
+                "codex",
+                "› Write the numbers.\n\n• Working (1s • esc to interrupt)\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol low · Context 3% used · weekly 60% left\n  ? for shortcuts\n".into(),
+                "codex | GPT-6.1-Sol",
+                "working",
+                "",
+            ),
+            (
+                "cursor",
+                "  │  ⚠ Workspace Trust Required   │\n  │  Do you trust the contents of this directory?   │\n  │  ▶ [a] Trust this workspace   │\n  │    [q] Quit   │\n  │  Use arrow keys to navigate, Enter to select, or press the key shown   │\n".into(),
+                "",
+                "blocked",
+                "workspace_trust",
+            ),
+            (
+                // The answered trust box stays above the composer.
+                "cursor",
+                "  │  ⚠ Workspace Trust Required   │\n  │    [a] Trust this workspace   │\n  │  ⏳ Trusting workspace...   │\n  ╰──────╯\n  Cursor Agent\n  v2026.09.18-9a7762b\n  → Plan, search, build anything\n  Auto\n  /private/tmp/project\n".into(),
+                "",
+                "idle",
+                "composer_idle",
+            ),
+            (
+                "cursor",
+                "  Cursor Agent\n  Tip: Use subagents to parallelize work and preserve context.\n  → Plan, search, build anything\n  Auto\n  /private/tmp/project\n".into(),
+                "",
+                "idle",
+                "composer_idle",
+            ),
+            (
+                "cursor",
+                "  seventy-seven\n ⠰⠰ Working  12.12k tokens\n  → Add a follow-up                         ctrl+c to stop\n  Auto · 9.4%\n  /private/tmp/project\n".into(),
+                "",
+                "working",
+                "stop_hint_working",
+            ),
+            (
+                "cursor",
+                " Run this command?\n  → Tell the agent what to do instead (Enter to send, empty to skip, Esc to cancel)        ctrl+c to stop\n".into(),
+                "",
+                "blocked",
+                "instruction_input",
+            ),
+            (
+                "agy",
+                "Accessing workspace:\n/private/tmp/project\nDo you trust the contents of this project?\n> Yes, I trust this folder\n  No, exit\n  ↑/↓ Navigate · enter Confirm\n".into(),
+                "",
+                "blocked",
+                "project_trust",
+            ),
+            (
+                "agy",
+                format!("{rule}\n>\n{rule}\n? for shortcuts                  Gemini 3.6 Flash · high\n"),
+                "",
+                "idle",
+                "composer_idle",
+            ),
+            (
+                "agy",
+                format!("{rule}\n>\n{rule}\nesc to cancel                    Gemini 3.6 Flash · high\n"),
+                "",
+                "unknown",
+                "",
+            ),
+            (
+                "kimi",
+                "  Trust this folder?\n  ↑↓ navigate · Enter select · Esc exit\n   ❯ Trust this folder\n     Enable project MCP servers. Remembered for this folder.\n     Don't trust\n     Exit Kimi Code. Asked again next launch.\n".into(),
+                "",
+                "blocked",
+                "folder_trust",
+            ),
+            (
+                "gemini",
+                "│ ? Get started   │\n│   How would you like to authenticate for this project?   │\n│   ● 1. Sign in with Google   │\n".into(),
+                "",
+                "blocked",
+                "auth_chooser",
+            ),
+            (
+                "omp",
+                format!(" Write the numbers.\n  󱊷 Working…\n{rule}\n❯\n{rule}\n ⠴ 1s ·  GLM 5.3 Flash ·  project ·  0.7%/1M\n"),
+                "π ⠼ omp",
+                "working",
+                "osc_title_working",
+            ),
+            (
+                "omp",
+                format!(" Write the numbers.\n  󱊷 Working…\n{rule}\n❯\n{rule}\n ⠴ 1s ·  GLM 5.3 Flash ·  project ·  0.7%/1M\n"),
+                "",
+                "working",
+                "working_line",
+            ),
+        ];
+        let engine = Engine::load_bundled();
+        for (provider, screen, title, state, rule_id) in cases {
+            let explained = engine.explain(provider, &screen, title);
+            assert_eq!(explained["state"], state, "{provider}: {screen}");
+            if !rule_id.is_empty() {
+                assert_eq!(explained["matched_rule"]["id"], rule_id, "{provider}: {screen}");
+            }
+        }
+        // Claude 2.1.289 (measured 2026-10-04): the turn-end marker under the
+        // prompt box, the streaming screen without it, and dialogs drawn
+        // below an old marker.
+        let footer = format!("{rule}\n❯ \n{rule}\n  status line\n");
+        let done = format!("❯ Write the numbers.\n⏺ one\n  two\n✻ Worked for 17s · done 8:54 PM\n{footer}");
+        let explained = engine.explain("claude", &done, "✳ Numbers");
+        assert_eq!(explained["state"], "idle");
+        assert_eq!(explained["matched_rule"]["id"], "live_prompt_box");
+        let marker = explained["ends_turn"].as_str().unwrap().to_owned();
+        assert_eq!(explained["turn_end_marker"], marker.as_str());
+        let interrupted = format!("❯ Write the numbers.\n⏺ one\n  ⎿  Interrupted · What should Claude do instead?\n{footer}");
+        let explained = engine.explain("claude", &interrupted, "✳ Numbers");
+        assert!(explained["ends_turn"].as_str().is_some_and(|other| other != marker));
+        let streaming = format!("❯ Write the numbers.\n⏺ one\n  two\n{footer}");
+        let explained = engine.explain("claude", &streaming, "✳ Numbers");
+        assert_eq!(explained["state"], "idle");
+        assert!(explained["ends_turn"].is_null() && explained["turn_end_marker"].is_null());
+        // "Waiting for" is not a duration.
+        let waiting = format!("✻ Waiting for 1 background agent\n{footer}");
+        assert!(engine.explain("claude", &waiting, "")["turn_end_marker"].is_null());
+        let permission = format!(
+            "✻ Worked for 17s · done 8:54 PM\n{rule}\n Bash command\n   ls\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n"
+        );
+        let explained = engine.explain("claude", &permission, "");
+        assert_eq!(explained["state"], "blocked");
+        assert!(explained["ends_turn"].is_null());
+        let picker = format!(
+            "✻ Worked for 17s · done 8:54 PM\n{rule}\n Select model\n ❯ 1. Default\n Enter to set as default · Esc to cancel\n"
+        );
+        let explained = engine.explain("claude", &picker, "");
+        assert_eq!(explained["matched_rule"]["id"], "model_picker_menu");
+        assert!(explained["ends_turn"].is_null());
+
+        // Measured keys; omp and cursor screens do not yet allow an interrupt.
+        assert_eq!(engine.interrupt_keys("omp"), vec!["Escape"]);
+        assert!(!engine.interruptible_rule("omp", "osc_title_working"));
+        assert!(engine.interrupt_keys("cursor").is_empty());
+        assert_eq!(engine.interrupt_keys("agy"), vec!["Escape"]);
+        // A model's answer quoting a dialog line is not a dialog.
+        let quoted = engine.explain("gemini", "The CLI asks: how would you like to authenticate?\n", "");
+        assert_ne!(quoted["state"], "blocked");
     }
 }

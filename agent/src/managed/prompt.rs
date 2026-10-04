@@ -15,6 +15,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 
+/// Providers that drop an Enter sent in the same command group as a paste
+/// (cursor-agent 2026.09.18, measured 2026-10-04): the text would sit in the
+/// composer while the receipt said delivered, so `prompt` refuses them.
+pub(super) const ENTER_DROPPED: &[&str] = &["cursor"];
+
 const OPTION: &str = "@masil-agent-prompt-receipts";
 const TICKETS: &str = "@masil-agent-prompt-tickets";
 const FENCE: &str = "@masil-agent-prompt-fence";
@@ -454,6 +459,12 @@ impl Manager {
                 .any(|c| c.is_control() && c != '\n' && c != '\t')
         {
             return Err("prompt must contain 1–32768 bytes without control keys".into());
+        }
+        if ENTER_DROPPED.contains(&agent.provider.as_str()) {
+            return Err(format!(
+                "prompt_unsupported: {} drops the Enter sent right after a paste; nothing was sent",
+                agent.provider
+            ));
         }
         let _lock = self.lock()?;
         let explicit = operation.is_some();

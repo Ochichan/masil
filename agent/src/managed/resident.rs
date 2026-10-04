@@ -955,12 +955,26 @@ impl Badge {
 }
 
 /// When the earliest report that still overrides a screen stops doing so.
-/// `collect` lets a report win for REPORT_FRESH_MS without any output.
+/// `collect` lets a report win for REPORT_FRESH_MS without any output; a
+/// held turn ends on a quiet screen, which no output announces, so it is
+/// looked at again every TURN_QUIET_SECONDS.
 fn report_expiry(agents: &[Agent], now: u64) -> Option<u64> {
     agents
         .iter()
-        .filter_map(|agent| agent.metadata.as_ref()?.report.as_ref())
-        .map(|report| report.at.saturating_add(super::REPORT_FRESH_MS + 1))
+        .filter_map(|agent| {
+            let report = agent.metadata.as_ref()?.report.as_ref()?;
+            let held = agent
+                .run_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.report.as_ref())
+                .is_some_and(|source| source.sequence == report.sequence && source.hold.is_some());
+            Some(if held {
+                now.saturating_add(super::TURN_QUIET_SECONDS * 1000 + 1)
+                    .min(report.at.saturating_add(super::TURN_HOLD_MAX_MS + 1))
+            } else {
+                report.at.saturating_add(super::REPORT_FRESH_MS + 1)
+            })
+        })
         .filter(|at| *at > now)
         .min()
 }

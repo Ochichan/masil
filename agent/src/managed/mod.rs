@@ -45,12 +45,17 @@ const META: &str = "@masil-managed-agent";
 const TRACKED: &str = "@masil-managed-observation";
 const EVIDENCE: &str = "@masil-agent-run-evidence";
 const STORE_OPTION: &str = "@masil-operation-store";
-const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}\t#{q:@masil-agent-run-evidence}\t#{q:@masil-agent-epoch}";
+const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}\t#{q:@masil-agent-run-evidence}\t#{q:@masil-agent-epoch}\t#{q:pane_last_output_time}";
 const CAPTURE_BATCH_SIZE: usize = 12;
 const MAX_PS_TTY_ARGUMENT: usize = 4096;
 const TRACKED_REJECTED: &str = "masil-agent-stale";
 /// How long a reported state overrides the screen.
 const REPORT_FRESH_MS: u64 = 30_000;
+/// The longest a hook-begun turn holds without its end (`TurnHold`).
+const TURN_HOLD_MAX_MS: u64 = 2 * 60 * 60 * 1000;
+/// A held turn whose idle-looking screen printed nothing for this long has
+/// ended without telling masil (an interrupt or a lost `Stop`).
+const TURN_QUIET_SECONDS: u64 = 20;
 /// Panes per server that agent management handles.
 const MAX_PANES: usize = 64;
 const TRACKED_LOST: &str = "identity_mismatch: agent run changed before the action";
@@ -215,6 +220,62 @@ struct ReportSource {
     /// interrupt's outcome is judged by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     event: Option<String>,
+    /// A hook-begun turn: the report holds until the turn ends, not for
+    /// `REPORT_FRESH_MS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hold: Option<TurnHold>,
+}
+
+/// A turn a provider hook said began (Claude's `UserPromptSubmit`). The
+/// provider's screen may look idle while it streams, so the report holds
+/// until `TurnReport::End`, a turn-end marker other than the one on screen
+/// when the turn began, a quiet idle-looking screen, or `TURN_HOLD_MAX_MS`.
+/// A visible blocker still wins while it shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TurnHold {
+    /// The digest of the turn-end marker on screen when the turn began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    marker: Option<String>,
+}
+
+impl TurnHold {
+    fn holds(&self, report: &Report, screen: &Evidence, last_output: Option<u64>) -> bool {
+        let now = now_ms();
+        if report.state != "working" || now.saturating_sub(report.at) > TURN_HOLD_MAX_MS {
+            return false;
+        }
+        if screen
+            .ends_turn()
+            .is_some_and(|marker| Some(marker) != self.marker.as_deref())
+        {
+            return false;
+        }
+        // Text streaming or a spinner prints at least every second.
+        let quiet = last_output.is_some_and(|at| (now / 1000).saturating_sub(at) >= TURN_QUIET_SECONDS)
+            && now.saturating_sub(report.at) >= TURN_QUIET_SECONDS * 1000;
+        !(screen.visible_idle() && quiet)
+    }
+}
+
+/// Drops a held turn report; true when there was one.
+fn end_turn_hold(metadata: &mut Metadata, evidence: &mut RunEvidence) -> bool {
+    let held = metadata.report.as_ref().is_some_and(|report| {
+        evidence
+            .report
+            .as_ref()
+            .is_some_and(|source| source.sequence == report.sequence && source.hold.is_some())
+    });
+    if held {
+        metadata.report = None;
+        evidence.report = None;
+    }
+    held
+}
+
+/// What a provider hook said of a turn (`Manager::report_turn`).
+pub(crate) enum TurnReport {
+    Begin { marker: Option<String> },
+    End,
 }
 
 /// A process by its ID and start time, which together do not repeat.
@@ -741,6 +802,9 @@ impl Manager {
         let mut agents = Vec::new();
         let mut tracked_groups = Vec::new();
         let mut tracked_updates = Vec::new();
+        // Held turns whose report this pass drops, applied to the returned
+        // agents once their group commits.
+        let mut dropped_holds = Vec::new();
         let mut inbox_effects: Vec<(String, Vec<inbox::Effect>)> = Vec::new();
         let mut epoch_groups: Vec<native_ui::GuardedGroup> = Vec::new();
         let mut seen_panes = HashSet::new();
@@ -810,6 +874,9 @@ impl Manager {
                 .parse::<u64>()
                 .map_err(|_| "invalid output generation")?;
             let mut report_authority = None;
+            // A held turn this look found over: its report is dropped below,
+            // so a later output does not bring the turn back.
+            let mut hold_ended = false;
             let mut counts = (0, 0);
             if let Some(report) = metadata.as_ref().and_then(|m| m.report.as_ref())
                 && foreground
@@ -829,7 +896,19 @@ impl Manager {
                         }
                         holds
                     }
-                    None => now_ms().saturating_sub(report.at) <= REPORT_FRESH_MS,
+                    None => match run_evidence
+                        .as_ref()
+                        .and_then(|e| e.report.as_ref())
+                        .filter(|source| source.sequence == report.sequence)
+                        .and_then(|source| source.hold.as_ref())
+                    {
+                        Some(hold) => {
+                            let holds = hold.holds(report, &evidence, fields[18].parse().ok());
+                            hold_ended = !holds;
+                            holds
+                        }
+                        None => now_ms().saturating_sub(report.at) <= REPORT_FRESH_MS,
+                    },
                 }
             {
                 // A visible blocker is stronger than a hook claiming idle/working.
@@ -930,6 +1009,7 @@ impl Manager {
             );
             let capabilities = capability_view(
                 provider.id,
+                prompt_submit_mode(&self.engine, provider.id),
                 self.engine.has_manifest(provider.id),
                 !self.engine.interrupt_keys(provider.id).is_empty(),
                 run_evidence.as_ref(),
@@ -976,12 +1056,26 @@ impl Manager {
                 progress: fields[15].clone(),
             };
             let epoch_write = epoch_record.map(|record| Self::option(&agent, EPOCH, record));
-            if changed {
+            let mut hold_write = Vec::new();
+            if let (true, Some(mut metadata), Some(mut evidence)) =
+                (hold_ended, agent.metadata.clone(), agent.run_evidence.clone())
+                && self.resident.as_ref().is_none_or(|resident| {
+                    resident.may_write(&fields[0], &fields[14], &fields[12], now_ms())
+                })
+                && end_turn_hold(&mut metadata, &mut evidence)
+            {
+                let encoded = encode(&metadata)?;
+                hold_write.push(Self::option(&agent, META, encoded.clone()));
+                hold_write.push(Self::option(&agent, EVIDENCE, encode(&evidence)?));
+                dropped_holds.push((agents.len(), metadata, encoded, evidence));
+            }
+            if changed || !hold_write.is_empty() {
                 let encoded = encode(&agent.tracked)?;
                 tracked_groups.push((
                     agent.pane_id.clone(),
                     identity_guard(&agent),
                     std::iter::once(Self::option(&agent, TRACKED, encoded.clone()))
+                        .chain(hold_write)
                         .chain(epoch_write)
                         .collect(),
                     // A group index: display-message runs strftime, which
@@ -1007,6 +1101,14 @@ impl Manager {
         let uncommitted = self
             .write_tracked_updates(&mut agents, &tracked_groups, &tracked_updates)
             .await?;
+        for (index, metadata, encoded, evidence) in dropped_holds {
+            let agent = &mut agents[index];
+            if !uncommitted.contains(&agent.pane_id) {
+                agent.metadata = Some(metadata);
+                agent.encoded = encoded;
+                agent.run_evidence = Some(evidence);
+            }
+        }
         self.write_epoch_records(&epoch_groups).await;
         // Only the panes whose tracked revision committed: a lost CAS
         // records nothing, and the next poll sees that change again.
@@ -1941,6 +2043,10 @@ impl Manager {
             ));
         }
         metadata.last_sequence = sequence;
+        // A cleared or resumed session starts no turn of the held one.
+        if matches!(origin, ReportOrigin::Callback { switch: true, .. }) && state.is_none() {
+            end_turn_hold(&mut metadata, &mut evidence);
+        }
         // State from a report that named another session is not this run's.
         let state = state.filter(|_| binding != Some(BindingOutcome::Contradicted));
         // While the coordinator reads the provider's own server, that server
@@ -1990,6 +2096,7 @@ impl Manager {
                     ReportOrigin::Callback { event, .. } => Some(event.chars().take(64).collect()),
                     ReportOrigin::Run => None,
                 },
+                hold: None,
             });
         }
         if let ReportOrigin::Callback { event, .. } = origin {
@@ -2024,6 +2131,88 @@ impl Manager {
         })
     }
 
+    /// A provider hook's turn report (`TurnReport`). `Begin` writes a held
+    /// `working` report; `End` drops a held report so the screen decides
+    /// again (an idle report would outrank a turn the screen shows running).
+    pub(crate) async fn report_turn(
+        &self,
+        agent: &Agent,
+        sequence: u64,
+        report: &TurnReport,
+    ) -> Result<(), String> {
+        let mut metadata = agent.metadata.clone().ok_or("agent is not managed")?;
+        if metadata.run != agent.run || agent.process != "running" {
+            return Err("identity_mismatch: stale agent report".into());
+        }
+        if sequence <= metadata.last_sequence
+            || metadata.report.as_ref().is_some_and(|r| sequence <= r.sequence)
+        {
+            return Err("report sequence did not advance".into());
+        }
+        let mut evidence = agent
+            .run_evidence
+            .clone()
+            .filter(|e| e.run == metadata.run)
+            .unwrap_or_else(|| RunEvidence {
+                run: metadata.run.clone(),
+                ..RunEvidence::default()
+            });
+        // The provider's own server decides while the coordinator reads it.
+        if evidence
+            .report
+            .as_ref()
+            .filter(|source| metadata.report.as_ref().is_some_and(|r| r.sequence == source.sequence))
+            .is_some_and(ReportSource::observed)
+        {
+            return Ok(());
+        }
+        match report {
+            TurnReport::Begin { marker } => {
+                metadata.report = Some(Report {
+                    sequence,
+                    state: "working".into(),
+                    at: now_ms(),
+                });
+                evidence.report = Some(ReportSource {
+                    sequence,
+                    source: REPORT_SOURCE_CALLBACK.into(),
+                    observer: None,
+                    generation: None,
+                    live: false,
+                    permissions: None,
+                    questions: None,
+                    event: Some("UserPromptSubmit".into()),
+                    hold: Some(TurnHold {
+                        marker: marker.clone(),
+                    }),
+                });
+            }
+            TurnReport::End => {
+                if !end_turn_hold(&mut metadata, &mut evidence) {
+                    return Ok(());
+                }
+            }
+        }
+        metadata.last_sequence = sequence;
+        let outcome = self
+            .guarded_input_outcome(
+                agent,
+                vec![
+                    Self::option(agent, META, encode(&metadata)?),
+                    Self::option(agent, EVIDENCE, encode(&evidence)?),
+                ],
+                None,
+            )
+            .await?;
+        if matches!(outcome, Guarded::Rejected) {
+            return Err(REPORT_REJECTED.into());
+        }
+        if self.resident.is_none() {
+            crate::coordinator::poke(&self.native.socket);
+        }
+        Ok(())
+    }
+
     /// The coordinator's report from the provider's own server
     /// (`observe.rs`). Written only when something a reader uses differs from
     /// what the pane holds; Ok(false) when nothing changed. Without
@@ -2056,6 +2245,7 @@ impl Manager {
             permissions: Some(api.permissions),
             questions: Some(api.questions),
             event: None,
+            hold: None,
         };
         let unchanged = metadata
             .report
@@ -2422,7 +2612,7 @@ fn provider_contract(engine: &Engine, id: &str) -> Result<Value, String> {
             (_, None, true) => "requested_only",
             _ => "none",
         },
-        "prompt_submit": "guarded_paste",
+        "prompt_submit": prompt_submit_mode(engine, provider.id),
         "provider_ack": false,
         "interrupt": if engine.interrupt_keys(provider.id).is_empty() { "unverified" } else { "measured_keys" },
         "approval_response": false,
@@ -2658,8 +2848,27 @@ fn binding_view(metadata: Option<&Metadata>, evidence: Option<&RunEvidence>) -> 
     }
 }
 
+/// How `agent prompt` can reach this provider: `guarded_paste`;
+/// `needs_integration` when only an installed lifecycle integration can show
+/// it waiting; `needs_idle_evidence` when nothing can (prompt refuses until
+/// something reports idle); `unsupported` when the provider drops the Enter
+/// (`prompt::ENTER_DROPPED`).
+fn prompt_submit_mode(engine: &Engine, provider: &str) -> &'static str {
+    if prompt::ENTER_DROPPED.contains(&provider) {
+        "unsupported"
+    } else if engine.has_idle_rule(provider) || matches!(provider, "opencode" | "kilo") {
+        "guarded_paste"
+    } else if integration::target_capability(provider) == Some("full_lifecycle") {
+        "needs_integration"
+    } else {
+        "needs_idle_evidence"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn capability_view(
     provider: &str,
+    prompt_mode: &str,
     has_manifest: bool,
     measured_interrupt: bool,
     evidence: Option<&RunEvidence>,
@@ -2702,10 +2911,10 @@ fn capability_view(
         contract: 2,
         state_authority: state_authority.into(),
         session_identity: session_identity.into(),
-        prompt_submit: if running {
-            "guarded_paste"
-        } else {
-            "unavailable"
+        prompt_submit: match prompt_mode {
+            _ if !running => "unavailable",
+            "needs_integration" if seen.is_some_and(|seen| seen.lifecycle) => "guarded_paste",
+            mode => mode,
         }
         .into(),
         provider_ack: prompts,
@@ -2910,7 +3119,7 @@ fn records(text: &str) -> Result<Vec<Vec<String>>, String> {
 
 fn validate_inventory(inventory: &[Vec<String>]) -> Result<(), String> {
     for fields in inventory {
-        if fields.len() != 18 || crate::pane_id(&fields[0]).is_err() {
+        if fields.len() != 19 || crate::pane_id(&fields[0]).is_err() {
             return Err("invalid native pane inventory".into());
         }
         if [&fields[11], &fields[12], &fields[16]]
@@ -3750,7 +3959,7 @@ mod tests {
     #[test]
     fn capabilities_follow_evidence_not_provider_names() {
         let none = binding_view(None, None);
-        let screen = capability_view("claude", true, true, None, "running", None, &none);
+        let screen = capability_view("claude", "guarded_paste", true, true, None, "running", None, &none);
         assert_eq!(screen.state_authority, "screen_detection");
         assert_eq!(screen.session_identity, "none");
         assert_eq!(screen.integration, "native_session_only");
@@ -3778,6 +3987,7 @@ mod tests {
         let binding = view(&metadata, &evidence);
         let native = capability_view(
             "pi",
+            "guarded_paste",
             true,
             false,
             Some(&evidence),
@@ -3789,7 +3999,7 @@ mod tests {
         assert_eq!(native.session_identity, "native_callback");
         assert!(native.lifecycle_seen && native.callbacks_seen && native.resume);
 
-        let exited = capability_view("pi", true, false, Some(&evidence), "exited", None, &binding);
+        let exited = capability_view("pi", "guarded_paste", true, false, Some(&evidence), "exited", None, &binding);
         assert_eq!(exited.state_authority, "process_only");
         assert_eq!(exited.prompt_submit, "unavailable");
         assert_eq!(exited.interrupt, "unavailable");
@@ -3806,6 +4016,7 @@ mod tests {
         assert!(
             !capability_view(
                 "pi",
+                "guarded_paste",
                 true,
                 false,
                 Some(&evidence),
@@ -3849,11 +4060,91 @@ mod tests {
             permissions: None,
             questions: None,
             event: Some("e".repeat(64)),
+            hold: Some(TurnHold {
+                marker: Some("0123456789abcdef".into()),
+            }),
         });
         assert_eq!(
             decode::<RunEvidence>(&encode(&evidence).unwrap()),
             Some(evidence)
         );
+    }
+
+    #[test]
+    fn a_held_turn_ends_on_a_new_marker_a_quiet_idle_screen_or_its_cap() {
+        let now = now_ms();
+        let report = |state: &str, at: u64| Report {
+            sequence: 1,
+            state: state.into(),
+            at,
+        };
+        let screen = |idle: bool, marker: Option<&str>| {
+            Evidence::from_value(json!({
+                "state": if idle { "idle" } else { "working" },
+                "visible_idle": idle,
+                "ends_turn": marker.filter(|_| idle),
+                "turn_end_marker": marker,
+            }))
+        };
+        let hold = TurnHold {
+            marker: Some("old".into()),
+        };
+        let fresh = Some(now / 1000);
+        // Streaming: the screen looks idle and still shows the old marker.
+        assert!(hold.holds(&report("working", now), &screen(true, Some("old")), fresh));
+        assert!(hold.holds(&report("working", now), &screen(true, None), fresh));
+        // The turn's own end marker.
+        assert!(!hold.holds(&report("working", now), &screen(true, Some("new")), fresh));
+        // A marker under a working screen does not end it.
+        assert!(hold.holds(&report("working", now), &screen(false, Some("new")), fresh));
+        // An idle-looking screen that printed nothing for the quiet time.
+        let quiet = Some(now / 1000 - TURN_QUIET_SECONDS - 1);
+        let begun = now - TURN_QUIET_SECONDS * 1000 - 1000;
+        assert!(!hold.holds(&report("working", begun), &screen(true, None), quiet));
+        // ... but not right after the turn began, nor under a working screen.
+        assert!(hold.holds(&report("working", now), &screen(true, None), quiet));
+        assert!(hold.holds(&report("working", begun), &screen(false, None), quiet));
+        // The cap, and a report that is not a running turn.
+        let old = now - TURN_HOLD_MAX_MS - 1;
+        assert!(!hold.holds(&report("working", old), &screen(false, None), fresh));
+        assert!(!hold.holds(&report("idle", now), &screen(true, None), fresh));
+        // No marker when the turn began: any marker ends it.
+        let unmarked = TurnHold::default();
+        assert!(!unmarked.holds(&report("working", now), &screen(true, Some("old")), fresh));
+    }
+
+    #[test]
+    fn ending_a_turn_drops_only_a_held_report() {
+        let mut metadata: Metadata = serde_json::from_value(json!({
+            "name": "c", "provider": "claude", "boot": "b", "generation": "1",
+            "run": "r", "argv": [], "session": null, "last_sequence": 5,
+            "report": {"sequence": 5, "state": "working", "at": 1}
+        }))
+        .unwrap();
+        let held = ReportSource {
+            sequence: 5,
+            source: REPORT_SOURCE_CALLBACK.into(),
+            observer: None,
+            generation: None,
+            live: false,
+            permissions: None,
+            questions: None,
+            event: Some("UserPromptSubmit".into()),
+            hold: Some(TurnHold::default()),
+        };
+        let mut evidence = RunEvidence {
+            run: "r".into(),
+            report: Some(ReportSource {
+                hold: None,
+                ..held.clone()
+            }),
+            ..RunEvidence::default()
+        };
+        assert!(!end_turn_hold(&mut metadata, &mut evidence));
+        assert!(metadata.report.is_some());
+        evidence.report = Some(held);
+        assert!(end_turn_hold(&mut metadata, &mut evidence));
+        assert!(metadata.report.is_none() && evidence.report.is_none());
     }
 
     #[test]

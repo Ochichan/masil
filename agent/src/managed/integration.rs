@@ -62,6 +62,7 @@ const TARGETS: &[Target] = &[
             "PermissionRequest",
             "Notification",
             "Stop",
+            "StopFailure",
         ],
     },
     Target {
@@ -598,6 +599,7 @@ fn registration_fragment(target: &Target, hook_path: &std::path::Path) -> Value 
                 "PermissionRequest":[{"hooks":[{"type":"command","command":command(""),"timeout":10}]}],
                 "Notification":[{"matcher":"elicitation_dialog","hooks":[{"type":"command","command":command(""),"timeout":10}]}],
                 "Stop":[{"hooks":[{"type":"command","command":command(""),"timeout":10}]}],
+                "StopFailure":[{"hooks":[{"type":"command","command":command(""),"timeout":10}]}],
             }})
         }
         "codex" => {
@@ -896,8 +898,13 @@ async fn hook(
                 target.id, &pane, &run, sequence, &mapped, payload,
             ))
             .await;
-        if target.id == "claude" && normalize_event(&mapped.event) == "userpromptsubmit" {
-            accept_claude_prompt(manager, &agent, payload).await;
+        if target.id == "claude" {
+            let event = normalize_event(&mapped.event);
+            // Acceptance does not wait on the turn report, nor fail with it.
+            if event == "userpromptsubmit" {
+                accept_claude_prompt(manager, &agent, payload).await;
+            }
+            claude_turn(manager, agent, &pane, sequence, &event).await;
         }
         return Ok(None);
     }
@@ -988,6 +995,38 @@ async fn hook(
         "binding": result.binding.map(|binding| binding.label()),
         "provider_accepted": false,
     })))
+}
+
+/// Claude's screen shows nothing while it streams an answer (2.1.289), so a
+/// prompt's `UserPromptSubmit` holds the run working until `Stop`,
+/// `StopFailure` or the screen's turn-end marker (`TurnReport`). Best effort:
+/// a hook prints nothing and never fails Claude's turn.
+async fn claude_turn(manager: &Manager, agent: super::Agent, pane: &str, sequence: u64, event: &str) {
+    let report = match event {
+        "userpromptsubmit" => super::TurnReport::Begin {
+            marker: agent.evidence.turn_end_marker().map(str::to_owned),
+        },
+        "stop" | "stopfailure" => super::TurnReport::End,
+        _ => return,
+    };
+    // Read again: the prompt acceptance just wrote this run's evidence, and
+    // a write from the hook's first read would drop it.
+    let run = agent.run.clone();
+    let mut agent = match manager.get(pane).await {
+        Ok(current) if current.run == run && current.process == "running" => current,
+        _ => return,
+    };
+    for _ in 0..2 {
+        match manager.report_turn(&agent, sequence, &report).await {
+            Err(error) if error == super::REPORT_REJECTED => match manager.get(pane).await {
+                Ok(current) if current.run == run && current.process == "running" => {
+                    agent = current
+                }
+                _ => return,
+            },
+            _ => return,
+        }
+    }
 }
 
 /// Inbox effects of one accepted callback. A reported `blocked` is an event
@@ -1236,6 +1275,23 @@ fn callback_effects(
                 pane,
                 run,
                 "turn_completed",
+                source_ref,
+                id,
+                summary.clone(),
+            ));
+            requested = true;
+        }
+        ("claude", "stopfailure") => {
+            let id = callback_id(payload, &["prompt_id", "promptId"]);
+            let source_ref = id
+                .as_deref()
+                .map(|id| format!("error:{run}:{id}"))
+                .unwrap_or_else(|| callback_ref("error", run, sequence));
+            effects.push(callback_event_effect(
+                provider,
+                pane,
+                run,
+                "error",
                 source_ref,
                 id,
                 summary.clone(),
@@ -1853,7 +1909,12 @@ fn session_event_allowed(provider: &str, event: &str) -> bool {
     match provider {
         "claude" => matches!(
             normalized.as_str(),
-            "sessionstart" | "userpromptsubmit" | "permissionrequest" | "notification" | "stop"
+            "sessionstart"
+                | "userpromptsubmit"
+                | "permissionrequest"
+                | "notification"
+                | "stop"
+                | "stopfailure"
         ),
         "codex" => matches!(normalized.as_str(), "sessionstart" | "stop"),
         "copilot" | "droid" | "qodercli" | "qwen" => normalized == "sessionstart",
@@ -1882,7 +1943,7 @@ fn event_only_callback(provider: &str, event: &str) -> bool {
         (provider, normalize_event(event).as_str()),
         (
             "claude",
-            "userpromptsubmit" | "permissionrequest" | "notification" | "stop"
+            "userpromptsubmit" | "permissionrequest" | "notification" | "stop" | "stopfailure"
         ) | ("codex", "stop")
     )
 }
