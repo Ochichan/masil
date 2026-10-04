@@ -1130,38 +1130,161 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
     Ok(0)
 }
 
-async fn wait(manager: &Manager, args: &[String]) -> Result<i32, String> {
-    let mut state = None;
-    let mut timeout = 30.0;
-    let mut after = false;
-    let mut i = 1;
+/// What `wait` waits for (EV-07).
+enum WaitFor<'a> {
+    /// `TARGET --state S [--after-change]`
+    State {
+        target: &'a str,
+        state: &'a str,
+        after: bool,
+    },
+    /// `--operation KEY --stage S`
+    Stage { key: &'a str, stage: &'a str },
+    /// `--run RUN --ended`
+    Ended { run: &'a str },
+    /// `--pane %N|--window @N|--session NAME --closed`
+    Closed { kind: &'a str, target: &'a str },
+}
+
+fn wait_options(args: &[String]) -> Result<(WaitFor<'_>, f64), String> {
+    let usage = || {
+        "usage: wait TARGET --state S | --operation KEY --stage S | --run RUN --ended | --pane %N|--window @N|--session NAME --closed [--timeout SECONDS]".to_owned()
+    };
+    let target = args.first().filter(|first| !first.starts_with("--"));
+    let mut values: Vec<(&str, &str)> = Vec::new();
+    let mut flags: Vec<&str> = Vec::new();
+    let mut timeout = None;
+    let mut i = usize::from(target.is_some());
     while i < args.len() {
-        match args[i].as_str() {
-            "--state" if state.is_none() => state = Some(value(args, i)?),
-            "--timeout" => {
-                timeout = value(args, i)?
-                    .parse::<f64>()
-                    .map_err(|_| "invalid_argument: invalid timeout")?
-            }
-            "--after-change" if !after => {
-                after = true;
+        let option = args[i].as_str();
+        match option {
+            "--after-change" | "--ended" | "--closed" if !flags.contains(&option) => {
+                flags.push(option);
                 i += 1;
-                continue;
             }
-            _ => return Err("usage: invalid wait options".into()),
+            // The last one counts, as before.
+            "--timeout" => {
+                timeout = Some(value(args, i)?);
+                i += 2;
+            }
+            "--state" | "--operation" | "--stage" | "--run" | "--pane" | "--window"
+            | "--session"
+                if !values.iter().any(|(name, _)| *name == option) =>
+            {
+                let given = value(args, i)?;
+                if given.starts_with("--") {
+                    return Err(usage());
+                }
+                values.push((option, given));
+                i += 2;
+            }
+            _ => return Err(usage()),
         }
-        i += 2;
     }
+    let timeout = match timeout {
+        Some(text) => text
+            .parse::<f64>()
+            .map_err(|_| "invalid_argument: invalid timeout")?,
+        None => 30.0,
+    };
     if !(0.05..=300.0).contains(&timeout) {
         return Err("invalid_argument: timeout must be 0.05–300 seconds".into());
     }
-    let state = state.ok_or("usage: wait requires --state")?;
+    let named: Vec<&str> = values.iter().map(|(name, _)| *name).collect();
+    let get = |name: &str| values.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+    let wanted = match (target, named.as_slice(), flags.as_slice()) {
+        (Some(target), ["--state"], [] | ["--after-change"]) => WaitFor::State {
+            target,
+            state: get("--state").ok_or_else(usage)?,
+            after: !flags.is_empty(),
+        },
+        (None, ["--operation", "--stage"] | ["--stage", "--operation"], []) => WaitFor::Stage {
+            key: get("--operation").ok_or_else(usage)?,
+            stage: get("--stage").ok_or_else(usage)?,
+        },
+        (None, ["--run"], ["--ended"]) => WaitFor::Ended {
+            run: get("--run").ok_or_else(usage)?,
+        },
+        (None, [kind @ ("--pane" | "--window" | "--session")], ["--closed"]) => WaitFor::Closed {
+            kind: kind.trim_start_matches("--"),
+            target: get(kind).ok_or_else(usage)?,
+        },
+        (Some(_), [], _) => return Err("usage: wait requires --state".into()),
+        _ => return Err(usage()),
+    };
+    Ok((wanted, timeout))
+}
+
+async fn wait(manager: &Manager, args: &[String]) -> Result<i32, String> {
+    let (wanted, timeout) = wait_options(args)?;
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout);
+    match wanted {
+        WaitFor::State {
+            target,
+            state,
+            after,
+        } => wait_state(manager, target, state, after, deadline).await,
+        WaitFor::Stage { key, stage } => wait_stage(manager, key, stage, deadline).await,
+        WaitFor::Ended { run } => wait_ended(manager, run, deadline).await,
+        WaitFor::Closed { kind, target } => wait_closed(manager, kind, target, deadline).await,
+    }
+}
+
+/// The exit status of a wait that ended for `end_reason`: 0 for what it
+/// waited for, 6 when it could not tell, 5 otherwise.
+fn wait_exit(end_reason: &str, waited_for: &str) -> i32 {
+    match end_reason {
+        _ if end_reason == waited_for => 0,
+        "server_gone" | "observation_lost" | "timeout" => 6,
+        _ => 5,
+    }
+}
+
+/// The server is gone (killed, or its socket removed).
+fn server_gone(error: &str) -> bool {
+    [
+        "no server running on",
+        "server exited unexpectedly",
+        "error connecting to",
+    ]
+    .iter()
+    .any(|text| error.contains(text))
+}
+
+/// A wait that could not read the server: `server_gone` or
+/// `observation_lost`, printed with `fields`.
+fn wait_unread(error: &str, mut fields: Value) -> Result<i32, String> {
+    let end_reason = if server_gone(error) {
+        "server_gone"
+    } else {
+        "observation_lost"
+    };
+    fields["outcome"] = json!(end_reason);
+    fields["end_reason"] = json!(end_reason);
+    fields["reason"] = json!(error);
+    print(&fields)?;
+    Ok(6)
+}
+
+async fn pause(deadline: Instant) {
+    tokio::time::sleep(
+        Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
+    )
+    .await;
+}
+
+async fn wait_state(
+    manager: &Manager,
+    target: &str,
+    state: &str,
+    after: bool,
+    deadline: Instant,
+) -> Result<i32, String> {
     validate_args(&[state.into()])?;
     if !["idle", "working", "blocked", "exited", "unknown"].contains(&state) {
         return Err("invalid_argument: unsupported wait state".into());
     }
-    let initial = manager.get(&args[0]).await?;
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout);
+    let initial = manager.get(target).await?;
     let mut changed = false;
     loop {
         let agent = match manager.get(&initial.pane_id).await {
@@ -1169,44 +1292,416 @@ async fn wait(manager: &Manager, args: &[String]) -> Result<i32, String> {
             Err(error) => {
                 let absent = failure::classify(&error).1 == "target_absent";
                 let reason = error.strip_prefix("target_absent: ").unwrap_or(&error);
+                let end_reason = if server_gone(&error) {
+                    "server_gone"
+                } else if !absent {
+                    "observation_lost"
+                } else {
+                    // The pane is still there and runs something else.
+                    match manager
+                        .command(&[
+                            "display-message",
+                            "-p",
+                            "-t",
+                            &initial.pane_id,
+                            "#{pane_id}",
+                        ])
+                        .await
+                    {
+                        Ok(pane) if pane.trim() == initial.pane_id => "agent_left_foreground",
+                        Err(error) if server_gone(&error) => "server_gone",
+                        _ => "pane_closed",
+                    }
+                };
                 print(
-                    &json!({"outcome":if absent{"target_removed"}else{"observation_lost"},"reason":reason,"pane_id":initial.pane_id,"run":initial.run}),
+                    &json!({"outcome":if absent && end_reason != "server_gone" {"target_removed"} else {"observation_lost"},"end_reason":end_reason,"reason":reason,"pane_id":initial.pane_id,"run":initial.run}),
                 )?;
-                return Ok(if absent { 5 } else { 6 });
+                return Ok(if absent && end_reason != "server_gone" {
+                    5
+                } else {
+                    6
+                });
             }
         };
         if agent.boot != initial.boot
             || agent.generation != initial.generation
             || agent.run != initial.run
         {
-            print(&json!({"outcome":"run_changed","pane_id":initial.pane_id,"run":initial.run}))?;
-            return Ok(5);
+            print(
+                &json!({"outcome":"run_changed","end_reason":"run_changed","pane_id":initial.pane_id,"run":initial.run}),
+            )?;
+            return Ok(wait_exit("run_changed", "state_observed"));
         }
         changed |= agent.state != initial.state;
         if agent.state == state && (!after || changed) {
             print(
-                &json!({"outcome":"state_observed","state":state,"pane_id":agent.pane_id,"run":agent.run,"task_success":null}),
+                &json!({"outcome":"state_observed","end_reason":"state_observed","state":state,"pane_id":agent.pane_id,"run":agent.run,"task_success":null}),
             )?;
             return Ok(0);
         }
         if agent.state == "exited" {
-            print(&json!({"outcome":"process_exited","pane_id":agent.pane_id,"run":agent.run}))?;
-            return Ok(5);
+            print(
+                &json!({"outcome":"process_exited","end_reason":"run_ended","pane_id":agent.pane_id,"run":agent.run}),
+            )?;
+            return Ok(wait_exit("run_ended", "state_observed"));
         }
         if Instant::now() >= deadline {
-            print(&json!({"outcome":"timeout","pane_id":agent.pane_id,"run":agent.run}))?;
-            return Ok(6);
+            print(
+                &json!({"outcome":"timeout","end_reason":"timeout","pane_id":agent.pane_id,"run":agent.run}),
+            )?;
+            return Ok(wait_exit("timeout", "state_observed"));
         }
-        tokio::time::sleep(
-            Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
-        )
-        .await;
+        pause(deadline).await;
+    }
+}
+
+/// An operation's stage in order, and whether nothing can follow it. A
+/// stage at the same rank as the one waited for (another confirmation of an
+/// interrupt) counts. Stages outside the order end the operation without
+/// reaching any.
+fn stage_rank(stage: &str) -> Option<(u8, bool)> {
+    Some(match stage {
+        "pending" => (0, false),
+        "dispatching" => (1, false),
+        "delivered" | "process_started" | "interrupt_key_delivered" => (2, false),
+        // The process ended before it was seen running; the pane closed;
+        // the interrupt's key ended the provider; a person said it was
+        // delivered (whether the provider took it stays unknown).
+        "process_exited" | "pane_closed" | "provider_exited" | "user_confirmed_delivered" => {
+            (2, true)
+        }
+        "native_accepted"
+        | "provider_stopped"
+        | "turn_end_observed"
+        | "completed_before_interrupt" => (3, true),
+        _ => return None,
+    })
+}
+
+/// The stages a `wait --stage` may name for an action.
+fn action_stages(action: &str) -> &'static [&'static str] {
+    match action {
+        "start" => &["process_started"],
+        "prompt" => &["delivered", "user_confirmed_delivered", "native_accepted"],
+        "interrupt" => &[
+            "interrupt_key_delivered",
+            "provider_stopped",
+            "turn_end_observed",
+            "completed_before_interrupt",
+        ],
+        "close" => &["pane_closed"],
+        "answer" => &["native_accepted"],
+        _ => &[],
+    }
+}
+
+async fn wait_stage(
+    manager: &Manager,
+    key: &str,
+    stage: &str,
+    deadline: Instant,
+) -> Result<i32, String> {
+    validate_args(&[key.into(), stage.into()])?;
+    let store = match manager.operation_store().await {
+        Ok(store) => store,
+        Err(error) if server_gone(&error) => {
+            return wait_unread(&error, json!({"operation_key": key}));
+        }
+        Err(error) => return Err(error),
+    };
+    let missing = || {
+        "target_absent: operation not found; it never existed or its namespace ended and it was deleted".to_owned()
+    };
+    let record = store.get(key)?.ok_or_else(missing)?;
+    let stages = action_stages(&record.action);
+    if !stages.contains(&stage) {
+        return Err(format!(
+            "invalid_argument: a {} operation's stages to wait for are {}",
+            record.action,
+            if stages.is_empty() {
+                "none".to_owned()
+            } else {
+                stages.join(", ")
+            }
+        ));
+    }
+    let wanted = stage_rank(stage).map_or(u8::MAX, |(rank, _)| rank);
+    loop {
+        let record = match store.get(key) {
+            Ok(Some(record)) => record,
+            result => {
+                let reason = result.err().unwrap_or_else(missing);
+                return wait_unread(&reason, json!({"operation_key": key}));
+            }
+        };
+        let report = |end_reason: &str| json!({"outcome":end_reason,"end_reason":end_reason,"operation_key":key,"action":record.action,"stage":record.state});
+        match stage_rank(&record.state) {
+            Some((rank, _)) if rank >= wanted => {
+                print(&report("stage_reached"))?;
+                return Ok(0);
+            }
+            Some((_, false)) => {}
+            // Ended without reaching it: the stored stage's own status, or
+            // a failure for a stage that is itself a success.
+            ended => {
+                print(&report("operation_ended"))?;
+                return Ok(match ended {
+                    _ if record.state == "user_confirmed_delivered" => 6,
+                    Some(_) => 5,
+                    None => failure::recorded_exit_code(&record.state, false),
+                });
+            }
+        }
+        if Instant::now() >= deadline {
+            print(&report("timeout"))?;
+            return Ok(wait_exit("timeout", "stage_reached"));
+        }
+        pause(deadline).await;
+    }
+}
+
+/// Whether some agent runs `run`. A job stopped with Ctrl-Z leaves `list`
+/// but is the same run when brought back, so a run masil did not start is
+/// live while the process recorded for it (`EPOCH`) still exists.
+async fn running(manager: &Manager, run: &str) -> Result<bool, String> {
+    let agents = match manager.collect(None).await {
+        Ok(agents) => agents,
+        // Another writer won a pane's update twice: no answer this time.
+        Err(error) if error.starts_with("identity_mismatch") => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if agents
+        .iter()
+        .any(|agent| agent.run == run && agent.process != "exited")
+    {
+        return Ok(true);
+    }
+    Ok(manager.inventory().await?.iter().any(|fields| {
+        fields.get(4).is_some_and(|dead| dead != "1")
+            && fields.get(17).is_some_and(|recorded| {
+                super::epoch_records(recorded).any(|(recorded, epoch)| {
+                    recorded == run
+                        && epoch.split_once(':').is_some_and(|(group, started)| {
+                            group
+                                .parse::<i32>()
+                                .ok()
+                                .filter(|group| *group > 1)
+                                .is_some_and(|group| {
+                                    crate::process::info(group)
+                                        .is_some_and(|info| info.started.to_string() == started)
+                                })
+                        })
+                })
+            })
+    }))
+}
+
+async fn wait_ended(manager: &Manager, run: &str, deadline: Instant) -> Result<i32, String> {
+    if run.is_empty() || run.len() > 128 || run.chars().any(char::is_control) {
+        return Err("invalid_argument: invalid run".into());
+    }
+    let mut seen = false;
+    loop {
+        let live = match running(manager, run).await {
+            Ok(live) => live,
+            Err(error) => return wait_unread(&error, json!({"run": run, "seen": seen})),
+        };
+        if !live {
+            // `seen` false: no agent ran it when the wait began.
+            print(&json!({"outcome":"run_ended","end_reason":"run_ended","run":run,"seen":seen}))?;
+            return Ok(0);
+        }
+        seen = true;
+        if Instant::now() >= deadline {
+            print(&json!({"outcome":"timeout","end_reason":"timeout","run":run,"seen":seen}))?;
+            return Ok(wait_exit("timeout", "run_ended"));
+        }
+        pause(deadline).await;
+    }
+}
+
+/// `%N`, `@N` or `$N` with the number as the server prints it, so `%00`
+/// is `%0`.
+fn object_id(sigil: char, text: &str) -> Option<String> {
+    let number = text.strip_prefix(sigil)?;
+    (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| number.parse::<u32>().ok())
+        .flatten()
+        .map(|number| format!("{sigil}{number}"))
+}
+
+async fn wait_closed(
+    manager: &Manager,
+    kind: &str,
+    target: &str,
+    deadline: Instant,
+) -> Result<i32, String> {
+    validate_args(&[target.into()])?;
+    let closed = format!("{kind}_closed");
+    let (sigil, field, listing, format) = match kind {
+        "pane" => ('%', 3, "", ""),
+        "window" => (
+            '@',
+            2,
+            "list-windows",
+            "#{window_id}\t#{session_name}:#{window_name}\t#{session_name}:#{window_index}",
+        ),
+        _ => ('$', 1, "list-sessions", "#{session_id}\t#{session_name}"),
+    };
+    // An ID that is gone was closed; a name is turned into its ID first
+    // (exactly, never a prefix), so a rename is not a close.
+    let (id, named) = match object_id(sigil, target) {
+        Some(id) => (id, false),
+        None if kind == "pane" => {
+            return Err("invalid_argument: --pane takes a pane ID (%N)".into());
+        }
+        None => {
+            // list-sessions takes no -a.
+            let all: &[&str] = if kind == "session" { &[] } else { &["-a"] };
+            let args = [&[listing][..], all, &["-F", format][..]].concat();
+            let text = match manager.command(&args).await {
+                Ok(text) => text,
+                Err(error) if server_gone(&error) => {
+                    return wait_unread(&error, json!({ kind: target, "seen": false }));
+                }
+                Err(error) => return Err(error),
+            };
+            // A window linked into a session twice is still one window.
+            let mut found = text
+                .lines()
+                .filter(|line| line.split('\t').skip(1).any(|name| name == target))
+                .filter_map(|line| line.split('\t').next())
+                .collect::<Vec<_>>();
+            found.sort_unstable();
+            found.dedup();
+            let mut found = found.into_iter();
+            let id = found
+                .next()
+                .ok_or_else(|| format!("target_absent: {kind} not found"))?
+                .to_owned();
+            if found.next().is_some() {
+                return Err(format!(
+                    "invalid_argument: more than one {kind} is named {target}; use its ID"
+                ));
+            }
+            (id, true)
+        }
+    };
+    let mut boot: Option<String> = None;
+    // Found by name: it was there when the wait began.
+    let mut seen = named;
+    loop {
+        let present = match manager
+            .command(&[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{masil_core_boot_id}\t#{session_id}\t#{window_id}\t#{pane_id}",
+            ])
+            .await
+        {
+            Ok(text) => {
+                let current = text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split('\t').next())
+                    .map(str::to_owned);
+                // A restarted server reuses IDs: what was waited on is gone.
+                let same = boot.get_or_insert_with(|| current.clone().unwrap_or_default())
+                    == current.as_deref().unwrap_or_default();
+                same && text
+                    .lines()
+                    .any(|line| line.split('\t').nth(field) == Some(id.as_str()))
+            }
+            Err(error) => return wait_unread(&error, json!({ kind: id, "seen": seen })),
+        };
+        if !present {
+            print(&json!({"outcome":closed,"end_reason":closed,kind:id,"seen":seen}))?;
+            return Ok(0);
+        }
+        seen = true;
+        if Instant::now() >= deadline {
+            print(&json!({"outcome":"timeout","end_reason":"timeout",kind:id,"seen":seen}))?;
+            return Ok(wait_exit("timeout", &closed));
+        }
+        pause(deadline).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_takes_one_form_at_a_time() {
+        let parse = |line: &str| {
+            let args = line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+            wait_options(&args).map(|(wanted, timeout)| {
+                let form = match wanted {
+                    WaitFor::State { after, .. } => format!("state after={after}"),
+                    WaitFor::Stage { key, stage } => format!("stage {key} {stage}"),
+                    WaitFor::Ended { run } => format!("ended {run}"),
+                    WaitFor::Closed { kind, target } => format!("closed {kind} {target}"),
+                };
+                (form, timeout)
+            })
+        };
+        assert_eq!(
+            parse("api --state idle --after-change").unwrap(),
+            ("state after=true".into(), 30.0)
+        );
+        assert_eq!(
+            parse("--stage pane_closed --operation k --timeout 2").unwrap(),
+            ("stage k pane_closed".into(), 2.0)
+        );
+        assert_eq!(parse("--run r1 --ended").unwrap().0, "ended r1");
+        // A repeated timeout: the last one, as before.
+        assert_eq!(
+            parse("api --state idle --timeout 1 --timeout 2").unwrap().1,
+            2.0
+        );
+        assert_eq!(
+            parse("--session work --closed").unwrap().0,
+            "closed session work"
+        );
+        for wrong in [
+            "api --state idle --run r1",
+            "--run r1",
+            "--pane %1 --window @1 --closed",
+            "--run r1 --ended --after-change",
+            "--run --ended --ended",
+            "api --state idle --state busy",
+            "--operation k --stage x --timeout 0",
+            "api --timeout 5",
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn a_wait_exits_0_only_for_what_it_waited_for() {
+        assert_eq!(wait_exit("pane_closed", "pane_closed"), 0);
+        assert_eq!(wait_exit("pane_closed", "state_observed"), 5);
+        assert_eq!(wait_exit("run_changed", "state_observed"), 5);
+        for unknown in ["server_gone", "observation_lost", "timeout"] {
+            assert_eq!(wait_exit(unknown, "run_ended"), 6);
+        }
+        // Every stage a wait may name is in the order.
+        for action in ["start", "prompt", "interrupt", "close", "answer"] {
+            for stage in action_stages(action) {
+                assert!(
+                    stage_rank(stage).is_some_and(|(rank, _)| rank >= 2),
+                    "{stage}"
+                );
+            }
+        }
+        assert_eq!(stage_rank("not_applied"), None);
+        assert_eq!(stage_rank("outcome_unknown"), None);
+        // A key that ended the provider was delivered; nothing confirms it.
+        assert_eq!(stage_rank("provider_exited"), Some((2, true)));
+        assert_eq!(object_id('%', "%00").as_deref(), Some("%0"));
+        assert_eq!(object_id('$', "$x"), None);
+    }
 
     #[test]
     fn every_catalog_verb_reaches_a_dispatcher_before_unknown_command_rejection() {

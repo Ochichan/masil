@@ -200,6 +200,9 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
             let target = args
                 .first()
                 .ok_or("usage: remote command requires a target")?;
+            if command == "wait" && target.starts_with("--") {
+                return Err("usage: an endpoint waits only for an agent's state (`wait TARGET --state S`); run the other waits on that host".into());
+            }
             let agent = match get(&endpoint, target).await {
                 Ok(agent) => agent,
                 // A keyed retry whose target is gone still has its receipt
@@ -525,15 +528,26 @@ async fn wait(endpoint: &Endpoint, initial: &Agent, args: &[String]) -> Result<i
         let value = match get(endpoint, &initial.pane_id).await {
             Ok(a) if a.run == initial.run && a.boot == initial.boot => a,
             Ok(_) => {
-                print(&json!({"stage":"run_changed","run":initial.run}))?;
+                print(
+                    &json!({"stage":"run_changed","end_reason":"run_changed","run":initial.run}),
+                )?;
                 return Ok(5);
             }
             Err(e) => {
-                print(&json!({"stage":"unavailable","run":initial.run,"error":e}))?;
+                let (class, code) = failure::classify(&e);
+                // The endpoint does not say whether the pane closed or only
+                // the agent left it.
+                let end_reason = if code == "target_absent" {
+                    "target_removed"
+                } else {
+                    "observation_lost"
+                };
+                print(
+                    &json!({"stage":"unavailable","end_reason":end_reason,"run":initial.run,"error":e}),
+                )?;
                 // No result from the endpoint is transient unless the
                 // endpoint said why: an error without a code, as from an older
                 // endpoint, is still only a missing result.
-                let (class, code) = failure::classify(&e);
                 return Ok(if code == "failed" {
                     4
                 } else {
@@ -544,18 +558,18 @@ async fn wait(endpoint: &Endpoint, initial: &Agent, args: &[String]) -> Result<i
         changed |= value.state != initial.state || value.revision != initial.revision;
         if changed && value.state == desired {
             print(
-                &json!({"stage":"state_observed","run":value.run,"state":value.state,"task_success":null}),
+                &json!({"stage":"state_observed","end_reason":"state_observed","run":value.run,"state":value.state,"task_success":null}),
             )?;
             return Ok(0);
         }
         if value.state == "exited" || value.process == "exited" {
             print(
-                &json!({"stage":"state_observed","run":value.run,"state":"exited","task_success":null}),
+                &json!({"stage":"state_observed","end_reason":"run_ended","run":value.run,"state":"exited","task_success":null}),
             )?;
             return Ok(5);
         }
         if Instant::now() >= until {
-            print(&json!({"stage":"timeout","run":initial.run}))?;
+            print(&json!({"stage":"timeout","end_reason":"timeout","run":initial.run}))?;
             return Ok(6);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;

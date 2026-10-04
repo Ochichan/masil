@@ -166,7 +166,7 @@ pub(crate) const VERBS: &[Verb] = &[
     },
     Verb {
         name: "wait",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] wait TARGET --state idle|working|blocked|exited [--timeout SECONDS] [--after-change]",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] wait TARGET --state idle|working|blocked|exited [--after-change] | wait --operation KEY --stage STAGE | wait --run RUN --ended | wait --pane %N|--window @N|--session NAME --closed [--timeout SECONDS]",
         mutating: false,
         target_stage: None,
         remote: true,
