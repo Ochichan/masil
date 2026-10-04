@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Build the pinned tmux-derived core without installing system packages."""
 import argparse
+import gzip
 import hashlib
 import io
 import json
 import os
+import platform
 import re
 from pathlib import Path
 import shutil
@@ -157,7 +159,8 @@ def build(source, name, env, jobs):
     staged = destination.with_suffix('.new')
     shutil.copy2(output / 'tmux', staged)
     staged.replace(destination)
-    metadata = {'source_commit': SHA, 'binary': str(destination),
+    metadata = {'source_commit': SHA, 'binary': str(destination.relative_to(ROOT)),
+                'masil_revision': git_revision(),
                 'sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
                 'compiler': subprocess.check_output([env['CC'], '--version'], text=True).splitlines()[0],
                 'cflags': env['CFLAGS'], 'configure': CONFIGURE_FLAGS,
@@ -166,13 +169,110 @@ def build(source, name, env, jobs):
     print(metadata['version'], destination, flush=True)
 
 
+DIST_README = """masil core {rev}
+
+bin/masil is the tmux-derived terminal core alone, built from tmux {sha}
+with the masil changes in this revision. It links libevent, ncurses,
+utf8proc and jemalloc from the paths of the machine that built it
+(otool -L or ldd shows them); install the same libraries there.
+
+Agent features (masil-agent) are not included. Started without -f, masil
+loads its UI layer, whose buttons and session autosave call masil-agent;
+without it they fail. Start with -f FILE (for example -f ~/.tmux.conf or
+-f /dev/null) for plain tmux defaults. masil keeps its own socket
+directory (masil-UID), so it does not reach running tmux servers.
+
+share/man/man1/tmux.1 is the tmux manual with masil's additions.
+UPSTREAM.json lists the imported tmux files and their hashes; build.json
+the compiler, flags, revision and binary hash. licenses/ holds the tmux
+(ISC) and yyjson (MIT) notices that NOTICE names.
+"""
+
+
+def git_revision():
+    """HEAD and whether the inputs of the core build differ from it."""
+    head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT,
+                          capture_output=True, text=True)
+    if head.returncode:
+        return None
+    dirty = subprocess.run(['git', 'status', '--porcelain', '--', 'core', 'scripts/build.py',
+                            'LICENSE', 'NOTICE'], cwd=ROOT, capture_output=True, text=True)
+    return {'commit': head.stdout.strip(), 'dirty': bool(dirty.stdout.strip()) or dirty.returncode != 0}
+
+
+def dist():
+    """Pack the built core alone into .build/dist; the agent is not included."""
+    binary = ROOT / 'bin/masil'
+    metadata_path = BUILD / 'core/build.json'
+    if not binary.exists() or not metadata_path.exists():
+        raise SystemExit('build the core first: python3 scripts/build.py')
+    metadata = json.loads(metadata_path.read_text())
+    if metadata.get('sha256') != hashlib.sha256(binary.read_bytes()).hexdigest():
+        raise SystemExit('bin/masil differs from .build/core/build.json; rebuild the core')
+    built = metadata.get('masil_revision')
+    # The archive's other files come from the tree now; they must be the
+    # ones the binary was built with.
+    if not built or built != git_revision():
+        raise SystemExit('the tree is not the one bin/masil was built from (or the build '
+                         'predates revision records); rebuild the core first')
+    # A dirty tree has no revision that names its other files.
+    if built['dirty']:
+        raise SystemExit('core, scripts/build.py, LICENSE or NOTICE has uncommitted changes; '
+                         'commit them and rebuild the core first')
+    rev = built['commit'][:12]
+    name = f'masil-core-{rev}-{platform.system().lower()}-{platform.machine()}'
+    files = [
+        (binary, 'bin/masil'),
+        (ROOT / 'core/tmux.1', 'share/man/man1/tmux.1'),
+        (ROOT / 'LICENSE', 'LICENSE'),
+        (ROOT / 'NOTICE', 'NOTICE'),
+        (ROOT / 'core/COPYING', 'licenses/tmux-COPYING'),
+        (ROOT / 'core/compat/yyjson/LICENSE', 'licenses/yyjson-LICENSE'),
+        (ROOT / 'core/UPSTREAM.json', 'UPSTREAM.json'),
+    ]
+    texts = {
+        'README': DIST_README.format(rev=rev, sha=SHA),
+        'build.json': json.dumps(metadata, indent=2) + '\n',
+    }
+
+    def anonymous(info):
+        info.uid = info.gid = 0
+        info.uname = info.gname = ''
+        return info
+
+    output = BUILD / 'dist'
+    output.mkdir(parents=True, exist_ok=True)
+    archive = output / (name + '.tar.gz')
+    staged = archive.with_suffix('.new')
+    try:
+        with staged.open('wb') as raw, \
+                gzip.GzipFile(filename=archive.with_suffix('').name, mode='wb', fileobj=raw) as gz, \
+                tarfile.open(fileobj=gz, mode='w') as tar:
+            for path, member in files:
+                tar.add(path, arcname=f'{name}/{member}', recursive=False, filter=anonymous)
+            for member, text in texts.items():
+                data = text.encode()
+                info = anonymous(tarfile.TarInfo(f'{name}/{member}'))
+                info.size = len(data)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data))
+        staged.replace(archive)
+    finally:
+        staged.unlink(missing_ok=True)
+    print(archive, flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--baseline', action='store_true')
     p.add_argument('--agent', action='store_true', help='build only the optional Rust observation client')
     p.add_argument('--clean', action='store_true', help='remove project build outputs only; preserve local tools')
     p.add_argument('--jobs', type=int, default=4)
+    p.add_argument('--dist', action='store_true', help='pack the built core alone into .build/dist')
     args = p.parse_args()
+    if args.dist:
+        dist()
+        return
     if args.clean:
         for path in (BUILD / 'core', BUILD / 'baseline', ROOT / 'bin'):
             if path.exists():
