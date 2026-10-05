@@ -96,10 +96,13 @@ pub(crate) struct Resident {
     stood_back: AtomicUsize,
     /// The pane and time of the last stand-back, for `status`.
     last_stood_back: Mutex<Option<(String, u64)>>,
+    /// Core-ledger actions hold this while their preconditions and effect are
+    /// in flight, so this watch does not rewrite TRACKED under them.
+    action_locks: Arc<super::core_action::PaneActionLocks>,
 }
 
 impl Resident {
-    fn new(tick: Duration) -> Self {
+    fn new(tick: Duration, action_locks: Arc<super::core_action::PaneActionLocks>) -> Self {
         Self {
             timing: Timing::new(tick),
             panes: Mutex::new(HashMap::new()),
@@ -107,6 +110,7 @@ impl Resident {
             inbox_dirty: AtomicBool::new(false),
             stood_back: AtomicUsize::new(0),
             last_stood_back: Mutex::new(None),
+            action_locks,
         }
     }
 
@@ -114,6 +118,9 @@ impl Resident {
     /// while another writer changed TRACKED under the same output, which
     /// means the two judge one screen differently (different manifests).
     pub(super) fn may_write(&self, pane: &str, output: &str, tracked: &str, now: u64) -> bool {
+        if self.action_locks.is_locked(pane) {
+            return false;
+        }
         let Ok(output) = output.parse::<u64>() else {
             return true;
         };
@@ -134,6 +141,10 @@ impl Resident {
             }
         }
         allowed
+    }
+
+    pub(super) fn action_locked(&self, pane: &str) -> bool {
+        self.action_locks.is_locked(pane)
     }
 
     /// Records what each agent pane holds after a pass.
@@ -236,6 +247,8 @@ pub(crate) struct WatchControl {
     /// The badge was counted after a pass or a poke: inbox events may have
     /// been written (resident extensions read them then).
     pub inbox_changed: Arc<Notify>,
+    /// Per-pane action ownership shared with the core-ledger RPC.
+    pub action_locks: Arc<super::core_action::PaneActionLocks>,
 }
 
 /// Consume both inbox-change sources every iteration. These must be separate
@@ -586,12 +599,7 @@ fn healthy_bridge_wait_interval(
         state.last_event_pass,
         now,
     );
-    if !state.healthy
-        || state.busy
-        || now < state.hot_until
-        || state.retry
-        || state.inbox_dirty
-    {
+    if !state.healthy || state.busy || now < state.hot_until || state.retry || state.inbox_dirty {
         return fallback;
     }
 
@@ -803,9 +811,13 @@ fn bridge_event_action(event: &Event) -> BridgeEventAction {
 impl Manager {
     /// The coordinator's Manager: it keeps per-pane memory and one store
     /// connection, and never pokes itself. `tick` is the quiet watch tick.
-    pub(crate) fn resident(socket: std::path::PathBuf, tick: Duration) -> Result<Self, String> {
+    pub(crate) fn resident(
+        socket: std::path::PathBuf,
+        tick: Duration,
+        action_locks: Arc<super::core_action::PaneActionLocks>,
+    ) -> Result<Self, String> {
         let mut manager = Self::new(socket, None)?;
-        manager.resident = Some(Resident::new(tick));
+        manager.resident = Some(Resident::new(tick, action_locks));
         Ok(manager)
     }
 
@@ -1058,9 +1070,7 @@ pub(crate) async fn watch(
             badge.count(&manager, started).await;
             if poked || inbox_changed {
                 control.inbox_changed.notify_one();
-                if !periodic
-                    && let Err(error) = notify(&manager, &mut notifier).await
-                {
+                if !periodic && let Err(error) = notify(&manager, &mut notifier).await {
                     errors.note(&error, &log, &control);
                 }
             }
@@ -1091,27 +1101,26 @@ pub(crate) async fn watch(
         // lightweight signature still catches a new foreground agent in an
         // unscoped pane. It is 5x less frequent than the old Linux path.
         let bridge_healthy = bridge.healthy;
-        let signature_changed = if bridge_healthy
-            && started.saturating_sub(last_list) >= timing.list_every
-        {
-            match manager
-                .command(&["list-panes", "-a", "-F", SIGNATURE])
-                .await
-            {
-                Ok(signature) => {
-                    last_list = started;
-                    let changed = signature != previous;
-                    previous = signature;
-                    changed
+        let signature_changed =
+            if bridge_healthy && started.saturating_sub(last_list) >= timing.list_every {
+                match manager
+                    .command(&["list-panes", "-a", "-F", SIGNATURE])
+                    .await
+                {
+                    Ok(signature) => {
+                        last_list = started;
+                        let changed = signature != previous;
+                        previous = signature;
+                        changed
+                    }
+                    Err(error) => {
+                        errors.note(&error, &log, &control);
+                        false
+                    }
                 }
-                Err(error) => {
-                    errors.note(&error, &log, &control);
-                    false
-                }
-            }
-        } else {
-            false
-        };
+            } else {
+                false
+            };
         if signature_changed {
             bridge.signature_changed();
         }
@@ -1608,7 +1617,10 @@ impl Reports {
     fn replace_pane(&mut self, pane: &str, agents: &[Agent]) {
         self.panes.retain(|_, candidate| candidate != pane);
         self.agents.retain(|_, agent| agent.pane_id != pane);
-        for agent in agents.iter().filter(|agent| super::observe::observable(agent)) {
+        for agent in agents
+            .iter()
+            .filter(|agent| super::observe::observable(agent))
+        {
             self.panes.insert(agent.run.clone(), agent.pane_id.clone());
             self.agents.insert(agent.run.clone(), agent.clone());
         }
@@ -2407,7 +2419,10 @@ mod tests {
     #[test]
     fn resident_inbox_dirty_is_consumed_once_even_with_a_pending_recount() {
         let control = WatchControl::default();
-        let resident = Resident::new(Duration::from_secs(1));
+        let resident = Resident::new(
+            Duration::from_secs(1),
+            Arc::new(super::super::core_action::PaneActionLocks::default()),
+        );
         resident.mark_inbox_dirty();
         control.recount.store(true, Ordering::SeqCst);
         assert!(take_inbox_changes(&control, Some(&resident)));

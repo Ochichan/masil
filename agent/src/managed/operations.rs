@@ -1612,6 +1612,79 @@ impl Store {
         )
     }
 
+    /// Persist an intermediate durable receipt while an operation is still
+    /// dispatching. Core-ledger interrupts use this after an earlier key has
+    /// a result and before their later key is issued, so each retained core
+    /// receipt can be retired only after SQLite has recorded it.
+    pub fn note_dispatch(
+        &mut self,
+        ticket: &Ticket,
+        stage: &str,
+        source: &str,
+        evidence: Option<&Value>,
+        now: u64,
+    ) -> Result<Record, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT state FROM operations WHERE id = ?1 AND ticket = ?2",
+                params![ticket.op, ticket.ticket],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        if current.as_deref() != Some(DISPATCHING) {
+            return Err("operation receipt changed concurrently; query it again".into());
+        }
+        Self::append(&tx, ticket.op, stage, source, evidence, now)?;
+        let key: String = tx
+            .query_row(
+                "SELECT key FROM operations WHERE id = ?1",
+                [ticket.op],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        let record = Self::record_in(&tx, &key)?.ok_or("operation disappeared")?;
+        tx.commit().map_err(sql)?;
+        Ok(record)
+    }
+
+    /// Append evidence to an unresolved outcome without changing its state.
+    /// Reconciliation uses this before it retires a core-ledger receipt, so
+    /// the proof remains available even when the entry leaves the core.
+    pub fn note_unknown(
+        &mut self,
+        record: &Record,
+        stage: &str,
+        source: &str,
+        evidence: Option<&Value>,
+        now: u64,
+    ) -> Result<Record, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT state FROM operations WHERE id = ?1 AND ticket = ?2",
+                params![record.op, record.ticket],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        if current.as_deref() != Some(UNKNOWN) {
+            return Err("operation receipt changed concurrently; query it again".into());
+        }
+        Self::append(&tx, record.op, stage, source, evidence, now)?;
+        let updated =
+            Self::record_in(&tx, &record.operation_key)?.ok_or("operation disappeared")?;
+        tx.commit().map_err(sql)?;
+        Ok(updated)
+    }
+
     /// Replace `outcome_unknown` with a state established later: new
     /// evidence found by reconcile or an explicit user decision.
     pub fn settle_unknown(

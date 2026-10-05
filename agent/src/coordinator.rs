@@ -26,9 +26,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 static POKES: AtomicUsize = AtomicUsize::new(0);
 
 /// Protocol and feature generation; a client replaces an older coordinator.
-/// 2: features, `reload`, the screen watch and the executable identity.
-pub(crate) const GENERATION: u64 = 2;
+/// 3: features, `reload`, the screen watch, executable identity, and the
+/// core guarded-action control RPC.
+pub(crate) const GENERATION: u64 = 3;
 const REQUEST_FRAME: usize = 8 * 1024;
+const ACTION_REQUEST_FRAME: usize = 64 * 1024;
 const RESPONSE_FRAME: usize = 64 * 1024;
 /// An `endpoint_call` answer: an endpoint's list fits.
 pub(crate) const LINK_FRAME: usize = 1024 * 1024 + 8 * 1024;
@@ -439,6 +441,36 @@ pub(crate) fn endpoint_call(
     }
 }
 
+/// Sends one guarded-action request through the coordinator. The caller
+/// starts or revives the coordinator first; once a core path was selected,
+/// a missing bridge is reported here rather than falling back to native.
+pub(crate) fn action(socket: &Path, params: Value) -> Result<Value, String> {
+    let body =
+        serde_json::to_vec(&json!({"v": 1, "id": "cli", "method": "action", "params": params}))
+            .map_err(|error| format!("invalid_action: {error}"))?;
+    if body.len() > ACTION_REQUEST_FRAME {
+        return Err("invalid_action: action request exceeds 64 KiB".into());
+    }
+    ensure(socket)?;
+    let server = check_state(socket)?;
+    let paths = paths(socket, &server.state)?;
+    match request_with(
+        &paths.listen,
+        "action",
+        params,
+        COMMAND_TIMEOUT + Duration::from_secs(2),
+        RESPONSE_FRAME,
+    ) {
+        // Once the control request has been written, a coordinator exit can
+        // race either side of the core effect. The caller must not retry a
+        // non-durable keys action through another path.
+        Err(error) if error.starts_with("coordinator_unavailable:") => Err(format!(
+            "outcome_unknown: coordinator action reply lost: {error}"
+        )),
+        result => result,
+    }
+}
+
 /// The running coordinator's resident extensions; None if none runs.
 pub(crate) fn extensions_status(socket: &Path) -> Option<Value> {
     let state = crate::managed::state_base().ok()?;
@@ -502,6 +534,7 @@ fn current(value: &Value, server: &ServerInfo) -> bool {
         && value["generation"]
             .as_u64()
             .is_some_and(|g| g >= GENERATION)
+        && value["action_protocol"].as_u64() == Some(crate::managed::core_action::ACTION_PROTOCOL)
         && exe_unchanged(&value["exe"])
 }
 
@@ -524,7 +557,8 @@ pub(crate) fn exe_identity() -> Value {
 }
 
 /// Whether the file a coordinator recorded as its executable is still the
-/// same file. An unknown identity counts as changed.
+/// same file. A replacement starts a new coordinator for every server so its
+/// code and its core action protocol move together.
 pub(crate) fn exe_unchanged(recorded: &Value) -> bool {
     let Some(path) = recorded["path"].as_str() else {
         return false;
@@ -937,6 +971,8 @@ pub(crate) fn revive(socket: &Path) {
         value["generation"]
             .as_u64()
             .is_some_and(|generation| generation >= GENERATION)
+            && value["action_protocol"].as_u64()
+                == Some(crate::managed::core_action::ACTION_PROTOCOL)
             && exe_unchanged(&value["exe"])
     });
     if !answering {
@@ -1149,9 +1185,11 @@ fn serve_locked(
         watch_parent(server.pid)?;
         let (listener, guard) = bind(&paths.listen)?;
         write_record(lock, &server, started)?;
+        let action_locks = Arc::new(crate::managed::core_action::PaneActionLocks::default());
         let shared = Arc::new(Shared {
             identity: json!({
                 "generation": GENERATION,
+                "action_protocol": crate::managed::core_action::ACTION_PROTOCOL,
                 "pid": std::process::id(),
                 "server_pid": server.pid,
                 "boot": server.boot,
@@ -1161,7 +1199,14 @@ fn serve_locked(
                 "exe": exe_identity(),
             }),
             features: std::sync::Mutex::new(Vec::new()),
-            control: Arc::new(crate::managed::resident::WatchControl::default()),
+            control: Arc::new(crate::managed::resident::WatchControl {
+                action_locks: action_locks.clone(),
+                ..Default::default()
+            }),
+            actions: Arc::new(crate::managed::core_action::CoordinatorActions::new(
+                options.socket.clone(),
+                action_locks,
+            )),
             reload: tokio::sync::Notify::new(),
             stop: Arc::new(tokio::sync::Notify::new()),
             last_active: Arc::new(std::sync::Mutex::new(Instant::now())),
@@ -1171,6 +1216,7 @@ fn serve_locked(
             links: Arc::default(),
             residents: Arc::default(),
         });
+        shared.actions.start().await;
         let supervisor = tokio::spawn(supervise(
             shared.clone(),
             options.socket.clone(),
@@ -1190,6 +1236,7 @@ fn serve_locked(
         )
         .await;
         supervisor.abort();
+        shared.actions.stop().await;
         stop_scheduler(&shared);
         shared.links.stop();
         // Its last act settles what came from the endpoints.
@@ -1214,6 +1261,8 @@ struct Shared {
     identity: Value,
     features: std::sync::Mutex<Vec<String>>,
     control: Arc<crate::managed::resident::WatchControl>,
+    /// The single core-ledger connection and its ordered action dispatcher.
+    actions: Arc<crate::managed::core_action::CoordinatorActions>,
     /// Wakes the supervisor to read the features again.
     reload: tokio::sync::Notify,
     stop: Arc<tokio::sync::Notify>,
@@ -1234,6 +1283,7 @@ impl Shared {
     fn identity(&self) -> Value {
         let mut identity = self.identity.clone();
         identity["features"] = json!(self.features());
+        identity["action_bridge"] = self.actions.status();
         identity
     }
 
@@ -1295,7 +1345,11 @@ async fn supervise(
                         .as_ref()
                         .is_none_or(tokio::task::JoinHandle::is_finished)
                 {
-                    match crate::managed::Manager::resident(socket.clone(), watch) {
+                    match crate::managed::Manager::resident(
+                        socket.clone(),
+                        watch,
+                        shared.control.action_locks.clone(),
+                    ) {
                         Ok(manager) => {
                             let path = log_path.clone();
                             *watcher = Some(tokio::spawn(crate::managed::resident::watch(
@@ -1685,14 +1739,20 @@ async fn serve_client(
         }
     };
     loop {
-        let Ok(Ok(body)) =
-            tokio::time::timeout(DEADLINE, ipc::read_frame(&mut stream, REQUEST_FRAME)).await
+        let Ok(Ok(body)) = tokio::time::timeout(DEADLINE, read_control_frame(&mut stream)).await
         else {
             return active;
         };
         let (response, stopping, frame) = if let Some(id) = test_request(&body) {
             count(&mut active);
             (notify_test_reply(shared, id).await, false, RESPONSE_FRAME)
+        } else if let Some((id, params)) = action_request(&body) {
+            count(&mut active);
+            (
+                action_reply(shared, id, &params).await,
+                false,
+                RESPONSE_FRAME,
+            )
         } else if let Some((id, params)) = link_request(&body) {
             (
                 endpoint_call_reply(shared, id, &params).await,
@@ -1712,6 +1772,55 @@ async fn serve_client(
         }
         if !matches!(written, Ok(Ok(()))) {
             return active;
+        }
+    }
+}
+
+/// The control socket normally keeps its 8 KiB request limit. C1b's action
+/// envelope carries up to 64 KiB, and no other method may use that allowance.
+async fn read_control_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>, String> {
+    let body = ipc::read_frame(stream, ACTION_REQUEST_FRAME).await?;
+    if body.len() <= REQUEST_FRAME || action_request(&body).is_some() {
+        Ok(body)
+    } else {
+        Err("request exceeds frame limit".into())
+    }
+}
+
+fn action_request(body: &[u8]) -> Option<(Value, Value)> {
+    let request = serde_json::from_slice::<Value>(body).ok()?;
+    let object = request.as_object()?;
+    let id = object.get("id")?;
+    (object.get("v") == Some(&json!(1))
+        && id
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && id.len() <= 64)
+        && object.get("method") == Some(&json!("action"))
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "v" | "id" | "method" | "params")))
+    .then(|| {
+        (
+            id.clone(),
+            object.get("params").cloned().unwrap_or(Value::Null),
+        )
+    })
+}
+
+async fn action_reply(shared: &Shared, id: Value, params: &Value) -> Value {
+    match shared.actions.execute(params).await {
+        Ok(value) => json!({"v": 1, "id": id, "ok": true, "value": value}),
+        Err(error) => {
+            let code = error
+                .split_once(':')
+                .map_or(error.as_str(), |(code, _)| code)
+                .trim();
+            json!({
+                "v": 1,
+                "id": id,
+                "ok": false,
+                "error": {"code": code, "message": error},
+            })
         }
     }
 }
@@ -1911,10 +2020,21 @@ mod tests {
     use super::*;
 
     fn shared() -> Shared {
+        let action_locks = Arc::new(crate::managed::core_action::PaneActionLocks::default());
         Shared {
-            identity: json!({"generation": GENERATION}),
+            identity: json!({
+                "generation": GENERATION,
+                "action_protocol": crate::managed::core_action::ACTION_PROTOCOL,
+            }),
             features: std::sync::Mutex::new(vec!["inbox".into()]),
-            control: Arc::default(),
+            control: Arc::new(crate::managed::resident::WatchControl {
+                action_locks: action_locks.clone(),
+                ..Default::default()
+            }),
+            actions: Arc::new(crate::managed::core_action::CoordinatorActions::new(
+                PathBuf::from("/tmp/masil-coordinator-test.sock"),
+                action_locks,
+            )),
             reload: tokio::sync::Notify::new(),
             stop: Arc::default(),
             last_active: Arc::new(std::sync::Mutex::new(Instant::now())),
@@ -1953,6 +2073,53 @@ mod tests {
         ] {
             assert_eq!(call(bad).0["error"]["code"], "invalid_request", "{bad}");
         }
+    }
+
+    #[test]
+    fn a_replaced_executable_is_not_a_current_coordinator() {
+        let server = ServerInfo {
+            pid: 42,
+            boot: "boot-a".into(),
+            state: PathBuf::from("/tmp/state"),
+        };
+        let compatible = json!({
+            "boot": "boot-a",
+            "server_pid": 42,
+            "generation": GENERATION,
+            "action_protocol": crate::managed::core_action::ACTION_PROTOCOL,
+            "exe": exe_identity(),
+        });
+        assert!(current(&compatible, &server));
+        let replaced = json!({
+            "boot": "boot-a",
+            "server_pid": 42,
+            "generation": GENERATION,
+            "action_protocol": crate::managed::core_action::ACTION_PROTOCOL,
+            "exe": {"path": "/another/masil-agent"},
+        });
+        assert!(!current(&replaced, &server));
+    }
+
+    #[test]
+    fn action_is_the_only_control_method_with_the_larger_frame() {
+        let action = serde_json::to_vec(&json!({
+            "v": 1,
+            "id": "test",
+            "method": "action",
+            "params": {"payload": "x".repeat(REQUEST_FRAME + 1)},
+        }))
+        .unwrap();
+        assert!(action.len() > REQUEST_FRAME && action.len() <= ACTION_REQUEST_FRAME);
+        assert!(action_request(&action).is_some());
+        let ordinary = serde_json::to_vec(&json!({
+            "v": 1,
+            "id": "test",
+            "method": "status",
+            "params": {"payload": "x".repeat(REQUEST_FRAME + 1)},
+        }))
+        .unwrap();
+        assert!(ordinary.len() > REQUEST_FRAME);
+        assert!(action_request(&ordinary).is_none());
     }
 
     #[test]

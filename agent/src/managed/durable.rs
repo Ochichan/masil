@@ -58,7 +58,7 @@ pub(crate) struct InterruptRequest {
 }
 
 /// How an interrupt reaches the provider.
-enum Via {
+pub(super) enum Via {
     /// Keys into the pane, in order.
     Keys(Vec<String>),
     /// OpenCode's own abort, over its answer channel.
@@ -93,8 +93,12 @@ fn transport_rejected(error: &str) -> bool {
 
 /// The public receipt of a run-bound effect, rebuilt identically on retry.
 fn effect_receipt(record: &Record) -> Value {
+    let path = record
+        .intent()
+        .and_then(|intent| intent["path"].as_str())
+        .unwrap_or("native_guard");
     json!({"stage":record.state,"pane_id":record.target,"run":record.run,
-        "operation_key":record.operation_key,"provider_accepted":false})
+        "operation_key":record.operation_key,"provider_accepted":false,"path":path})
 }
 
 fn finish_effect(
@@ -200,6 +204,101 @@ impl Manager {
         key: Option<ClientKey<'_>>,
         request: &InterruptRequest,
     ) -> Result<Value, String> {
+        if self.action_path().await? == super::ActionPath::CoreLedger {
+            if let Some(key) = key
+                && key.pin != agent.run
+            {
+                return Err(
+                    "identity_mismatch: interrupt target run changed; this operation cannot be replayed"
+                        .into(),
+                );
+            }
+            let mut store = self.operation_store().await?;
+            // Native durable admission returns an existing final receipt
+            // before it judges the screen. Preserve that order here: a
+            // keyed retry after the turn ended must not be refused merely
+            // because the screen is no longer interruptible.
+            if let Some(key) = key {
+                if !operations::valid_id(key.id) {
+                    return Err(
+                        "invalid_argument: operation ID must be 1–64 letters, digits, '.', '_', ':' or '-'"
+                            .into(),
+                    );
+                }
+                let operation_key =
+                    operations::key(&format!("run:{}", agent.run), "interrupt", key.id);
+                if let Some(record) = store.get(&operation_key)?
+                    && !matches!(
+                        record.state.as_str(),
+                        operations::DISPATCHING | "rejected_before_effect" | "not_applied"
+                    )
+                {
+                    return Ok(effect_receipt(&record));
+                }
+            }
+            if agent.process != "running" {
+                return Err("identity_mismatch: agent is not verified in the foreground".into());
+            }
+            let (current, via) = self.interrupt_plan(&mut store, agent, request).await?;
+            match via {
+                // The caller owns the screen judgment. The coordinator only
+                // checks identity and dispatches these already-selected keys.
+                Via::Keys(keys) => {
+                    let mut tracked_retry = super::core_action::TrackedChangeRetry::default();
+                    let result = self
+                        .core_durable_action(
+                            &current,
+                            "interrupt",
+                            key.map(|key| key.id),
+                            Some(&keys),
+                        )
+                        .await;
+                    if !result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| tracked_retry.take(error))
+                    {
+                        return result;
+                    }
+
+                    // The caller owns the screen judgment. Re-plan once
+                    // when its TRACKED value changed, but never carry an
+                    // interrupt into another foreground run.
+                    let again = self.get(&current.pane_id).await?;
+                    if !super::core_action::same_core_run(&current, &again) {
+                        return Err(
+                            "identity_mismatch: interrupt target changed before retrying after tracked state changed"
+                                .into(),
+                        );
+                    }
+                    let (again, via) = self.interrupt_plan(&mut store, &again, request).await?;
+                    return match via {
+                        Via::Keys(keys) => {
+                            self.core_durable_action(
+                                &again,
+                                "interrupt",
+                                key.map(|key| key.id),
+                                Some(&keys),
+                            )
+                            .await
+                        }
+                        // The API abort is deliberately local. It depends on
+                        // the caller's answer channel and never crosses the
+                        // coordinator action bridge.
+                        Via::Abort => {
+                            self.effect(&again, Effect::Interrupt, key, Some(request))
+                                .await
+                        }
+                    };
+                }
+                Via::Abort => {
+                    // Keep OpenCode's abort on the caller side.
+                    return self
+                        .effect(&current, Effect::Interrupt, key, Some(request))
+                        .await;
+                }
+            }
+        }
         if agent.process != "running" {
             return Err("identity_mismatch: agent is not verified in the foreground".into());
         }
@@ -209,7 +308,7 @@ impl Manager {
 
     /// Whether and how this agent's turn can be interrupted now, judged on
     /// a fresh look at its screen; the agent as seen then.
-    async fn interrupt_plan(
+    pub(super) async fn interrupt_plan(
         &self,
         store: &mut Store,
         agent: &Agent,
@@ -425,6 +524,27 @@ impl Manager {
         agent: &Agent,
         key: Option<ClientKey<'_>>,
     ) -> Result<Value, String> {
+        if self.action_path().await? == super::ActionPath::CoreLedger {
+            if let Some(key) = key
+                && key.pin != agent.run
+            {
+                return Err(
+                    "identity_mismatch: close target run changed; this operation cannot be replayed"
+                        .into(),
+                );
+            }
+            let outcome = self
+                .core_durable_action(agent, "close", key.map(|key| key.id), None)
+                .await?;
+            let stage = outcome["stage"].as_str().unwrap_or_default();
+            if !matches!(
+                stage,
+                "not_applied" | "outcome_unknown" | "rejected_before_effect"
+            ) {
+                super::tokens::remove(&self.native.socket, &agent.run);
+            }
+            return Ok(outcome);
+        }
         let outcome = self.effect(agent, Effect::Close, key, None).await?;
         let stage = outcome["stage"].as_str().unwrap_or_default();
         if !matches!(
@@ -434,6 +554,30 @@ impl Manager {
             super::tokens::remove(&self.native.socket, &agent.run);
         }
         Ok(outcome)
+    }
+
+    async fn core_durable_action(
+        &self,
+        agent: &Agent,
+        action: &str,
+        operation: Option<&str>,
+        keys: Option<&[String]>,
+    ) -> Result<Value, String> {
+        let socket = self.native.socket.clone();
+        let mut params = json!({
+            "operation": action,
+            "pane_id": agent.pane_id,
+            "expected": super::core_action::expected(agent),
+            "operation_id": operation,
+        });
+        if action == "interrupt"
+            && let Some(keys) = keys
+        {
+            params["keys"] = json!(keys);
+        }
+        tokio::task::spawn_blocking(move || crate::coordinator::action(&socket, params))
+            .await
+            .map_err(|error| format!("coordinator_unavailable: {error}"))?
     }
 
     async fn effect(
@@ -1177,6 +1321,26 @@ impl Manager {
                 store.resolve(record, state, "reconcile", None, now)
             }
             action @ ("interrupt" | "close") => {
+                // A core-ledger effect is settled only by its retained core
+                // result. The native effects option says nothing about it:
+                // treating a delivered core interrupt as absent would make a
+                // later retry send the same operation key again.
+                if record
+                    .intent()
+                    .is_some_and(|intent| intent["path"] == "core_ledger")
+                {
+                    let evidence = json!({
+                        "path": "core_ledger",
+                        "reconciled": "awaiting_coordinator_ledger",
+                    });
+                    return store.resolve(
+                        record,
+                        operations::UNKNOWN,
+                        "core_ledger_reconcile",
+                        Some(&evidence),
+                        now,
+                    );
+                }
                 let effect = if action == "interrupt" {
                     Effect::Interrupt
                 } else {

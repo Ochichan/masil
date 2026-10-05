@@ -343,7 +343,7 @@ fn coordinator_check(socket: Option<&Path>) -> Check {
         ),
         "stale" => (
             Status::Warn,
-            "a coordinator of an earlier server boot, an older masil-agent or a replaced executable answers; the next mutating command or autosave replaces it".to_owned(),
+            "a coordinator from an earlier server boot, an older masil-agent, or an executable that changed still answers; the next mutating command or autosave replaces it".to_owned(),
         ),
         "unresponsive" => (
             Status::Warn,
@@ -363,6 +363,17 @@ fn coordinator_check(socket: Option<&Path>) -> Check {
         .ok();
     let (status, summary) = if state != "running" {
         (status, summary)
+    } else if running["action_bridge"]["state"].as_str() == Some("bridge_unavailable") {
+        (
+            Status::Warn,
+            format!(
+                "the selected core action ledger bridge remained unavailable after its native retry{}",
+                running["action_bridge"]["detail"]
+                    .as_str()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            ),
+        )
     } else if running["exe"]["path"].as_str().map(Path::new) != own_exe.as_deref() {
         (
             Status::Warn,
@@ -551,14 +562,17 @@ fn environment_check(
     // TMUX names the server whose pane doctor runs in; that pane's TERM and
     // TERM_PROGRAM are the server's, not the terminal around it.
     let pane_socket = var("TMUX").and_then(|value| value.split(',').next().map(PathBuf::from));
-    let in_diagnosed_pane = pane_socket.as_deref().zip(socket).is_some_and(|(pane, socket)| {
-        pane == socket
-            || pane
-                .canonicalize()
-                .ok()
-                .zip(socket.canonicalize().ok())
-                .is_some_and(|(left, right)| left == right)
-    });
+    let in_diagnosed_pane = pane_socket
+        .as_deref()
+        .zip(socket)
+        .is_some_and(|(pane, socket)| {
+            pane == socket
+                || pane
+                    .canonicalize()
+                    .ok()
+                    .zip(socket.canonicalize().ok())
+                    .is_some_and(|(left, right)| left == right)
+        });
     let wsl = var("WSL_DISTRO_NAME").is_some()
         || std::fs::read_to_string("/proc/version")
             .is_ok_and(|version| version.to_ascii_lowercase().contains("microsoft"));

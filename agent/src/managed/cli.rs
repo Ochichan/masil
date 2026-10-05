@@ -761,7 +761,13 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             print(&if command == "get" {
                 json!(agent)
             } else {
-                json!({"pane_id":agent.pane_id,"provider":agent.provider,"state":agent.state,"evidence":agent.evidence})
+                json!({
+                    "pane_id":agent.pane_id,
+                    "provider":agent.provider,
+                    "state":agent.state,
+                    "evidence":agent.evidence,
+                    "action":manager.action_path_report().await?,
+                })
             })?;
         }
         "read" if args.len() == 1 || (args.len() == 2 && args[1] == "--history") => {
@@ -1015,7 +1021,11 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "send-keys" if args.len() >= 2 => {
             let agent = manager.get(&args[0]).await?;
-            print(&manager.keys(&agent, &args[1..], super::TrackedRetry::SameRun).await?)?;
+            print(
+                &manager
+                    .keys(&agent, &args[1..], super::TrackedRetry::SameRun)
+                    .await?,
+            )?;
         }
         "draft" if args.len() == 2 => {
             let agent = manager.get(&args[0]).await?;
@@ -1805,12 +1815,7 @@ async fn bridge_boot_probe(manager: &Manager, expected_boot: &str) -> (BridgePro
     }
 }
 
-fn wait_closed_server_gone(
-    kind: &str,
-    id: &str,
-    seen: bool,
-    reason: &str,
-) -> Result<i32, String> {
+fn wait_closed_server_gone(kind: &str, id: &str, seen: bool, reason: &str) -> Result<i32, String> {
     print(&json!({
         "outcome":"server_gone",
         "end_reason":"server_gone",
@@ -1858,12 +1863,9 @@ async fn wait_closed_timeout_after_presence(
     match bridge_target_present(manager, target.field, target.id, &endpoint.core_boot_id).await {
         Ok(false) => wait_closed_observed(target, seen),
         Ok(true) => wait_closed_timeout(target.kind, target.id, true, target.closed),
-        Err(bridge::Error::BootMismatch) => wait_closed_server_gone(
-            target.kind,
-            target.id,
-            seen,
-            "native core boot changed",
-        ),
+        Err(bridge::Error::BootMismatch) => {
+            wait_closed_server_gone(target.kind, target.id, seen, "native core boot changed")
+        }
         Err(error) if server_gone(&error.to_string()) => {
             wait_closed_server_gone(target.kind, target.id, seen, &error.to_string())
         }
@@ -1966,7 +1968,8 @@ async fn wait_closed_bridge(
     };
 
     if lifecycle {
-        match bridge_target_present(manager, target.field, target.id, &endpoint.core_boot_id).await {
+        match bridge_target_present(manager, target.field, target.id, &endpoint.core_boot_id).await
+        {
             Ok(false) => {
                 return Ok(Some(wait_closed_observed(&target, seen)?));
             }
@@ -2132,10 +2135,22 @@ mod tests {
 
     #[test]
     fn bridge_probe_maps_only_gone_or_restarted_cores_to_server_gone() {
-        assert_eq!(bridge_probe_end_reason(BridgeProbe::SameBoot), "observation_lost");
-        assert_eq!(bridge_probe_end_reason(BridgeProbe::Unreadable), "observation_lost");
-        assert_eq!(bridge_probe_end_reason(BridgeProbe::ServerGone), "server_gone");
-        assert_eq!(bridge_probe_end_reason(BridgeProbe::BootChanged), "server_gone");
+        assert_eq!(
+            bridge_probe_end_reason(BridgeProbe::SameBoot),
+            "observation_lost"
+        );
+        assert_eq!(
+            bridge_probe_end_reason(BridgeProbe::Unreadable),
+            "observation_lost"
+        );
+        assert_eq!(
+            bridge_probe_end_reason(BridgeProbe::ServerGone),
+            "server_gone"
+        );
+        assert_eq!(
+            bridge_probe_end_reason(BridgeProbe::BootChanged),
+            "server_gone"
+        );
     }
 
     #[test]

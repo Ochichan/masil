@@ -3,6 +3,7 @@ pub(crate) mod answer;
 pub(crate) mod changes;
 mod cli;
 mod commands;
+pub(crate) mod core_action;
 mod dictation;
 mod durable;
 pub(crate) mod endpoints;
@@ -38,7 +39,7 @@ use std::ffi::OsString;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 pub(crate) use store::validate_private_metadata;
 
 const META: &str = "@masil-managed-agent";
@@ -62,6 +63,50 @@ const TRACKED_LOST: &str = "identity_mismatch: agent run changed before the acti
 /// A report that lost its guard to a concurrent write; the caller may read
 /// the agent again and retry.
 pub(super) const REPORT_REJECTED: &str = "identity_mismatch: agent state changed before the report";
+
+/// The action path is fixed for one native core boot. A core that advertises
+/// actions must never fall back to the native guarded path after the bridge
+/// becomes unavailable: doing so could repeat an unknown effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActionPath {
+    CoreLedger,
+    NativeGuard,
+}
+
+impl ActionPath {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::CoreLedger => "core_ledger",
+            Self::NativeGuard => "native_guard",
+        }
+    }
+}
+
+#[derive(Default)]
+struct ActionPathCache {
+    by_boot: HashMap<String, ActionPath>,
+}
+
+impl ActionPathCache {
+    fn get(&self, boot: &str) -> Option<ActionPath> {
+        self.by_boot.get(boot).copied()
+    }
+
+    fn path(&mut self, boot: &str, advertised: &str) -> Result<ActionPath, String> {
+        if let Some(path) = self.by_boot.get(boot) {
+            return Ok(*path);
+        }
+        let path = match advertised {
+            "1" => ActionPath::CoreLedger,
+            "" | "0" => ActionPath::NativeGuard,
+            _ => return Err("invalid native core action capability".into()),
+        };
+        self.by_boot.insert(boot.to_owned(), path);
+        Ok(path)
+    }
+}
+
+static ACTION_PATHS: OnceLock<Mutex<ActionPathCache>> = OnceLock::new();
 
 pub(super) fn server_unreachable(error: String) -> String {
     if [
@@ -251,7 +296,8 @@ impl TurnHold {
             return false;
         }
         // Text streaming or a spinner prints at least every second.
-        let quiet = last_output.is_some_and(|at| (now / 1000).saturating_sub(at) >= TURN_QUIET_SECONDS)
+        let quiet = last_output
+            .is_some_and(|at| (now / 1000).saturating_sub(at) >= TURN_QUIET_SECONDS)
             && now.saturating_sub(report.at) >= TURN_QUIET_SECONDS * 1000;
         !(screen.visible_idle() && quiet)
     }
@@ -619,6 +665,48 @@ impl Manager {
         valid_boot(boot.trim()).map(str::to_owned)
     }
 
+    /// Whether this boot accepts guarded actions through its core ledger.
+    /// The format is read once for a boot so a disappearing bridge cannot
+    /// turn a selected ledger path into a native guarded retry.
+    pub(crate) async fn action_path(&self) -> Result<ActionPath, String> {
+        let boot = self.boot().await?;
+        let cache = ACTION_PATHS.get_or_init(|| Mutex::new(ActionPathCache::default()));
+        if let Some(path) = cache
+            .lock()
+            .map_err(|_| "core action path cache unavailable")?
+            .get(&boot)
+        {
+            return Ok(path);
+        }
+        let advertised = self
+            .command(&["display-message", "-p", "#{masil_core_actions}"])
+            .await?;
+        let advertised = advertised.strip_suffix('\n').unwrap_or(&advertised);
+        if advertised.chars().any(char::is_control) {
+            return Err("invalid native core action capability".into());
+        }
+        cache
+            .lock()
+            .map_err(|_| "core action path cache unavailable")?
+            .path(&boot, advertised)
+    }
+
+    /// The selected path and, when one runs, the coordinator's bridge state.
+    /// This is read-only so `explain` can report a broken selected ledger
+    /// without starting or replacing a coordinator.
+    pub(crate) async fn action_path_report(&self) -> Result<Value, String> {
+        let path = self.action_path().await?;
+        if path == ActionPath::NativeGuard {
+            return Ok(json!({"path": path.name(), "bridge": "not_required"}));
+        }
+        let socket = self.native.socket.clone();
+        let report = tokio::task::spawn_blocking(move || crate::coordinator::status(&socket))
+            .await
+            .map_err(|error| format!("coordinator_unavailable: {error}"))??;
+        let bridge = report["coordinator"]["action_bridge"].clone();
+        Ok(json!({"path": path.name(), "bridge": bridge, "coordinator": report["state"]}))
+    }
+
     /// The private core bridge endpoint paired with this native server's
     /// boot identity. An empty format value means the bridge is disabled.
     pub(super) async fn bridge_endpoint(&self) -> Result<Option<crate::bridge::Endpoint>, String> {
@@ -802,7 +890,7 @@ impl Manager {
     pub(super) async fn resident_list(
         &self,
     ) -> Result<(Vec<Agent>, HashSet<String>, Option<String>, bool), String> {
-        self.collect_with_bridge_scope(None).await
+        self.collect_with_bridge_scope(None, false).await
     }
 
     /// A resident's narrow bridge pass also tells the caller whether its
@@ -812,7 +900,7 @@ impl Manager {
         &self,
         pane: &str,
     ) -> Result<(Vec<Agent>, bool), String> {
-        self.collect_with_bridge_scope(Some(pane))
+        self.collect_with_bridge_scope(Some(pane), false)
             .await
             .map(|(agents, _, _, inbox_changed)| (agents, inbox_changed))
     }
@@ -821,18 +909,41 @@ impl Manager {
     /// writer can win a pane's update; one more pass finds that change
     /// already written. A targeted call ignores lost writes of other panes.
     async fn collect(&self, target: Option<&str>) -> Result<Vec<Agent>, String> {
-        self.collect_with_bridge_scope(target)
+        self.collect_with_bridge_scope(target, false)
             .await
             .map(|(agents, _, _, _)| agents)
+    }
+
+    /// An action coordinator needs a fresh view to validate an effect, but
+    /// it must not replace TRACKED with a judgment made from its own
+    /// manifests. The caller that selected the effect owns that write.
+    pub(crate) async fn get_readonly(&self, target: &str) -> Result<Agent, String> {
+        if target.starts_with('%') {
+            crate::pane_id(target).map_err(|error| format!("unknown_target_syntax: {error}"))?;
+        }
+        let mut matches = self
+            .collect_with_bridge_scope(Some(target), true)
+            .await?
+            .0
+            .into_iter()
+            .filter(|agent| agent.pane_id == target || agent.name == target);
+        let agent = matches
+            .next()
+            .ok_or("target_absent: agent target not found")?;
+        if matches.next().is_some() {
+            return Err("unknown_target_syntax: ambiguous agent name; use a pane ID".into());
+        }
+        Ok(agent)
     }
 
     async fn collect_with_bridge_scope(
         &self,
         target: Option<&str>,
+        read_only: bool,
     ) -> Result<(Vec<Agent>, HashSet<String>, Option<String>, bool), String> {
         let mut retried = false;
         loop {
-            let result = self.collect_once(target).await;
+            let result = self.collect_once(target, read_only).await;
             let lost = match &result {
                 Ok((agents, uncommitted, _, _, _)) => uncommitted.iter().any(|pane| match target {
                     None => true,
@@ -863,6 +974,7 @@ impl Manager {
     async fn collect_once(
         &self,
         target: Option<&str>,
+        read_only: bool,
     ) -> Result<
         (
             Vec<Agent>,
@@ -1045,9 +1157,11 @@ impl Manager {
             // The coordinator stands back where another writer judged the
             // same screen differently, so the two never trade writes.
             let changed = changed
-                && self.resident.as_ref().is_none_or(|resident| {
-                    resident.may_write(&fields[0], &fields[14], &fields[12], now_ms())
-                });
+                && (read_only
+                    || self.resident.as_ref().is_none_or(|resident| {
+                        resident.may_write(&fields[0], &fields[14], &fields[12], now_ms())
+                    }));
+            let write_tracked = changed && !read_only;
             let returned_idle = previous.run == run
                 && state == "idle"
                 && (previous.state == "working" || previous.returned_idle);
@@ -1066,7 +1180,7 @@ impl Manager {
             } else {
                 previous.clone()
             };
-            if changed {
+            if write_tracked {
                 inbox_effects.push((
                     fields[0].clone(),
                     screen_effects(provider.id, &fields[0], &previous, &tracked, dead),
@@ -1143,8 +1257,11 @@ impl Manager {
             };
             let epoch_write = epoch_record.map(|record| Self::option(&agent, EPOCH, record));
             let mut hold_write = Vec::new();
-            if let (true, Some(mut metadata), Some(mut evidence)) =
-                (hold_ended, agent.metadata.clone(), agent.run_evidence.clone())
+            if let (true, Some(mut metadata), Some(mut evidence)) = (
+                hold_ended,
+                agent.metadata.clone(),
+                agent.run_evidence.clone(),
+            ) && !read_only
                 && self.resident.as_ref().is_none_or(|resident| {
                     resident.may_write(&fields[0], &fields[14], &fields[12], now_ms())
                 })
@@ -1155,7 +1272,7 @@ impl Manager {
                 hold_write.push(Self::option(&agent, EVIDENCE, encode(&evidence)?));
                 dropped_holds.push((agents.len(), metadata, encoded, evidence));
             }
-            if changed || !hold_write.is_empty() {
+            if write_tracked || !hold_write.is_empty() {
                 let encoded = encode(&agent.tracked)?;
                 tracked_groups.push((
                     agent.pane_id.clone(),
@@ -1184,9 +1301,12 @@ impl Manager {
             }
             agents.push(agent);
         }
-        let uncommitted = self
-            .write_tracked_updates(&mut agents, &tracked_groups, &tracked_updates)
-            .await?;
+        let uncommitted = if read_only {
+            Vec::new()
+        } else {
+            self.write_tracked_updates(&mut agents, &tracked_groups, &tracked_updates)
+                .await?
+        };
         for (index, metadata, encoded, evidence) in dropped_holds {
             let agent = &mut agents[index];
             if !uncommitted.contains(&agent.pane_id) {
@@ -1195,19 +1315,24 @@ impl Manager {
                 agent.run_evidence = Some(evidence);
             }
         }
-        self.write_epoch_records(&epoch_groups).await;
+        if !read_only {
+            self.write_epoch_records(&epoch_groups).await;
+        }
         // Only the panes whose tracked revision committed: a lost CAS
         // records nothing, and the next poll sees that change again.
-        let inbox_changed = self
-            .inbox_apply(
+        let inbox_changed = if read_only {
+            false
+        } else {
+            self.inbox_apply(
                 inbox_effects
                     .into_iter()
                     .filter(|(pane, _)| !uncommitted.contains(pane))
                     .flat_map(|(_, effects)| effects)
                     .collect(),
             )
-            .await;
-        if let Some(resident) = &self.resident {
+            .await
+        };
+        if !read_only && let Some(resident) = &self.resident {
             resident.remember(&agents, target.is_none());
         }
         bridge_scope.extend(
@@ -1269,6 +1394,48 @@ impl Manager {
             .collect::<Vec<_>>();
         if sizes.iter().any(|size| *size > native_ui::MAX_SCRIPT) {
             return Err("native tracked update exceeds script limit".into());
+        }
+
+        // A core-ledger action owns this pane until its core response is
+        // known. Recheck directly before writing: the pass may have built
+        // its groups just before the action acquired the pane lock.
+        if self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| groups.iter().any(|group| resident.action_locked(&group.0)))
+        {
+            let mut uncommitted = Vec::new();
+            for index in 0..groups.len() {
+                if self
+                    .resident
+                    .as_ref()
+                    .is_some_and(|resident| resident.action_locked(&groups[index].0))
+                {
+                    uncommitted.push(groups[index].0.clone());
+                    continue;
+                }
+                let output = self
+                    .native
+                    .guarded_groups(&groups[index..=index])
+                    .await
+                    .map_err(server_unreachable)?;
+                let rejected =
+                    rejected_groups(&String::from_utf8_lossy(&output.stdout), index..index + 1);
+                if !rejected.is_empty() {
+                    return Ok(uncommitted
+                        .into_iter()
+                        .chain(
+                            rejected
+                                .into_iter()
+                                .map(|rejected| groups[rejected].0.clone()),
+                        )
+                        .chain((index + 1..groups.len()).map(|later| groups[later].0.clone()))
+                        .collect());
+                }
+                let (agent, encoded) = &updates[index];
+                agents[*agent].tracked_encoded = encoded.clone();
+            }
+            return Ok(uncommitted);
         }
 
         let mut start = 0;
@@ -1375,7 +1542,8 @@ impl Manager {
         commands: Vec<Vec<String>>,
         retry: TrackedRetry,
     ) -> Result<(), String> {
-        self.guarded_input_condition(agent, commands, None, retry).await
+        self.guarded_input_condition(agent, commands, None, retry)
+            .await
     }
 
     async fn guarded_input_condition(
@@ -2045,6 +2213,24 @@ impl Manager {
         if agent.process != "running" {
             return Err("identity_mismatch: agent is not verified in the foreground".into());
         }
+        if self.action_path().await? == ActionPath::CoreLedger {
+            let socket = self.native.socket.clone();
+            let params = json!({
+                "operation": "keys",
+                "pane_id": agent.pane_id,
+                "expected": core_action::expected(agent),
+                "keys": keys,
+                "retry": match retry {
+                    TrackedRetry::Never => "never",
+                    TrackedRetry::SameRun => "same_run",
+                },
+            });
+            return tokio::task::spawn_blocking(move || {
+                crate::coordinator::action(&socket, params)
+            })
+            .await
+            .map_err(|error| format!("coordinator_unavailable: {error}"))?;
+        }
         let mut args = vec![
             "send-keys".into(),
             "-t".into(),
@@ -2053,9 +2239,13 @@ impl Manager {
         ];
         args.extend_from_slice(keys);
         self.guarded_input(agent, vec![args], retry).await?;
-        Ok(
-            json!({"stage":"keys_delivered","pane_id":agent.pane_id,"run":agent.run,"provider_accepted":false}),
-        )
+        Ok(json!({
+            "stage":"keys_delivered",
+            "pane_id":agent.pane_id,
+            "run":agent.run,
+            "provider_accepted":false,
+            "path":"native_guard",
+        }))
     }
 
     pub async fn draft(&self, agent: &Agent, text: &str) -> Result<Value, String> {
@@ -2275,7 +2465,10 @@ impl Manager {
             return Err("identity_mismatch: stale agent report".into());
         }
         if sequence <= metadata.last_sequence
-            || metadata.report.as_ref().is_some_and(|r| sequence <= r.sequence)
+            || metadata
+                .report
+                .as_ref()
+                .is_some_and(|r| sequence <= r.sequence)
         {
             return Err("report sequence did not advance".into());
         }
@@ -2291,7 +2484,12 @@ impl Manager {
         if evidence
             .report
             .as_ref()
-            .filter(|source| metadata.report.as_ref().is_some_and(|r| r.sequence == source.sequence))
+            .filter(|source| {
+                metadata
+                    .report
+                    .as_ref()
+                    .is_some_and(|r| r.sequence == source.sequence)
+            })
             .is_some_and(ReportSource::observed)
         {
             return Ok(());
@@ -3622,6 +3820,16 @@ async fn identify_foreground(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn core_action_path_is_cached_by_boot() {
+        let mut cache = ActionPathCache::default();
+        assert_eq!(cache.path("boot-a", "1").unwrap(), ActionPath::CoreLedger);
+        // A transient later format read cannot turn this boot into native.
+        assert_eq!(cache.path("boot-a", "0").unwrap(), ActionPath::CoreLedger);
+        assert_eq!(cache.path("boot-b", "").unwrap(), ActionPath::NativeGuard);
+        assert!(ActionPathCache::default().path("boot-c", "other").is_err());
+    }
+
+    #[test]
     fn an_unmanaged_run_keeps_its_name_until_its_group_id_is_reused() {
         let base = "b1-%3-2-40";
         // First seen: the name earlier binaries use, and a record.
@@ -4119,7 +4327,16 @@ mod tests {
     #[test]
     fn capabilities_follow_evidence_not_provider_names() {
         let none = binding_view(None, None);
-        let screen = capability_view("claude", "guarded_paste", true, true, None, "running", None, &none);
+        let screen = capability_view(
+            "claude",
+            "guarded_paste",
+            true,
+            true,
+            None,
+            "running",
+            None,
+            &none,
+        );
         assert_eq!(screen.state_authority, "screen_detection");
         assert_eq!(screen.session_identity, "none");
         assert_eq!(screen.integration, "native_session_only");
@@ -4159,7 +4376,16 @@ mod tests {
         assert_eq!(native.session_identity, "native_callback");
         assert!(native.lifecycle_seen && native.callbacks_seen && native.resume);
 
-        let exited = capability_view("pi", "guarded_paste", true, false, Some(&evidence), "exited", None, &binding);
+        let exited = capability_view(
+            "pi",
+            "guarded_paste",
+            true,
+            false,
+            Some(&evidence),
+            "exited",
+            None,
+            &binding,
+        );
         assert_eq!(exited.state_authority, "process_only");
         assert_eq!(exited.prompt_submit, "unavailable");
         assert_eq!(exited.interrupt, "unavailable");
