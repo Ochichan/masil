@@ -18,10 +18,20 @@
 #define MASIL_BRIDGE_H
 
 struct window_pane;
+struct window;
+struct client;
+struct session;
 
 void	masil_bridge_start(void);
 void	masil_bridge_stop(void);
+void	masil_bridge_server_exiting(void);
 const char *masil_bridge_get_boot_id(void);
+const char *masil_bridge_get_socket_path(void);
+char	*masil_bridge_client_id(struct client *);
+char	*masil_bridge_client_profile(struct client *);
+void	 masil_bridge_window_active_changed(struct window *);
+void	 masil_bridge_session_changed(struct session *);
+void	 masil_bridge_client_session_changed(struct client *);
 
 void	masil_bridge_pane_created(struct window_pane *);
 void	masil_bridge_pane_destroyed(struct window_pane *);

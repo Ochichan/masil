@@ -2368,11 +2368,36 @@ format_cb_masil_client_stalled(struct format_tree *ft)
 	    get_timer() - c->tty.masil_progress >= 5000));
 }
 
+/* masil: stable opaque identity for the requesting tmux client. */
+static void *
+format_cb_masil_client_id(struct format_tree *ft)
+{
+	if (ft->c == NULL)
+		return (xstrdup(""));
+	return (masil_bridge_client_id(ft->c));
+}
+
+/* masil: hashed terminal profile without exposing raw environment values. */
+static void *
+format_cb_masil_client_profile(struct format_tree *ft)
+{
+	if (ft->c == NULL)
+		return (xstrdup("unstable"));
+	return (masil_bridge_client_profile(ft->c));
+}
+
 /* Callback for masil_core_boot_id. */
 static void *
 format_cb_masil_core_boot_id(__unused struct format_tree *ft)
 {
 	return (xstrdup(masil_bridge_get_boot_id()));
+}
+
+/* masil: bridge endpoint, empty when bridge startup was disabled or failed. */
+static void *
+format_cb_masil_bridge_socket(__unused struct format_tree *ft)
+{
+	return (xstrdup(masil_bridge_get_socket_path()));
 }
 
 /* Callback for masil_pane_agent_name. */
@@ -3871,6 +3896,15 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "masil_bracketed_paste", FORMAT_TABLE_STRING,
 	  format_cb_masil_bracketed_paste
+	},
+	{ "masil_bridge_socket", FORMAT_TABLE_STRING,
+	  format_cb_masil_bridge_socket
+	},
+	{ "masil_client_id", FORMAT_TABLE_STRING,
+	  format_cb_masil_client_id
+	},
+	{ "masil_client_profile", FORMAT_TABLE_STRING,
+	  format_cb_masil_client_profile
 	},
 	{ "masil_client_stalled", FORMAT_TABLE_STRING,
 	  format_cb_masil_client_stalled

@@ -848,6 +848,8 @@ window_set_active_pane(struct window *w, struct window_pane *wp, int notify)
 	window_pane_stack_push(&w->last_panes, lastwp);
 
 	w->active = wp;
+	/* masil: observe active-pane changes even when native notify is false. */
+	masil_bridge_window_active_changed(w);
 	w->active->active_point = next_active_point++;
 	w->active->flags |= PANE_CHANGED;
 

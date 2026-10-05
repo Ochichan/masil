@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "masil-bridge.h"
 
 static void	server_client_free(int, short, void *);
 static void	server_client_check_pane_resize(struct window_pane *);
@@ -51,6 +52,28 @@ static int	server_client_dispatch_command(struct client *, struct imsg *);
 static int	server_client_dispatch_identify(struct client *, struct imsg *);
 static int	server_client_dispatch_shell(struct client *);
 static void	server_client_report_theme(struct client *, enum client_theme);
+
+/* masil: stable client serials are monotonic for the lifetime of the server. */
+static uint64_t	masil_client_next_serial;
+
+/* masil: profile source values must not appear in identify debug logs. */
+static int
+masil_client_profile_environment(const char *value)
+{
+	static const char *const names[] = {
+	    "MASIL_CLIENT_KEY", "TERM_SESSION_ID", "ITERM_SESSION_ID",
+	    "WT_SESSION", "WEZTERM_PANE", "KITTY_WINDOW_ID"
+	};
+	size_t	length = strcspn(value, "=");
+	u_int	i;
+
+	for (i = 0; i < nitems(names); i++) {
+		if (strlen(names[i]) == length &&
+		    memcmp(value, names[i], length) == 0)
+			return (1);
+	}
+	return (0);
+}
 
 /* Number of attached clients. */
 u_int
@@ -164,6 +187,10 @@ server_client_create(int fd)
 	setblocking(fd, 0);
 
 	c = xcalloc(1, sizeof *c);
+	/* masil: never reuse a client identity within this server boot. */
+	if (masil_client_next_serial == UINT64_MAX)
+		fatalx("masil client serial exhausted");
+	c->masil_serial = ++masil_client_next_serial;
 	c->references = 1;
 	c->peer = proc_add_peer(server_proc, fd, server_client_dispatch, c);
 
@@ -361,6 +388,8 @@ server_client_set_session(struct client *c, struct session *s)
 
 	server_check_unattached();
 	server_update_socket();
+	/* masil: defer initial view publication until CLIENT_ATTACHED is set. */
+	masil_bridge_client_session_changed(c);
 }
 
 /* Lost a client. */
@@ -2965,7 +2994,12 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 			return (-1);
 		if (strchr(data, '=') != NULL)
 			environ_put(c->environ, data, 0);
-		log_debug("client %p IDENTIFY_ENVIRON %s", c, data);
+		if (log_get_level() != 0) {
+			if (masil_client_profile_environment(data))
+				log_debug("client %p IDENTIFY_ENVIRON <redacted>", c);
+			else
+				log_debug("client %p IDENTIFY_ENVIRON %s", c, data);
+		}
 		break;
 	case MSG_IDENTIFY_CLIENTPID:
 		if (datalen != sizeof c->pid)

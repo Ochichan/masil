@@ -309,6 +309,7 @@ server_loop(void)
 	if (job_still_running())
 		return (0);
 
+	masil_bridge_server_exiting();
 	return (1);
 }
 
@@ -319,6 +320,7 @@ server_send_exit(void)
 	struct client	*c, *c1;
 	struct session	*s, *s1;
 
+	masil_bridge_server_exiting();
 	cmd_wait_for_flush();
 
 	TAILQ_FOREACH_SAFE(c, &clients, entry, c1) {

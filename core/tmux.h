@@ -2246,6 +2246,16 @@ struct client {
 	const char		*user;
 	struct cmdq_list	*queue;
 
+	/* masil: boot-scoped identity and last published client view. */
+	uint64_t		 masil_serial;
+	uint64_t		 masil_view_revision;
+	u_int			 masil_view_session_id;
+	u_int			 masil_view_window_id;
+	u_int			 masil_view_pane_id;
+	u_char			 masil_view_valid;
+	int			 masil_view_known;
+	int			 masil_gone_emitted;
+
 	struct control_state	*control_state;
 	u_int			 pause_age;
 

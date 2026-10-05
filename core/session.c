@@ -25,6 +25,7 @@
 #include <time.h>
 
 #include "tmux.h"
+#include "masil-bridge.h"
 
 struct sessions		sessions;
 u_int			next_session_id;
@@ -513,6 +514,8 @@ session_set_current(struct session *s, struct winlink *wl)
 	winlink_stack_remove(&s->lastw, wl);
 	winlink_stack_push(&s->lastw, s->curw);
 	s->curw = wl;
+	/* masil: publish the new view even when callers emit no native event. */
+	masil_bridge_session_changed(s);
 	if (options_get_number(global_options, "focus-events")) {
 		if (old != NULL)
 			window_update_focus(old->window);
@@ -666,6 +669,8 @@ session_group_synchronize_from(struct session *target)
 	struct session_group	*sg;
 	struct session		*s;
 
+	/* masil: swap-window may replace target->curw->window directly. */
+	masil_bridge_session_changed(target);
 	if ((sg = session_group_contains(target)) == NULL)
 		return;
 
@@ -718,6 +723,8 @@ session_group_synchronize1(struct session *target, struct session *s)
 		s->curw = winlink_find_by_index(&s->windows, target->curw->idx);
 	if (s->curw == NULL)
 		s->curw = RB_MIN(winlinks, &s->windows);
+	/* masil: window-linked fires before the synchronized curw is fixed. */
+	masil_bridge_session_changed(s);
 
 	/* Fix up the last window stack. */
 	memcpy(&old_lastw, &s->lastw, sizeof old_lastw);
@@ -799,6 +806,8 @@ session_renumber_windows(struct session *s)
 			server_clear_marked();
 	}
 	s->curw = winlink_find_by_index(&s->windows, new_curw_idx);
+	/* masil: curw now points into the rebuilt winlink tree. */
+	masil_bridge_session_changed(s);
 
 	/* Free the old winlinks (reducing window references too). */
 	RB_FOREACH_SAFE(wl, winlinks, &old_wins, wl1)
