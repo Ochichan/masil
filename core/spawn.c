@@ -17,9 +17,11 @@
  */
 
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +52,21 @@
  *
  * - remaining environment, comes from the session.
  */
+
+static void
+spawn_masil_launch_failure(int fd, enum masil_launch_stage stage, int error)
+{
+	struct masil_launch_status status;
+	ssize_t			 written;
+
+	memset(&status, 0, sizeof status);
+	status.stage = stage;
+	status.error = error;
+	do {
+		written = write(fd, &status, sizeof status);
+	} while (written == -1 && errno == EINTR);
+	_exit(126);
+}
 
 static void
 spawn_log(const char *from, struct spawn_context *sc)
@@ -255,8 +272,10 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	char			  path[PATH_MAX];
 	const char		 *cmd, *tmp, *home = find_home();
 	const char		 *actual_cwd = NULL;
-	int			  argc;
+	int			  argc, cwd_fd, status_pipe[2] = { -1, -1 };
+	int			  strict = (sc->flags & SPAWN_MASIL_STRICT_CWD) != 0;
 	u_int			  idx;
+	struct stat		  sb;
 	struct termios		  now;
 	u_int			  hlimit;
 	struct winsize		  ws;
@@ -272,6 +291,11 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	}
 
 	spawn_log(__func__, sc);
+	if (strict && (sc->masil_launch == NULL || sc->cwd == NULL ||
+	    *sc->cwd == '\0')) {
+		xasprintf(cause, "strict launch has no working directory");
+		return (NULL);
+	}
 
 	if (sc->flags & SPAWN_MODAL) {
 		if (~sc->flags & SPAWN_FLOATING) {
@@ -289,11 +313,18 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	 * the pane's stored one unless specified.
 	 */
 	if (sc->cwd != NULL) {
-		if (item != NULL)
+		if (strict)
+			cwd = xstrdup(sc->cwd); /* masil: never expand strict cwd. */
+		else if (item != NULL)
 			cwd = format_single(item, sc->cwd, c, ts, NULL, NULL);
 		else
 			cwd = xstrdup(sc->cwd);
-		if (*cwd != '/') {
+		if (strict && *cwd != '/') {
+			xasprintf(cause, "strict launch cwd is not absolute");
+			free(cwd);
+			return (NULL);
+		}
+		if (!strict && *cwd != '/') {
 			xasprintf(&new_cwd, "%s%s%s",
 			    server_client_get_cwd(c, ts),
 			    *cwd != '\0' ? "/" : "", cwd);
@@ -468,7 +499,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	new_wp->flags &= ~PANE_EMPTY;
 
 	/* Store current working directory and change to new one. */
-	if (getcwd(path, sizeof path) != NULL) {
+	if (!strict && getcwd(path, sizeof path) != NULL) {
 		if (chdir(new_wp->cwd) == 0)
 			actual_cwd = new_wp->cwd;
 		else if (home != NULL && chdir(home) == 0)
@@ -476,12 +507,28 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		else if (chdir("/") == 0)
 			actual_cwd = "/";
 	}
+	if (strict && pipe(status_pipe) != 0) {
+		xasprintf(cause, "launch status pipe failed: %s", strerror(errno));
+		new_wp->fd = -1;
+		if (~sc->flags & SPAWN_RESPAWN) {
+			server_client_remove_pane(new_wp);
+			layout_close_pane(new_wp);
+			window_remove_pane(w, new_wp);
+		}
+		sigprocmask(SIG_SETMASK, &oldset, NULL);
+		environ_free(child);
+		return (NULL);
+	}
 
 	/* Fork the new process. */
 	if (~sc->flags & SPAWN_RESPAWN)
 		masil_bridge_pty_changed(new_wp);
 	new_wp->pid = fdforkpty(ptm_fd, &new_wp->fd, new_wp->tty, NULL, &ws);
 	if (new_wp->pid == -1) {
+		if (status_pipe[0] != -1)
+			close(status_pipe[0]);
+		if (status_pipe[1] != -1)
+			close(status_pipe[1]);
 		xasprintf(cause, "fork failed: %s", strerror(errno));
 		new_wp->fd = -1;
 		if (~sc->flags & SPAWN_RESPAWN) {
@@ -499,11 +546,45 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	 * directory back.
 	 */
 	if (new_wp->pid != 0) {
-		if (actual_cwd != NULL &&
+		if (strict) {
+			close(status_pipe[1]);
+			masil_launch_context_set_status_fd(sc->masil_launch,
+			    status_pipe[0]);
+		} else if (actual_cwd != NULL &&
 		    chdir(path) != 0 &&
 		    (home == NULL || chdir(home) != 0))
 			chdir("/");
 		goto complete;
+	}
+	if (strict) {
+		close(status_pipe[0]);
+		cwd_fd = open(new_wp->cwd, O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+		if (cwd_fd == -1)
+			spawn_masil_launch_failure(status_pipe[1],
+			    MASIL_LAUNCH_STAGE_CWD_OPEN, errno);
+		if (fchdir(cwd_fd) != 0)
+			spawn_masil_launch_failure(status_pipe[1],
+			    MASIL_LAUNCH_STAGE_CWD_OPEN, errno);
+		if (fstat(cwd_fd, &sb) != 0)
+			spawn_masil_launch_failure(status_pipe[1],
+			    MASIL_LAUNCH_STAGE_CWD_IDENTITY, errno);
+		if ((uint64_t)sb.st_dev != masil_launch_context_cwd_dev(
+		    sc->masil_launch) || (uint64_t)sb.st_ino !=
+		    masil_launch_context_cwd_ino(sc->masil_launch))
+			spawn_masil_launch_failure(status_pipe[1],
+			    MASIL_LAUNCH_STAGE_CWD_IDENTITY, ESTALE);
+		close(cwd_fd);
+		/* masil: do not let fclose of a preexisting fd 3 close status. */
+		log_close();
+		if (dup2(status_pipe[1], MASIL_LAUNCH_STATUS_FD) == -1)
+			spawn_masil_launch_failure(status_pipe[1],
+			    MASIL_LAUNCH_STAGE_EXEC, errno);
+		if (status_pipe[1] != MASIL_LAUNCH_STATUS_FD)
+			close(status_pipe[1]);
+		if (fcntl(MASIL_LAUNCH_STATUS_FD, F_SETFD, FD_CLOEXEC) == -1)
+			spawn_masil_launch_failure(MASIL_LAUNCH_STATUS_FD,
+			    MASIL_LAUNCH_STAGE_EXEC, errno);
+		actual_cwd = new_wp->cwd;
 	}
 
 #if defined(HAVE_SYSTEMD) && defined(ENABLE_CGROUPS)
@@ -526,8 +607,12 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	 * Update terminal escape characters from the session if available and
 	 * force VERASE to tmux's backspace.
 	 */
-	if (tcgetattr(STDIN_FILENO, &now) != 0)
+	if (tcgetattr(STDIN_FILENO, &now) != 0) {
+		if (strict)
+			spawn_masil_launch_failure(MASIL_LAUNCH_STATUS_FD,
+			    MASIL_LAUNCH_STAGE_EXEC, errno);
 		_exit(1);
+	}
 	if (s->tio != NULL)
 		memcpy(now.c_cc, s->tio->c_cc, sizeof now.c_cc);
 	key = options_get_number(global_options, "backspace");
@@ -538,25 +623,39 @@ spawn_pane(struct spawn_context *sc, char **cause)
 #ifdef IUTF8
 	now.c_iflag |= IUTF8;
 #endif
-	if (tcsetattr(STDIN_FILENO, TCSANOW, &now) != 0)
+	if (tcsetattr(STDIN_FILENO, TCSANOW, &now) != 0) {
+		if (strict)
+			spawn_masil_launch_failure(MASIL_LAUNCH_STATUS_FD,
+			    MASIL_LAUNCH_STAGE_EXEC, errno);
 		_exit(1);
+	}
 
 	/* Clean up file descriptors and signals and update the environment. */
 	proc_clear_signals(server_proc, 1);
-	closefrom(STDERR_FILENO + 1);
+	if (strict)
+		closefrom(MASIL_LAUNCH_STATUS_FD + 1);
+	else
+		closefrom(STDERR_FILENO + 1);
 	sigprocmask(SIG_SETMASK, &oldset, NULL);
-	log_close();
+	if (!strict)
+		log_close();
 	environ_push(child);
 
 	/*
 	 * If given multiple arguments, use execvp(). Copy the arguments to
 	 * ensure they end in a NULL.
 	 */
-	if (new_wp->argc != 0 && new_wp->argc != 1) {
+	if (new_wp->argc != 0 && (new_wp->argc != 1 || strict)) {
 		argvp = cmd_copy_argv(new_wp->argc, new_wp->argv);
 		execvp(argvp[0], argvp);
+		if (strict)
+			spawn_masil_launch_failure(MASIL_LAUNCH_STATUS_FD,
+			    MASIL_LAUNCH_STAGE_EXEC, errno);
 		_exit(1);
 	}
+	if (strict)
+		spawn_masil_launch_failure(MASIL_LAUNCH_STATUS_FD,
+		    MASIL_LAUNCH_STAGE_EXEC, EINVAL);
 
 	/*
 	 * If one argument, pass it to $SHELL -c. Otherwise create a login

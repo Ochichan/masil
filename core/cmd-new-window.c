@@ -66,6 +66,17 @@ cmd_new_window_exec(struct cmd *self, struct cmdq_item *item)
 	const char		*template, *name;
 	struct cmd_find_state	 fs;
 	struct args_value	*av;
+	/* masil: C3 context is present only on fixed guarded launches. */
+	struct masil_launch_context *masil_launch = cmdq_get_masil_launch(item);
+
+	if (masil_launch != NULL) {
+		masil_launch_context_command_started(masil_launch);
+		if (masil_launch_context_cancelled(masil_launch)) {
+			/* masil: never let a bridge-timeout launch run after queue resume. */
+			cmdq_error(item, "launch command cancelled");
+			return (CMD_RETURN_ERROR);
+		}
+	}
 
 	if (args_has(args, 'E') &&
 	    count != 0 &&
@@ -80,10 +91,17 @@ cmd_new_window_exec(struct cmd *self, struct cmdq_item *item)
 	 * otherwise -n if one exists with that name. If neither matches,
 	 * fall through and create a window as normal.
 	 */
-	name = args_get(args, 'n');
+	name = masil_launch == NULL ? args_get(args, 'n') :
+	    masil_launch_context_name(masil_launch);
 	if (name != NULL) {
-		expanded = format_single(item, name, c, s, NULL, NULL);
+		if (masil_launch == NULL)
+			expanded = format_single(item, name, c, s, NULL, NULL);
+		else
+			expanded = xstrdup(name); /* masil: never expand launch names. */
 		if (!check_name(expanded)) {
+			if (masil_launch != NULL)
+				masil_launch_context_set_error(masil_launch,
+				    "invalid window name: %s", expanded);
 			cmdq_error(item, "invalid window name: %s", expanded);
 			free(expanded);
 			return (CMD_RETURN_ERROR);
@@ -138,17 +156,23 @@ cmd_new_window_exec(struct cmd *self, struct cmdq_item *item)
 	sc.tc = tc;
 
 	sc.name = wname;
-	args_to_vector(args, &sc.argc, &sc.argv);
-	sc.environ = environ_create();
-
-	av = args_first_value(args, 'e');
-	while (av != NULL) {
-		environ_put(sc.environ, av->string, 0);
-		av = args_next_value(av);
+	if (masil_launch == NULL) {
+		args_to_vector(args, &sc.argc, &sc.argv);
+		sc.environ = environ_create();
+		av = args_first_value(args, 'e');
+		while (av != NULL) {
+			environ_put(sc.environ, av->string, 0);
+			av = args_next_value(av);
+		}
+	} else {
+		/* masil: guarded launch values never pass through command arguments. */
+		masil_launch_context_argv(masil_launch, &sc.argc, &sc.argv);
+		sc.environ = masil_launch_context_environ(masil_launch);
 	}
 
 	sc.idx = idx;
-	sc.cwd = args_get(args, 'c');
+	sc.cwd = masil_launch == NULL ? args_get(args, 'c') :
+	    masil_launch_context_cwd(masil_launch);
 
 	sc.flags = 0;
 	if (args_has(args, 'E') || (count == 1 && *args_string(args, 0) == '\0'))
@@ -157,12 +181,22 @@ cmd_new_window_exec(struct cmd *self, struct cmdq_item *item)
 		sc.flags |= SPAWN_DETACHED;
 	if (args_has(args, 'k'))
 		sc.flags |= SPAWN_KILL;
+	if (masil_launch != NULL) {
+		/* masil: launch's cwd is literal and verified by spawn.c. */
+		sc.masil_launch = masil_launch;
+		sc.flags |= SPAWN_MASIL_STRICT_CWD;
+	}
 
 	if ((new_wl = spawn_window(&sc, &cause)) == NULL) {
+		if (masil_launch != NULL)
+			masil_launch_context_set_error(masil_launch, "%s", cause);
 		cmdq_error(item, "create window failed: %s", cause);
 		free(cause);
 		goto fail;
 	}
+	if (masil_launch != NULL)
+		masil_launch_context_pane_created(masil_launch,
+		    new_wl->window->active);
 	if (!args_has(args, 'd') || new_wl == s->curw) {
 		cmd_find_from_winlink(current, new_wl, 0);
 		server_redraw_session_group(s);

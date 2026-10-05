@@ -80,6 +80,8 @@ struct cmdq_state {
 	int			 flags;
 
 	struct format_tree	*formats;
+	/* masil: C3 private launch context; state and callback hold references. */
+	struct masil_launch_context *masil_launch;
 
 	struct key_event	 event;
 	struct cmd_find_state	 current;
@@ -259,7 +261,27 @@ cmdq_free_state(struct cmdq_state *state)
 
 	if (state->formats != NULL)
 		format_free(state->formats);
+	if (state->masil_launch != NULL)
+		masil_launch_context_release(state->masil_launch);
 	free(state);
+}
+
+/* masil: C3 only launch's fixed command list may carry this context. */
+void
+cmdq_set_masil_launch(struct cmdq_state *state,
+    struct masil_launch_context *masil_launch)
+{
+	if (state->masil_launch != NULL)
+		masil_launch_context_release(state->masil_launch);
+	state->masil_launch = masil_launch;
+	if (masil_launch != NULL)
+		masil_launch_context_retain(masil_launch);
+}
+
+struct masil_launch_context *
+cmdq_get_masil_launch(struct cmdq_item *item)
+{
+	return (item->state->masil_launch);
 }
 
 /* Add a format to command queue. */
@@ -848,6 +870,9 @@ cmdq_error(struct cmdq_item *item, const char *fmt, ...)
 	va_start(ap, fmt);
 	xvasprintf(&msg, fmt, ap);
 	va_end(ap);
+	if (item->state->masil_launch != NULL)
+		/* masil: C3 keeps the fixed command's diagnostic in its context. */
+		masil_launch_context_set_error(item->state->masil_launch, "%s", msg);
 
 	log_debug("%s: %s", __func__, msg);
 

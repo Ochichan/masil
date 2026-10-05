@@ -62,6 +62,7 @@ struct input_requests;
 struct job;
 struct json_node;
 struct menu_data;
+struct masil_launch_context;
 struct mode_tree_data;
 struct mouse_event;
 struct options;
@@ -2565,6 +2566,7 @@ struct spawn_context {
 
 	int			  idx;
 	const char		 *cwd;
+	struct masil_launch_context *masil_launch;
 
 	int			  flags;
 #define SPAWN_KILL 0x1
@@ -2581,6 +2583,19 @@ struct spawn_context {
 #define SPAWN_MODAL 0x800
 #define SPAWN_FLOATOVERZOOM 0x1000
 #define SPAWN_GROUP 0x2000 /* masil: split inside a floating group */
+#define SPAWN_MASIL_STRICT_CWD 0x4000
+};
+
+/* masil: strict launch status uses this FD until exec closes it. */
+#define MASIL_LAUNCH_STATUS_FD 3
+enum masil_launch_stage {
+	MASIL_LAUNCH_STAGE_CWD_OPEN = 1,
+	MASIL_LAUNCH_STAGE_CWD_IDENTITY,
+	MASIL_LAUNCH_STAGE_EXEC
+};
+struct masil_launch_status {
+	uint8_t		 stage;
+	int		 error;
 };
 
 /* Paste buffer. */
@@ -3239,6 +3254,9 @@ struct cmdq_state *cmdq_link_state(struct cmdq_state *);
 struct cmdq_state *cmdq_copy_state(struct cmdq_state *,
 		     struct cmd_find_state *);
 void		  cmdq_free_state(struct cmdq_state *);
+void		  cmdq_set_masil_launch(struct cmdq_state *,
+		     struct masil_launch_context *);
+struct masil_launch_context *cmdq_get_masil_launch(struct cmdq_item *);
 void printflike(3, 4) cmdq_add_format(struct cmdq_state *, const char *,
 		     const char *, ...);
 void		  cmdq_add_formats(struct cmdq_state *, struct format_tree *);
@@ -4284,6 +4302,26 @@ struct spawn_editor_state *spawn_editor(struct client *, const char *, size_t,
 void		 spawn_cancel_editor(struct spawn_editor_state *);
 pid_t		 spawn_get_editor_pid(struct spawn_editor_state *);
 void		 spawn_editor_finish(struct window_pane *);
+
+/* masil: C3 launch context owns literal spawn values and cancellation state. */
+const char	 *masil_launch_context_cwd(struct masil_launch_context *);
+const char	 *masil_launch_context_name(struct masil_launch_context *);
+struct environ	 *masil_launch_context_environ(struct masil_launch_context *);
+void		  masil_launch_context_argv(struct masil_launch_context *, int *,
+		     char ***);
+void		  masil_launch_context_command_started(
+		     struct masil_launch_context *);
+int		  masil_launch_context_cancelled(struct masil_launch_context *);
+uint64_t	  masil_launch_context_cwd_dev(struct masil_launch_context *);
+uint64_t	  masil_launch_context_cwd_ino(struct masil_launch_context *);
+void		  masil_launch_context_retain(struct masil_launch_context *);
+void		  masil_launch_context_release(struct masil_launch_context *);
+void		  masil_launch_context_set_status_fd(
+		     struct masil_launch_context *, int);
+void		  masil_launch_context_pane_created(
+		     struct masil_launch_context *, struct window_pane *);
+void printflike(2, 3) masil_launch_context_set_error(
+		     struct masil_launch_context *, const char *, ...);
 
 /* regsub.c */
 char		*regsub(const char *, const char *, const char *, int);

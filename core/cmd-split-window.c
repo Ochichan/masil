@@ -94,8 +94,19 @@ cmd_split_window_exec(struct cmd *self, struct cmdq_item *item)
 	char			*cause = NULL, *cp, *title;
 	const struct options_table_entry *oe;
 	struct args_value	*av;
+	/* masil: C3 context is present only on fixed guarded launches. */
+	struct masil_launch_context *masil_launch = cmdq_get_masil_launch(item);
 	enum pane_lines		 lines;
 	u_int			 count = args_count(args);
+
+	if (masil_launch != NULL) {
+		masil_launch_context_command_started(masil_launch);
+		if (masil_launch_context_cancelled(masil_launch)) {
+			/* masil: never let a bridge-timeout launch run after queue resume. */
+			cmdq_error(item, "launch command cancelled");
+			return (CMD_RETURN_ERROR);
+		}
+	}
 
 	if (window_active_pane_is_over_zoom(w))
 		restore_zoom = 1;
@@ -192,6 +203,8 @@ cmd_split_window_exec(struct cmd *self, struct cmdq_item *item)
 	else
 		lc = layout_get_tiled_cell(item, args, w, wp, flags, &cause);
 	if (cause != NULL) {
+		if (masil_launch != NULL)
+			masil_launch_context_set_error(masil_launch, "%s", cause);
 		cmdq_error(item, "%s", cause);
 		free(cause);
 		if (restore_zoom)
@@ -206,20 +219,33 @@ cmd_split_window_exec(struct cmd *self, struct cmdq_item *item)
 	sc.wp0 = wp;
 	sc.lc = lc;
 
-	args_to_vector(args, &sc.argc, &sc.argv);
-	sc.environ = environ_create();
-
-	av = args_first_value(args, 'e');
-	while (av != NULL) {
-		environ_put(sc.environ, av->string, 0);
-		av = args_next_value(av);
+	if (masil_launch == NULL) {
+		args_to_vector(args, &sc.argc, &sc.argv);
+		sc.environ = environ_create();
+		av = args_first_value(args, 'e');
+		while (av != NULL) {
+			environ_put(sc.environ, av->string, 0);
+			av = args_next_value(av);
+		}
+	} else {
+		/* masil: guarded launch values never pass through command arguments. */
+		masil_launch_context_argv(masil_launch, &sc.argc, &sc.argv);
+		sc.environ = masil_launch_context_environ(masil_launch);
 	}
 
 	sc.idx = -1;
-	sc.cwd = args_get(args, 'c');
+	sc.cwd = masil_launch == NULL ? args_get(args, 'c') :
+	    masil_launch_context_cwd(masil_launch);
 	sc.flags = flags;
+	if (masil_launch != NULL) {
+		/* masil: launch's cwd is literal and verified by spawn.c. */
+		sc.masil_launch = masil_launch;
+		sc.flags |= SPAWN_MASIL_STRICT_CWD;
+	}
 
 	if ((new_wp = spawn_pane(&sc, &cause)) == NULL) {
+		if (masil_launch != NULL)
+			masil_launch_context_set_error(masil_launch, "%s", cause);
 		cmdq_error(item, "create pane failed: %s", cause);
 		free(cause);
 		/*
@@ -229,6 +255,8 @@ cmd_split_window_exec(struct cmd *self, struct cmdq_item *item)
 		 */
 		goto fail;
 	}
+	if (masil_launch != NULL)
+		masil_launch_context_pane_created(masil_launch, new_wp);
 	if (args_has(args, 'K') && args_has(args, 'O'))
 		new_wp->flags |= PANE_CAPTUREALLKEYS;
 	if (args_has(args, 'C') && args_has(args, 'O'))

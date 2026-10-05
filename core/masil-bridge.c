@@ -76,6 +76,7 @@ enum masil_bridge_event_reason {
 	MASIL_BRIDGE_REMOVED,
 	/* masil: events below extend the watch stream in protocol 1.2. */
 	MASIL_BRIDGE_CREATED,
+	MASIL_BRIDGE_LAUNCH,
 	MASIL_BRIDGE_WINDOW_REMOVED,
 	MASIL_BRIDGE_SESSION_REMOVED,
 	MASIL_BRIDGE_CLIENT_VIEW,
@@ -102,12 +103,14 @@ struct masil_bridge_journal_event {
 	uint64_t		 screen_generation;
 	uint64_t		 client_serial;
 	uint64_t		 view_revision;
+	int			 launch_errno;
 	u_int			 pane_id;
 	u_int			 window_id;
 	u_int			 session_id;
 	uint16_t		 slot;
 	uint8_t			 reason;
 	uint8_t			 valid;
+	uint8_t			 launch_stage;
 };
 
 struct masil_bridge_client {
@@ -126,6 +129,7 @@ struct masil_bridge_client {
 	size_t			 tx_off;
 	uint64_t		 stream_epoch;
 	uint64_t		 watch_cursor;
+	uint64_t		 coordinator_cursor;
 	uint64_t		 watch_bits[MASIL_BRIDGE_WATCH_SLOTS / 64];
 	uint16_t		 watch_slots[MASIL_BRIDGE_WATCH_PANES];
 	size_t			 watch_count;
@@ -639,7 +643,7 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 	if (coordinator)
 		masil_json_printf(&builder,
 		    "\"actions\":true,\"dispatch_epoch\":\"%llu\","
-		    "\"input\":true,\"submit\":false},",
+		    "\"input\":true,\"launch\":true,\"submit\":false},",
 		    (unsigned long long)action_epoch);
 	else
 		/* masil: ordinary hello keeps its protocol-1.2 key set unchanged. */
@@ -656,6 +660,7 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 	}
 	client->coordinator = coordinator;
 	client->action_epoch = action_epoch;
+	client->coordinator_cursor = masil_bridge_event_seq;
 	client->hello_done = 1;
 	if (coordinator)
 		masil_bridge_coordinator_connected = 1;
@@ -796,6 +801,8 @@ masil_bridge_reason_string(enum masil_bridge_event_reason reason)
 		return ("removed");
 	case MASIL_BRIDGE_CREATED:
 		return ("created");
+	case MASIL_BRIDGE_LAUNCH:
+		return ("launch");
 	case MASIL_BRIDGE_WINDOW_REMOVED:
 		return ("window_removed");
 	case MASIL_BRIDGE_SESSION_REMOVED:
@@ -827,6 +834,19 @@ masil_bridge_watch_slot(struct window_pane *wp)
 	return (slot);
 }
 
+static struct masil_bridge_watch_slot *
+masil_bridge_watch_slot_by_id(u_int pane_id)
+{
+	size_t i;
+
+	for (i = 0; i < nitems(masil_bridge_watch_slots); i++) {
+		if (masil_bridge_watch_slots[i].used &&
+		    masil_bridge_watch_slots[i].pane_id == pane_id)
+			return (&masil_bridge_watch_slots[i]);
+	}
+	return (NULL);
+}
+
 static void
 masil_bridge_watch_slot_refresh(struct masil_bridge_watch_slot *slot)
 {
@@ -842,7 +862,8 @@ masil_bridge_watch_wake(void)
 	struct masil_bridge_client *client;
 
 	for (client = masil_bridge_clients; client != NULL; client = client->next) {
-		if (client->watching && client->tx == NULL)
+		if ((client->watching || (client->coordinator && !client->watching)) &&
+		    client->tx == NULL)
 			event_active(&client->event, EV_READ, 1);
 	}
 }
@@ -1582,6 +1603,7 @@ masil_bridge_event_visible(struct masil_bridge_client *client,
 	case MASIL_BRIDGE_PTY_CHANGED:
 	case MASIL_BRIDGE_EXITED:
 	case MASIL_BRIDGE_REMOVED:
+	case MASIL_BRIDGE_LAUNCH:
 		if (client->lifecycle_all)
 			return (1);
 		break;
@@ -1679,6 +1701,16 @@ masil_bridge_watch_pump(struct masil_bridge_client *client)
 			    (unsigned long long)record->pty_generation,
 			    (unsigned long long)record->screen_generation);
 			break;
+		case MASIL_BRIDGE_LAUNCH:
+			masil_json_printf(&builder,
+			    ",\"pane_id\":\"%%%u\",\"pty_generation\":\"%llu\","
+			    "\"stage\":\"%s\",\"errno\":%d", record->pane_id,
+			    (unsigned long long)record->pty_generation,
+			    record->launch_stage == 0 ? "exec_ok" :
+			    record->launch_stage == 1 ? "cwd_open" :
+			    record->launch_stage == 2 ? "cwd_identity" : "exec",
+			    record->launch_errno);
+			break;
 		case MASIL_BRIDGE_WINDOW_REMOVED:
 			masil_json_printf(&builder, ",\"window_id\":\"@%u\"",
 			    record->window_id);
@@ -1715,6 +1747,70 @@ masil_bridge_watch_pump(struct masil_bridge_client *client)
 	}
 	if (client->watch_cursor < last)
 		client->watch_reschedule = 1;
+	return (0);
+}
+
+/* masil: the coordinator gets launch outcomes without becoming a watch. */
+static int
+masil_bridge_coordinator_launch_pump(struct masil_bridge_client *client)
+{
+	struct masil_json_builder builder = {
+	    masil_bridge_response, 0, sizeof masil_bridge_response, 0
+	};
+	struct masil_bridge_journal_event *record;
+	uint64_t first, last, next;
+	size_t offset, index;
+
+	if (!client->coordinator || client->watching || client->tx != NULL ||
+	    masil_bridge_journal_count == 0)
+		return (0);
+	first = masil_bridge_journal[masil_bridge_journal_head].seq;
+	last = masil_bridge_event_seq;
+	if (client->coordinator_cursor < first - 1) {
+		/* masil: make a wrapped launch journal explicit to the coordinator. */
+		masil_json_printf(&builder,
+		    "{\"v\":1,\"kind\":\"gap\",\"core_boot_id\":\"%s\","
+		    "\"stream_epoch\":\"0\",\"after_seq\":\"%llu\","
+		    "\"first_available_seq\":\"%llu\",\"last_seq\":\"%llu\","
+		    "\"code\":\"resync_required\"}", masil_bridge_boot_id,
+		    (unsigned long long)client->coordinator_cursor,
+		    (unsigned long long)first, (unsigned long long)last);
+		masil_bridge_stats.gaps++;
+		if (masil_bridge_queue_builder(client, &builder) != 0)
+			return (-1);
+		client->coordinator_cursor = first - 1;
+		return (0);
+	}
+	while (client->coordinator_cursor < last) {
+		next = client->coordinator_cursor + 1;
+		offset = next - first;
+		if (offset >= masil_bridge_journal_count)
+			break;
+		index = (masil_bridge_journal_head + offset) %
+		    MASIL_BRIDGE_JOURNAL_EVENTS;
+		record = &masil_bridge_journal[index];
+		if (record->reason != MASIL_BRIDGE_LAUNCH) {
+			client->coordinator_cursor = record->seq;
+			continue;
+		}
+		masil_json_printf(&builder,
+		    "{\"v\":1,\"kind\":\"event\",\"core_boot_id\":\"%s\","
+		    "\"stream_epoch\":\"0\",\"event_seq\":\"%llu\","
+		    "\"reason\":\"launch\",\"pane_id\":\"%%%u\","
+		    "\"pty_generation\":\"%llu\",\"stage\":\"%s\","
+		    "\"errno\":%d}", masil_bridge_boot_id,
+		    (unsigned long long)record->seq, record->pane_id,
+		    (unsigned long long)record->pty_generation,
+		    record->launch_stage == 0 ? "exec_ok" :
+		    record->launch_stage == 1 ? "cwd_open" :
+		    record->launch_stage == 2 ? "cwd_identity" : "exec",
+		    record->launch_errno);
+		if (masil_bridge_queue_builder(client, &builder) != 0)
+			return (-1);
+		/* masil: advance only after the launch frame has been accepted. */
+		client->coordinator_cursor = record->seq;
+		return (0);
+	}
 	return (0);
 }
 
@@ -2199,6 +2295,10 @@ masil_bridge_client_callback(int fd, short events, void *data)
 
 	if (client->tx == NULL && masil_bridge_consume(client, &frames, &bytes,
 	    started) != 0) {
+		masil_bridge_client_close(client);
+		return;
+	}
+	if (client->tx == NULL && masil_bridge_coordinator_launch_pump(client) != 0) {
 		masil_bridge_client_close(client);
 		return;
 	}
@@ -3035,6 +3135,35 @@ masil_bridge_output_changed(struct window_pane *wp)
 		slot->dirty_after = now;
 	masil_bridge_pending_dirty++;
 	masil_bridge_dirty_schedule(slot->dirty_after);
+}
+
+void
+masil_bridge_launch(unsigned int pane_id, uint64_t pty_generation,
+    const char *stage, int error)
+{
+	struct masil_bridge_watch_slot *slot;
+	struct masil_bridge_journal_event *record;
+
+	if (!masil_bridge_enabled || masil_bridge_exiting)
+		return;
+	record = masil_bridge_journal_new(MASIL_BRIDGE_LAUNCH);
+	if (record == NULL)
+		return;
+	if (strcmp(stage, "exec_ok") == 0)
+		record->launch_stage = 0;
+	else if (strcmp(stage, "cwd_open") == 0)
+		record->launch_stage = 1;
+	else if (strcmp(stage, "cwd_identity") == 0)
+		record->launch_stage = 2;
+	else
+		record->launch_stage = 3;
+	record->launch_errno = error;
+	record->pane_id = pane_id;
+	record->pty_generation = pty_generation;
+	if ((slot = masil_bridge_watch_slot_by_id(pane_id)) != NULL)
+		record->slot = slot - masil_bridge_watch_slots;
+	record->valid |= MASIL_BRIDGE_VIEW_PANE;
+	masil_bridge_journal_finish();
 }
 
 void
