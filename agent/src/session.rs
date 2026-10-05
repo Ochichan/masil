@@ -2031,6 +2031,10 @@ pub(crate) fn start_autosave(socket: &str) -> Result<(), String> {
     let mut command = Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
     command
         .args(["session", "autosave", "--socket", socket])
+        // Started from a save or a feature change, not with the server: the
+        // caller already started what it needs, and an immediate restart
+        // check would undo a coordinator stop that follows at once.
+        .env(SPAWNED_BY_AGENT, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2079,6 +2083,9 @@ fn boot_autosave_enabled(server: &Server, socket: &Path) -> bool {
     )
 }
 
+/// Marks a saver that masil-agent started after a save or a feature change.
+const SPAWNED_BY_AGENT: &str = "MASIL_AUTOSAVE_SPAWNED";
+
 /// Saves automatically every @masil-autosave minutes while this server lives.
 /// One saver runs per socket; it stops when no server answers there or the
 /// masil UI layer is turned off, and waits while @masil-autosave is off or 0.
@@ -2100,8 +2107,11 @@ fn autosave(raw_socket: &str, boot: bool) -> Result<i32, String> {
         return Ok(0);
     }
     // Before the saver lock: when the server restarts on this socket within
-    // one check, the earlier saver keeps the lock and this one exits.
-    crate::coordinator::restart_if_enabled(&socket);
+    // one check, the earlier saver keeps the lock and this one exits. Only a
+    // saver started with the server needs it.
+    if std::env::var_os(SPAWNED_BY_AGENT).is_none() {
+        crate::coordinator::restart_if_enabled(&socket);
+    }
     let dir = snapshot_dir()?;
     let Some(_lock) = autosave_lock(&dir, socket_text)? else {
         return Ok(0);

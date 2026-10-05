@@ -1,5 +1,5 @@
 use super::{Agent, Manager, commands, failure, validate_args};
-use crate::providers;
+use crate::{bridge, providers};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -1015,7 +1015,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "send-keys" if args.len() >= 2 => {
             let agent = manager.get(&args[0]).await?;
-            print(&manager.keys(&agent, &args[1..]).await?)?;
+            print(&manager.keys(&agent, &args[1..], super::TrackedRetry::SameRun).await?)?;
         }
         "draft" if args.len() == 2 => {
             let agent = manager.get(&args[0]).await?;
@@ -1581,6 +1581,13 @@ fn object_id(sigil: char, text: &str) -> Option<String> {
         .map(|number| format!("{sigil}{number}"))
 }
 
+struct ClosedTarget<'a> {
+    kind: &'a str,
+    field: usize,
+    id: &'a str,
+    closed: &'a str,
+}
+
 async fn wait_closed(
     manager: &Manager,
     kind: &str,
@@ -1638,9 +1645,37 @@ async fn wait_closed(
             (id, true)
         }
     };
+    // A missing/unavailable bridge is not an observation loss before a
+    // stream exists: preserve the old 200 ms native polling path in that
+    // case. Once a watch ACK arrives, a gap/EOF/identity mismatch cannot be
+    // reconciled by silently switching back to a different observation mode.
+    let bridge_target = ClosedTarget {
+        kind,
+        field,
+        id: &id,
+        closed: &closed,
+    };
+    if let Ok(Some(endpoint)) = manager.bridge_endpoint().await
+        && let Some(result) =
+            wait_closed_bridge(manager, bridge_target, named, deadline, endpoint).await?
+    {
+        return Ok(result);
+    }
+    wait_closed_polling(manager, kind, field, &id, named, &closed, deadline).await
+}
+
+/// Polling fallback kept byte-for-byte equivalent in its native observation
+/// behavior to the earlier waiter.
+async fn wait_closed_polling(
+    manager: &Manager,
+    kind: &str,
+    field: usize,
+    id: &str,
+    mut seen: bool,
+    closed: &str,
+    deadline: Instant,
+) -> Result<i32, String> {
     let mut boot: Option<String> = None;
-    // Found by name: it was there when the wait began.
-    let mut seen = named;
     loop {
         let present = match manager
             .command(&[
@@ -1662,7 +1697,7 @@ async fn wait_closed(
                     == current.as_deref().unwrap_or_default();
                 same && text
                     .lines()
-                    .any(|line| line.split('\t').nth(field) == Some(id.as_str()))
+                    .any(|line| line.split('\t').nth(field) == Some(id))
             }
             Err(error) => return wait_unread(&error, json!({ kind: id, "seen": seen })),
         };
@@ -1672,10 +1707,315 @@ async fn wait_closed(
         }
         seen = true;
         if Instant::now() >= deadline {
-            print(&json!({"outcome":"timeout","end_reason":"timeout",kind:id,"seen":seen}))?;
-            return Ok(wait_exit("timeout", &closed));
+            return wait_closed_timeout(kind, id, seen, closed);
         }
         pause(deadline).await;
+    }
+}
+
+/// A one-time native check after a lifecycle watch ACK closes the subscribe
+/// race: a removal between opening the stream and checking is either already
+/// absent here or is retained in the lifecycle journal after the ACK fence.
+async fn bridge_target_present(
+    manager: &Manager,
+    field: usize,
+    id: &str,
+    boot: &str,
+) -> Result<bool, bridge::Error> {
+    let text = manager
+        .command(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{masil_core_boot_id}\t#{session_id}\t#{window_id}\t#{pane_id}",
+        ])
+        .await
+        .map_err(|error| bridge::Error::Lost(format!("checking lifecycle target: {error}")))?;
+    if let Some(current) = text.lines().next().and_then(|line| line.split('\t').next())
+        && current != boot
+    {
+        return Err(bridge::Error::BootMismatch);
+    }
+    Ok(text
+        .lines()
+        .any(|line| line.split('\t').nth(field) == Some(id)))
+}
+
+fn wait_closed_timeout(kind: &str, id: &str, seen: bool, closed: &str) -> Result<i32, String> {
+    print(&json!({"outcome":"timeout","end_reason":"timeout",kind:id,"seen":seen}))?;
+    Ok(wait_exit("timeout", closed))
+}
+
+fn wait_closed_observed(target: &ClosedTarget<'_>, seen: bool) -> Result<i32, String> {
+    let mut output = json!({
+        "outcome": target.closed,
+        "end_reason": target.closed,
+        "seen": seen,
+    });
+    output[target.kind] = json!(target.id);
+    print(&output)?;
+    Ok(0)
+}
+
+fn wait_closed_lost(
+    kind: &str,
+    id: &str,
+    seen: bool,
+    error: &bridge::Error,
+) -> Result<i32, String> {
+    print(&json!({
+        "outcome":"observation_lost",
+        "end_reason":"observation_lost",
+        "reason":format!("bridge: {error}"),
+        kind:id,
+        "seen":seen,
+    }))?;
+    Ok(6)
+}
+
+/// The one native boot probe after a fenced stream fails. A changed boot is
+/// equivalent to a gone server for a wait: IDs belong to the old core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeProbe {
+    SameBoot,
+    ServerGone,
+    BootChanged,
+    Unreadable,
+}
+
+fn bridge_probe_end_reason(probe: BridgeProbe) -> &'static str {
+    match probe {
+        BridgeProbe::ServerGone | BridgeProbe::BootChanged => "server_gone",
+        BridgeProbe::SameBoot | BridgeProbe::Unreadable => "observation_lost",
+    }
+}
+
+async fn bridge_boot_probe(manager: &Manager, expected_boot: &str) -> (BridgeProbe, String) {
+    match manager
+        .command(&["display-message", "-p", "#{masil_core_boot_id}"])
+        .await
+    {
+        Ok(boot) if boot.trim() == expected_boot => (BridgeProbe::SameBoot, String::new()),
+        Ok(boot) => (
+            BridgeProbe::BootChanged,
+            format!("native core boot changed to {}", boot.trim()),
+        ),
+        Err(error) if server_gone(&error) => (BridgeProbe::ServerGone, error),
+        Err(error) => (BridgeProbe::Unreadable, error),
+    }
+}
+
+fn wait_closed_server_gone(
+    kind: &str,
+    id: &str,
+    seen: bool,
+    reason: &str,
+) -> Result<i32, String> {
+    print(&json!({
+        "outcome":"server_gone",
+        "end_reason":"server_gone",
+        "reason":reason,
+        kind:id,
+        "seen":seen,
+    }))?;
+    Ok(6)
+}
+
+/// A watch has already crossed its hello fence, so it may not silently fall
+/// back to polling. Probe once to distinguish a stopped/restarted server from
+/// a live server whose stream can no longer be trusted.
+async fn wait_closed_stream_lost(
+    manager: &Manager,
+    target: &ClosedTarget<'_>,
+    seen: bool,
+    endpoint: &bridge::Endpoint,
+    error: &bridge::Error,
+) -> Result<i32, String> {
+    if error.is_server_exiting() {
+        return wait_closed_server_gone(target.kind, target.id, seen, "bridge: server exiting");
+    }
+    let (probe, reason) = bridge_boot_probe(manager, &endpoint.core_boot_id).await;
+    if bridge_probe_end_reason(probe) == "server_gone" {
+        let reason = if reason.is_empty() {
+            format!("bridge: {error}")
+        } else {
+            reason
+        };
+        return wait_closed_server_gone(target.kind, target.id, seen, &reason);
+    }
+    wait_closed_lost(target.kind, target.id, seen, error)
+}
+
+/// Preserve the polling waiter's ordering for a tiny timeout: one native
+/// presence check happens before timeout is reported, even when the bridge
+/// setup consumed the deadline.
+async fn wait_closed_timeout_after_presence(
+    manager: &Manager,
+    target: &ClosedTarget<'_>,
+    seen: bool,
+    endpoint: &bridge::Endpoint,
+) -> Result<i32, String> {
+    match bridge_target_present(manager, target.field, target.id, &endpoint.core_boot_id).await {
+        Ok(false) => wait_closed_observed(target, seen),
+        Ok(true) => wait_closed_timeout(target.kind, target.id, true, target.closed),
+        Err(bridge::Error::BootMismatch) => wait_closed_server_gone(
+            target.kind,
+            target.id,
+            seen,
+            "native core boot changed",
+        ),
+        Err(error) if server_gone(&error.to_string()) => {
+            wait_closed_server_gone(target.kind, target.id, seen, &error.to_string())
+        }
+        Err(error) => wait_closed_lost(target.kind, target.id, seen, &error),
+    }
+}
+
+/// `exited` does not mean a pane object closed: a remain-on-exit pane remains
+/// watchable until the lifecycle stream says `removed`.
+fn bridge_closed_event(target: &ClosedTarget<'_>, event: &bridge::Event) -> bool {
+    match event {
+        bridge::Event::Pane { pane_id, reason } => {
+            target.kind == "pane" && pane_id == target.id && *reason == bridge::PaneReason::Removed
+        }
+        bridge::Event::WindowRemoved { window_id } => {
+            target.kind == "window" && window_id == target.id
+        }
+        bridge::Event::SessionRemoved { session_id } => {
+            target.kind == "session" && session_id == target.id
+        }
+        bridge::Event::ServerExiting => false,
+    }
+}
+
+/// `Some` is a completed wait; `None` tells the caller that no bridge stream
+/// could be established and it should use the historical polling fallback.
+async fn wait_closed_bridge(
+    manager: &Manager,
+    target: ClosedTarget<'_>,
+    mut seen: bool,
+    deadline: Instant,
+    endpoint: bridge::Endpoint,
+) -> Result<Option<i32>, String> {
+    let deadline_at = tokio::time::Instant::from_std(deadline);
+    let client = match tokio::time::timeout_at(
+        deadline_at,
+        bridge::Client::connect(&endpoint, "wait-closed-hello"),
+    )
+    .await
+    {
+        Ok(Ok(client)) => client,
+        Ok(Err(error)) if error.is_server_exiting() => {
+            return Ok(Some(wait_closed_server_gone(
+                target.kind,
+                target.id,
+                seen,
+                "bridge: server exiting",
+            )?));
+        }
+        Ok(Err(error)) if error.falls_back_to_polling() => return Ok(None),
+        Ok(Err(error)) => {
+            return Ok(Some(wait_closed_lost(
+                target.kind,
+                target.id,
+                seen,
+                &error,
+            )?));
+        }
+        Err(_) => {
+            return Ok(Some(
+                wait_closed_timeout_after_presence(manager, &target, seen, &endpoint).await?,
+            ));
+        }
+    };
+    let lifecycle = target.kind != "pane";
+    let panes = if lifecycle {
+        Vec::new()
+    } else {
+        vec![target.id.to_owned()]
+    };
+    let mut watch = match tokio::time::timeout_at(
+        deadline_at,
+        client.watch("wait-closed-watch", panes, lifecycle),
+    )
+    .await
+    {
+        Ok(Ok(watch)) => watch,
+        Ok(Err(error)) if target.kind == "pane" && error.is_target_gone() => {
+            return Ok(Some(wait_closed_observed(&target, seen)?));
+        }
+        Ok(Err(error)) if error.is_server_exiting() => {
+            return Ok(Some(wait_closed_server_gone(
+                target.kind,
+                target.id,
+                seen,
+                "bridge: server exiting",
+            )?));
+        }
+        Ok(Err(error)) if error.falls_back_to_polling() => return Ok(None),
+        Ok(Err(error)) => {
+            return Ok(Some(
+                wait_closed_stream_lost(manager, &target, seen, &endpoint, &error).await?,
+            ));
+        }
+        Err(_) => {
+            return Ok(Some(
+                wait_closed_timeout_after_presence(manager, &target, seen, &endpoint).await?,
+            ));
+        }
+    };
+
+    if lifecycle {
+        match bridge_target_present(manager, target.field, target.id, &endpoint.core_boot_id).await {
+            Ok(false) => {
+                return Ok(Some(wait_closed_observed(&target, seen)?));
+            }
+            Ok(true) => seen = true,
+            Err(error) => {
+                if error == bridge::Error::BootMismatch {
+                    return Ok(Some(wait_closed_server_gone(
+                        target.kind,
+                        target.id,
+                        seen,
+                        "native core boot changed",
+                    )?));
+                }
+                return Ok(Some(
+                    wait_closed_stream_lost(manager, &target, seen, &endpoint, &error).await?,
+                ));
+            }
+        }
+    } else {
+        // A successful scoped ACK includes the pane baseline, so it existed
+        // at the stream fence even if it exits before the first event.
+        seen = true;
+    }
+
+    loop {
+        let event = tokio::select! {
+            event = watch.next() => match event {
+                Ok(event) => event,
+                Err(error) => return Ok(Some(
+                    wait_closed_stream_lost(manager, &target, seen, &endpoint, &error).await?,
+                )),
+            },
+            _ = tokio::time::sleep_until(deadline_at) => {
+                return Ok(Some(wait_closed_timeout(target.kind, target.id, seen, target.closed)?));
+            }
+        };
+        if matches!(event, bridge::Event::ServerExiting) {
+            return Ok(Some(wait_closed_server_gone(
+                target.kind,
+                target.id,
+                seen,
+                "bridge: server exiting",
+            )?));
+        }
+        if bridge_closed_event(&target, &event) {
+            return Ok(Some(wait_closed_observed(&target, seen)?));
+        }
+        // `exited` is deliberately not a completion: remain-on-exit leaves
+        // the pane object present, and a later `removed` is authoritative.
     }
 }
 
@@ -1752,6 +2092,50 @@ mod tests {
         assert_eq!(stage_rank("provider_exited"), Some((2, true)));
         assert_eq!(object_id('%', "%00").as_deref(), Some("%0"));
         assert_eq!(object_id('$', "$x"), None);
+    }
+
+    #[test]
+    fn bridge_closed_wait_ignores_exit_until_the_object_is_removed() {
+        let pane = ClosedTarget {
+            kind: "pane",
+            field: 3,
+            id: "%4",
+            closed: "pane_closed",
+        };
+        assert!(!bridge_closed_event(
+            &pane,
+            &bridge::Event::Pane {
+                pane_id: "%4".into(),
+                reason: bridge::PaneReason::Exited,
+            }
+        ));
+        assert!(bridge_closed_event(
+            &pane,
+            &bridge::Event::Pane {
+                pane_id: "%4".into(),
+                reason: bridge::PaneReason::Removed,
+            }
+        ));
+        let window = ClosedTarget {
+            kind: "window",
+            field: 2,
+            id: "@2",
+            closed: "window_closed",
+        };
+        assert!(bridge_closed_event(
+            &window,
+            &bridge::Event::WindowRemoved {
+                window_id: "@2".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn bridge_probe_maps_only_gone_or_restarted_cores_to_server_gone() {
+        assert_eq!(bridge_probe_end_reason(BridgeProbe::SameBoot), "observation_lost");
+        assert_eq!(bridge_probe_end_reason(BridgeProbe::Unreadable), "observation_lost");
+        assert_eq!(bridge_probe_end_reason(BridgeProbe::ServerGone), "server_gone");
+        assert_eq!(bridge_probe_end_reason(BridgeProbe::BootChanged), "server_gone");
     }
 
     #[test]

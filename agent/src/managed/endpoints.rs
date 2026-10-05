@@ -1106,7 +1106,9 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
                     manager.rename(&agent, &name).await?;
                     Ok(json!({"stage":"registered", "pane_id":agent.pane_id, "name":name}))
                 }
-                Action::Keys { keys } => manager.keys(&agent, &keys).await,
+                Action::Keys { keys } => {
+                    manager.keys(&agent, &keys, super::TrackedRetry::Never).await
+                }
                 Action::Draft { text } => manager.draft(&agent, &text).await,
                 Action::Prompt { text, operation } => {
                     manager.prompt_served(&agent, &text, operation).await

@@ -233,22 +233,30 @@ impl Manager {
 
     /// Writes the effects to the inbox if it is on, then nudges a running
     /// coordinator. Failures are logged and otherwise ignored.
-    pub(super) async fn inbox_apply(&self, effects: Vec<Effect>) {
+    pub(super) async fn inbox_apply(&self, effects: Vec<Effect>) -> bool {
         if effects.is_empty() {
-            return;
+            return false;
         }
         // The coordinator keeps its connection and is the one poked.
         if self.is_resident() {
-            if let Err(error) = self
+            let applied = match self
                 .with_resident_store(move |store| apply(store, &effects))
                 .await
             {
-                log("inbox.log", &json!({"error": error}));
+                Ok(Some(())) => true,
+                Ok(None) => false,
+                Err(error) => {
+                    log("inbox.log", &json!({"error": error}));
+                    false
+                }
+            };
+            if applied && let Some(resident) = &self.resident {
+                resident.mark_inbox_dirty();
             }
-            return;
+            return applied;
         }
         let Some(instance) = self.inbox_instance().await else {
-            return;
+            return false;
         };
         let socket: PathBuf = self.native.socket.clone();
         let written = tokio::task::spawn_blocking(move || {
@@ -259,8 +267,14 @@ impl Manager {
         .await
         .unwrap_or_else(|error| Err(error.to_string()));
         match written {
-            Ok(()) => crate::coordinator::poke(&self.native.socket),
-            Err(error) => log("inbox.log", &json!({"error": error})),
+            Ok(()) => {
+                crate::coordinator::poke(&self.native.socket);
+                true
+            }
+            Err(error) => {
+                log("inbox.log", &json!({"error": error}));
+                false
+            }
         }
     }
 }

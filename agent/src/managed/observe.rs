@@ -98,6 +98,7 @@ struct Timing {
 }
 
 struct Observed {
+    pane: String,
     output: u64,
     wake: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
@@ -122,8 +123,33 @@ impl Observers {
         agents: &[Agent],
         updates: &mpsc::UnboundedSender<Update>,
     ) {
+        self.sync_inner(manager, agents, updates, None).await;
+    }
+
+    /// Updates one pane without treating every other observer as absent. This
+    /// lets a bridge screen-dirty notification take the narrow native path.
+    pub(super) async fn sync_pane(
+        &mut self,
+        manager: &Manager,
+        pane: &str,
+        agents: &[Agent],
+        updates: &mpsc::UnboundedSender<Update>,
+    ) {
+        self.sync_inner(manager, agents, updates, Some(pane)).await;
+    }
+
+    async fn sync_inner(
+        &mut self,
+        manager: &Manager,
+        agents: &[Agent],
+        updates: &mpsc::UnboundedSender<Update>,
+        pane: Option<&str>,
+    ) {
         let mut seen = HashSet::new();
-        for agent in agents.iter().filter(|agent| observable(agent)) {
+        for agent in agents
+            .iter()
+            .filter(|agent| observable(agent) && pane.is_none_or(|pane| agent.pane_id == pane))
+        {
             seen.insert(agent.run.clone());
             if let Some(observed) = self.runs.get_mut(&agent.run) {
                 if observed.output != agent.output_generation {
@@ -146,6 +172,7 @@ impl Observers {
             self.runs.insert(
                 agent.run.clone(),
                 Observed {
+                    pane: agent.pane_id.clone(),
                     output: agent.output_generation,
                     wake,
                     task,
@@ -153,6 +180,9 @@ impl Observers {
             );
         }
         self.runs.retain(|run, observed| {
+            if pane.is_some_and(|pane| observed.pane != pane) {
+                return true;
+            }
             let keep = seen.contains(run);
             if !keep {
                 observed.task.abort();
@@ -165,6 +195,19 @@ impl Observers {
         for (_, observed) in self.runs.drain() {
             observed.task.abort();
         }
+    }
+
+    /// A PTY replacement or removal breaks the process association behind an
+    /// API observer. It is restarted only after the resident's next native
+    /// pass has established the pane's current run.
+    pub(super) fn invalidate_pane(&mut self, pane: &str) {
+        self.runs.retain(|_, observed| {
+            let keep = observed.pane != pane;
+            if !keep {
+                observed.task.abort();
+            }
+            keep
+        });
     }
 
     pub(super) fn len(&self) -> usize {

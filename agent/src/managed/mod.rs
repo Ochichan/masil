@@ -619,6 +619,45 @@ impl Manager {
         valid_boot(boot.trim()).map(str::to_owned)
     }
 
+    /// The private core bridge endpoint paired with this native server's
+    /// boot identity. An empty format value means the bridge is disabled.
+    pub(super) async fn bridge_endpoint(&self) -> Result<Option<crate::bridge::Endpoint>, String> {
+        let value = self
+            .command(&[
+                "display-message",
+                "-p",
+                "#{masil_core_boot_id}\t#{masil_bridge_socket}",
+            ])
+            .await?;
+        let value = value.strip_suffix('\n').unwrap_or(&value);
+        let (boot, path) = value
+            .split_once('\t')
+            .ok_or("invalid native bridge endpoint")?;
+        if path.contains('\t') || path.chars().any(char::is_control) {
+            return Err("invalid native bridge endpoint".into());
+        }
+        let boot = valid_boot(boot)?.to_owned();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::bridge::Endpoint {
+            path: PathBuf::from(path),
+            core_boot_id: boot,
+        }))
+    }
+
+    /// A bridge lifecycle change is only a hint. Clear the transient screen
+    /// and resident memo so the next authoritative pass follows the same
+    /// generation-change path as a normal poll.
+    pub(super) fn invalidate_pane_observation(&self, pane: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(pane);
+        }
+        if let Some(resident) = &self.resident {
+            resident.forget(pane);
+        }
+    }
+
     async fn inventory(&self) -> Result<Vec<Vec<String>>, String> {
         let output = self.command(&["list-panes", "-a", "-F", FORMAT]).await?;
         let records = records(&output)?;
@@ -757,15 +796,45 @@ impl Manager {
         self.collect(None).await
     }
 
+    /// The resident pass and the exact raw pane scope it should watch. The
+    /// scope comes from the same inventory as the returned agents, including
+    /// marker-bearing panes whose current foreground cannot be identified.
+    pub(super) async fn resident_list(
+        &self,
+    ) -> Result<(Vec<Agent>, HashSet<String>, Option<String>, bool), String> {
+        self.collect_with_bridge_scope(None).await
+    }
+
+    /// A resident's narrow bridge pass also tells the caller whether its
+    /// committed tracked change altered the inbox. The resident does not poke
+    /// itself after such a write, so it must refresh its own projections.
+    pub(super) async fn resident_collect_pane(
+        &self,
+        pane: &str,
+    ) -> Result<(Vec<Agent>, bool), String> {
+        self.collect_with_bridge_scope(Some(pane))
+            .await
+            .map(|(agents, _, _, inbox_changed)| (agents, inbox_changed))
+    }
+
     /// The agents, with each changed tracked state written. A concurrent
     /// writer can win a pane's update; one more pass finds that change
     /// already written. A targeted call ignores lost writes of other panes.
     async fn collect(&self, target: Option<&str>) -> Result<Vec<Agent>, String> {
+        self.collect_with_bridge_scope(target)
+            .await
+            .map(|(agents, _, _, _)| agents)
+    }
+
+    async fn collect_with_bridge_scope(
+        &self,
+        target: Option<&str>,
+    ) -> Result<(Vec<Agent>, HashSet<String>, Option<String>, bool), String> {
         let mut retried = false;
         loop {
             let result = self.collect_once(target).await;
             let lost = match &result {
-                Ok((agents, uncommitted)) => uncommitted.iter().any(|pane| match target {
+                Ok((agents, uncommitted, _, _, _)) => uncommitted.iter().any(|pane| match target {
                     None => true,
                     Some(target) => {
                         pane == target
@@ -782,7 +851,9 @@ impl Manager {
             }
             return match result {
                 Ok(_) if lost => Err(TRACKED_LOST.into()),
-                result => result.map(|(agents, _)| agents),
+                result => result.map(|(agents, _, bridge_scope, core_boot_id, inbox_changed)| {
+                    (agents, bridge_scope, core_boot_id, inbox_changed)
+                }),
             };
         }
     }
@@ -792,9 +863,24 @@ impl Manager {
     async fn collect_once(
         &self,
         target: Option<&str>,
-    ) -> Result<(Vec<Agent>, Vec<String>), String> {
+    ) -> Result<
+        (
+            Vec<Agent>,
+            Vec<String>,
+            HashSet<String>,
+            Option<String>,
+            bool,
+        ),
+        String,
+    > {
         let inventory = self.inventory().await?;
         validate_inventory(&inventory)?;
+        let core_boot_id = inventory.first().map(|fields| fields[5].clone());
+        let mut bridge_scope: HashSet<String> = inventory
+            .iter()
+            .filter(|fields| !fields[11].is_empty() || !fields[12].is_empty())
+            .map(|fields| fields[0].clone())
+            .collect();
         let identified = identify_foregrounds(&inventory).await;
         let mut prepared = self
             .capture_cache_misses(&inventory, &identified, target)
@@ -1112,18 +1198,31 @@ impl Manager {
         self.write_epoch_records(&epoch_groups).await;
         // Only the panes whose tracked revision committed: a lost CAS
         // records nothing, and the next poll sees that change again.
-        self.inbox_apply(
-            inbox_effects
-                .into_iter()
-                .filter(|(pane, _)| !uncommitted.contains(pane))
-                .flat_map(|(_, effects)| effects)
-                .collect(),
-        )
-        .await;
+        let inbox_changed = self
+            .inbox_apply(
+                inbox_effects
+                    .into_iter()
+                    .filter(|(pane, _)| !uncommitted.contains(pane))
+                    .flat_map(|(_, effects)| effects)
+                    .collect(),
+            )
+            .await;
         if let Some(resident) = &self.resident {
             resident.remember(&agents, target.is_none());
         }
-        Ok((agents, uncommitted))
+        bridge_scope.extend(
+            agents
+                .iter()
+                .filter(|agent| agent.bridge_watchable())
+                .map(|agent| agent.pane_id.clone()),
+        );
+        Ok((
+            agents,
+            uncommitted,
+            bridge_scope,
+            core_boot_id,
+            inbox_changed,
+        ))
     }
 
     /// Records which process each unmanaged run is (`EPOCH`). Best effort:
@@ -1270,8 +1369,13 @@ impl Manager {
         Ok(())
     }
 
-    async fn guarded_input(&self, agent: &Agent, commands: Vec<Vec<String>>) -> Result<(), String> {
-        self.guarded_input_condition(agent, commands, None).await
+    async fn guarded_input(
+        &self,
+        agent: &Agent,
+        commands: Vec<Vec<String>>,
+        retry: TrackedRetry,
+    ) -> Result<(), String> {
+        self.guarded_input_condition(agent, commands, None, retry).await
     }
 
     async fn guarded_input_condition(
@@ -1279,15 +1383,33 @@ impl Manager {
         agent: &Agent,
         commands: Vec<Vec<String>>,
         condition: Option<&str>,
+        retry: TrackedRetry,
     ) -> Result<(), String> {
+        let rejected =
+            || "identity_mismatch: agent foreground or run changed before input delivery".into();
         match self
-            .guarded_input_outcome(agent, commands, condition)
+            .guarded_input_outcome(agent, commands.clone(), condition)
+            .await?
+        {
+            Guarded::Applied => return Ok(()),
+            Guarded::Rejected if retry == TrackedRetry::SameRun => {}
+            Guarded::Rejected => return Err(rejected()),
+        }
+        // `Rejected` proves nothing ran. The guard also covers the tracked
+        // state, which the coordinator rewrites as the screen changes; when
+        // only that moved, the agent is the same and one retry is safe.
+        let Ok(fresh) = self.get(&agent.pane_id).await else {
+            return Err(rejected());
+        };
+        if !same_run(agent, &fresh) {
+            return Err(rejected());
+        }
+        match self
+            .guarded_input_outcome(&fresh, commands, condition)
             .await?
         {
             Guarded::Applied => Ok(()),
-            Guarded::Rejected => Err(
-                "identity_mismatch: agent foreground or run changed before input delivery".into(),
-            ),
+            Guarded::Rejected => Err(rejected()),
         }
     }
 
@@ -1910,7 +2032,15 @@ impl Manager {
             .map(|_| ())
     }
 
-    pub async fn keys(&self, agent: &Agent, keys: &[String]) -> Result<Value, String> {
+    /// `retry` decides what a tracked-state change between the caller's read
+    /// and delivery means: the CLI's explicit keys go to the same run, while
+    /// a remote caller's keys answer the state it saw and are refused.
+    pub async fn keys(
+        &self,
+        agent: &Agent,
+        keys: &[String],
+        retry: TrackedRetry,
+    ) -> Result<Value, String> {
         validate_args(keys)?;
         if agent.process != "running" {
             return Err("identity_mismatch: agent is not verified in the foreground".into());
@@ -1922,7 +2052,7 @@ impl Manager {
             "--".into(),
         ];
         args.extend_from_slice(keys);
-        self.guarded_input(agent, vec![args]).await?;
+        self.guarded_input(agent, vec![args], retry).await?;
         Ok(
             json!({"stage":"keys_delivered","pane_id":agent.pane_id,"run":agent.run,"provider_accepted":false}),
         )
@@ -2539,6 +2669,13 @@ pub(crate) fn coordinator_features(base: &Path, socket: &Path) -> Result<Vec<Str
 }
 
 impl Agent {
+    /// A pane with either durable management marker needs an explicit bridge
+    /// screen scope. This mirrors the resident signature's META/TRACKED
+    /// condition without treating ordinary provider-looking panes as managed.
+    pub(super) fn bridge_watchable(&self) -> bool {
+        self.metadata.is_some() || !self.tracked_encoded.is_empty()
+    }
+
     /// The desk's binding label. Rows from an endpoint without run evidence
     /// keep the configured-but-unverified wording.
     fn binding_label(&self) -> &'static str {
@@ -2990,6 +3127,29 @@ fn and(guards: &[String]) -> String {
         .cloned()
         .reduce(|tail, head| format!("#{{&&:{head},{tail}}}"))
         .unwrap_or_else(|| "0".into())
+}
+
+/// Whether input refused only because the tracked state moved may be sent
+/// again to the same run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackedRetry {
+    /// Refuse: the input answers the state the caller saw.
+    Never,
+    /// Send once more when the agent is still the same run.
+    SameRun,
+}
+
+/// The same agent run in the same pane: what the identity guard checks,
+/// apart from the tracked state that observation keeps rewriting.
+fn same_run(before: &Agent, after: &Agent) -> bool {
+    before.pane_id == after.pane_id
+        && before.boot == after.boot
+        && before.generation == after.generation
+        && before.run == after.run
+        && before.encoded == after.encoded
+        && before.foreground_group == after.foreground_group
+        && before.process_epoch == after.process_epoch
+        && after.process == "running"
 }
 
 fn identity_guard(agent: &Agent) -> String {
