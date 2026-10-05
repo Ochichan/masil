@@ -46,7 +46,7 @@ void	masil_bridge_pty_changed(struct window_pane *);
 void	masil_bridge_output_changed(struct window_pane *);
 void	masil_bridge_geometry_changed(struct window_pane *);
 
-/* masil: C1a coordinator action ledger interface. */
+/* masil: C1a ledger and C2a coordinator input staging interface. */
 int	 masil_action_supported(void);
 uint64_t masil_action_coordinator_open(void);
 void	 masil_action_coordinator_close(uint64_t);

@@ -639,7 +639,7 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 	if (coordinator)
 		masil_json_printf(&builder,
 		    "\"actions\":true,\"dispatch_epoch\":\"%llu\","
-		    "\"submit\":false},",
+		    "\"input\":true,\"submit\":false},",
 		    (unsigned long long)action_epoch);
 	else
 		/* masil: ordinary hello keeps its protocol-1.2 key set unchanged. */
@@ -2038,11 +2038,13 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 		result = masil_bridge_hello(client, request_id, request_id_length,
 		    root);
 	} else if (yyjson_equals_str(kind, "guarded_action") ||
+	    yyjson_equals_str(kind, "input_begin") ||
+	    yyjson_equals_str(kind, "input_chunk") ||
 	    yyjson_equals_str(kind, "retire_receipt") ||
 	    yyjson_equals_str(kind, "ledger_query") ||
 	    yyjson_equals_str(kind, "ledger_list") ||
 	    yyjson_equals_str(kind, "ledger_epochs")) {
-		/* masil: only the epoch-owning coordinator may access the ledger. */
+		/* masil: only the epoch-owning coordinator may access ledger staging. */
 		if (!client->coordinator) {
 			result = masil_bridge_error(client, request_id, request_id_length,
 			    "coordinator_required",

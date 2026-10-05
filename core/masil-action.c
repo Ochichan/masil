@@ -16,6 +16,9 @@
 
 #include <sys/types.h>
 
+#include <netinet/in.h>
+
+#include <resolv.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,7 +34,8 @@
 #define MASIL_ACTION_SLOTS		2048
 #define MASIL_ACTION_SLOT_BYTES	256
 #define MASIL_ACTION_PAYLOAD_DIGEST_BYTES 64
-#define MASIL_ACTION_KEY_BYTES		171
+/* C2a reserves four bytes in each retained result for queued_bytes. */
+#define MASIL_ACTION_KEY_BYTES		167
 #define MASIL_ACTION_CLOSED_EPOCHS	8
 #define MASIL_ACTION_CLOSED_EPOCH_CAPACITY \
 	(MASIL_ACTION_SLOTS + MASIL_ACTION_CLOSED_EPOCHS)
@@ -39,6 +43,13 @@
 #define MASIL_ACTION_LIST_ENTRY_BYTES	4096
 #define MASIL_ACTION_EPOCH_ENTRY_BYTES	128
 #define MASIL_ACTION_LIST_TRAILER_BYTES	128
+#define MASIL_ACTION_STAGING_SLOTS	4
+#define MASIL_ACTION_STAGING_BYTES	(32 * 1024)
+/* data_b64 is at most 6 KiB so a chunk request fits the 8 KiB bridge frame. */
+#define MASIL_ACTION_STAGING_CHUNK_B64	(6 * 1024)
+#define MASIL_ACTION_STAGING_CHUNK_BYTES	(MASIL_ACTION_STAGING_CHUNK_B64 / 4 * 3)
+#define MASIL_ACTION_STAGING_ID_BYTES	64
+#define MASIL_ACTION_STAGING_TTL	30000
 
 enum masil_action_result {
 	MASIL_ACTION_RESULT_NONE,
@@ -65,7 +76,11 @@ enum masil_action_reason {
 	MASIL_ACTION_REASON_TITLE_CHANGED,
 	MASIL_ACTION_REASON_PROGRESS_CHANGED,
 	MASIL_ACTION_REASON_INVALID_KEY,
-	MASIL_ACTION_REASON_WINDOW_UNLINKED
+	MASIL_ACTION_REASON_WINDOW_UNLINKED,
+	MASIL_ACTION_REASON_STAGING_INCOMPLETE,
+	MASIL_ACTION_REASON_STAGING_DIGEST_MISMATCH,
+	MASIL_ACTION_REASON_STAGING_KEY_MISMATCH,
+	MASIL_ACTION_REASON_BRACKET_MODE_OFF
 };
 
 enum masil_action_kind {
@@ -80,6 +95,7 @@ enum masil_action_kind {
 struct masil_action_slot {
 	uint64_t	 epoch;
 	uint64_t	 seq;
+	uint32_t	 queued_bytes;
 	unsigned char	 payload_digest[MASIL_ACTION_PAYLOAD_DIGEST_BYTES];
 	uint8_t		 used;
 	uint8_t		 result;
@@ -141,6 +157,11 @@ struct masil_action_preconditions {
 struct masil_action_data {
 	enum masil_action_kind kind;
 	yyjson_val		*keys;
+	const char		*staging_id;
+	size_t			 staging_id_length;
+	int			 bracketed;
+	int			 submit_enter;
+	int			 input_legacy;
 };
 
 struct masil_action_request {
@@ -168,6 +189,18 @@ struct masil_action_sha256_ctx {
 	size_t	 used;
 };
 
+struct masil_action_staging_slot {
+	struct masil_action_key		 operation_key;
+	struct masil_action_sha256_ctx sha256;
+	unsigned char			 expected_digest[32];
+	char				 id[MASIL_ACTION_STAGING_ID_BYTES + 1];
+	char				*data;
+	uint64_t			 deadline;
+	size_t				 total_len;
+	size_t				 received;
+	int				 active;
+};
+
 static struct masil_action_slot *masil_action_slots;
 static size_t masil_action_slots_used;
 static size_t masil_action_slot_cursor;
@@ -177,6 +210,10 @@ static uint64_t masil_action_active_next_seq;
 static size_t masil_action_active_slots_used;
 static struct masil_action_closed_epoch *masil_action_closed_epochs;
 static size_t masil_action_closed_count;
+static struct masil_action_staging_slot
+    masil_action_staging[MASIL_ACTION_STAGING_SLOTS];
+static struct event masil_action_staging_event;
+static int masil_action_staging_timer_active;
 
 static void printflike(2, 3) masil_action_json_printf(
     struct masil_action_json *, const char *, ...);
@@ -264,6 +301,18 @@ masil_action_sha256_transform(struct masil_action_sha256_ctx *ctx,
 }
 
 static void
+masil_action_sha256_init(struct masil_action_sha256_ctx *ctx)
+{
+	static const uint32_t initial_state[8] = {
+		0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+		0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+	};
+
+	memset(ctx, 0, sizeof *ctx);
+	memcpy(ctx->state, initial_state, sizeof ctx->state);
+}
+
+static void
 masil_action_sha256_update(struct masil_action_sha256_ctx *ctx,
     const unsigned char *data, size_t length)
 {
@@ -316,12 +365,9 @@ masil_action_sha256_final(struct masil_action_sha256_ctx *ctx,
 void
 masil_action_sha256(const void *data, size_t length, unsigned char digest[32])
 {
-	struct masil_action_sha256_ctx ctx = {
-		{ 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-		  0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 },
-		0, { 0 }, 0
-	};
+	struct masil_action_sha256_ctx ctx;
 
+	masil_action_sha256_init(&ctx);
 	masil_action_sha256_update(&ctx, data, length);
 	masil_action_sha256_final(&ctx, digest);
 }
@@ -536,6 +582,14 @@ masil_action_reason_name(enum masil_action_reason reason)
 		return ("invalid_key");
 	case MASIL_ACTION_REASON_WINDOW_UNLINKED:
 		return ("window_unlinked");
+	case MASIL_ACTION_REASON_STAGING_INCOMPLETE:
+		return ("staging_incomplete");
+	case MASIL_ACTION_REASON_STAGING_DIGEST_MISMATCH:
+		return ("staging_digest_mismatch");
+	case MASIL_ACTION_REASON_STAGING_KEY_MISMATCH:
+		return ("staging_key_mismatch");
+	case MASIL_ACTION_REASON_BRACKET_MODE_OFF:
+		return ("bracket_mode_off");
 	case MASIL_ACTION_REASON_NONE:
 		break;
 	}
@@ -576,7 +630,7 @@ static int
 masil_action_response_result(char *response, size_t response_size,
     const char *kind, const char *request_id, size_t request_id_length,
     const struct masil_action_ticket *ticket, enum masil_action_result result,
-    enum masil_action_reason reason)
+    enum masil_action_reason reason, uint32_t queued_bytes)
 {
 	struct masil_action_json json = { response, 0, response_size, 0 };
 	unsigned char digest[32];
@@ -599,6 +653,9 @@ masil_action_response_result(char *response, size_t response_size,
 	masil_action_json_quote(&json, result_text, strlen(result_text));
 	masil_action_json_puts(&json, ",\"result_digest\":");
 	masil_action_json_quote(&json, digest_text, strlen(digest_text));
+	if (queued_bytes != 0)
+		masil_action_json_printf(&json, ",\"queued_bytes\":%u",
+		    queued_bytes);
 	masil_action_json_puts(&json, "}");
 	return (masil_action_json_done(&json));
 }
@@ -855,11 +912,32 @@ masil_action_kind_from_string(const char *string, size_t length)
 }
 
 static int
+masil_action_staging_id_valid(const char *id, size_t length)
+{
+	size_t i;
+
+	if (length == 0 || length > MASIL_ACTION_STAGING_ID_BYTES)
+		return (0);
+	for (i = 0; i < length; i++) {
+		if ((id[i] >= 'A' && id[i] <= 'Z') ||
+		    (id[i] >= 'a' && id[i] <= 'z') ||
+		    (id[i] >= '0' && id[i] <= '9') || id[i] == '.' ||
+		    id[i] == '_' || id[i] == ':' || id[i] == '-')
+			continue;
+		return (0);
+	}
+	return (1);
+}
+
+static int
 masil_action_parse_action(yyjson_val *value, struct masil_action_data *action)
 {
 	static const char *const keys_fields[] = { "kind", "type", "keys" };
 	static const char *const no_argument_fields[] = { "kind", "type" };
-	yyjson_val *kind, *type;
+	static const char *const input_fields[] = {
+		"kind", "type", "staging_id", "bracketed", "submit"
+	};
+	yyjson_val *kind, *type, *item;
 	const char *string;
 	size_t length;
 
@@ -867,6 +945,9 @@ masil_action_parse_action(yyjson_val *value, struct masil_action_data *action)
 		string = yyjson_get_str(value);
 		length = yyjson_get_len(value);
 		action->kind = masil_action_kind_from_string(string, length);
+		/* A bare "input_commit" names no staging: unsupported, as in C1a. */
+		if (action->kind == MASIL_ACTION_INPUT_COMMIT)
+			action->input_legacy = 1;
 		return (action->kind == MASIL_ACTION_KEYS ? -1 : 0);
 	}
 	if (!yyjson_is_obj(value))
@@ -904,8 +985,185 @@ masil_action_parse_action(yyjson_val *value, struct masil_action_data *action)
 		if (masil_action_schema(value, no_argument_fields,
 		    nitems(no_argument_fields)) != 0)
 			return (-1);
+	} else if (action->kind == MASIL_ACTION_INPUT_COMMIT) {
+		/* Keep C1a's argument-free placeholder safely non-effectful. */
+		if (masil_action_schema(value, no_argument_fields,
+		    nitems(no_argument_fields)) == 0) {
+			action->input_legacy = 1;
+			return (0);
+		}
+		if (masil_action_schema(value, input_fields,
+		    nitems(input_fields)) != 0 ||
+		    masil_action_parse_string(value, "staging_id", &action->staging_id,
+		    &action->staging_id_length) != 0 ||
+		    !masil_action_staging_id_valid(action->staging_id,
+		    action->staging_id_length))
+			return (-1);
+		item = yyjson_obj_get(value, "bracketed");
+		if (!yyjson_is_bool(item))
+			return (-1);
+		action->bracketed = yyjson_get_bool(item);
+		item = yyjson_obj_get(value, "submit");
+		if (!yyjson_is_str(item))
+			return (-1);
+		string = yyjson_get_str(item);
+		length = yyjson_get_len(item);
+		if (length == 4 && memcmp(string, "none", length) == 0)
+			action->submit_enter = 0;
+		else if (length == 5 && memcmp(string, "enter", length) == 0)
+			action->submit_enter = 1;
+		else
+			return (-1);
 	}
 	return (0);
+}
+
+static int
+masil_action_input_preconditions_valid(const struct masil_action_request *request)
+{
+	const struct masil_action_preconditions *preconditions =
+	    &request->preconditions;
+
+	return (preconditions->has_mode && preconditions->mode_none &&
+	    preconditions->has_output_generation &&
+	    preconditions->has_tracked_digest && preconditions->has_title &&
+	    preconditions->has_progress);
+}
+
+static int
+masil_action_key_equal(const struct masil_action_key *left,
+    const struct masil_action_key *right)
+{
+	return (left->length == right->length &&
+	    memcmp(left->bytes, right->bytes, left->length) == 0);
+}
+
+static void
+masil_action_staging_release(struct masil_action_staging_slot *slot)
+{
+	char *data = slot->data;
+
+	if (data != NULL)
+		memset(data, 0, MASIL_ACTION_STAGING_BYTES);
+	memset(slot, 0, sizeof *slot);
+	slot->data = data;
+}
+
+static void
+masil_action_staging_expire(void)
+{
+	uint64_t now = get_timer();
+	size_t i;
+
+	for (i = 0; i < nitems(masil_action_staging); i++) {
+		if (masil_action_staging[i].active &&
+		    masil_action_staging[i].deadline <= now)
+			masil_action_staging_release(&masil_action_staging[i]);
+	}
+}
+
+static void masil_action_staging_schedule(void);
+
+static void
+masil_action_staging_timeout(__unused int fd, __unused short events,
+    __unused void *data)
+{
+	masil_action_staging_timer_active = 0;
+	masil_action_staging_expire();
+	masil_action_staging_schedule();
+}
+
+static void
+masil_action_staging_schedule(void)
+{
+	struct timeval tv;
+	uint64_t earliest = 0, now, remaining;
+	size_t i;
+
+	if (masil_action_staging_timer_active) {
+		evtimer_del(&masil_action_staging_event);
+		masil_action_staging_timer_active = 0;
+	}
+	for (i = 0; i < nitems(masil_action_staging); i++) {
+		if (!masil_action_staging[i].active)
+			continue;
+		if (earliest == 0 || masil_action_staging[i].deadline < earliest)
+			earliest = masil_action_staging[i].deadline;
+	}
+	if (earliest == 0)
+		return;
+	now = get_timer();
+	remaining = earliest > now ? earliest - now : 0;
+	tv.tv_sec = remaining / 1000;
+	tv.tv_usec = (remaining % 1000) * 1000;
+	evtimer_set(&masil_action_staging_event, masil_action_staging_timeout,
+	    NULL);
+	evtimer_add(&masil_action_staging_event, &tv);
+	masil_action_staging_timer_active = 1;
+}
+
+static struct masil_action_staging_slot *
+masil_action_staging_find(const char *id, size_t length)
+{
+	size_t i;
+
+	for (i = 0; i < nitems(masil_action_staging); i++) {
+		if (masil_action_staging[i].active &&
+		    strlen(masil_action_staging[i].id) == length &&
+		    memcmp(masil_action_staging[i].id, id, length) == 0)
+			return (&masil_action_staging[i]);
+	}
+	return (NULL);
+}
+
+static struct masil_action_staging_slot *
+masil_action_staging_allocate(void)
+{
+	size_t i;
+
+	for (i = 0; i < nitems(masil_action_staging); i++) {
+		if (masil_action_staging[i].active)
+			continue;
+		if (masil_action_staging[i].data == NULL)
+			masil_action_staging[i].data = xmalloc(MASIL_ACTION_STAGING_BYTES);
+		return (&masil_action_staging[i]);
+	}
+	return (NULL);
+}
+
+static void
+masil_action_staging_close(void)
+{
+	size_t i;
+
+	if (masil_action_staging_timer_active) {
+		evtimer_del(&masil_action_staging_event);
+		masil_action_staging_timer_active = 0;
+	}
+	for (i = 0; i < nitems(masil_action_staging); i++) {
+		free(masil_action_staging[i].data);
+		memset(&masil_action_staging[i], 0,
+		    sizeof masil_action_staging[i]);
+	}
+}
+
+static enum masil_action_reason
+masil_action_staging_check(struct masil_action_staging_slot *slot,
+    const struct masil_action_request *request)
+{
+	struct masil_action_sha256_ctx sha256;
+	unsigned char digest[32];
+
+	if (slot->received != slot->total_len)
+		return (MASIL_ACTION_REASON_STAGING_INCOMPLETE);
+	sha256 = slot->sha256;
+	masil_action_sha256_final(&sha256, digest);
+	if (memcmp(digest, slot->expected_digest, sizeof digest) != 0)
+		return (MASIL_ACTION_REASON_STAGING_DIGEST_MISMATCH);
+	if (!masil_action_key_equal(&slot->operation_key,
+	    &request->operation_key))
+		return (MASIL_ACTION_REASON_STAGING_KEY_MISMATCH);
+	return (MASIL_ACTION_REASON_NONE);
 }
 
 /* masil: epochs are boot-local; retained closures are never evicted for age. */
@@ -986,6 +1244,8 @@ masil_action_coordinator_close(uint64_t epoch)
 
 	if (epoch == 0 || epoch != masil_action_active_epoch)
 		return;
+	/* masil: C2a input buffers belong to the coordinator connection. */
+	masil_action_staging_close();
 	masil_action_closed_epoch_trim_empty(masil_action_active_slots_used == 0 ?
 	    MASIL_ACTION_CLOSED_EPOCHS - 1 : MASIL_ACTION_CLOSED_EPOCHS);
 	/* The 2,048-slot bound guarantees a zero-slot entry when this is full. */
@@ -1439,9 +1699,50 @@ masil_action_pane_context(struct window_pane *wp, struct session **session,
 	return (-1);
 }
 
+/* Keep C2a's direct buffer write byte-for-byte with paste-buffer -p -r. */
+static void
+masil_action_input_paste(struct window_pane *wp, const char *data, size_t size,
+    int bracketed, uint32_t *queued_bytes)
+{
+	const char *end = data + size, *line;
+	char *escaped;
+	size_t length, queued = 0;
+
+	if (bracketed) {
+		bufferevent_write(wp->event, "\033[200~", 6);
+		queued += 6;
+	}
+	for (;;) {
+		line = memchr(data, '\n', end - data);
+		if (line == NULL)
+			break;
+		length = utf8_stravisx(&escaped, data, line - data,
+		    VIS_SAFE|VIS_NOSLASH);
+		bufferevent_write(wp->event, escaped, length);
+		free(escaped);
+		bufferevent_write(wp->event, "\n", 1);
+		queued += length + 1;
+		data = line + 1;
+	}
+	if (data != end) {
+		length = utf8_stravisx(&escaped, data, end - data,
+		    VIS_SAFE|VIS_NOSLASH);
+		bufferevent_write(wp->event, escaped, length);
+		free(escaped);
+		queued += length;
+	}
+	if (bracketed) {
+		bufferevent_write(wp->event, "\033[201~", 6);
+		queued += 6;
+	}
+	*queued_bytes = queued;
+}
+
 static enum masil_action_result
 masil_action_apply(const struct masil_action_request *request,
-    struct window_pane *wp, enum masil_action_reason *reason)
+    struct window_pane *wp, struct masil_action_staging_slot *staging,
+    enum masil_action_reason *reason,
+    uint32_t *queued_bytes)
 {
 	struct session *session;
 	struct winlink *winlink;
@@ -1449,6 +1750,7 @@ masil_action_apply(const struct masil_action_request *request,
 	size_t count, i;
 
 	*reason = MASIL_ACTION_REASON_NONE;
+	*queued_bytes = 0;
 	switch (request->action.kind) {
 	case MASIL_ACTION_KEYS:
 		if (!TAILQ_EMPTY(&wp->modes)) {
@@ -1475,6 +1777,28 @@ masil_action_apply(const struct masil_action_request *request,
 		server_kill_pane(wp);
 		return (MASIL_ACTION_RESULT_APPLIED);
 	case MASIL_ACTION_INPUT_COMMIT:
+		if (request->action.input_legacy)
+			return (MASIL_ACTION_RESULT_UNSUPPORTED);
+		if (request->action.bracketed &&
+		    (~wp->screen->mode & MODE_BRACKETPASTE)) {
+			*reason = MASIL_ACTION_REASON_BRACKET_MODE_OFF;
+			return (MASIL_ACTION_RESULT_REJECTED);
+		}
+		if (request->action.submit_enter &&
+		    masil_action_pane_context(wp, &session, &winlink) != 0) {
+			*reason = MASIL_ACTION_REASON_WINDOW_UNLINKED;
+			return (MASIL_ACTION_RESULT_REJECTED);
+		}
+		/*
+		 * Like paste-buffer -p: brackets follow the pane's mode, and
+		 * bracketed:true only requires that mode (checked above).
+		 */
+		masil_action_input_paste(wp, staging->data, staging->total_len,
+		    (wp->screen->mode & MODE_BRACKETPASTE) != 0, queued_bytes);
+		if (request->action.submit_enter &&
+		    window_pane_key(wp, NULL, session, winlink, C0_CR, NULL) == 0)
+			(*queued_bytes)++;
+		return (MASIL_ACTION_RESULT_APPLIED);
 	case MASIL_ACTION_LAUNCH:
 	case MASIL_ACTION_FOCUS:
 	case MASIL_ACTION_UNKNOWN:
@@ -1490,10 +1814,12 @@ masil_action_guarded_execute(uint64_t connection_epoch,
     struct masil_action_request *request, char *response, size_t response_size)
 {
 	struct masil_action_slot *slot = NULL;
+	struct masil_action_staging_slot *staging = NULL;
 	struct window_pane *wp;
 	enum masil_action_result result;
 	enum masil_action_reason reason;
 	uint64_t watermark;
+	uint32_t queued_bytes = 0;
 
 	if (connection_epoch == 0 || connection_epoch != masil_action_active_epoch ||
 	    request->ticket.epoch != connection_epoch) {
@@ -1515,7 +1841,7 @@ masil_action_guarded_execute(uint64_t connection_epoch,
 			    request_id, request_id_length, "idempotency_conflict"));
 		return (masil_action_response_result(response, response_size,
 		    "guarded_action", request_id, request_id_length, &request->ticket,
-		    slot->result, slot->reason));
+		    slot->result, slot->reason, slot->queued_bytes));
 	}
 	if (request->ticket.seq > masil_action_active_next_seq)
 		return (masil_action_response_error(response, response_size,
@@ -1523,26 +1849,59 @@ masil_action_guarded_execute(uint64_t connection_epoch,
 	if (masil_action_active_next_seq == UINT64_MAX)
 		return (masil_action_response_error(response, response_size,
 		    request_id, request_id_length, "sequence_exhausted"));
+	if (request->action.kind == MASIL_ACTION_INPUT_COMMIT &&
+	    !request->action.input_legacy) {
+		/*
+		 * Unknown or expired IDs are request errors, before a ticket is
+		 * consumed. Completion, digest, and key checks below instead belong to
+		 * the admitted effect and are retained rejected-before-effect results.
+		 */
+		masil_action_staging_expire();
+		masil_action_staging_schedule();
+		staging = masil_action_staging_find(request->action.staging_id,
+		    request->action.staging_id_length);
+		if (staging == NULL)
+			return (masil_action_response_error(response, response_size,
+			    request_id, request_id_length, "staging_unknown"));
+	}
 	if (request->retain && (slot = masil_action_slot_allocate()) == NULL) {
 		masil_action_active_next_seq++;
+		if (staging != NULL) {
+			masil_action_staging_release(staging);
+			masil_action_staging_schedule();
+		}
 		return (masil_action_response_error(response, response_size,
 		    request_id, request_id_length, "ledger_full"));
 	}
 	masil_action_active_next_seq++;
 	if (request->retain)
 		masil_action_slot_store(slot, request);
-	reason = masil_action_check_preconditions(request, &wp);
+	if (staging != NULL)
+		reason = masil_action_staging_check(staging, request);
+	else
+		reason = MASIL_ACTION_REASON_NONE;
 	if (reason != MASIL_ACTION_REASON_NONE)
 		result = MASIL_ACTION_RESULT_REJECTED;
-	else
-		result = masil_action_apply(request, wp, &reason);
+	else {
+		reason = masil_action_check_preconditions(request, &wp);
+		if (reason != MASIL_ACTION_REASON_NONE)
+			result = MASIL_ACTION_RESULT_REJECTED;
+		else
+			result = masil_action_apply(request, wp, staging, &reason,
+			    &queued_bytes);
+	}
 	if (slot != NULL) {
 		slot->result = result;
 		slot->reason = reason;
+		slot->queued_bytes = queued_bytes;
+	}
+	if (staging != NULL) {
+		masil_action_staging_release(staging);
+		masil_action_staging_schedule();
 	}
 	return (masil_action_response_result(response, response_size,
 	    "guarded_action", request_id, request_id_length, &request->ticket,
-	    result, reason));
+	    result, reason, queued_bytes));
 }
 
 static int
@@ -1659,6 +2018,9 @@ masil_action_response_list(char *response, size_t response_size,
 		masil_action_json_puts(&entry_json, ",\"result_digest\":");
 		masil_action_json_quote(&entry_json, result_digest,
 		    strlen(result_digest));
+		if (slot->queued_bytes != 0)
+			masil_action_json_printf(&entry_json,
+			    ",\"queued_bytes\":%u", slot->queued_bytes);
 		masil_action_json_puts(&entry_json, "}");
 		if (masil_action_json_done(&entry_json) != 0)
 			return (masil_action_response_error(response, response_size,
@@ -1798,8 +2160,175 @@ masil_action_guarded_request(uint64_t connection_epoch,
 	    &request.action) != 0)
 		return (masil_action_response_error(response, response_size,
 		    request_id, request_id_length, "invalid_action"));
+	if (request.action.kind == MASIL_ACTION_INPUT_COMMIT &&
+	    !request.action.input_legacy &&
+	    !masil_action_input_preconditions_valid(&request))
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "invalid_preconditions"));
 	return (masil_action_guarded_execute(connection_epoch, request_id,
 	    request_id_length, &request, response, response_size));
+}
+
+static int
+masil_action_response_input_begin(char *response, size_t response_size,
+    const char *request_id, size_t request_id_length, const char *staging_id,
+    size_t staging_id_length)
+{
+	struct masil_action_json json = { response, 0, response_size, 0 };
+
+	masil_action_json_puts(&json,
+	    "{\"v\":1,\"kind\":\"input_begin\",\"request_id\":");
+	masil_action_json_quote(&json, request_id, request_id_length);
+	masil_action_json_puts(&json, ",\"staging_id\":");
+	masil_action_json_quote(&json, staging_id, staging_id_length);
+	masil_action_json_puts(&json, "}");
+	return (masil_action_json_done(&json));
+}
+
+static int
+masil_action_response_input_chunk(char *response, size_t response_size,
+    const char *request_id, size_t request_id_length, const char *staging_id,
+    size_t staging_id_length, size_t received)
+{
+	struct masil_action_json json = { response, 0, response_size, 0 };
+
+	masil_action_json_puts(&json,
+	    "{\"v\":1,\"kind\":\"input_chunk\",\"request_id\":");
+	masil_action_json_quote(&json, request_id, request_id_length);
+	masil_action_json_puts(&json, ",\"staging_id\":");
+	masil_action_json_quote(&json, staging_id, staging_id_length);
+	masil_action_json_printf(&json, ",\"received\":%zu}", received);
+	return (masil_action_json_done(&json));
+}
+
+static int
+masil_action_input_epoch_matches(uint64_t connection_epoch, char *response,
+    size_t response_size, const char *request_id, size_t request_id_length)
+{
+	uint64_t watermark;
+
+	if (connection_epoch != 0 && connection_epoch == masil_action_active_epoch)
+		return (0);
+	if (masil_action_closed_watermark(connection_epoch, &watermark))
+		return (masil_action_response_error(response, response_size, request_id,
+		    request_id_length, "epoch_closed"));
+	return (masil_action_response_error(response, response_size, request_id,
+	    request_id_length, "epoch_unknown"));
+}
+
+static int
+masil_action_input_begin_request(uint64_t connection_epoch,
+    const char *request_id, size_t request_id_length, yyjson_val *root,
+    char *response, size_t response_size)
+{
+	static const char *const fields[] = {
+		"v", "kind", "request_id", "staging_id", "operation_key",
+		"total_len", "sha256", "core_boot_id"
+	};
+	struct masil_action_staging_slot *slot;
+	struct masil_action_key operation_key;
+	const char *staging_id, *boot_id;
+	size_t staging_id_length, boot_id_length;
+	uint64_t total_len, now;
+	unsigned char digest[32];
+	char *data;
+	int result;
+
+	if ((result = masil_action_input_epoch_matches(connection_epoch, response,
+	    response_size, request_id, request_id_length)) != 0)
+		return (result);
+	if (masil_action_schema(root, fields, nitems(fields)) != 0 ||
+	    masil_action_parse_string(root, "staging_id", &staging_id,
+	    &staging_id_length) != 0 || !masil_action_staging_id_valid(staging_id,
+	    staging_id_length) || masil_action_parse_core_boot_id(root, &boot_id,
+	    &boot_id_length) != 0 || masil_action_parse_u64(yyjson_obj_get(root,
+	    "total_len"), &total_len) != 0 || total_len == 0 ||
+	    total_len > MASIL_ACTION_STAGING_BYTES ||
+	    masil_action_digest_decode(yyjson_obj_get(root, "sha256"), digest) != 0)
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "invalid_request"));
+	if (!masil_action_core_boot_matches(boot_id, boot_id_length))
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "boot_mismatch"));
+	if (masil_action_parse_operation_key(yyjson_obj_get(root, "operation_key"),
+	    &operation_key) != 0)
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "invalid_operation_key"));
+	masil_action_staging_expire();
+	masil_action_staging_schedule();
+	if (masil_action_staging_find(staging_id, staging_id_length) != NULL)
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "staging_conflict"));
+	if ((slot = masil_action_staging_allocate()) == NULL)
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "staging_full"));
+	data = slot->data;
+	memset(slot, 0, sizeof *slot);
+	slot->data = data;
+	memcpy(slot->id, staging_id, staging_id_length);
+	slot->operation_key = operation_key;
+	memcpy(slot->expected_digest, digest, sizeof digest);
+	slot->total_len = total_len;
+	now = get_timer();
+	slot->deadline = now > UINT64_MAX - MASIL_ACTION_STAGING_TTL ?
+	    UINT64_MAX : now + MASIL_ACTION_STAGING_TTL;
+	masil_action_sha256_init(&slot->sha256);
+	slot->active = 1;
+	masil_action_staging_schedule();
+	return (masil_action_response_input_begin(response, response_size,
+	    request_id, request_id_length, staging_id, staging_id_length));
+}
+
+static int
+masil_action_input_chunk_request(uint64_t connection_epoch,
+    const char *request_id, size_t request_id_length, yyjson_val *root,
+    char *response, size_t response_size)
+{
+	static const char *const fields[] = {
+		"v", "kind", "request_id", "staging_id", "offset", "data_b64"
+	};
+	struct masil_action_staging_slot *slot;
+	const char *staging_id, *data_b64;
+	size_t staging_id_length, data_b64_length;
+	uint64_t offset;
+	unsigned char data[MASIL_ACTION_STAGING_CHUNK_BYTES];
+	int decoded, result;
+
+	if ((result = masil_action_input_epoch_matches(connection_epoch, response,
+	    response_size, request_id, request_id_length)) != 0)
+		return (result);
+	if (masil_action_schema(root, fields, nitems(fields)) != 0 ||
+	    masil_action_parse_string(root, "staging_id", &staging_id,
+	    &staging_id_length) != 0 || !masil_action_staging_id_valid(staging_id,
+	    staging_id_length) || masil_action_parse_u64(yyjson_obj_get(root,
+	    "offset"), &offset) != 0 || masil_action_parse_string(root,
+	    "data_b64", &data_b64, &data_b64_length) != 0 ||
+	    data_b64_length > MASIL_ACTION_STAGING_CHUNK_B64 ||
+	    memchr(data_b64, '\0', data_b64_length) != NULL)
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "invalid_request"));
+	masil_action_staging_expire();
+	masil_action_staging_schedule();
+	slot = masil_action_staging_find(staging_id, staging_id_length);
+	if (slot == NULL)
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "staging_unknown"));
+	if (offset != slot->received)
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "staging_offset"));
+	decoded = b64_pton(data_b64, data, sizeof data);
+	if (decoded <= 0 || decoded > MASIL_ACTION_STAGING_CHUNK_BYTES)
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "invalid_request"));
+	if ((size_t)decoded > slot->total_len - slot->received)
+		return (masil_action_response_error(response, response_size,
+		    request_id, request_id_length, "staging_overflow"));
+	memcpy(slot->data + slot->received, data, decoded);
+	masil_action_sha256_update(&slot->sha256, data, decoded);
+	slot->received += decoded;
+	return (masil_action_response_input_chunk(response, response_size,
+	    request_id, request_id_length, staging_id, staging_id_length,
+	    slot->received));
 }
 
 static int
@@ -1838,7 +2367,7 @@ masil_action_retire_request(const char *request_id, size_t request_id_length,
 	if (ticket.seq >= watermark)
 		return (masil_action_response_result(response, response_size,
 		    "retire_receipt", request_id, request_id_length, &ticket,
-		    MASIL_ACTION_RESULT_NOT_APPLIED, MASIL_ACTION_REASON_NONE));
+		    MASIL_ACTION_RESULT_NOT_APPLIED, MASIL_ACTION_REASON_NONE, 0));
 	slot = masil_action_slot_find(&ticket);
 	if (slot == NULL)
 		return (masil_action_response_error(response, response_size,
@@ -1887,14 +2416,14 @@ masil_action_query_request(const char *request_id, size_t request_id_length,
 	if (ticket.seq >= watermark)
 		return (masil_action_response_result(response, response_size,
 		    "ledger_query", request_id, request_id_length, &ticket,
-		    MASIL_ACTION_RESULT_NOT_APPLIED, MASIL_ACTION_REASON_NONE));
+		    MASIL_ACTION_RESULT_NOT_APPLIED, MASIL_ACTION_REASON_NONE, 0));
 	slot = masil_action_slot_find(&ticket);
 	if (slot == NULL)
 		return (masil_action_response_error(response, response_size,
 		    request_id, request_id_length, "receipt_not_retained"));
 	return (masil_action_response_result(response, response_size,
 	    "ledger_query", request_id, request_id_length, &ticket, slot->result,
-	    slot->reason));
+	    slot->reason, slot->queued_bytes));
 }
 
 static int
@@ -1974,6 +2503,12 @@ masil_action_dispatch(uint64_t connection_epoch, const char *request_id,
 {
 	if (strcmp(kind, "guarded_action") == 0)
 		return (masil_action_guarded_request(connection_epoch, request_id,
+		    request_id_length, root, response, response_size));
+	if (strcmp(kind, "input_begin") == 0)
+		return (masil_action_input_begin_request(connection_epoch, request_id,
+		    request_id_length, root, response, response_size));
+	if (strcmp(kind, "input_chunk") == 0)
+		return (masil_action_input_chunk_request(connection_epoch, request_id,
 		    request_id_length, root, response, response_size));
 	if (strcmp(kind, "retire_receipt") == 0)
 		return (masil_action_retire_request(request_id, request_id_length,
