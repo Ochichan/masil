@@ -460,6 +460,8 @@ server_signal(int sig)
 			server_fd = fd;
 			server_update_socket();
 		}
+		/* masil: restore an unlinked private bridge endpoint on the same signal. */
+		masil_bridge_rebind();
 		server_add_accept(0);
 		break;
 	case SIGUSR2:

@@ -205,6 +205,7 @@ dist_tmux_SOURCES = \
 	prompt.c \
 	regsub.c \
 	masil-agent-name.c \
+	masil-action.c \
 	masil-bridge.c \
 	masil-bridge.h \
 	masil-ui.c \

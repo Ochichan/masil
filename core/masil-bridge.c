@@ -38,6 +38,7 @@
 #define MASIL_BRIDGE_TX_MAX		(64 * 1024)
 #define MASIL_BRIDGE_CODEC_POOL		(512 * 1024)
 #define MASIL_BRIDGE_TX_TOTAL		(512 * 1024)
+#define MASIL_BRIDGE_COORDINATOR_HEADROOM (MASIL_BRIDGE_TX_MAX + 4)
 #define MASIL_BRIDGE_CLIENTS		32
 #define MASIL_BRIDGE_ORDINARY_CLIENTS	30
 #define MASIL_BRIDGE_UNAUTHENTICATED	4
@@ -114,6 +115,7 @@ struct masil_bridge_client {
 	int			 hello_done;
 	int			 coordinator;
 	int			 coordinator_only;
+	uint64_t		 action_epoch;
 	int			 close_after_write;
 	struct event		 event;
 	struct event		 timeout_event;
@@ -160,6 +162,7 @@ struct masil_json_builder {
 };
 
 static int			 masil_bridge_enabled;
+static int			 masil_bridge_path_derived;
 static int			 masil_bridge_exiting;
 static int			 masil_bridge_fd = -1;
 static struct event		 masil_bridge_event;
@@ -390,9 +393,11 @@ masil_bridge_client_close(struct masil_bridge_client *client)
 		masil_bridge_unauthenticated--;
 	/* masil: release role admission only after an authenticated close. */
 	if (client->hello_done) {
-		if (client->coordinator)
+		if (client->coordinator) {
+			/* masil: closing a coordinator fences its action epoch. */
+			masil_action_coordinator_close(client->action_epoch);
 			masil_bridge_coordinator_connected = 0;
-		else if (masil_bridge_ordinary_clients != 0)
+		} else if (masil_bridge_ordinary_clients != 0)
 			masil_bridge_ordinary_clients--;
 	}
 	previous = &masil_bridge_clients;
@@ -413,10 +418,14 @@ static int
 masil_bridge_queue(struct masil_bridge_client *client, const char *json,
     size_t length)
 {
-	size_t frame_length = length + 4;
+	size_t frame_length = length + 4, reserve = 0;
 
-	if (length == 0 || length > MASIL_BRIDGE_TX_MAX || client->tx != NULL ||
-	    frame_length > MASIL_BRIDGE_TX_TOTAL - masil_bridge_tx_bytes)
+	if (length == 0 || length > MASIL_BRIDGE_TX_MAX || client->tx != NULL)
+		return (-1);
+	if (masil_bridge_coordinator_connected && !client->coordinator)
+		reserve = MASIL_BRIDGE_COORDINATOR_HEADROOM;
+	if (masil_bridge_tx_bytes > MASIL_BRIDGE_TX_TOTAL - reserve ||
+	    frame_length > MASIL_BRIDGE_TX_TOTAL - reserve - masil_bridge_tx_bytes)
 		return (-1);
 	client->tx = xmalloc(frame_length);
 	masil_bridge_put_u32(client->tx, length);
@@ -427,6 +436,14 @@ masil_bridge_queue(struct masil_bridge_client *client, const char *json,
 	masil_bridge_stats.tx_frames++;
 	masil_bridge_client_update(client);
 	return (0);
+}
+
+static int
+masil_bridge_coordinator_response_ready(struct masil_bridge_client *client)
+{
+	return (client->tx == NULL &&
+	    masil_bridge_tx_bytes <= MASIL_BRIDGE_TX_TOTAL -
+	    MASIL_BRIDGE_COORDINATOR_HEADROOM);
 }
 
 static void
@@ -572,6 +589,7 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 	    masil_bridge_response, 0, sizeof masil_bridge_response, 0
 	};
 	yyjson_val	*value;
+	uint64_t	 action_epoch = 0;
 	int		 coordinator = 0;
 
 	/* masil: two transport slots remain unavailable to ordinary clients. */
@@ -603,6 +621,9 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 		return (masil_bridge_error(client, request_id, request_id_length,
 		    "connection_limit", "ordinary connection limit reached"));
 	}
+	if (coordinator && (action_epoch = masil_action_coordinator_open()) == 0)
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "epoch_exhausted", "an action epoch is not available"));
 
 	masil_json_puts(&builder,
 	    "{\"v\":1,\"kind\":\"hello\",\"request_id\":");
@@ -614,15 +635,27 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 	    ",\"negotiated_version\":{\"major\":1,\"minor\":2},"
 	    "\"capabilities\":{\"inventory\":true,\"snapshot\":true,"
 	    "\"stats\":true,\"watch\":true,\"events\":true,"
-	    "\"lifecycle\":true,\"clients\":true,\"server_exiting\":true,"
-	    "\"actions\":false,\"submit\":false},"
+	    "\"lifecycle\":true,\"clients\":true,\"server_exiting\":true,");
+	if (coordinator)
+		masil_json_printf(&builder,
+		    "\"actions\":true,\"dispatch_epoch\":\"%llu\","
+		    "\"submit\":false},",
+		    (unsigned long long)action_epoch);
+	else
+		/* masil: ordinary hello keeps its protocol-1.2 key set unchanged. */
+		masil_json_puts(&builder, "\"actions\":false,\"submit\":false},");
+	masil_json_puts(&builder,
 	    "\"limits\":{\"rx_frame\":8192,\"tx_frame\":65536,"
 	    "\"json_depth\":8,\"inventory_page\":64,"
 	    "\"snapshot_rows\":32,\"snapshot_columns\":240,"
 	    "\"snapshot_text\":16384}}");
-	if (masil_bridge_queue_builder(client, &builder) != 0)
+	if (masil_bridge_queue_builder(client, &builder) != 0) {
+		if (coordinator)
+			masil_action_coordinator_close(action_epoch);
 		return (-1);
+	}
 	client->coordinator = coordinator;
+	client->action_epoch = action_epoch;
 	client->hello_done = 1;
 	if (coordinator)
 		masil_bridge_coordinator_connected = 1;
@@ -1949,7 +1982,7 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 	yyjson_val	*root, *version, *kind, *request;
 	const char	*code = NULL, *request_id = NULL;
 	size_t		 request_id_length = 0;
-	int		 result;
+	int		 action_result, result;
 
 	if (!yyjson_alc_pool_init(&allocator, masil_bridge_codec_pool,
 	    sizeof masil_bridge_codec_pool))
@@ -2004,6 +2037,42 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 		}
 		result = masil_bridge_hello(client, request_id, request_id_length,
 		    root);
+	} else if (yyjson_equals_str(kind, "guarded_action") ||
+	    yyjson_equals_str(kind, "retire_receipt") ||
+	    yyjson_equals_str(kind, "ledger_query") ||
+	    yyjson_equals_str(kind, "ledger_list") ||
+	    yyjson_equals_str(kind, "ledger_epochs")) {
+		/* masil: only the epoch-owning coordinator may access the ledger. */
+		if (!client->coordinator) {
+			result = masil_bridge_error(client, request_id, request_id_length,
+			    "coordinator_required",
+			    "this request requires the coordinator connection");
+		} else if (client->watching) {
+			result = masil_bridge_error(client, request_id, request_id_length,
+			    "stream_active", "watch connection does not accept requests");
+			client->close_after_write = 1;
+		} else if (!masil_bridge_coordinator_response_ready(client)) {
+			/*
+			 * Non-coordinator queues reserve one complete coordinator frame, so an
+			 * admitted action response cannot fail after its effect. Filling the
+			 * pre-existing queue enough to reach bridge_busy needs stalled peers;
+			 * that transport race is intentionally impractical for the ledger test.
+			 */
+			result = masil_bridge_error(client, request_id, request_id_length,
+			    "bridge_busy", "coordinator response capacity is unavailable");
+		} else {
+			action_result = masil_action_dispatch(client->action_epoch,
+			    request_id, request_id_length, yyjson_get_str(kind), root,
+			    masil_bridge_response, sizeof masil_bridge_response);
+			if (action_result < 0)
+				result = -1;
+			else {
+				if (action_result > 0)
+					masil_bridge_stats.rejected++;
+				result = masil_bridge_queue(client, masil_bridge_response,
+				    strlen(masil_bridge_response));
+			}
+		}
 	} else if (client->watching) {
 		result = masil_bridge_error(client, request_id, request_id_length,
 		    "stream_active", "watch connection does not accept requests");
@@ -2492,13 +2561,38 @@ masil_bridge_get_boot_id(void)
 	return (masil_bridge_boot_id);
 }
 
+static int
+masil_bridge_listener_live(void)
+{
+	struct stat sb;
+
+	if (!masil_bridge_enabled || masil_bridge_fd == -1 ||
+	    masil_bridge_path[0] == '\0')
+		return (0);
+	return (lstat(masil_bridge_path, &sb) == 0 &&
+	    sb.st_dev == masil_bridge_socket_dev &&
+	    sb.st_ino == masil_bridge_socket_ino);
+}
+
 /* masil: expose only the active bridge endpoint to format expansion. */
 const char *
 masil_bridge_get_socket_path(void)
 {
-	if (!masil_bridge_enabled)
+	if (!masil_bridge_listener_live())
 		return ("");
 	return (masil_bridge_path);
+}
+
+/*
+ * masil: formats can detect C1a without opening a coordinator connection.
+ * The answer is fixed for the boot (bridge started and actions built in), so
+ * a lost socket makes effects fail rather than switch a caller to the native
+ * path; masil_bridge_socket shows whether the listener is live.
+ */
+int
+masil_bridge_actions_supported(void)
+{
+	return (masil_bridge_enabled && masil_action_supported());
 }
 
 /* masil: client ids are stable only within the current core boot. */
@@ -2586,6 +2680,7 @@ masil_bridge_start(void)
 	(void)masil_bridge_get_boot_id();
 	if (masil_bridge_enabled)
 		return;
+	masil_bridge_path_derived = 0;
 	/* masil: unset enables the private default; empty and off disable it. */
 	if (configured != NULL &&
 	    (*configured == '\0' || strcmp(configured, "off") == 0))
@@ -2608,11 +2703,13 @@ masil_bridge_start(void)
 		masil_bridge_path[0] = '\0';
 		return;
 	}
+	masil_bridge_path_derived = derived;
 	if ((derived && masil_bridge_reclaim_stale(masil_bridge_path) != 0) ||
 	    (!derived && (lstat(masil_bridge_path, &sb) == 0 ||
 	    errno != ENOENT))) {
 		log_debug("masil bridge: refusing existing socket path %s",
 		    masil_bridge_path);
+		masil_bridge_path_derived = 0;
 		masil_bridge_path[0] = '\0';
 		return;
 	}
@@ -2684,7 +2781,97 @@ fail:
 		close(masil_bridge_fd);
 		masil_bridge_fd = -1;
 	}
+	masil_bridge_path_derived = 0;
 	masil_bridge_path[0] = '\0';
+}
+
+/* masil: SIGUSR1 restores an unlinked endpoint without dropping live peers. */
+void
+masil_bridge_rebind(void)
+{
+	struct sockaddr_un	 address;
+	struct stat		 bound, current;
+	char			 derived_path[sizeof masil_bridge_path], cause[256];
+	mode_t			 old_mask;
+	int			 fd = -1, saved_errno;
+
+	if (!masil_bridge_enabled || masil_bridge_fd == -1 ||
+	    masil_bridge_path[0] == '\0')
+		return;
+	if (lstat(masil_bridge_path, &current) == 0) {
+		if (current.st_dev == masil_bridge_socket_dev &&
+		    current.st_ino == masil_bridge_socket_ino)
+			return;
+		log_debug("masil bridge: refusing changed socket path %s",
+		    masil_bridge_path);
+		return;
+	}
+	if (errno != ENOENT) {
+		log_debug("masil bridge: refusing unsafe rebind path %s",
+		    masil_bridge_path);
+		return;
+	}
+	if (masil_bridge_path_derived) {
+		if (masil_bridge_default_path(derived_path, sizeof derived_path, cause,
+		    sizeof cause) != 0 || strcmp(derived_path, masil_bridge_path) != 0) {
+			log_debug("masil bridge: refusing unsafe default rebind path %s",
+			    masil_bridge_path);
+			return;
+		}
+	} else if (masil_bridge_private_parent(masil_bridge_path) != 0) {
+		log_debug("masil bridge: refusing unsafe rebind path %s",
+		    masil_bridge_path);
+		return;
+	}
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd == -1)
+		goto fail;
+	if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)
+		goto fail;
+	memset(&address, 0, sizeof address);
+	address.sun_family = AF_UNIX;
+	if (strlcpy(address.sun_path, masil_bridge_path,
+	    sizeof address.sun_path) >= sizeof address.sun_path) {
+		errno = ENAMETOOLONG;
+		goto fail;
+	}
+	old_mask = umask(S_IRWXG|S_IRWXO);
+	if (bind(fd, (struct sockaddr *)&address, sizeof address) != 0) {
+		saved_errno = errno;
+		umask(old_mask);
+		errno = saved_errno;
+		goto fail;
+	}
+	(void)umask(old_mask);
+	if (lstat(masil_bridge_path, &bound) != 0)
+		goto fail;
+	if (!S_ISSOCK(bound.st_mode) || bound.st_uid != geteuid() ||
+	    chmod(masil_bridge_path, S_IRUSR|S_IWUSR) != 0 ||
+	    listen(fd, MASIL_BRIDGE_CLIENTS) != 0)
+		goto fail_bound;
+	setblocking(fd, 0);
+	event_del(&masil_bridge_event);
+	close(masil_bridge_fd);
+	masil_bridge_fd = fd;
+	masil_bridge_socket_dev = bound.st_dev;
+	masil_bridge_socket_ino = bound.st_ino;
+	event_set(&masil_bridge_event, masil_bridge_fd, EV_READ|EV_PERSIST,
+	    masil_bridge_accept, NULL);
+	event_add(&masil_bridge_event, NULL);
+	log_debug("masil bridge: rebound %s", masil_bridge_path);
+	return;
+
+fail_bound:
+	saved_errno = errno;
+	if (lstat(masil_bridge_path, &current) == 0 &&
+	    current.st_dev == bound.st_dev && current.st_ino == bound.st_ino)
+		unlink(masil_bridge_path);
+	errno = saved_errno;
+fail:
+	log_debug("masil bridge: failed to rebind %s: %s", masil_bridge_path,
+	    strerror(errno));
+	if (fd != -1)
+		close(fd);
 }
 
 void
@@ -2711,6 +2898,7 @@ masil_bridge_stop(void)
 	    sb.st_ino == masil_bridge_socket_ino)
 		unlink(masil_bridge_path);
 	masil_bridge_enabled = 0;
+	masil_bridge_path_derived = 0;
 	masil_bridge_path[0] = '\0';
 }
 

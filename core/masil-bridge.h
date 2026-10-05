@@ -17,16 +17,22 @@
 #ifndef MASIL_BRIDGE_H
 #define MASIL_BRIDGE_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 struct window_pane;
 struct window;
 struct client;
 struct session;
+struct yyjson_val;
 
 void	masil_bridge_start(void);
 void	masil_bridge_stop(void);
+void	masil_bridge_rebind(void);
 void	masil_bridge_server_exiting(void);
 const char *masil_bridge_get_boot_id(void);
 const char *masil_bridge_get_socket_path(void);
+int	 masil_bridge_actions_supported(void);
 char	*masil_bridge_client_id(struct client *);
 char	*masil_bridge_client_profile(struct client *);
 void	 masil_bridge_window_active_changed(struct window *);
@@ -39,5 +45,13 @@ void	masil_bridge_pane_state_changed(struct window_pane *);
 void	masil_bridge_pty_changed(struct window_pane *);
 void	masil_bridge_output_changed(struct window_pane *);
 void	masil_bridge_geometry_changed(struct window_pane *);
+
+/* masil: C1a coordinator action ledger interface. */
+int	 masil_action_supported(void);
+uint64_t masil_action_coordinator_open(void);
+void	 masil_action_coordinator_close(uint64_t);
+int	 masil_action_dispatch(uint64_t, const char *, size_t, const char *,
+	     struct yyjson_val *, char *, size_t);
+void	 masil_action_sha256(const void *, size_t, unsigned char[32]);
 
 #endif /* MASIL_BRIDGE_H */

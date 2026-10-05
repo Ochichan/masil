@@ -2393,6 +2393,17 @@ format_cb_masil_core_boot_id(__unused struct format_tree *ft)
 	return (xstrdup(masil_bridge_get_boot_id()));
 }
 
+/*
+ * masil: this value is fixed for the boot when the bridge starts with actions
+ * built in. A lost socket fails effects instead of switching callers to another
+ * path.
+ */
+static void *
+format_cb_masil_core_actions(__unused struct format_tree *ft)
+{
+	return (xstrdup(masil_bridge_actions_supported() ? "1" : "0"));
+}
+
 /* masil: bridge endpoint, empty when bridge startup was disabled or failed. */
 static void *
 format_cb_masil_bridge_socket(__unused struct format_tree *ft)
@@ -3908,6 +3919,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "masil_client_stalled", FORMAT_TABLE_STRING,
 	  format_cb_masil_client_stalled
+	},
+	{ "masil_core_actions", FORMAT_TABLE_STRING,
+	  format_cb_masil_core_actions
 	},
 	{ "masil_core_boot_id", FORMAT_TABLE_STRING,
 	  format_cb_masil_core_boot_id
