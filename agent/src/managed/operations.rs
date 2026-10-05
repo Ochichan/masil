@@ -114,6 +114,20 @@ const FEATURES: &[(&str, &str)] = &[
     ("restore_plans", RESTORE_SCHEMA),
 ];
 
+const PROMPT_CORE_LEDGER_FEATURE: &[(&str, &str)] =
+    &[("prompt_core_ledger", PROMPT_CORE_LEDGER_SCHEMA)];
+
+/// C2b keeps the prompt number outside the pane option ledger on servers
+/// whose input goes through the core ledger.  The operation record remains
+/// the receipt; this small table preserves the highest consumed number after
+/// old receipts are compacted.
+const PROMPT_CORE_LEDGER_SCHEMA: &str = "
+CREATE TABLE prompt_sequences (
+  run TEXT PRIMARY KEY,
+  sequence INTEGER NOT NULL
+);
+";
+
 /// T1-d (AM-14): an agent restore's plan, found by the snapshot's SHA-256,
 /// and how far each of its targets got. The store is this server's, so
 /// another server keeps its own plan (claims beside the snapshot tell it
@@ -625,6 +639,38 @@ impl Record {
             .filter_map(|receipt| receipt.evidence.as_ref())
             .find(|evidence| evidence["ticket"] == self.ticket.as_str())
     }
+}
+
+fn prompt_slot(record: &Record) -> Option<u64> {
+    record
+        .intent()
+        .and_then(|intent| intent["slot"].as_u64())
+        .filter(|slot| *slot != 0)
+}
+
+fn prompt_consumes_slot(state: &str) -> bool {
+    matches!(
+        state,
+        DISPATCHING
+            | "delivered"
+            | "native_accepted"
+            | "user_confirmed_delivered"
+            | "user_confirmed_not_delivered"
+            | UNKNOWN
+    )
+}
+
+/// Only outcomes that are final for a prompt number belong in the compact
+/// sequence row. Live and unknown attempts are found from their operation
+/// records instead, so a later proof of `not_applied` can reuse the number.
+fn prompt_persists_slot(state: &str) -> bool {
+    matches!(
+        state,
+        "delivered"
+            | "native_accepted"
+            | "user_confirmed_delivered"
+            | "user_confirmed_not_delivered"
+    )
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1447,6 +1493,85 @@ impl Store {
         .map_err(sql)
     }
 
+    fn prompt_records_in(conn: &Connection, run: &str) -> Result<Vec<Record>, String> {
+        let keys: Vec<String> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT key FROM operations
+                     WHERE namespace = ?1 AND action = 'prompt'
+                     ORDER BY store_seq DESC",
+                )
+                .map_err(sql)?;
+            statement
+                .query_map([format!("run:{run}")], |row| row.get(0))
+                .map_err(sql)?
+                .collect::<Result<_, _>>()
+                .map_err(sql)?
+        };
+        keys.iter()
+            .filter_map(|key| Self::record_in(conn, key).transpose())
+            .collect()
+    }
+
+    fn prompt_record_in(conn: &Connection, run: &str, slot: u64) -> Result<Option<Record>, String> {
+        Ok(Self::prompt_records_in(conn, run)?
+            .into_iter()
+            .find(|record| prompt_slot(record) == Some(slot)))
+    }
+
+    fn prompt_unresolved_in(conn: &Connection, run: &str) -> Result<bool, String> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM operations
+              WHERE namespace = ?1 AND action = 'prompt' AND state IN (?2, ?3))",
+            params![format!("run:{run}"), DISPATCHING, UNKNOWN],
+            |row| row.get(0),
+        )
+        .map_err(sql)
+    }
+
+    fn prompt_next_in(conn: &Connection, run: &str) -> Result<u64, String> {
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT sequence FROM prompt_sequences WHERE run = ?1",
+                [run],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        let stored = u64::try_from(stored.unwrap_or_default())
+            .map_err(|_| "prompt operation counter is invalid")?;
+        let recovered = Self::prompt_records_in(conn, run)?
+            .iter()
+            .filter(|record| prompt_consumes_slot(&record.state))
+            .filter_map(prompt_slot)
+            .max()
+            .unwrap_or_default();
+        stored
+            .max(recovered)
+            .checked_add(1)
+            .ok_or_else(|| "prompt operation counter exhausted".into())
+    }
+
+    fn set_prompt_sequence_in(
+        tx: &rusqlite::Transaction<'_>,
+        run: &str,
+        slot: u64,
+    ) -> Result<(), String> {
+        let slot = i64::try_from(slot).map_err(|_| "prompt operation counter exhausted")?;
+        Self::check_reader_in(tx)?;
+        tx.execute(
+            "INSERT INTO prompt_sequences (run, sequence) VALUES (?1, ?2)
+             ON CONFLICT (run) DO UPDATE SET sequence = MAX(sequence, excluded.sequence)",
+            params![run, slot],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+
+    fn enable_prompt_core_ledger(&mut self) -> Result<(), String> {
+        apply_features(&mut self.conn, PROMPT_CORE_LEDGER_FEATURE, now_ms())
+    }
+
     pub fn admit(
         &mut self,
         new: &NewOperation<'_>,
@@ -1454,6 +1579,126 @@ impl Store {
         now: u64,
     ) -> Result<Admission, String> {
         self.admit_with(new, intent, now, None)
+    }
+
+    /// The next prompt slot for a run on the core-ledger path.  The number
+    /// survives receipt compaction in `prompt_sequences`; the scan repairs a
+    /// narrow crash window after a receipt commits before its sequence row.
+    pub fn prompt_next(&mut self, run: &str) -> Result<u64, String> {
+        self.enable_prompt_core_ledger()?;
+        Self::prompt_next_in(&self.conn, run)
+    }
+
+    /// The current receipt for a numbered prompt slot, if its receipts have
+    /// not expired.  A prompt can have a non-numeric operation key (queues
+    /// and automatic submissions), so this cannot be reconstructed from the
+    /// public operation number alone.
+    pub fn prompt_record(&mut self, run: &str, slot: u64) -> Result<Option<Record>, String> {
+        self.enable_prompt_core_ledger()?;
+        Self::prompt_record_in(&self.conn, run, slot)
+    }
+
+    /// A dispatching or unknown prompt blocks every new prompt for its run.
+    pub fn prompt_unresolved(&mut self, run: &str) -> Result<bool, String> {
+        self.enable_prompt_core_ledger()?;
+        Self::prompt_unresolved_in(&self.conn, run)
+    }
+
+    /// Records a prompt's terminal consumed slot. A live dispatch or unknown
+    /// attempt occupies its number through the operation scan; keeping either
+    /// in the compact sequence would make a later `not_applied` proof consume
+    /// a number that native delivery can reuse.
+    pub fn note_prompt_result(&mut self, record: &Record) -> Result<(), String> {
+        if record.action != "prompt" {
+            return Ok(());
+        }
+        self.enable_prompt_core_ledger()?;
+        let Some(run) = record.run.as_deref() else {
+            return Ok(());
+        };
+        let Some(slot) = prompt_slot(record) else {
+            return Ok(());
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        if prompt_persists_slot(&record.state) {
+            Self::set_prompt_sequence_in(&tx, run, slot)?;
+        } else {
+            // Repair sequence rows written by an earlier C2b binary when an
+            // unknown prompt is later proven not to have reached the pane.
+            // Do not lower a later terminal sequence.
+            tx.execute(
+                "DELETE FROM prompt_sequences WHERE run = ?1 AND sequence = ?2",
+                params![
+                    run,
+                    i64::try_from(slot).map_err(|_| "prompt operation counter exhausted")?
+                ],
+            )
+            .map_err(sql)?;
+        }
+        tx.commit().map_err(sql)
+    }
+
+    /// Admit one core-ledger prompt and reserve its SQLite operation before
+    /// input staging begins.  The slot check and the durable intent share one
+    /// immediate transaction, so another prompt cannot claim the same number.
+    pub fn admit_prompt(
+        &mut self,
+        new: &NewOperation<'_>,
+        intent: Value,
+        now: u64,
+        requested_slot: Option<u64>,
+        queued: Option<&QueuedPrompt<'_>>,
+    ) -> Result<(Admission, u64), String> {
+        let run = new.run.ok_or("invalid prompt operation run")?;
+        self.enable_prompt_core_ledger()?;
+        self.check_wal_pressure()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let next = Self::prompt_next_in(&tx, run)?;
+        let slot = requested_slot.unwrap_or(next);
+        if slot == 0 || slot > next {
+            return Err(format!("next prompt operation must be {next}"));
+        }
+
+        let key = key(new.namespace, new.action, new.id);
+        let existing_slot = Self::prompt_record_in(&tx, run, slot)?;
+        if slot < next {
+            let record = existing_slot.ok_or(
+                "outcome_unknown: prompt receipt expired; the operation will not be repeated",
+            )?;
+            if record.digest != new.digest {
+                return Err("prompt operation was already used with different content".into());
+            }
+            tx.commit().map_err(sql)?;
+            return Ok((Admission::Recorded(record), slot));
+        }
+
+        if let Some(record) = &existing_slot {
+            if record.operation_key == key {
+                if record.digest != new.digest {
+                    return Err("prompt operation was already used with different content".into());
+                }
+                if matches!(record.state.as_str(), DISPATCHING | UNKNOWN) {
+                    let record = record.clone();
+                    tx.commit().map_err(sql)?;
+                    return Ok((Admission::Recorded(record), slot));
+                }
+            } else if matches!(record.state.as_str(), DISPATCHING | UNKNOWN) {
+                return Err("a prompt delivery is unresolved; inspect its receipt and the native TUI before any new submission".into());
+            }
+        }
+        if Self::prompt_unresolved_in(&tx, run)? {
+            return Err("a prompt delivery is unresolved; inspect its receipt and the native TUI before any new submission".into());
+        }
+
+        let admission = Self::admit_in(&tx, new, intent, now, queued)?;
+        tx.commit().map_err(sql)?;
+        Ok((admission, slot))
     }
 
     /// As `admit`; a dispatch of a queued prompt also marks its queue row in
@@ -1466,21 +1711,33 @@ impl Store {
         now: u64,
         queued: Option<&QueuedPrompt<'_>>,
     ) -> Result<Admission, String> {
-        let key = key(new.namespace, new.action, new.id);
         self.check_wal_pressure()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let existing = Self::record_in(&tx, &key)?;
+        let admission = Self::admit_in(&tx, new, intent, now, queued)?;
+        tx.commit().map_err(sql)?;
+        Ok(admission)
+    }
+
+    fn admit_in(
+        tx: &rusqlite::Transaction<'_>,
+        new: &NewOperation<'_>,
+        intent: Value,
+        now: u64,
+        queued: Option<&QueuedPrompt<'_>>,
+    ) -> Result<Admission, String> {
+        let key = key(new.namespace, new.action, new.id);
+        let existing = Self::record_in(tx, &key)?;
         let ticket = super::nonce()?;
         let op = match existing {
             None => {
-                Self::check_capacity_in(&tx)?;
-                if live_bytes(&tx)? >= HIGH_WATER_BYTES {
+                Self::check_capacity_in(tx)?;
+                if live_bytes(tx)? >= HIGH_WATER_BYTES {
                     return Err("store_full: the operation store holds 224 MiB of data; resolve or wait for older operations to expire".into());
                 }
-                let seq = Self::next_seq(&tx)?;
+                let seq = Self::next_seq(tx)?;
                 tx.execute(
                     "INSERT INTO operations (key, namespace, action, client_id, explicit, target, run, boot,
                        digest, payload_bytes, state, ticket, attempts, lease_until_ms, owner_pid,
@@ -1532,9 +1789,9 @@ impl Store {
                 }
                 // A compacted record made whole again counts toward capacity.
                 if record.compacted_ms.is_some() {
-                    Self::check_capacity_in(&tx)?;
+                    Self::check_capacity_in(tx)?;
                 }
-                let seq = Self::next_seq(&tx)?;
+                let seq = Self::next_seq(tx)?;
                 tx.execute(
                     "UPDATE operations SET state = ?2, digest = ?3, payload_bytes = ?4, target = ?5,
                        ticket = ?6, attempts = attempts + 1, lease_until_ms = ?7, owner_pid = ?8,
@@ -1561,8 +1818,8 @@ impl Store {
             object.insert("ticket".into(), json!(ticket));
             object.insert("digest".into(), json!(new.digest));
         }
-        Self::append(&tx, op, "accepted_durable", "masil", None, now)?;
-        Self::append(&tx, op, "dispatch_intent", "masil", Some(&intent), now)?;
+        Self::append(tx, op, "accepted_durable", "masil", None, now)?;
+        Self::append(tx, op, "dispatch_intent", "masil", Some(&intent), now)?;
         if let Some(queued) = queued {
             let marked = tx
                 .execute(
@@ -1587,7 +1844,6 @@ impl Store {
                 );
             }
         }
-        tx.commit().map_err(sql)?;
         Ok(Admission::Dispatch(Ticket { op, key, ticket }))
     }
 
@@ -4600,6 +4856,126 @@ mod tests {
             digest,
             payload_bytes: 5,
         }
+    }
+
+    #[test]
+    fn core_prompt_numbers_and_unresolved_slots_live_in_sqlite() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let first = request("d1");
+        let (admission, slot) = store
+            .admit_prompt(
+                &first,
+                json!({"slot": 1, "path": "core_ledger"}),
+                100,
+                Some(1),
+                None,
+            )
+            .unwrap();
+        assert_eq!(slot, 1);
+        let first_ticket = dispatch(admission);
+        assert_eq!(store.prompt_next("r1").unwrap(), 2);
+        assert!(store.prompt_unresolved("r1").unwrap());
+
+        let delivered = store
+            .finish(&first_ticket, "delivered", "core_ledger", None, 110)
+            .unwrap();
+        store.note_prompt_result(&delivered).unwrap();
+        assert_eq!(store.prompt_next("r1").unwrap(), 2);
+        assert!(matches!(
+            store
+                .admit_prompt(
+                    &NewOperation { id: "3", ..request("d3") },
+                    json!({"slot": 3, "path": "core_ledger"}),
+                    120,
+                    Some(3),
+                    None,
+                )
+                .unwrap_err(),
+            error if error == "next prompt operation must be 2"
+        ));
+
+        let second = NewOperation {
+            id: "2",
+            ..request("d2")
+        };
+        let (admission, slot) = store
+            .admit_prompt(
+                &second,
+                json!({"slot": 2, "path": "core_ledger"}),
+                130,
+                Some(2),
+                None,
+            )
+            .unwrap();
+        assert_eq!(slot, 2);
+        let unknown = store
+            .finish(&dispatch(admission), UNKNOWN, "core_ledger", None, 140)
+            .unwrap();
+        store.note_prompt_result(&unknown).unwrap();
+        assert_eq!(store.prompt_next("r1").unwrap(), 3);
+        assert!(store.prompt_unresolved("r1").unwrap());
+        assert!(
+            store
+                .admit_prompt(
+                    &NewOperation {
+                        id: "3",
+                        ..request("d3")
+                    },
+                    json!({"slot": 3, "path": "core_ledger"}),
+                    150,
+                    Some(3),
+                    None,
+                )
+                .unwrap_err()
+                .starts_with("a prompt delivery is unresolved")
+        );
+
+        let settled = store
+            .settle_unknown(&unknown, "user_confirmed_not_delivered", "user", None, 160)
+            .unwrap();
+        store.note_prompt_result(&settled).unwrap();
+        assert!(!store.prompt_unresolved("r1").unwrap());
+        assert_eq!(store.prompt_next("r1").unwrap(), 3);
+
+        let third = NewOperation {
+            id: "3",
+            ..request("d3")
+        };
+        let (admission, slot) = store
+            .admit_prompt(
+                &third,
+                json!({"slot": 3, "path": "core_ledger"}),
+                170,
+                Some(3),
+                None,
+            )
+            .unwrap();
+        assert_eq!(slot, 3);
+        let unknown = store
+            .finish(&dispatch(admission), UNKNOWN, "core_ledger", None, 180)
+            .unwrap();
+        store.note_prompt_result(&unknown).unwrap();
+        assert_eq!(store.prompt_next("r1").unwrap(), 4);
+
+        let not_applied = store
+            .settle_unknown(&unknown, "not_applied", "core_ledger_reconcile", None, 190)
+            .unwrap();
+        store.note_prompt_result(&not_applied).unwrap();
+        assert_eq!(store.prompt_next("r1").unwrap(), 3);
+        let (admission, slot) = store
+            .admit_prompt(
+                &third,
+                json!({"slot": 3, "path": "core_ledger"}),
+                200,
+                Some(3),
+                None,
+            )
+            .unwrap();
+        assert_eq!(slot, 3);
+        assert!(matches!(admission, Admission::Dispatch(_)));
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

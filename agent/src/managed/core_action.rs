@@ -109,6 +109,9 @@ pub(crate) struct Preconditions {
     pub(crate) current_command: String,
     pub(crate) meta_digest: String,
     pub(crate) tracked_digest: Option<String>,
+    pub(crate) expected_output_generation: Option<u64>,
+    pub(crate) expected_title: Option<String>,
+    pub(crate) expected_progress: Option<String>,
 }
 
 impl Preconditions {
@@ -133,6 +136,15 @@ impl Preconditions {
         if let Some(digest) = &self.tracked_digest {
             value["tracked_digest"] = json!(digest);
         }
+        if let Some(generation) = self.expected_output_generation {
+            value["expected_output_generation"] = json!(generation.to_string());
+        }
+        if let Some(title) = &self.expected_title {
+            value["expected_title"] = json!(title);
+        }
+        if let Some(progress) = &self.expected_progress {
+            value["expected_progress"] = json!(progress);
+        }
         value
     }
 }
@@ -155,6 +167,7 @@ pub(crate) enum LedgerResult {
     Applied {
         ticket: DispatchTicket,
         result_digest: String,
+        queued_bytes: Option<u64>,
     },
     RejectedBeforeEffect {
         ticket: DispatchTicket,
@@ -353,6 +366,7 @@ pub(crate) struct Client {
     requests: mpsc::Sender<WireRequest>,
     core_boot_id: String,
     epoch: u64,
+    input: bool,
     next_seq: u64,
     request_number: u64,
     broken: bool,
@@ -378,7 +392,7 @@ impl Client {
         )
         .await?;
         let hello = read_value(&mut stream, false).await?;
-        let epoch = parse_hello(&hello, hello_id, endpoint)?;
+        let (epoch, input) = parse_hello(&hello, hello_id, endpoint)?;
         let (read, write) = stream.into_split();
         let (requests, received_requests) = mpsc::channel(1);
         let (frames, received_frames) = mpsc::unbounded_channel();
@@ -388,6 +402,7 @@ impl Client {
             requests,
             core_boot_id: endpoint.core_boot_id.clone(),
             epoch,
+            input,
             next_seq: 0,
             request_number: 0,
             broken: false,
@@ -398,6 +413,10 @@ impl Client {
 
     pub(crate) const fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    pub(crate) const fn supports_input(&self) -> bool {
+        self.input
     }
 
     pub(crate) fn core_boot_id(&self) -> &str {
@@ -456,6 +475,61 @@ impl Client {
             self.broken = true;
         }
         Ok(result)
+    }
+
+    /// Stages one prompt body on this coordinator connection.  The core owns
+    /// the bytes until the following `input_commit`; no pane input happens in
+    /// this phase.
+    pub(crate) async fn stage_input(
+        &mut self,
+        staging_id: &str,
+        operation_key: &OperationKey,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        if !self.supports_input() {
+            return Err(Error::Unavailable(
+                "the core does not support staged input".into(),
+            ));
+        }
+        if !valid_staging_id(staging_id) {
+            return Err(Error::InvalidArgument(
+                "invalid_argument: staging ID is invalid".into(),
+            ));
+        }
+        if bytes.is_empty() || bytes.len() > 32_768 {
+            return Err(Error::InvalidArgument(
+                "invalid_argument: staged input must contain 1–32768 bytes".into(),
+            ));
+        }
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let reply = self
+            .call_with_busy(
+                "input_begin",
+                json!({
+                    "staging_id": staging_id,
+                    "operation_key": operation_key.value(),
+                    "total_len": bytes.len(),
+                    "sha256": digest,
+                    "core_boot_id": self.core_boot_id,
+                }),
+            )
+            .await?;
+        parse_input_begin(&reply, staging_id)?;
+        for (index, chunk) in bytes.chunks(4_608).enumerate() {
+            let offset = index * 4_608;
+            let reply = self
+                .call_with_busy(
+                    "input_chunk",
+                    json!({
+                        "staging_id": staging_id,
+                        "offset": offset,
+                        "data_b64": base64(chunk),
+                    }),
+                )
+                .await?;
+            parse_input_chunk(&reply, staging_id, offset + chunk.len())?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn retire_receipt(
@@ -840,7 +914,76 @@ fn response_id(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn parse_hello(value: &Value, request_id: &str, endpoint: &Endpoint) -> Result<u64, Error> {
+fn valid_staging_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[((first & 0x03) << 4 | second >> 4) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[((second & 0x0f) << 2 | third >> 6) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[(third & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
+fn parse_input_begin(value: &Value, staging_id: &str) -> Result<(), Error> {
+    let request_id = response_id(value)
+        .ok_or_else(|| Error::Protocol("input_begin response has no request_id".into()))?;
+    if let Some(error) = parse_error(value, &request_id)? {
+        return Err(error);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Protocol("input_begin response is not an object".into()))?;
+    if object.get("v").and_then(Value::as_u64) != Some(1)
+        || object.get("kind").and_then(Value::as_str) != Some("input_begin")
+        || object.get("staging_id").and_then(Value::as_str) != Some(staging_id)
+    {
+        return Err(Error::Protocol("invalid input_begin response".into()));
+    }
+    Ok(())
+}
+
+fn parse_input_chunk(value: &Value, staging_id: &str, received: usize) -> Result<(), Error> {
+    let request_id = response_id(value)
+        .ok_or_else(|| Error::Protocol("input_chunk response has no request_id".into()))?;
+    if let Some(error) = parse_error(value, &request_id)? {
+        return Err(error);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Protocol("input_chunk response is not an object".into()))?;
+    let actual = decimal_or_number(object.get("received"), "input_chunk.received")?;
+    if object.get("v").and_then(Value::as_u64) != Some(1)
+        || object.get("kind").and_then(Value::as_str) != Some("input_chunk")
+        || object.get("staging_id").and_then(Value::as_str) != Some(staging_id)
+        || actual != received as u64
+    {
+        return Err(Error::Protocol("invalid input_chunk response".into()));
+    }
+    Ok(())
+}
+
+fn parse_hello(value: &Value, request_id: &str, endpoint: &Endpoint) -> Result<(u64, bool), Error> {
     if let Some(error) = parse_error(value, request_id)? {
         if matches!(&error, Error::Rejected { code, .. } if code == "epoch_exhausted") {
             return Err(Error::Unavailable(
@@ -869,7 +1012,10 @@ fn parse_hello(value: &Value, request_id: &str, endpoint: &Endpoint) -> Result<u
             "the core does not support actions".into(),
         ));
     }
-    decimal(capabilities.get("dispatch_epoch"), "dispatch_epoch")
+    Ok((
+        decimal(capabilities.get("dispatch_epoch"), "dispatch_epoch")?,
+        capabilities.get("input").and_then(Value::as_bool) == Some(true),
+    ))
 }
 
 fn parse_error(value: &Value, request_id: &str) -> Result<Option<Error>, Error> {
@@ -941,9 +1087,14 @@ fn parse_ledger_reply(
         .ok_or_else(|| Error::Protocol("ledger response has invalid result_digest".into()))?
         .to_owned();
     if result == "applied" {
+        let queued_bytes = match object.get("queued_bytes") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(decimal_or_number(Some(value), "queued_bytes")?),
+        };
         return Ok(LedgerResult::Applied {
             ticket,
             result_digest: digest,
+            queued_bytes,
         });
     }
     if result == "not_applied" {
@@ -1123,6 +1274,7 @@ fn parse_ledger_list(value: &Value, epoch: u64) -> Result<LedgerPage, Error> {
                     "dispatch_ticket": ticket.value(),
                     "result": object.get("result").cloned().unwrap_or(Value::Null),
                     "result_digest": object.get("result_digest").cloned().unwrap_or(Value::Null),
+                    "queued_bytes": object.get("queued_bytes").cloned().unwrap_or(Value::Null),
                 }),
                 "ledger_query",
                 ticket,
@@ -1345,6 +1497,28 @@ impl CoordinatorActions {
                 self.close(&manager, core, &pane, &expected, operation.as_deref())
                     .await
             }
+            ControlAction::Prompt {
+                pane,
+                expected,
+                text,
+                operation,
+                queued,
+                needs_bracket,
+                checkpoint,
+            } => {
+                self.prompt(
+                    &manager,
+                    core,
+                    &pane,
+                    &expected,
+                    &text,
+                    operation,
+                    queued,
+                    needs_bracket,
+                    checkpoint,
+                )
+                .await
+            }
         };
         let boot_mismatch = outcome
             .as_ref()
@@ -1457,13 +1631,14 @@ impl CoordinatorActions {
                 continue;
             }
             let evidence = json!({"path": "core_ledger", "reconciled": "boot_mismatch"});
-            store.finish(
+            let record = store.finish(
                 &ticket_for(&record),
                 UNKNOWN,
                 "core_ledger_reconcile",
                 Some(&evidence),
                 now_ms(),
             )?;
+            store.note_prompt_result(&record)?;
         }
         Ok(())
     }
@@ -1562,6 +1737,245 @@ impl CoordinatorActions {
         self.durable_kill(manager, core, current, operation).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prompt(
+        &self,
+        manager: &Manager,
+        core: &mut Client,
+        pane: &str,
+        expected: &Expected,
+        text: &str,
+        operation: Option<u64>,
+        queued: Option<(i64, i64)>,
+        needs_bracket: bool,
+        checkpoint: bool,
+    ) -> Result<Value, String> {
+        if !core.supports_input() {
+            return Err("bridge_unavailable: the core does not support staged input".into());
+        }
+        let current = manager.get_readonly(pane).await?;
+        // The caller supplied its freshly read idle screen snapshot. The
+        // coordinator confirms identity before durable admission, then gives
+        // those exact guards to core for the commit boundary.
+        expected.matches(&current, false)?;
+
+        let mut store = manager.operation_store().await?;
+        let next = store.prompt_next(&current.run)?;
+        let slot = operation.unwrap_or(next);
+        if slot == 0 || slot > next {
+            return Err(format!("next prompt operation must be {next}"));
+        }
+        let id = if let Some(operation) = operation {
+            operation.to_string()
+        } else if let Some((item, _)) = queued {
+            format!("q{item}")
+        } else {
+            format!("auto-{}", nonce()?)
+        };
+        let namespace = format!("run:{}", current.run);
+        let operation_id = digest(&format!("{namespace}/prompt/{id}"));
+        let key_nonce = nonce()?;
+        let key = durable_key(&self.socket, &current, &key_nonce, &operation_id);
+        let text_digest = digest(text);
+        let core_ticket = core.next_ticket();
+        // A rejected input_begin/input_chunk does not consume the core
+        // ticket.  Include the durable-key nonce so an explicit retry using
+        // that ticket cannot collide with the still-live staging slot.
+        let staging_id = format!(
+            "prompt-{}-{}-{}",
+            core_ticket.epoch,
+            core_ticket.seq,
+            &key_nonce[..12]
+        );
+        let mut input_preconditions = preconditions(
+            &current,
+            expected
+                .tracked_digest
+                .as_ref()
+                .map(std::string::ToString::to_string),
+        );
+        input_preconditions.expected_output_generation = expected.output_generation;
+        input_preconditions.expected_title = expected.title.clone();
+        input_preconditions.expected_progress = expected.progress.clone();
+        let action = GuardedAction {
+            operation_key: key.clone(),
+            ticket: core_ticket,
+            payload_digest: digest(&format!(
+                "input:{slot}:{staging_id}:{needs_bracket}:enter:{}",
+                text_digest
+            )),
+            retain: true,
+            preconditions: input_preconditions,
+            action: json!({
+                "kind": "input_commit",
+                "staging_id": staging_id.clone(),
+                "bracketed": needs_bracket,
+                "submit": "enter",
+            }),
+        };
+        validate_guarded_action(&action)?;
+        let intent = json!({
+            "slot": slot,
+            "path": "core_ledger",
+            "core": {
+                "operation_key": key.value(),
+                "dispatch_ticket": core_ticket.value(),
+            },
+            "accept_digest": super::prompt::accept_digest(&current.provider, text),
+            "paste_ms": now_ms(),
+            "queue_item": queued.map(|(item, _)| item),
+        });
+        let marked = queued.map(|(item, revision)| super::operations::QueuedPrompt {
+            item,
+            revision,
+            run: &current.run,
+        });
+        let request = NewOperation {
+            namespace: &namespace,
+            action: "prompt",
+            id: &id,
+            explicit: operation.is_some(),
+            target: &current.pane_id,
+            run: Some(&current.run),
+            boot: &current.boot,
+            digest: &text_digest,
+            payload_bytes: text.len() as u64,
+        };
+        let (admission, slot) =
+            store.admit_prompt(&request, intent, now_ms(), Some(slot), marked.as_ref())?;
+        let ticket = match admission {
+            Admission::Dispatch(ticket) => {
+                // Match the native path: a checkpoint follows durable
+                // admission, never a replay, refusal or unresolved receipt.
+                if checkpoint {
+                    crate::checkpoint::before_prompt(&current.cwd, &current.name, &current.run);
+                }
+                ticket
+            }
+            Admission::Recorded(record) => {
+                return Ok(super::prompt::core_public_record(
+                    &current.run,
+                    slot,
+                    &record,
+                ));
+            }
+            Admission::NeedsReconcile(record) => {
+                return Err(format!(
+                    "outcome_unknown: prompt operation {} is unresolved; query its receipt before retrying",
+                    record.operation_key
+                ));
+            }
+        };
+
+        match core.stage_input(&staging_id, &key, text.as_bytes()).await {
+            Ok(()) => {}
+            Err(error) => {
+                let (state, message) = prompt_staging_failure(slot, &error);
+                if matches!(
+                    &error,
+                    Error::Unavailable(_) | Error::Lost(_) | Error::Protocol(_)
+                ) {
+                    core.broken = true;
+                }
+                let evidence = json!({
+                    "path": "core_ledger",
+                    "core_ticket": core_ticket.value(),
+                    "core_operation_key": key.value(),
+                    "staging_id": staging_id,
+                    "error": error.to_string(),
+                    "result": state,
+                });
+                let _ = Self::finish_prompt_admitted(
+                    &mut store,
+                    core,
+                    &ticket,
+                    state,
+                    &evidence,
+                    "the prompt staging result could not be committed",
+                )?;
+                return Err(message);
+            }
+        }
+
+        match core.guarded_action(action).await {
+            Ok(LedgerResult::Applied {
+                ticket: core_ticket,
+                result_digest,
+                queued_bytes: Some(queued_bytes),
+            }) => {
+                let evidence = input_result_evidence(
+                    &key,
+                    core_ticket,
+                    &result_digest,
+                    "applied",
+                    Some(queued_bytes),
+                );
+                let record = Self::finish_prompt_admitted(
+                    &mut store,
+                    core,
+                    &ticket,
+                    "delivered",
+                    &evidence,
+                    "the prompt input_commit applied, but its durable receipt could not be committed",
+                )?;
+                if core
+                    .retire_receipt(&key, core_ticket, &result_digest, record.updated_ms)
+                    .await
+                    .is_err()
+                {
+                    core.broken = true;
+                }
+                if super::observe::observable(&current) {
+                    crate::coordinator::poke(&self.socket);
+                }
+                Ok(super::prompt::core_public_record(
+                    &current.run,
+                    slot,
+                    &record,
+                ))
+            }
+            Ok(LedgerResult::Applied {
+                ticket: core_ticket,
+                result_digest,
+                ..
+            }) => {
+                let mut evidence =
+                    core_result_evidence(&key, core_ticket, &result_digest, "applied");
+                evidence["error"] = json!("input_commit omitted queued_bytes");
+                Self::finish_prompt_admitted(
+                    &mut store,
+                    core,
+                    &ticket,
+                    UNKNOWN,
+                    &evidence,
+                    "the core applied input_commit without queued-byte evidence",
+                )?;
+                core.broken = true;
+                Err("outcome_unknown: input_commit omitted queued-byte evidence".into())
+            }
+            Ok(result) => {
+                self.finish_prompt_result(&mut store, core, &ticket, &key, slot, result)
+                    .await
+            }
+            Err(error) => {
+                let (state, message) = prompt_transport_failure(slot, &error);
+                if !matches!(&error, Error::InvalidArgument(_) | Error::Busy(_)) {
+                    core.broken = true;
+                }
+                let evidence = json!({"path": "core_ledger", "error": error.to_string()});
+                Self::finish_prompt_admitted(
+                    &mut store,
+                    core,
+                    &ticket,
+                    state,
+                    &evidence,
+                    "the prompt input_commit ended without a durable result",
+                )?;
+                Err(message)
+            }
+        }
+    }
+
     async fn send_keys(
         &self,
         core: &mut Client,
@@ -1622,6 +2036,132 @@ impl CoordinatorActions {
                 }
             }
         }
+    }
+
+    fn finish_prompt_admitted(
+        store: &mut Store,
+        core: &mut Client,
+        ticket: &Ticket,
+        state: &str,
+        evidence: &Value,
+        context: &str,
+    ) -> Result<Record, String> {
+        let record = Self::finish_admitted(store, core, ticket, state, evidence, context)?;
+        store.note_prompt_result(&record).map_err(|error| {
+            core.broken = true;
+            format!(
+                "outcome_unknown: prompt receipt was committed, but its SQLite number could not be committed: {error}"
+            )
+        })?;
+        Ok(record)
+    }
+
+    async fn finish_prompt_result(
+        &self,
+        store: &mut Store,
+        core: &mut Client,
+        ticket: &Ticket,
+        key: &OperationKey,
+        slot: u64,
+        result: LedgerResult,
+    ) -> Result<Value, String> {
+        let (state, message, core_ticket, result_digest, evidence) = match result {
+            LedgerResult::RejectedBeforeEffect {
+                ticket,
+                reason,
+                result_digest,
+            } => {
+                let evidence = input_result_evidence(
+                    key,
+                    ticket,
+                    &result_digest,
+                    "rejected_before_effect",
+                    None,
+                );
+                (
+                    "rejected_before_effect",
+                    prompt_rejection(slot, &reason),
+                    Some(ticket),
+                    Some(result_digest),
+                    evidence,
+                )
+            }
+            LedgerResult::NotApplied {
+                ticket,
+                result_digest,
+            } => {
+                let evidence =
+                    input_result_evidence(key, ticket, &result_digest, "not_applied", None);
+                (
+                    "not_applied",
+                    "not_applied: the core ledger proved this prompt did not reach pane input"
+                        .into(),
+                    Some(ticket),
+                    Some(result_digest),
+                    evidence,
+                )
+            }
+            LedgerResult::LedgerFull => (
+                "not_applied",
+                "ledger_full: the core ledger is full before prompt input_commit".into(),
+                None,
+                None,
+                json!({"path": "core_ledger", "result": "ledger_full"}),
+            ),
+            LedgerResult::IdempotencyConflict => (
+                UNKNOWN,
+                "outcome_unknown: idempotency_conflict: the core ledger ticket belongs to a different request".into(),
+                None,
+                None,
+                json!({"path": "core_ledger", "result": "idempotency_conflict"}),
+            ),
+            LedgerResult::ReceiptNotRetained => (
+                UNKNOWN,
+                "outcome_unknown: receipt_not_retained: the core ledger cannot prove this prompt result".into(),
+                None,
+                None,
+                json!({"path": "core_ledger", "result": "receipt_not_retained"}),
+            ),
+            LedgerResult::TicketGap => (
+                UNKNOWN,
+                "outcome_unknown: ticket_gap: the core ledger ticket sequence is out of sync".into(),
+                None,
+                None,
+                json!({"path": "core_ledger", "result": "ticket_gap"}),
+            ),
+            LedgerResult::EpochClosed => (
+                UNKNOWN,
+                "outcome_unknown: epoch_closed: the core ledger connection epoch closed".into(),
+                None,
+                None,
+                json!({"path": "core_ledger", "result": "epoch_closed"}),
+            ),
+            LedgerResult::EpochUnknown => (
+                UNKNOWN,
+                "outcome_unknown: epoch_unknown: the core ledger no longer knows this connection epoch".into(),
+                None,
+                None,
+                json!({"path": "core_ledger", "result": "epoch_unknown"}),
+            ),
+            LedgerResult::Applied { .. } => return Err("invalid prompt ledger result".into()),
+        };
+        let record = Self::finish_prompt_admitted(
+            store,
+            core,
+            ticket,
+            state,
+            &evidence,
+            "the core returned a prompt result, but its durable receipt could not be committed",
+        )?;
+        if let (Some(core_ticket), Some(result_digest)) = (core_ticket, result_digest)
+            && core
+                .retire_receipt(key, core_ticket, &result_digest, record.updated_ms)
+                .await
+                .is_err()
+        {
+            core.broken = true;
+        }
+        Err(message)
     }
 
     async fn durable_interrupt(
@@ -1768,8 +2308,10 @@ impl CoordinatorActions {
                 Ok(LedgerResult::Applied {
                     ticket: core_ticket,
                     result_digest,
+                    ..
                 }) if final_key => {
-                    let evidence = core_result_evidence(core_ticket, &result_digest, "applied");
+                    let evidence =
+                        core_result_evidence(&key, core_ticket, &result_digest, "applied");
                     let record = Self::finish_admitted(
                         &mut store,
                         core,
@@ -1790,8 +2332,10 @@ impl CoordinatorActions {
                 Ok(LedgerResult::Applied {
                     ticket: core_ticket,
                     result_digest,
+                    ..
                 }) => {
-                    let evidence = core_result_evidence(core_ticket, &result_digest, "applied");
+                    let evidence =
+                        core_result_evidence(&key, core_ticket, &result_digest, "applied");
                     let record = match store.note_dispatch(
                         &ticket,
                         "core_action_result",
@@ -1955,8 +2499,9 @@ impl CoordinatorActions {
             Ok(LedgerResult::Applied {
                 ticket: core_ticket,
                 result_digest,
+                ..
             }) => {
-                let evidence = core_result_evidence(core_ticket, &result_digest, "applied");
+                let evidence = core_result_evidence(&key, core_ticket, &result_digest, "applied");
                 let record = Self::finish_admitted(
                     &mut store,
                     core,
@@ -2108,20 +2653,50 @@ impl CoordinatorActions {
                 result_digest,
             } => (
                 "not_applied",
-                "not_applied".into(),
+                "not_applied: the core ledger proved this action did not apply".into(),
                 Some(ticket),
                 Some(result_digest),
             ),
-            LedgerResult::LedgerFull => ("not_applied", "ledger_full".into(), None, None),
+            LedgerResult::LedgerFull => (
+                "not_applied",
+                "ledger_full: the core ledger is full before the action".into(),
+                None,
+                None,
+            ),
             LedgerResult::IdempotencyConflict => {
-                (UNKNOWN, "idempotency_conflict".into(), None, None)
+                (
+                    UNKNOWN,
+                    "outcome_unknown: idempotency_conflict: the core ledger ticket belongs to a different request".into(),
+                    None,
+                    None,
+                )
             }
             LedgerResult::ReceiptNotRetained => {
-                (UNKNOWN, "receipt_not_retained".into(), None, None)
+                (
+                    UNKNOWN,
+                    "outcome_unknown: receipt_not_retained: the core ledger cannot prove this action result".into(),
+                    None,
+                    None,
+                )
             }
-            LedgerResult::TicketGap => (UNKNOWN, "ticket_gap".into(), None, None),
-            LedgerResult::EpochClosed => (UNKNOWN, "epoch_closed".into(), None, None),
-            LedgerResult::EpochUnknown => (UNKNOWN, "epoch_unknown".into(), None, None),
+            LedgerResult::TicketGap => (
+                UNKNOWN,
+                "outcome_unknown: ticket_gap: the core ledger ticket sequence is out of sync".into(),
+                None,
+                None,
+            ),
+            LedgerResult::EpochClosed => (
+                UNKNOWN,
+                "outcome_unknown: epoch_closed: the core ledger connection epoch closed".into(),
+                None,
+                None,
+            ),
+            LedgerResult::EpochUnknown => (
+                UNKNOWN,
+                "outcome_unknown: epoch_unknown: the core ledger no longer knows this connection epoch".into(),
+                None,
+                None,
+            ),
             LedgerResult::Applied { .. } => return Err("invalid durable result".into()),
         };
         let state = if partial {
@@ -2212,23 +2787,24 @@ impl CoordinatorActions {
                 .ok_or("operation disappeared during core ledger reconciliation")?;
             let has_receipt = (current.state != super::operations::DISPATCHING
                 && current.state != UNKNOWN)
-                || has_ticket_receipt(&current, entry.ticket);
+                || has_ticket_receipt(&current, entry.ticket, &entry.operation_key);
             let decision = reconcile_decision(has_receipt, &entry.result);
             let evidence = ledger_result_evidence(entry);
             let current = if current.state == UNKNOWN {
                 // Retaining the ledger result is part of reconciliation, not
                 // just cleanup. Once the slot is retired this receipt is the
                 // operator's only evidence of what the core proved.
-                let settled = match &entry.result {
-                    LedgerResult::RejectedBeforeEffect { .. } if has_core_effect(&current) => {
-                        Some("interrupt_partial")
-                    }
-                    LedgerResult::RejectedBeforeEffect { .. } => Some("rejected_before_effect"),
-                    LedgerResult::NotApplied { .. } if has_core_effect(&current) => {
-                        Some("interrupt_partial")
-                    }
-                    _ => None,
-                };
+                let settled =
+                    prompt_core_state(&current, &entry.result).or_else(|| match &entry.result {
+                        LedgerResult::RejectedBeforeEffect { .. } if has_core_effect(&current) => {
+                            Some("interrupt_partial")
+                        }
+                        LedgerResult::RejectedBeforeEffect { .. } => Some("rejected_before_effect"),
+                        LedgerResult::NotApplied { .. } if has_core_effect(&current) => {
+                            Some("interrupt_partial")
+                        }
+                        _ => None,
+                    });
                 match settled {
                     Some(state) => store.settle_unknown(
                         &current,
@@ -2248,13 +2824,15 @@ impl CoordinatorActions {
             } else if decision == ReconcileDecision::OutcomeUnknown
                 && current.state == super::operations::DISPATCHING
             {
-                let state = match &entry.result {
-                    LedgerResult::RejectedBeforeEffect { .. } if has_core_effect(&current) => {
-                        "interrupt_partial"
+                let state = prompt_core_state(&current, &entry.result).unwrap_or_else(|| {
+                    match &entry.result {
+                        LedgerResult::RejectedBeforeEffect { .. } if has_core_effect(&current) => {
+                            "interrupt_partial"
+                        }
+                        LedgerResult::RejectedBeforeEffect { .. } => "rejected_before_effect",
+                        _ => UNKNOWN,
                     }
-                    LedgerResult::RejectedBeforeEffect { .. } => "rejected_before_effect",
-                    _ => UNKNOWN,
-                };
+                });
                 store.finish(
                     &ticket_for(&current),
                     state,
@@ -2265,6 +2843,7 @@ impl CoordinatorActions {
             } else {
                 current
             };
+            store.note_prompt_result(&current)?;
             let result_digest = entry
                 .result
                 .result_digest()
@@ -2277,7 +2856,7 @@ impl CoordinatorActions {
             )
             .await
             .map_err(|error| error.to_string())?;
-            retained.insert(entry.ticket);
+            retained.insert((entry.ticket, entry.operation_key.ledger_digest()));
         }
         // A boot change removes the old core's ledger entirely. Its unresolved
         // intents cannot be queried against this boot, so make that fact
@@ -2293,13 +2872,14 @@ impl CoordinatorActions {
                 continue;
             }
             let evidence = json!({"path": "core_ledger", "reconciled": "boot_mismatch"});
-            store.finish(
+            let current = store.finish(
                 &ticket_for(&current),
                 UNKNOWN,
                 "core_ledger_reconcile",
                 Some(&evidence),
                 now_ms(),
             )?;
+            store.note_prompt_result(&current)?;
         }
 
         // Any current-boot intent that did not appear in ledger_list belongs
@@ -2325,34 +2905,72 @@ impl CoordinatorActions {
             let missing: Vec<_> = intents
                 .into_iter()
                 .filter(|intent| {
-                    !retained.contains(&intent.ticket)
-                        && !has_ticket_receipt(&current, intent.ticket)
+                    !retained.contains(&(intent.ticket, intent.operation_key.ledger_digest()))
+                        && !has_ticket_receipt(&current, intent.ticket, &intent.operation_key)
                 })
                 .collect();
             if missing.is_empty() {
-                // A dispatched multi-key interrupt can have a durable receipt
-                // for its first key, but no final operation receipt when the
-                // coordinator dies in the intentional inter-key pause.
-                if current.state == super::operations::DISPATCHING && has_core_effect(&current) {
-                    // Every planned key applied means only the final receipt
-                    // was lost; fewer means the pause between keys ended it.
-                    let (state, reconciled) =
-                        if applied_core_effects(&current) < current.payload_bytes as usize {
-                            ("interrupt_partial", "missing_later_ticket")
-                        } else {
-                            ("interrupt_key_delivered", "all_keys_applied")
-                        };
+                // A result recorded before a coordinator died is enough to
+                // settle a dispatching operation even after it retired the
+                // corresponding core slot. Multi-key interrupts need their
+                // special partial-result accounting; input commits and close
+                // actions have one effect and must not be compared with their
+                // payload byte count.
+                if let Some(state) = recorded_prompt_core_state(&current) {
                     let evidence = json!({
                         "path": "core_ledger",
-                        "reconciled": reconciled,
+                        "reconciled": "recorded_input_result",
                     });
-                    store.finish(
-                        &ticket_for(&current),
-                        state,
-                        "core_ledger_reconcile",
-                        Some(&evidence),
-                        now_ms(),
-                    )?;
+                    let current = if current.state == super::operations::DISPATCHING {
+                        store.finish(
+                            &ticket_for(&current),
+                            state,
+                            "core_ledger_reconcile",
+                            Some(&evidence),
+                            now_ms(),
+                        )?
+                    } else if current.state == UNKNOWN {
+                        store.settle_unknown(
+                            &current,
+                            state,
+                            "core_ledger_reconcile",
+                            Some(&evidence),
+                            now_ms(),
+                        )?
+                    } else {
+                        current
+                    };
+                    store.note_prompt_result(&current)?;
+                    continue;
+                }
+                if current.state == super::operations::DISPATCHING {
+                    let recovered = match current.action.as_str() {
+                        "close" if has_core_effect(&current) => {
+                            Some(("pane_closed", "recorded_kill_pane"))
+                        }
+                        "interrupt" if has_core_effect(&current) => {
+                            if applied_core_effects(&current) < current.payload_bytes as usize {
+                                Some(("interrupt_partial", "missing_later_ticket"))
+                            } else {
+                                Some(("interrupt_key_delivered", "all_keys_applied"))
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((state, reconciled)) = recovered {
+                        let evidence = json!({
+                            "path": "core_ledger",
+                            "reconciled": reconciled,
+                        });
+                        let current = store.finish(
+                            &ticket_for(&current),
+                            state,
+                            "core_ledger_reconcile",
+                            Some(&evidence),
+                            now_ms(),
+                        )?;
+                        store.note_prompt_result(&current)?;
+                    }
                 }
                 continue;
             }
@@ -2397,21 +3015,23 @@ impl CoordinatorActions {
             let evidence = unresolved
                 .unwrap_or_else(|| json!({"path": "core_ledger", "reconciled": "not_applied"}));
             if current.state == super::operations::DISPATCHING {
-                store.finish(
+                let current = store.finish(
                     &ticket_for(&current),
                     state,
                     "core_ledger_reconcile",
                     Some(&evidence),
                     now_ms(),
                 )?;
+                store.note_prompt_result(&current)?;
             } else if state != UNKNOWN {
-                store.settle_unknown(
+                let current = store.settle_unknown(
                     &current,
                     state,
                     "core_ledger_reconcile",
                     Some(&evidence),
                     now_ms(),
                 )?;
+                store.note_prompt_result(&current)?;
             }
         }
         if core.is_broken() {
@@ -2471,6 +3091,9 @@ struct Expected {
     tracked_digest: Option<String>,
     foreground_pgid: String,
     process_epoch: Option<String>,
+    output_generation: Option<u64>,
+    title: Option<String>,
+    progress: Option<String>,
 }
 
 impl Expected {
@@ -2487,11 +3110,17 @@ impl Expected {
             "foreground_pgid",
             "process_epoch",
         ];
-        if !(required.len()..=required.len() + 1).contains(&object.len())
+        let optional = [
+            "tracked_digest",
+            "expected_output_generation",
+            "expected_title",
+            "expected_progress",
+        ];
+        if !(required.len()..=required.len() + optional.len()).contains(&object.len())
             || required.iter().any(|field| !object.contains_key(*field))
-            || object
-                .keys()
-                .any(|field| !required.contains(&field.as_str()) && field != "tracked_digest")
+            || object.keys().any(|field| {
+                !required.contains(&field.as_str()) && !optional.contains(&field.as_str())
+            })
             || (tracked_required && !object.contains_key("tracked_digest"))
         {
             return Err("invalid_action: invalid expected schema".into());
@@ -2525,6 +3154,29 @@ impl Expected {
             .contains_key("tracked_digest")
             .then(|| digest("tracked_digest"))
             .transpose()?;
+        let output_generation = match object.get("expected_output_generation") {
+            None => None,
+            Some(value) => Some(
+                decimal_or_number(Some(value), "expected_output_generation")
+                    .map_err(|_| "invalid_action: expected output generation is invalid")?,
+            ),
+        };
+        let plain = |field: &str| {
+            object
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| value.len() <= 4_096 && !value.contains('\0'))
+                .map(str::to_owned)
+                .ok_or_else(|| format!("invalid_action: expected {field} is invalid"))
+        };
+        let title = object
+            .contains_key("expected_title")
+            .then(|| plain("expected_title"))
+            .transpose()?;
+        let progress = object
+            .contains_key("expected_progress")
+            .then(|| plain("expected_progress"))
+            .transpose()?;
         Ok(Self {
             pane: text("pane_id")?,
             boot: text("boot")?,
@@ -2534,6 +3186,9 @@ impl Expected {
             tracked_digest,
             foreground_pgid,
             process_epoch,
+            output_generation,
+            title,
+            progress,
         })
     }
 
@@ -2599,6 +3254,15 @@ enum ControlAction {
         expected: Expected,
         operation: Option<String>,
     },
+    Prompt {
+        pane: String,
+        expected: Expected,
+        text: String,
+        operation: Option<u64>,
+        queued: Option<(i64, i64)>,
+        needs_bracket: bool,
+        checkpoint: bool,
+    },
 }
 
 struct InterruptAction<'a> {
@@ -2630,6 +3294,17 @@ impl ControlAction {
             "keys" => &["operation", "pane_id", "expected", "keys", "retry"],
             "interrupt" => &["operation", "pane_id", "expected", "operation_id", "keys"],
             "close" => &["operation", "pane_id", "expected", "operation_id"],
+            "prompt" => &[
+                "operation",
+                "pane_id",
+                "expected",
+                "text",
+                "operation_id",
+                "queued",
+                "needs_bracket",
+                "submit",
+                "checkpoint",
+            ],
             _ => return Err("invalid_action: unknown core action".into()),
         };
         if object
@@ -2651,6 +3326,7 @@ impl ControlAction {
         let operation_id = match object.get("operation_id") {
             None | Some(Value::Null) => None,
             Some(Value::String(id)) if valid_operation_id(id) => Some(id.clone()),
+            _ if operation == "prompt" => None,
             _ => return Err("invalid_action: operation_id is invalid".into()),
         };
         match operation {
@@ -2691,15 +3367,98 @@ impl ControlAction {
                     operation: operation_id,
                 })
             }
+            "prompt" => {
+                if operation_id.is_some() {
+                    return Err("invalid_action: prompt operation_id is invalid".into());
+                }
+                let expected = expected_for_action(object.get("expected"), &pane, true)?;
+                let (Some(_), Some(title), Some(progress)) = (
+                    expected.output_generation,
+                    expected.title.as_ref(),
+                    expected.progress.as_ref(),
+                ) else {
+                    return Err("invalid_action: prompt expected snapshot is incomplete".into());
+                };
+                if title.len() > 4_096 || progress.len() > 4_096 {
+                    return Err("invalid_action: prompt expected snapshot is invalid".into());
+                }
+                let text = object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| {
+                        !text.is_empty()
+                            && text.len() <= 32_768
+                            && !text
+                                .chars()
+                                .any(|c| c.is_control() && c != '\n' && c != '\t')
+                    })
+                    .map(str::to_owned)
+                    .ok_or("invalid_action: prompt text is invalid")?;
+                let prompt_operation = match object.get("operation_id") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        decimal_or_number(Some(value), "prompt operation")
+                            .map_err(|_| "invalid_action: prompt operation is invalid")?,
+                    ),
+                };
+                let queued = match object.get("queued") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Object(value))
+                        if value.len() == 2
+                            && value.contains_key("item")
+                            && value.contains_key("revision") =>
+                    {
+                        let item = value
+                            .get("item")
+                            .and_then(Value::as_i64)
+                            .filter(|item| *item > 0)
+                            .ok_or("invalid_action: queued item is invalid")?;
+                        let revision = value
+                            .get("revision")
+                            .and_then(Value::as_i64)
+                            .filter(|revision| *revision >= 0)
+                            .ok_or("invalid_action: queued revision is invalid")?;
+                        Some((item, revision))
+                    }
+                    _ => return Err("invalid_action: queued prompt is invalid".into()),
+                };
+                if prompt_operation.is_some() && queued.is_some() {
+                    return Err("invalid_action: queued prompts cannot name an operation".into());
+                }
+                let needs_bracket = object
+                    .get("needs_bracket")
+                    .and_then(Value::as_bool)
+                    .ok_or("invalid_action: prompt needs_bracket is invalid")?;
+                if needs_bracket != (text.contains('\n') || text.contains('\t')) {
+                    return Err("invalid_action: prompt bracket rule is invalid".into());
+                }
+                if object.get("submit").and_then(Value::as_str) != Some("enter") {
+                    return Err("invalid_action: prompt submit is invalid".into());
+                }
+                let checkpoint = object
+                    .get("checkpoint")
+                    .and_then(Value::as_bool)
+                    .ok_or("invalid_action: prompt checkpoint is invalid")?;
+                Ok(Self::Prompt {
+                    pane,
+                    expected,
+                    text,
+                    operation: prompt_operation,
+                    queued,
+                    needs_bracket,
+                    checkpoint,
+                })
+            }
             _ => unreachable!(),
         }
     }
 
     fn pane(&self) -> &str {
         match self {
-            Self::Keys { pane, .. } | Self::Interrupt { pane, .. } | Self::Close { pane, .. } => {
-                pane
-            }
+            Self::Keys { pane, .. }
+            | Self::Interrupt { pane, .. }
+            | Self::Close { pane, .. }
+            | Self::Prompt { pane, .. } => pane,
         }
     }
 }
@@ -2757,6 +3516,9 @@ fn preconditions(agent: &Agent, tracked_digest: Option<String>) -> Preconditions
         current_command: agent.foreground_command.clone(),
         meta_digest: digest(&agent.encoded),
         tracked_digest,
+        expected_output_generation: None,
+        expected_title: None,
+        expected_progress: None,
     }
 }
 
@@ -2807,6 +3569,14 @@ pub(crate) fn expected(agent: &Agent) -> Value {
     })
 }
 
+pub(crate) fn prompt_expected(agent: &Agent) -> Value {
+    let mut value = expected(agent);
+    value["expected_output_generation"] = json!(agent.output_generation.to_string());
+    value["expected_title"] = json!(&agent.title);
+    value["expected_progress"] = json!(&agent.progress);
+    value
+}
+
 fn durable_key(socket: &Path, agent: &Agent, nonce: &str, operation_id: &str) -> OperationKey {
     let socket = Sha256::digest(socket.as_os_str().as_bytes());
     let environment_id: String = socket[..8]
@@ -2836,24 +3606,115 @@ fn core_intent(operation_key: &OperationKey, ticket: DispatchTicket) -> Value {
     })
 }
 
-fn core_result_evidence(ticket: DispatchTicket, result_digest: &str, result: &str) -> Value {
+fn core_result_evidence(
+    operation_key: &OperationKey,
+    ticket: DispatchTicket,
+    result_digest: &str,
+    result: &str,
+) -> Value {
     json!({
         "path": "core_ledger",
         "core_ticket": ticket.value(),
+        "core_operation_key": operation_key.value(),
         "result_digest": result_digest,
         "result": result,
     })
+}
+
+fn input_result_evidence(
+    operation_key: &OperationKey,
+    ticket: DispatchTicket,
+    result_digest: &str,
+    result: &str,
+    queued_bytes: Option<u64>,
+) -> Value {
+    let mut evidence = core_result_evidence(operation_key, ticket, result_digest, result);
+    if let Some(queued_bytes) = queued_bytes {
+        evidence["queued_bytes"] = json!(queued_bytes);
+    }
+    evidence
+}
+
+fn prompt_rejection(slot: u64, reason: &str) -> String {
+    format!(
+        "rejected_before_effect: prompt operation {slot} was rejected or its delivery is unknown: {reason}; query prompt-receipt before retrying"
+    )
+}
+
+fn prompt_staging_failure(slot: u64, error: &Error) -> (&'static str, String) {
+    match error {
+        Error::Rejected { .. } | Error::InvalidArgument(_) | Error::Busy(_) => (
+            "rejected_before_effect",
+            prompt_rejection(slot, &error.to_string()),
+        ),
+        // Staging has no input effect and does not reserve a dispatch
+        // sequence. Even a lost or malformed staging reply therefore proves
+        // this prompt did not reach `input_commit`.
+        Error::Unavailable(_) | Error::Lost(_) | Error::Protocol(_) => (
+            "not_applied",
+            format!("not_applied: prompt input staging ended before input_commit: {error}"),
+        ),
+    }
+}
+
+fn prompt_transport_failure(slot: u64, error: &Error) -> (&'static str, String) {
+    match error {
+        // `invalid_action` and an exhausted `bridge_busy` reply are known
+        // before the core reserves an input_commit ticket.  Keep their
+        // prompt receipt in the native path's refusal class rather than
+        // inventing a retryable no-op outcome.
+        Error::InvalidArgument(_) | Error::Busy(_) | Error::Rejected { .. } => (
+            "rejected_before_effect",
+            prompt_rejection(slot, &error.to_string()),
+        ),
+        Error::Unavailable(_) | Error::Lost(_) | Error::Protocol(_) => {
+            (UNKNOWN, format!("outcome_unknown: {error}"))
+        }
+    }
+}
+
+fn prompt_core_state(record: &Record, result: &LedgerResult) -> Option<&'static str> {
+    if record.action != "prompt" {
+        return None;
+    }
+    match result {
+        // An applied input_commit is a delivery receipt only when the core
+        // retained its byte-count evidence.  A prompt can never legitimately
+        // queue zero bytes (it has text and an Enter), so an omitted value is
+        // not enough to promote an uncertain crash recovery to delivered.
+        LedgerResult::Applied {
+            queued_bytes: Some(_),
+            ..
+        } => Some("delivered"),
+        LedgerResult::Applied { .. } => None,
+        LedgerResult::RejectedBeforeEffect { .. } => Some("rejected_before_effect"),
+        LedgerResult::NotApplied { .. } => Some("not_applied"),
+        LedgerResult::LedgerFull
+        | LedgerResult::IdempotencyConflict
+        | LedgerResult::ReceiptNotRetained
+        | LedgerResult::TicketGap
+        | LedgerResult::EpochClosed
+        | LedgerResult::EpochUnknown => None,
+    }
 }
 
 fn ledger_result_evidence(entry: &LedgerEntry) -> Value {
     let mut evidence = json!({
         "path": "core_ledger",
         "core_ticket": entry.ticket.value(),
+        "core_operation_key": entry.operation_key.value(),
         "result_digest": entry.result.result_digest(),
         "result": entry.result.result_text(),
     });
     if let LedgerResult::RejectedBeforeEffect { reason, .. } = &entry.result {
         evidence["reason"] = json!(reason);
+    }
+    if let LedgerResult::Applied {
+        queued_bytes: Some(queued_bytes),
+        ..
+    } = &entry.result
+    {
+        evidence["queued_bytes"] = json!(queued_bytes);
     }
     evidence
 }
@@ -2925,6 +3786,32 @@ fn has_core_effect(record: &Record) -> bool {
     applied_core_effects(record) > 0
 }
 
+fn recorded_prompt_core_state(record: &Record) -> Option<&'static str> {
+    if record.action != "prompt" {
+        return None;
+    }
+    let intent = core_intents(record).pop()?;
+    record.receipts.iter().rev().find_map(|receipt| {
+        let evidence = receipt.evidence.as_ref()?;
+        [evidence, &evidence["evidence"]]
+            .into_iter()
+            .find_map(|evidence| {
+                core_receipt_matches(evidence, intent.ticket, &intent.operation_key).then(|| {
+                    match evidence["result"].as_str() {
+                        // A staged input is a delivery only if the retained core
+                        // answer included its queued byte count.
+                        Some("applied") if evidence["queued_bytes"].as_u64().is_some() => {
+                            Some("delivered")
+                        }
+                        Some("rejected_before_effect") => Some("rejected_before_effect"),
+                        Some("not_applied") => Some("not_applied"),
+                        _ => None,
+                    }
+                })?
+            })
+    })
+}
+
 fn applied_core_effects(record: &Record) -> usize {
     record
         .receipts
@@ -2939,12 +3826,30 @@ fn applied_core_effects(record: &Record) -> usize {
         .count()
 }
 
-fn has_ticket_receipt(record: &Record, ticket: DispatchTicket) -> bool {
+fn core_receipt_matches(
+    evidence: &Value,
+    ticket: DispatchTicket,
+    operation_key: &OperationKey,
+) -> bool {
+    evidence["path"] == "core_ledger"
+        && evidence["core_ticket"] == ticket.value()
+        && evidence["core_operation_key"] == operation_key.value()
+}
+
+fn has_ticket_receipt(
+    record: &Record,
+    ticket: DispatchTicket,
+    operation_key: &OperationKey,
+) -> bool {
     record.receipts.iter().any(|receipt| {
-        receipt
-            .evidence
-            .as_ref()
-            .is_some_and(|evidence| evidence["core_ticket"] == ticket.value())
+        receipt.evidence.as_ref().is_some_and(|evidence| {
+            core_receipt_matches(evidence, ticket, operation_key)
+                // `finish_admitted` preserves failed-receipt evidence under
+                // this key. A staging failure did not consume its ticket, so
+                // matching only its ticket could hide a later action that
+                // reused that ticket with a new operation key.
+                || core_receipt_matches(&evidence["evidence"], ticket, operation_key)
+        })
     })
 }
 
@@ -3053,6 +3958,64 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_prompt_failure_mapping_keeps_guard_refusals_final() {
+        let rejected = Error::Rejected {
+            code: "staging_full".into(),
+            message: "no slot".into(),
+        };
+        let (state, message) = prompt_staging_failure(4, &rejected);
+        assert_eq!(state, "rejected_before_effect");
+        assert!(message.starts_with("rejected_before_effect:"));
+
+        let staging_lost = Error::Lost("peer closed".into());
+        let (state, message) = prompt_staging_failure(4, &staging_lost);
+        assert_eq!(state, "not_applied");
+        assert!(message.starts_with("not_applied:"));
+
+        let lost = Error::Lost("peer closed".into());
+        let (state, message) = prompt_transport_failure(4, &lost);
+        assert_eq!(state, UNKNOWN);
+        assert!(message.starts_with("outcome_unknown:"));
+
+        let busy = Error::Busy("no reply slot".into());
+        let (state, message) = prompt_transport_failure(4, &busy);
+        assert_eq!(state, "rejected_before_effect");
+        assert!(message.starts_with("rejected_before_effect:"));
+
+        let prompt = json!({
+            "operation": "prompt",
+            "pane_id": "%3",
+            "expected": {
+                "pane_id": "%3",
+                "boot": "boot",
+                "generation": "1",
+                "run": "run",
+                "meta_digest": "a".repeat(64),
+                "tracked_digest": "b".repeat(64),
+                "foreground_pgid": "42",
+                "process_epoch": "42:1",
+                "expected_output_generation": "9",
+                "expected_title": "title",
+                "expected_progress": "progress"
+            },
+            "text": "line one\nline two",
+            "operation_id": 4,
+            "queued": null,
+            "needs_bracket": true,
+            "submit": "enter",
+            "checkpoint": true
+        });
+        assert!(matches!(
+            ControlAction::parse(&prompt),
+            Ok(ControlAction::Prompt {
+                operation: Some(4),
+                needs_bracket: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn maps_ledger_error_codes() {
         let ticket = DispatchTicket { epoch: 1, seq: 0 };
         for (code, wanted) in [
@@ -3098,6 +4061,7 @@ mod tests {
         assert!(consumes_ticket(&LedgerResult::Applied {
             ticket,
             result_digest: "a".repeat(64),
+            queued_bytes: None,
         }));
         assert!(consumes_ticket(&LedgerResult::LedgerFull));
         assert!(!consumes_ticket(&LedgerResult::TicketGap));
@@ -3110,6 +4074,7 @@ mod tests {
         let applied = LedgerResult::Applied {
             ticket,
             result_digest: "b".repeat(64),
+            queued_bytes: None,
         };
         let not_applied = LedgerResult::NotApplied {
             ticket,
@@ -3127,6 +4092,104 @@ mod tests {
             reconcile_decision(false, &not_applied),
             ReconcileDecision::OutcomeUnknown
         );
+    }
+
+    #[test]
+    fn staging_receipt_does_not_hide_an_applied_retry_with_the_same_ticket() {
+        // input_begin failure consumes neither the ticket nor an input_commit
+        // slot. A retry therefore gets a fresh operation key but can use the
+        // same ticket. If it applies and SQLite loses the final receipt, only
+        // the retry key identifies the retained core entry.
+        let ticket = DispatchTicket { epoch: 4, seq: 9 };
+        let staged_key = OperationKey {
+            environment_id: "env".into(),
+            principal: "local".into(),
+            namespace_epoch: "boot".into(),
+            namespace_nonce: "staging".into(),
+            operation_id: "prompt".into(),
+        };
+        let retry_key = OperationKey {
+            namespace_nonce: "retry".into(),
+            ..staged_key.clone()
+        };
+        let sqlite_ticket = "sqlite-attempt".to_owned();
+        let mut first_intent = core_intent(&staged_key, ticket);
+        first_intent["ticket"] = json!(sqlite_ticket);
+        let mut retry_intent = core_intent(&retry_key, ticket);
+        retry_intent["ticket"] = json!(sqlite_ticket);
+        let staging_failure = json!({
+            "path": "core_ledger",
+            "core_ticket": ticket.value(),
+            "core_operation_key": staged_key.value(),
+            "result": "rejected_before_effect",
+        });
+        let record = Record {
+            op: 1,
+            operation_key: "run:r/prompt/1".into(),
+            action: "prompt".into(),
+            id: "1".into(),
+            explicit: true,
+            target: "%1".into(),
+            run: Some("r".into()),
+            boot: "boot".into(),
+            digest: "digest".into(),
+            payload_bytes: 7,
+            state: super::super::operations::DISPATCHING.into(),
+            ticket: sqlite_ticket,
+            attempts: 2,
+            lease_until_ms: 0,
+            created_ms: 0,
+            updated_ms: 0,
+            compacted_ms: None,
+            receipts: vec![
+                super::super::operations::ReceiptRow {
+                    ordinal: 1,
+                    stage: "dispatch_intent".into(),
+                    source: "core_ledger".into(),
+                    evidence: Some(first_intent),
+                    at_ms: 0,
+                },
+                super::super::operations::ReceiptRow {
+                    ordinal: 2,
+                    stage: "rejected_before_effect".into(),
+                    source: "core_ledger".into(),
+                    evidence: Some(staging_failure),
+                    at_ms: 0,
+                },
+                super::super::operations::ReceiptRow {
+                    ordinal: 3,
+                    stage: "dispatch_intent".into(),
+                    source: "core_ledger".into(),
+                    evidence: Some(retry_intent),
+                    at_ms: 0,
+                },
+            ],
+        };
+        let entry = LedgerEntry {
+            ticket,
+            operation_id: retry_key.operation_id.clone(),
+            operation_key_digest: retry_key.ledger_digest(),
+            operation_key: retry_key.clone(),
+            payload_digest: "a".repeat(64),
+            result: LedgerResult::Applied {
+                ticket,
+                result_digest: "b".repeat(64),
+                queued_bytes: Some(8),
+            },
+        };
+
+        assert!(stored_intent_for_entry(std::slice::from_ref(&record), &entry).is_some());
+        assert!(has_ticket_receipt(&record, ticket, &staged_key));
+        assert!(!has_ticket_receipt(&record, ticket, &retry_key));
+        assert_eq!(recorded_prompt_core_state(&record), None);
+        assert_eq!(
+            reconcile_decision(
+                has_ticket_receipt(&record, ticket, &retry_key),
+                &entry.result
+            ),
+            ReconcileDecision::OutcomeUnknown,
+        );
+        assert_eq!(prompt_core_state(&record, &entry.result), Some("delivered"));
     }
 
     #[test]

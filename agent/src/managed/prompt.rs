@@ -1,14 +1,14 @@
 //! Guarded, explicit prompt delivery with bounded per-run retry receipts.
 //!
-//! The pane ledger records the effect: the guarded group writes `pending`
-//! before the paste and `delivered` after Enter. The group applies only if
-//! the ledger and fence still hold the values read before admission, so a
-//! late copy of the group cannot type the prompt again. The durable store
-//! records admission, dispatch intent and the confirmed stage. The ledger's
-//! JSON is unchanged from earlier releases; tickets and the fence live in
-//! separate options so older binaries still read it.
+//! The native path records the effect in a pane ledger: the guarded group
+//! writes `pending` before the paste and `delivered` after Enter. The core
+//! path keeps its number and receipt in SQLite, then commits staged input
+//! through the coordinator. The legacy option format stays unchanged for
+//! native-path servers.
 use super::operations::{self, Admission, NewOperation, Record, Store, Ticket};
-use super::{Agent, Guarded, Manager, and, decode, encode, failure::AfterEffect, nonce};
+use super::{
+    ActionPath, Agent, Guarded, Manager, and, decode, encode, failure::AfterEffect, nonce,
+};
 use crate::observation::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,6 +23,9 @@ pub(super) const ENTER_DROPPED: &[&str] = &["cursor"];
 const OPTION: &str = "@masil-agent-prompt-receipts";
 const TICKETS: &str = "@masil-agent-prompt-tickets";
 const FENCE: &str = "@masil-agent-prompt-fence";
+/// This is deliberately not valid hex.  The pre-C2 decoder rejects it before
+/// it can treat a stale pane ledger as authoritative.
+const CORE_LEDGER_SENTINEL: &str = "core-ledger-c2";
 const MAX_RETAINED: usize = 16;
 /// How long after delivery a provider's report can still accept a prompt.
 const ACCEPT_WINDOW_MS: u64 = 120_000;
@@ -94,7 +97,7 @@ impl PaneLedger {
 
     fn public(&self, entry: &Receipt) -> Value {
         json!({"operation":entry.operation,"run":self.ledger.run,"stage":entry.stage,"provider_accepted":false,
-            "task_success":null,"operation_key":self.key(entry.operation)})
+            "task_success":null,"operation_key":self.key(entry.operation),"path":"native_guard"})
     }
 }
 
@@ -188,7 +191,22 @@ pub(super) fn sha256(text: &str) -> String {
 }
 
 /// A durable record for a slot the pane ledger no longer holds.
-fn public_record(run: &str, operation: u64, record: &Record) -> Value {
+pub(super) fn public_record(run: &str, operation: u64, record: &Record) -> Value {
+    let path = record
+        .intent()
+        .and_then(|intent| intent["path"].as_str())
+        .unwrap_or("native_guard");
+    public_record_at_path(run, operation, record, path)
+}
+
+/// The core path is known by its caller even after receipt compaction has
+/// dropped the original dispatch intent, so it must not fall back to the
+/// legacy path label when an explicit receipt is read later.
+pub(super) fn core_public_record(run: &str, operation: u64, record: &Record) -> Value {
+    public_record_at_path(run, operation, record, "core_ledger")
+}
+
+fn public_record_at_path(run: &str, operation: u64, record: &Record, path: &str) -> Value {
     let stage = match record.state.as_str() {
         "delivered" | "user_confirmed_delivered" | "native_accepted" => "delivered",
         "user_confirmed_not_delivered" => "not_delivered",
@@ -196,7 +214,8 @@ fn public_record(run: &str, operation: u64, record: &Record) -> Value {
     };
     with_acceptance(
         json!({"operation":operation,"run":run,"stage":stage,"provider_accepted":false,"task_success":null,
-            "operation_key":record.operation_key}),
+            "operation_key":record.operation_key,
+            "path":path}),
         record,
     )
 }
@@ -211,6 +230,9 @@ impl Manager {
         agent: &Agent,
         operation: Option<u64>,
     ) -> Result<Value, String> {
+        if self.action_path().await? == ActionPath::CoreLedger {
+            return self.core_prompt_receipt(agent, operation).await;
+        }
         let pane = self.prompt_ledger(agent).await?;
         let operation = operation.unwrap_or(pane.ledger.sequence);
         if let Some(entry) = pane
@@ -230,6 +252,29 @@ impl Manager {
             return Ok(public);
         }
         self.retained_prompt(agent, operation).await
+    }
+
+    async fn core_prompt_receipt(
+        &self,
+        agent: &Agent,
+        operation: Option<u64>,
+    ) -> Result<Value, String> {
+        let mut store = self.operation_store().await?;
+        let next = store.prompt_next(&agent.run)?;
+        let operation = operation.unwrap_or_else(|| next.saturating_sub(1));
+        let expired =
+            "prompt receipt unavailable or expired; delivery must not be retried automatically";
+        if operation == 0 {
+            return Err(expired.into());
+        }
+        if let Some(record) = store.prompt_record(&agent.run, operation)? {
+            return Ok(core_public_record(&agent.run, operation, &record));
+        }
+        let record = store
+            .get(&explicit_key(&agent.run, operation))?
+            .filter(|record| record.state != operations::DISPATCHING)
+            .ok_or(expired)?;
+        Ok(core_public_record(&agent.run, operation, &record))
     }
 
     /// A record of the server's store, read without creating or
@@ -465,6 +510,11 @@ impl Manager {
                 "prompt_unsupported: {} drops the Enter sent right after a paste; nothing was sent",
                 agent.provider
             ));
+        }
+        if self.action_path().await? == ActionPath::CoreLedger {
+            return self
+                .deliver_core(agent, text, operation, queued, checkpoint)
+                .await;
         }
         let _lock = self.lock()?;
         let explicit = operation.is_some();
@@ -716,7 +766,7 @@ impl Manager {
                         .unwrap_or_else(|_| {
                             json!({"operation": operation, "run": agent.run, "stage": "delivered",
                                    "provider_accepted": false, "task_success": null,
-                                   "operation_key": ticket.key})
+                                   "operation_key": ticket.key, "path": "native_guard"})
                         }))
                 }
                 Ok(Guarded::Rejected) => {
@@ -748,6 +798,168 @@ impl Manager {
                 }
             };
         }
+    }
+
+    /// Core-path delivery sends the verified screen snapshot, durable intent,
+    /// staged input, and guarded commit through the coordinator. The option
+    /// ledger is never read on this path.
+    async fn deliver_core(
+        &self,
+        agent: &Agent,
+        text: &str,
+        operation: Option<u64>,
+        queued: Option<(i64, i64)>,
+        checkpoint: bool,
+    ) -> Result<Value, String> {
+        let digest = sha256(text);
+        // A killed coordinator leaves a dispatching SQLite record until its
+        // replacement connects to the core ledger. Let `ensure` run that
+        // startup reconciliation once before treating such a record as a
+        // prompt-unresolved refusal.
+        let mut ensured_dispatching = false;
+        loop {
+            let has_core_dispatching = {
+                let store = self.operation_store().await?;
+                store.list(true, 4096)?.iter().any(|record| {
+                    record.action == "prompt"
+                        && record.run.as_deref() == Some(agent.run.as_str())
+                        && record.state == operations::DISPATCHING
+                        && record
+                            .intent()
+                            .is_some_and(|intent| intent["path"] == "core_ledger")
+                })
+            };
+            if !has_core_dispatching || ensured_dispatching {
+                break;
+            }
+            self.ensure_core_coordinator().await?;
+            ensured_dispatching = true;
+        }
+        {
+            let mut store = self.operation_store().await?;
+            let next = store.prompt_next(&agent.run)?;
+            let slot = operation.unwrap_or(next);
+            if slot == 0 || slot > next {
+                return Err(format!("next prompt operation must be {next}"));
+            }
+            if slot < next {
+                let record = match store.prompt_record(&agent.run, slot)? {
+                    Some(record) => Some(record),
+                    // Receipt compaction drops the dispatch intent that maps
+                    // an explicit number to a slot. Native replay falls back
+                    // to this durable explicit key, so the core path must too.
+                    None if operation.is_some() => store
+                        .get(&explicit_key(&agent.run, slot))?
+                        .filter(|record| record.state != operations::DISPATCHING),
+                    None => None,
+                }
+                .ok_or(
+                    "outcome_unknown: prompt receipt expired; the operation will not be repeated",
+                )?;
+                if record.digest != digest {
+                    return Err("prompt operation was already used with different content".into());
+                }
+                return Ok(core_public_record(&agent.run, slot, &record));
+            }
+            if let Some(record) = store.prompt_record(&agent.run, slot)?
+                && matches!(
+                    record.state.as_str(),
+                    operations::DISPATCHING | operations::UNKNOWN
+                )
+            {
+                if record.digest != digest {
+                    return Err("prompt operation was already used with different content".into());
+                }
+                return Ok(core_public_record(&agent.run, slot, &record));
+            }
+            if store.prompt_unresolved(&agent.run)? {
+                return Err("a prompt delivery is unresolved; inspect its receipt and the native TUI before any new submission".into());
+            }
+        }
+
+        let current = self.get(&agent.pane_id).await?;
+        if current.run != agent.run
+            || current.boot != agent.boot
+            || current.generation != agent.generation
+            || current.session_id != agent.session_id
+            || current.revision != agent.revision
+        {
+            return Err(
+                "identity_mismatch: agent changed while preparing the prompt; inspect it again"
+                    .into(),
+            );
+        }
+        if current.state != "idle" || current.process != "running" {
+            return Err("prompt requires an idle, verified foreground agent; blocked, working and unknown states cannot receive a prompt".into());
+        }
+        // The second read is the one that established this call's idle
+        // judgment. Use all of its screen guards, not the caller's older
+        // snapshot, exactly as the native guarded path does.
+        let current_expected = super::core_action::prompt_expected(&current);
+        let needs_bracket = text.contains('\n') || text.contains('\t');
+        if needs_bracket
+            && self
+                .command(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &current.pane_id,
+                    "#{masil_bracketed_paste}",
+                ])
+                .await?
+                .trim()
+                != "1"
+        {
+            return Err(
+                "multiline prompt requires native bracketed paste; prepare a draft instead".into(),
+            );
+        }
+        self.core_prompt_sentinel(&current).await?;
+        let socket = self.native.socket.clone();
+        let params = json!({
+            "operation": "prompt",
+            "pane_id": current.pane_id,
+            "expected": current_expected,
+            "text": text,
+            "operation_id": operation,
+            "queued": queued.map(|(item, revision)| json!({"item": item, "revision": revision})),
+            "needs_bracket": needs_bracket,
+            "submit": "enter",
+            "checkpoint": checkpoint,
+        });
+        tokio::task::spawn_blocking(move || crate::coordinator::action(&socket, params))
+            .await
+            .map_err(|error| format!("coordinator_unavailable: {error}"))?
+    }
+
+    async fn ensure_core_coordinator(&self) -> Result<(), String> {
+        let socket = self.native.socket.clone();
+        tokio::task::spawn_blocking(move || crate::coordinator::ensure(&socket))
+            .await
+            .map_err(|error| format!("coordinator_unavailable: {error}"))?
+            .map(drop)
+    }
+
+    async fn core_prompt_sentinel(&self, agent: &Agent) -> Result<(), String> {
+        self.command(&[
+            "set-option",
+            "-p",
+            "-t",
+            &agent.pane_id,
+            OPTION,
+            CORE_LEDGER_SENTINEL,
+        ])
+        .await?;
+        self.command(&[
+            "set-option",
+            "-p",
+            "-t",
+            &agent.pane_id,
+            TICKETS,
+            CORE_LEDGER_SENTINEL,
+        ])
+        .await
+        .map(|_| ())
     }
 
     /// Judge one attempt from the pane. If its ticket is absent, a fence
@@ -816,6 +1028,30 @@ impl Manager {
         store: &mut Store,
         record: &Record,
     ) -> Result<Record, String> {
+        if record
+            .intent()
+            .is_some_and(|intent| intent["path"] == "core_ledger")
+        {
+            // A replacement coordinator lists retained entries and queries
+            // missing tickets as it starts. Let it settle any retained core
+            // result first.
+            self.ensure_core_coordinator().await?;
+            let current = store.get(&record.operation_key)?.ok_or_else(|| {
+                "operation disappeared during core ledger reconciliation".to_owned()
+            })?;
+            if current.state == operations::DISPATCHING && current.lease_until_ms <= now_ms() {
+                let current = store.resolve(
+                    &current,
+                    operations::UNKNOWN,
+                    "reconcile",
+                    Some(&json!({"path": "core_ledger", "reconciled": "receipt_unavailable"})),
+                    now_ms(),
+                )?;
+                store.note_prompt_result(&current)?;
+                return Ok(current);
+            }
+            return Ok(current);
+        }
         let now = now_ms();
         let agent = match self.get(&record.target).await {
             Ok(agent) if Some(&agent.run) == record.run.as_ref() => agent,
@@ -850,6 +1086,19 @@ impl Manager {
         record: &Record,
         delivered: bool,
     ) -> Result<Record, String> {
+        if record
+            .intent()
+            .is_some_and(|intent| intent["path"] == "core_ledger")
+        {
+            let state = if delivered {
+                "user_confirmed_delivered"
+            } else {
+                "user_confirmed_not_delivered"
+            };
+            let record = store.settle_unknown(record, state, "user", None, now_ms())?;
+            store.note_prompt_result(&record)?;
+            return Ok(record);
+        }
         let _lock = self.lock()?;
         let state = if delivered {
             "user_confirmed_delivered"
@@ -962,8 +1211,18 @@ mod tests {
         assert_eq!(
             pane.public(&pane.ledger.entries[0]),
             json!({"operation":1,"run":"r","stage":"pending","provider_accepted":false,
-                "task_success":null,"operation_key":"run:r/prompt/1"})
+                "task_success":null,"operation_key":"run:r/prompt/1","path":"native_guard"})
         );
+    }
+
+    #[test]
+    fn core_ledger_sentinel_is_corrupt_to_the_pre_c2_decoder() {
+        // Pre-C2 prompt delivery reads only `-receipts`; this is the sentinel
+        // that makes an old binary refuse the server instead of pasting from
+        // a stale pane ledger. `-tickets` is marked too for C2 bookkeeping,
+        // but it is not the compatibility fence.
+        assert!(decode::<Ledger>(CORE_LEDGER_SENTINEL).is_none());
+        assert!(decode::<Tickets>(CORE_LEDGER_SENTINEL).is_none());
     }
 
     #[test]
