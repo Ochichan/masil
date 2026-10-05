@@ -696,21 +696,25 @@ masil_action_parse_core_boot_id(yyjson_val *object, const char **boot_id,
 	    boot_id_length) == 0 && *boot_id_length != 0 ? 0 : -1);
 }
 
+/* The operation key components, in their stored order. */
+static const char *const masil_action_key_fields[] = {
+	"environment_id", "principal", "namespace_epoch", "namespace_nonce",
+	"operation_id"
+};
+
 static int
 masil_action_parse_operation_key(yyjson_val *value,
     struct masil_action_key *operation_key)
 {
-	static const char *const fields[] = {
-		"environment_id", "principal", "namespace_epoch",
-		"namespace_nonce", "operation_id"
-	};
 	const char *string;
 	size_t length, i, used = 0;
 
-	if (masil_action_schema(value, fields, nitems(fields)) != 0)
+	if (masil_action_schema(value, masil_action_key_fields,
+	    nitems(masil_action_key_fields)) != 0)
 		return (-1);
-	for (i = 0; i < nitems(fields); i++) {
-		if (masil_action_parse_string(value, fields[i], &string, &length) != 0 ||
+	for (i = 0; i < nitems(masil_action_key_fields); i++) {
+		if (masil_action_parse_string(value, masil_action_key_fields[i],
+		    &string, &length) != 0 ||
 		    length == 0 || length > UINT8_MAX ||
 		    used + 1 + length > sizeof operation_key->bytes)
 			return (-1);
@@ -1580,11 +1584,12 @@ masil_action_response_list(char *response, size_t response_size,
 	struct masil_action_json entry_json;
 	struct masil_action_ticket ticket;
 	const struct masil_action_slot *slot, *slots[MASIL_ACTION_SLOTS];
-	const unsigned char *operation_id;
+	const unsigned char *operation_id, *key_value;
 	unsigned char digest[32];
 	char entry[MASIL_ACTION_LIST_ENTRY_BYTES];
 	char key_digest[65], result_digest[65], result[128];
 	size_t operation_id_length, entries = 0, returned = 0, i, needed;
+	size_t component, key_value_length;
 	uint64_t next_seq = has_after_seq ? after_seq : 0;
 	int first = 1, truncated = 0;
 
@@ -1624,6 +1629,28 @@ masil_action_response_list(char *response, size_t response_size,
 		    operation_id_length);
 		masil_action_json_puts(&entry_json, ",\"operation_key_digest\":");
 		masil_action_json_quote(&entry_json, key_digest, strlen(key_digest));
+		/*
+		 * The whole key, so a coordinator that lost its record can still
+		 * retire the entry instead of leaving the slot pinned.
+		 */
+		masil_action_json_puts(&entry_json, ",\"operation_key\":{");
+		for (component = 0; component < nitems(masil_action_key_fields);
+		    component++) {
+			if (masil_action_slot_component(slot, component,
+			    &key_value, &key_value_length) != 0)
+				return (masil_action_response_error(response,
+				    response_size, request_id, request_id_length,
+				    "ledger_corrupt"));
+			if (component != 0)
+				masil_action_json_puts(&entry_json, ",");
+			masil_action_json_quote(&entry_json,
+			    masil_action_key_fields[component],
+			    strlen(masil_action_key_fields[component]));
+			masil_action_json_puts(&entry_json, ":");
+			masil_action_json_quote(&entry_json,
+			    (const char *)key_value, key_value_length);
+		}
+		masil_action_json_puts(&entry_json, "}");
 		masil_action_json_puts(&entry_json, ",\"payload_digest\":");
 		masil_action_json_quote(&entry_json, (const char *)slot->payload_digest,
 		    slot->payload_digest_length);
