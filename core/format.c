@@ -2419,6 +2419,16 @@ format_cb_masil_core_actions(__unused struct format_tree *ft)
 	return (xstrdup(masil_bridge_actions_supported() ? "1" : "0"));
 }
 
+/*
+ * masil: fixed for the boot like masil_core_actions. A core without it has no
+ * publish_summary request, so callers keep their option-based path.
+ */
+static void *
+format_cb_masil_core_summary(__unused struct format_tree *ft)
+{
+	return (xstrdup(masil_bridge_summary_supported() ? "1" : "0"));
+}
+
 /* masil: bridge endpoint, empty when bridge startup was disabled or failed. */
 static void *
 format_cb_masil_bridge_socket(__unused struct format_tree *ft)
@@ -3944,6 +3954,9 @@ static const struct format_table_entry format_table[] = {
 	{ "masil_core_boot_id", FORMAT_TABLE_STRING,
 	  format_cb_masil_core_boot_id
 	},
+	{ "masil_core_summary", FORMAT_TABLE_STRING,
+	  format_cb_masil_core_summary
+	},
 	{ "masil_foreground_pgid", FORMAT_TABLE_STRING,
 	  format_cb_masil_foreground_pgid
 	},
@@ -4832,6 +4845,12 @@ format_find(struct format_tree *ft, const char *key, uint64_t modifiers,
 	if (o != NULL) {
 		found = options_to_string(o, array_key, 1);
 		free(array_key);
+		goto found;
+	}
+
+	/* masil: #{masil_summary_<key>} reads the bridge cache, so no table entry. */
+	if (strncmp(key, "masil_summary_", 14) == 0) {
+		found = masil_bridge_summary_get(key + 14);
 		goto found;
 	}
 

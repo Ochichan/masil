@@ -1418,6 +1418,32 @@ options_user_option_referenced(const char *name)
 	return (0);
 }
 
+/*
+ * masil: whether a client's status line may mention name. This reuses the scan
+ * of every string and array option at global, session and window level, so an
+ * indirect reference through a user option or #{E:...} is found too. A client
+ * without a session cannot be decided and counts as a reference.
+ */
+int
+options_status_references(struct client *c, const char *name)
+{
+	struct session	*s = c->session;
+	struct winlink	*wl;
+
+	if (s == NULL)
+		return (1);
+	if (options_references(global_options, name) ||
+	    options_references(global_s_options, name) ||
+	    options_references(global_w_options, name) ||
+	    options_references(s->options, name))
+		return (1);
+	RB_FOREACH(wl, winlinks, &s->windows) {
+		if (options_references(wl->window->options, name))
+			return (1);
+	}
+	return (0);
+}
+
 void
 options_push_changes(const char *name)
 {

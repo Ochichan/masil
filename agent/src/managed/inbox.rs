@@ -416,19 +416,27 @@ pub(super) async fn set_enabled(manager: &Manager, enabled: bool) -> Result<Valu
     store.set_inbox_enabled(enabled)?;
     if !enabled {
         // The badge goes with the switch, even with no coordinator to clear
-        // it.
-        manager
-            .command(&[
-                "set-option",
-                "-gq",
-                "@masil-inbox",
-                "off",
-                ";",
-                "set-option",
-                "-gqu",
-                crate::coordinator::BADGE_OPTION,
-            ])
-            .await?;
+        // it. On a core with summaries the coordinator holds the badge as a
+        // summary that this process cannot clear, and it clears it when the
+        // reload below stops its watch; the option is not touched there.
+        if manager.summary_capable().await? {
+            manager
+                .command(&["set-option", "-gq", "@masil-inbox", "off"])
+                .await?;
+        } else {
+            manager
+                .command(&[
+                    "set-option",
+                    "-gq",
+                    "@masil-inbox",
+                    "off",
+                    ";",
+                    "set-option",
+                    "-gqu",
+                    crate::coordinator::BADGE_OPTION,
+                ])
+                .await?;
+        }
     }
     let socket = manager.native.socket.clone();
     let coordinator = tokio::task::spawn_blocking(move || {
@@ -579,26 +587,38 @@ pub(super) async fn command(manager: &Manager, args: &[String]) -> Result<Value,
             } else {
                 Some(0)
             };
-            let badge = manager
-                .command(&["show-options", "-gqv", crate::coordinator::BADGE_OPTION])
-                .await?
-                .trim()
-                .parse::<i64>()
-                .unwrap_or(0);
+            // A core with summaries shows the badge as a summary only the
+            // coordinator can publish, so a stale one is repaired by asking
+            // the coordinator to count again; the option is left alone.
+            let summary = manager.summary_capable().await?;
+            let shown = if summary {
+                manager
+                    .command(&["display-message", "-p", "#{masil_summary_inbox}"])
+                    .await?
+            } else {
+                manager
+                    .command(&["show-options", "-gqv", crate::coordinator::BADGE_OPTION])
+                    .await?
+            };
+            let badge = shown.trim().parse::<i64>().unwrap_or(0);
             let repair = unseen.filter(|unseen| *unseen != badge);
             if let Some(unseen) = repair {
-                let value = unseen.to_string();
-                let args: &[&str] = if unseen == 0 {
-                    &["set-option", "-gqu", crate::coordinator::BADGE_OPTION]
+                if summary {
+                    crate::coordinator::recount(&manager.native.socket);
                 } else {
-                    &[
-                        "set-option",
-                        "-gq",
-                        crate::coordinator::BADGE_OPTION,
-                        &value,
-                    ]
-                };
-                manager.command(args).await?;
+                    let value = unseen.to_string();
+                    let args: &[&str] = if unseen == 0 {
+                        &["set-option", "-gqu", crate::coordinator::BADGE_OPTION]
+                    } else {
+                        &[
+                            "set-option",
+                            "-gq",
+                            crate::coordinator::BADGE_OPTION,
+                            &value,
+                        ]
+                    };
+                    manager.command(args).await?;
+                }
             }
             let socket = manager.native.socket.clone();
             let coordinator =

@@ -40,6 +40,11 @@ const DEFAULT_IDLE: Duration = Duration::from_secs(600);
 const DEFAULT_WATCH: Duration = Duration::from_secs(2);
 /// The server option the status line shows the unseen inbox count from.
 pub(crate) const BADGE_OPTION: &str = "@masil-inbox-unseen";
+/// The summary key that carries the same count to a core that accepts
+/// summaries, in place of the option.
+pub(crate) const BADGE_SUMMARY: &str = "inbox";
+/// How long the one-shot badge clear waits for a running core action.
+const BADGE_CLEAR_WAIT: Duration = Duration::from_secs(5);
 /// The features the running coordinator serves, for session autosave to
 /// bring one back after it ends; unset when there are none.
 const WANTED_OPTION: &str = "@masil-coordinator-wanted";
@@ -1312,6 +1317,10 @@ fn serve_locked(
         let (listener, guard) = bind(&paths.listen)?;
         write_record(lock, &server, started)?;
         let action_locks = Arc::new(crate::managed::core_action::PaneActionLocks::default());
+        let actions = Arc::new(crate::managed::core_action::CoordinatorActions::new(
+            options.socket.clone(),
+            action_locks.clone(),
+        ));
         let shared = Arc::new(Shared {
             identity: json!({
                 "generation": GENERATION,
@@ -1326,13 +1335,11 @@ fn serve_locked(
             }),
             features: std::sync::Mutex::new(Vec::new()),
             control: Arc::new(crate::managed::resident::WatchControl {
-                action_locks: action_locks.clone(),
+                action_locks,
+                actions: Some(actions.clone()),
                 ..Default::default()
             }),
-            actions: Arc::new(crate::managed::core_action::CoordinatorActions::new(
-                options.socket.clone(),
-                action_locks,
-            )),
+            actions,
             reload: tokio::sync::Notify::new(),
             stop: Arc::new(tokio::sync::Notify::new()),
             last_active: Arc::new(std::sync::Mutex::new(Instant::now())),
@@ -1546,12 +1553,27 @@ async fn supervise(
             handle.abort();
             // A badge write in flight lands before the clear below.
             let _ = handle.await;
-            // The inbox went off: no badge for it.
-            let socket = socket.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                masil(&socket, &["set-option", "-gqu", BADGE_OPTION])
-            })
-            .await;
+            // The inbox went off: no badge for it. A core that takes
+            // summaries holds it as one, and the option stays unwritten. This
+            // clear is not retried, so it waits for a running action to
+            // release the connection. With no connection the core's cache is
+            // already empty.
+            let summary = match crate::managed::Manager::new(socket.clone(), None) {
+                Ok(manager) => manager.summary_capable().await.unwrap_or(false),
+                Err(_) => false,
+            };
+            if summary {
+                let _ = shared
+                    .actions
+                    .publish_summary_within(BADGE_SUMMARY, None, BADGE_CLEAR_WAIT)
+                    .await;
+            } else {
+                let socket = socket.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    masil(&socket, &["set-option", "-gqu", BADGE_OPTION])
+                })
+                .await;
+            }
         }
         if !exe_unchanged(&shared.identity["exe"]) {
             log(&log_path, "the masil-agent executable changed; exiting");

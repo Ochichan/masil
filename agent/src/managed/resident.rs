@@ -249,14 +249,18 @@ pub(crate) struct WatchControl {
     pub inbox_changed: Arc<Notify>,
     /// Per-pane action ownership shared with the core-ledger RPC.
     pub action_locks: Arc<super::core_action::PaneActionLocks>,
+    /// The core connection the badge publishes through when the core takes
+    /// summaries. None leaves the badge on its server option.
+    pub actions: Option<Arc<super::core_action::CoordinatorActions>>,
 }
 
 /// Consume both inbox-change sources every iteration. These must be separate
 /// swaps so a pending recount cannot leave a resident-store write behind.
-fn take_inbox_changes(control: &WatchControl, resident: Option<&Resident>) -> bool {
+/// Returns whether anything changed and whether a recount was requested.
+fn take_inbox_changes(control: &WatchControl, resident: Option<&Resident>) -> (bool, bool) {
     let recounted = control.recount.swap(false, Ordering::SeqCst);
     let resident_dirty = resident.is_some_and(Resident::take_inbox_dirty);
-    recounted || resident_dirty
+    (recounted || resident_dirty, recounted)
 }
 
 /// A bounded reconnect schedule for bridge setup failures. The resident
@@ -898,7 +902,7 @@ pub(crate) async fn watch(
     let mut busy = false;
     let mut absent: HashMap<String, u64> = HashMap::new();
     let mut stood_back = 0;
-    let mut badge = Badge::read(&manager).await;
+    let mut badge = Badge::read(&manager, control.actions.clone()).await;
     let mut first = true;
     // `--answers` OpenCode runs: their tasks read the servers, this loop
     // writes what they find (observe.rs).
@@ -1042,7 +1046,10 @@ pub(crate) async fn watch(
             reports.flush(&manager, observer).await;
         }
         let poked = control.poked.swap(false, Ordering::SeqCst);
-        let inbox_changed = take_inbox_changes(&control, manager.resident.as_ref());
+        let (inbox_changed, recounted) = take_inbox_changes(&control, manager.resident.as_ref());
+        if recounted {
+            badge.recount_requested();
+        }
         force_pass |= poked;
         // `agent prompt` pokes once it has delivered.
         reports.accept(&manager, poked || inbox_changed).await;
@@ -1819,34 +1826,84 @@ async fn record_outcome(
         .map(drop)
 }
 
-/// The status-line badge: the unseen count in a server option, written
-/// only when it changes and at most once a second, since every option write
-/// redraws every client.
+/// The status-line badge: the unseen count, written only when it changes and
+/// at most once a second. On a core that takes summaries it is published as
+/// the `inbox` summary and the option is never written, even while the
+/// connection is down; otherwise it is a server option, and every option
+/// write redraws every client that shows it.
 struct Badge {
     /// The value the server shows; None when unknown.
     shown: Option<i64>,
-    /// A value waiting for the once-a-second limit.
+    /// A change not yet written because of the gap.
     pending: Option<i64>,
     last_write: u64,
     counted: u64,
     reread_at: u64,
+    /// Whether the core takes summaries; None until the server answers.
+    summary: Option<bool>,
+    /// The core connection that publishes summaries, if this process has one.
+    actions: Option<Arc<super::core_action::CoordinatorActions>>,
+    /// The epoch of the connection the summary lives on, None while there is
+    /// none. A new connection starts with an empty core cache.
+    path_epoch: Option<u64>,
+    /// When a reconnect was last started, so a down connection is retried at
+    /// most once per BADGE_RECONNECT_MS.
+    reconnect_at: u64,
 }
 
 const BADGE_GAP_MS: u64 = 1_000;
+const BADGE_RECONNECT_MS: u64 = 5_000;
 
 impl Badge {
-    async fn read(manager: &Manager) -> Self {
-        let shown = manager
-            .command(&["show-options", "-gqv", crate::coordinator::BADGE_OPTION])
-            .await
-            .ok()
-            .map(|text| text.trim().parse::<i64>().unwrap_or(0));
-        Self {
-            shown,
+    async fn read(
+        manager: &Manager,
+        actions: Option<Arc<super::core_action::CoordinatorActions>>,
+    ) -> Self {
+        let summary = manager.summary_capable().await.ok();
+        let path_epoch = actions.as_ref().and_then(|actions| actions.summary_epoch());
+        let mut badge = Self {
+            shown: None,
             pending: None,
             last_write: 0,
             counted: 0,
             reread_at: 0,
+            summary,
+            actions,
+            path_epoch,
+            reconnect_at: 0,
+        };
+        match summary {
+            Some(true) => {
+                // A core with summaries starts empty; the first count publishes.
+                if path_epoch.is_some() {
+                    badge.retire_option(manager).await;
+                }
+            }
+            Some(false) => badge.shown = badge.read_option(manager).await,
+            None => {}
+        }
+        badge
+    }
+
+    async fn read_option(&self, manager: &Manager) -> Option<i64> {
+        manager
+            .command(&["show-options", "-gqv", crate::coordinator::BADGE_OPTION])
+            .await
+            .ok()
+            .map(|text| text.trim().parse::<i64>().unwrap_or(0))
+    }
+
+    /// Removes a count an earlier process left in the option, once, so the
+    /// summary is the only badge.
+    async fn retire_option(&self, manager: &Manager) {
+        if self
+            .read_option(manager)
+            .await
+            .is_some_and(|value| value != 0)
+        {
+            let _ = manager
+                .command(&["set-option", "-gqu", crate::coordinator::BADGE_OPTION])
+                .await;
         }
     }
 
@@ -1874,25 +1931,85 @@ impl Badge {
     }
 
     /// Reads the shown value again: another process (`inbox status`, a
-    /// stale coordinator) may have changed it.
+    /// stale coordinator) may have changed it. A summary has no other writer,
+    /// so it is published again at the next count, which also finds a
+    /// connection that died unnoticed.
     async fn reread(&mut self, manager: &Manager) {
-        if let Ok(text) = manager
-            .command(&["show-options", "-gqv", crate::coordinator::BADGE_OPTION])
-            .await
-        {
-            self.shown = Some(text.trim().parse::<i64>().unwrap_or(0));
+        match self.summary {
+            Some(true) => self.shown = None,
+            Some(false) => {
+                if let Some(shown) = self.read_option(manager).await {
+                    self.shown = Some(shown);
+                }
+            }
+            None => {}
         }
     }
 
-    async fn update(&mut self, manager: &Manager, count: i64, now: u64) {
-        if self.shown == Some(count) {
-            self.pending = None;
+    /// A recount request (`inbox status`) on a summary core publishes the
+    /// value again: the core cache may be empty after an idle disconnect
+    /// while `shown` still matches. The core answers `changed: false`
+    /// without a redraw when it already holds the value.
+    fn recount_requested(&mut self) {
+        if self.summary == Some(true) {
+            self.shown = None;
+        }
+    }
+
+    /// Learns which path this server is on, and on a summary core notices a
+    /// new connection, whose core cache has none of the old values.
+    async fn follow_path(&mut self, manager: &Manager) {
+        if self.summary.is_none() {
+            self.summary = manager.summary_capable().await.ok();
+        }
+        if self.summary != Some(true) {
             return;
         }
-        if now.saturating_sub(self.last_write) < BADGE_GAP_MS {
-            self.pending = Some(count);
+        let current = self
+            .actions
+            .as_ref()
+            .and_then(|actions| actions.summary_epoch());
+        if current == self.path_epoch {
             return;
         }
+        self.path_epoch = current;
+        self.shown = None;
+        if current.is_some() {
+            self.retire_option(manager).await;
+        }
+    }
+
+    /// Publishes the count; a zero count clears the summary. Without a live
+    /// connection the value stays pending and a reconnect starts, but the
+    /// option is not written in its place.
+    async fn publish(&mut self, count: i64, now: u64) -> bool {
+        let Some(actions) = &self.actions else {
+            return false;
+        };
+        let value = (count != 0).then_some(count);
+        match actions
+            .publish_summary(crate::coordinator::BADGE_SUMMARY, value)
+            .await
+        {
+            super::core_action::SummaryPublish::Published(epoch) => {
+                self.path_epoch = Some(epoch);
+                true
+            }
+            super::core_action::SummaryPublish::Disconnected => {
+                if now.saturating_sub(self.reconnect_at) >= BADGE_RECONNECT_MS {
+                    self.reconnect_at = now;
+                    let actions = Arc::clone(actions);
+                    tokio::spawn(async move { actions.reconnect().await });
+                }
+                // The core empties its cache when the connection closes, so
+                // a clear is already what it shows.
+                value.is_none()
+            }
+            _ => false,
+        }
+    }
+
+    async fn write_option(&self, manager: &Manager, count: i64) -> bool {
         let value = count.to_string();
         let args: &[&str] = if count == 0 {
             &["set-option", "-gqu", crate::coordinator::BADGE_OPTION]
@@ -1904,9 +2021,33 @@ impl Badge {
                 &value,
             ]
         };
+        manager.command(args).await.is_ok()
+    }
+
+    async fn update(&mut self, manager: &Manager, count: i64, now: u64) {
+        self.follow_path(manager).await;
+        if self.summary.is_none() {
+            // The path is unknown, so neither one is written yet.
+            self.last_write = now;
+            self.pending = Some(count);
+            return;
+        }
+        if self.shown == Some(count) {
+            self.pending = None;
+            return;
+        }
+        if now.saturating_sub(self.last_write) < BADGE_GAP_MS {
+            self.pending = Some(count);
+            return;
+        }
         // A failed write is retried after a gap, never in a tight loop.
         self.last_write = now;
-        if manager.command(args).await.is_ok() {
+        let written = if self.summary == Some(true) {
+            self.publish(count, now).await
+        } else {
+            self.write_option(manager, count).await
+        };
+        if written {
             self.shown = Some(count);
             self.pending = None;
         } else {
@@ -1915,10 +2056,19 @@ impl Badge {
     }
 
     async fn clear(&mut self, manager: &Manager) {
-        if self.shown != Some(0) {
-            let _ = manager
-                .command(&["set-option", "-gqu", crate::coordinator::BADGE_OPTION])
-                .await;
+        match self.summary {
+            Some(true) => {
+                // The option is not this badge's on a core with summaries.
+                if self.shown != Some(0) && self.path_epoch.is_some() {
+                    self.publish(0, now_ms()).await;
+                }
+            }
+            Some(false) if self.shown != Some(0) => {
+                let _ = manager
+                    .command(&["set-option", "-gqu", crate::coordinator::BADGE_OPTION])
+                    .await;
+            }
+            Some(false) | None => {}
         }
     }
 }
@@ -2429,12 +2579,56 @@ mod tests {
         );
         resident.mark_inbox_dirty();
         control.recount.store(true, Ordering::SeqCst);
-        assert!(take_inbox_changes(&control, Some(&resident)));
-        assert!(!take_inbox_changes(&control, Some(&resident)));
+        assert_eq!(take_inbox_changes(&control, Some(&resident)), (true, true));
+        assert_eq!(
+            take_inbox_changes(&control, Some(&resident)),
+            (false, false)
+        );
 
         resident.mark_inbox_dirty();
-        assert!(take_inbox_changes(&control, Some(&resident)));
-        assert!(!take_inbox_changes(&control, Some(&resident)));
+        assert_eq!(take_inbox_changes(&control, Some(&resident)), (true, false));
+        assert_eq!(
+            take_inbox_changes(&control, Some(&resident)),
+            (false, false)
+        );
+    }
+
+    fn test_badge(
+        summary: Option<bool>,
+        actions: Option<Arc<super::super::core_action::CoordinatorActions>>,
+    ) -> Badge {
+        Badge {
+            shown: Some(3),
+            pending: None,
+            last_write: 0,
+            counted: 0,
+            reread_at: 0,
+            summary,
+            actions,
+            path_epoch: None,
+            reconnect_at: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn a_recount_request_forgets_the_shown_value_on_a_summary_core_only() {
+        let mut badge = test_badge(Some(true), None);
+        badge.recount_requested();
+        assert_eq!(badge.shown, None);
+        let mut badge = test_badge(Some(false), None);
+        badge.recount_requested();
+        assert_eq!(badge.shown, Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_clear_without_a_connection_counts_as_written_but_a_count_does_not() {
+        let actions = Arc::new(super::super::core_action::CoordinatorActions::new(
+            std::path::PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(super::super::core_action::PaneActionLocks::default()),
+        ));
+        let mut badge = test_badge(Some(true), Some(actions));
+        assert!(badge.publish(0, 0).await);
+        assert!(!badge.publish(2, 0).await);
     }
 
     #[test]

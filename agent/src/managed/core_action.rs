@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -27,6 +27,9 @@ const RESPONSE_FRAME: usize = 64 * 1024;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const BUSY_ATTEMPTS: usize = 5;
 const INTERRUPT_INTER_KEY_PAUSE: Duration = Duration::from_millis(300);
+/// An idle coordinator connection sends a heartbeat this often. The core
+/// treats its summaries as stale after 90 seconds without any request.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// A missing child status is reconciled through the pane registration path.
 /// Keep this decisively below the control-socket launch budget so the caller
 /// receives that reconciliation rather than timing out first.
@@ -437,6 +440,8 @@ pub(crate) struct Client {
     input: bool,
     launch: bool,
     focus: bool,
+    summary: bool,
+    summary_revision: u64,
     next_seq: u64,
     request_number: u64,
     broken: bool,
@@ -462,7 +467,7 @@ impl Client {
         )
         .await?;
         let hello = read_value(&mut stream, false).await?;
-        let (epoch, input, launch, focus) = parse_hello(&hello, hello_id, endpoint)?;
+        let (epoch, input, launch, focus, summary) = parse_hello(&hello, hello_id, endpoint)?;
         let (read, write) = stream.into_split();
         let (requests, received_requests) = mpsc::channel(1);
         let (frames, received_frames) = mpsc::unbounded_channel();
@@ -476,6 +481,7 @@ impl Client {
             launch_events,
             Arc::clone(&focus_router),
             endpoint.core_boot_id.clone(),
+            summary.then_some(HEARTBEAT_INTERVAL),
         ));
         Ok(Self {
             requests,
@@ -486,6 +492,8 @@ impl Client {
             input,
             launch,
             focus,
+            summary,
+            summary_revision: 0,
             next_seq: 0,
             request_number: 0,
             broken: false,
@@ -508,6 +516,10 @@ impl Client {
 
     pub(crate) const fn supports_focus(&self) -> bool {
         self.focus
+    }
+
+    pub(crate) const fn supports_summary(&self) -> bool {
+        self.summary
     }
 
     pub(crate) fn core_boot_id(&self) -> &str {
@@ -677,6 +689,33 @@ impl Client {
             return Ok(());
         }
         Err(Error::Protocol("invalid retire response".into()))
+    }
+
+    /// Publishes one status summary value, or clears the key when `value` is
+    /// None. Revisions rise with every request on this connection, so a
+    /// later value always wins at the core. Returns whether the core's
+    /// stored value changed.
+    pub(crate) async fn publish_summary(
+        &mut self,
+        key: &str,
+        value: Option<i64>,
+    ) -> Result<bool, Error> {
+        if !self.summary {
+            return Err(Error::Unavailable(
+                "the core does not support status summaries".into(),
+            ));
+        }
+        self.summary_revision = self
+            .summary_revision
+            .checked_add(1)
+            .ok_or_else(|| Error::Protocol("summary revision exhausted".into()))?;
+        let reply = self
+            .call_with_busy(
+                "publish_summary",
+                summary_fields(key, value, self.summary_revision),
+            )
+            .await?;
+        parse_summary_reply(&reply)
     }
 
     pub(crate) async fn ledger_query(
@@ -1033,6 +1072,7 @@ async fn writer_task(
     launch_events: mpsc::UnboundedSender<Result<bridge::CoordinatorFrame, Error>>,
     focus_router: Arc<FocusRouter>,
     core_boot_id: String,
+    heartbeat: Option<Duration>,
 ) {
     writer_loop(
         write,
@@ -1041,6 +1081,7 @@ async fn writer_task(
         launch_events,
         &focus_router,
         core_boot_id,
+        heartbeat,
     )
     .await;
     // However the loop ended, no further focus frame can arrive.
@@ -1054,14 +1095,20 @@ async fn writer_loop(
     launch_events: mpsc::UnboundedSender<Result<bridge::CoordinatorFrame, Error>>,
     focus_router: &FocusRouter,
     core_boot_id: String,
+    heartbeat: Option<Duration>,
 ) {
     let mut active: Option<WireRequest> = None;
     let mut requests_open = true;
     let mut last_launch_sequence = 0;
+    // Any request keeps the core's summaries live, so the heartbeat counts
+    // from the last write and only an idle connection sends one.
+    let mut last_write = tokio::time::Instant::now();
+    let mut heartbeats = 0_u64;
     loop {
         if !requests_open && active.is_none() {
             return;
         }
+        let heartbeat_due = heartbeat.map(|every| last_write + every);
         tokio::select! {
             request = requests.recv(), if requests_open && active.is_none() => {
                 let Some(request) = request else {
@@ -1069,7 +1116,10 @@ async fn writer_loop(
                     continue;
                 };
                 match write_value(&mut write, &request.value).await {
-                    Ok(()) => active = Some(request),
+                    Ok(()) => {
+                        last_write = tokio::time::Instant::now();
+                        active = Some(request);
+                    }
                     Err(error) => {
                         let _ = request.reply.send(Err(error.clone()));
                         while let Ok(waiting) = requests.try_recv() {
@@ -1080,6 +1130,30 @@ async fn writer_loop(
                         return;
                     }
                 }
+            }
+            () = async {
+                match heartbeat_due {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            }, if active.is_none() => {
+                // The answer is read like any other and its sender is gone,
+                // so nobody waits on it; an action queues behind it.
+                heartbeats += 1;
+                let request_id = format!("core-heartbeat-{heartbeats}");
+                let value = json!({"v": 1, "kind": "heartbeat", "request_id": request_id});
+                let (reply, _answer) = oneshot::channel();
+                last_write = tokio::time::Instant::now();
+                if let Err(error) = write_value(&mut write, &value).await {
+                    let _ = launch_events.send(Err(error));
+                    while let Ok(waiting) = requests.try_recv() {
+                        let _ = waiting.reply.send(Err(Error::Lost(
+                            "the coordinator bridge connection ended".into(),
+                        )));
+                    }
+                    return;
+                }
+                active = Some(WireRequest { value, request_id, reply });
             }
             frame = frames.recv() => {
                 let result = match frame {
@@ -1384,7 +1458,7 @@ fn parse_hello(
     value: &Value,
     request_id: &str,
     endpoint: &Endpoint,
-) -> Result<(u64, bool, bool, bool), Error> {
+) -> Result<(u64, bool, bool, bool, bool), Error> {
     if let Some(error) = parse_error(value, request_id)? {
         if matches!(&error, Error::Rejected { code, .. } if code == "epoch_exhausted") {
             return Err(Error::Unavailable(
@@ -1418,6 +1492,7 @@ fn parse_hello(
         capabilities.get("input").and_then(Value::as_bool) == Some(true),
         capabilities.get("launch").and_then(Value::as_bool) == Some(true),
         capabilities.get("focus").and_then(Value::as_bool) == Some(true),
+        capabilities.get("summary").and_then(Value::as_bool) == Some(true),
     ))
 }
 
@@ -1447,6 +1522,37 @@ fn parse_error(value: &Value, request_id: &str) -> Result<Option<Error>, Error> 
         code: code.into(),
         message: message.into(),
     }))
+}
+
+/// The request fields of `publish_summary`. A zero count is a clear, which
+/// the core takes as a null value.
+fn summary_fields(key: &str, value: Option<i64>, revision: u64) -> Value {
+    json!({
+        "key": key,
+        "value": value,
+        "revision": revision,
+    })
+}
+
+fn parse_summary_reply(value: &Value) -> Result<bool, Error> {
+    let request_id = response_id(value)
+        .ok_or_else(|| Error::Protocol("summary response has no request_id".into()))?;
+    if let Some(error) = parse_error(value, &request_id)? {
+        return Err(error);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Protocol("summary response is not an object".into()))?;
+    if object.get("v").and_then(Value::as_u64) != Some(1)
+        || object.get("kind").and_then(Value::as_str) != Some("publish_summary")
+        || object.get("result").and_then(Value::as_str) != Some("ok")
+    {
+        return Err(Error::Protocol("invalid summary response".into()));
+    }
+    object
+        .get("changed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| Error::Protocol("summary response has no changed flag".into()))
 }
 
 fn parse_ledger_reply(
@@ -1915,6 +2021,41 @@ pub(crate) struct CoordinatorActions {
     active: AtomicUsize,
     idle: Notify,
     status: Mutex<ActionStatus>,
+    /// The dispatch epoch of the live connection while the core accepts
+    /// summaries on it, else 0. Read without the client lock, so the badge
+    /// never waits behind an action to learn which path it is on.
+    summary_epoch: AtomicU64,
+    /// Set when a background reconnect succeeded; the next focus consumes it
+    /// because its revision may predate the connection.
+    fresh_baseline: AtomicBool,
+    /// Consecutive failed background reconnects and when the next may start.
+    reconnect_backoff: Mutex<ReconnectBackoff>,
+}
+
+/// Failed-reconnect bookkeeping: 5 s, 10 s, 20 s ... capped at 60 s.
+#[derive(Debug, Default)]
+struct ReconnectBackoff {
+    failures: u32,
+    not_before: Option<std::time::Instant>,
+}
+
+fn reconnect_delay(failures: u32) -> Duration {
+    let seconds = 5u64.saturating_mul(1u64 << failures.saturating_sub(1).min(4));
+    Duration::from_secs(seconds.min(60))
+}
+
+/// What `CoordinatorActions::publish_summary` did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SummaryPublish {
+    /// The core took the value on the connection with this epoch.
+    Published(u64),
+    /// The core on the live connection does not accept summaries, or the
+    /// coordinator is stopping.
+    Unsupported,
+    /// There is no live connection; a reconnect has to come first.
+    Disconnected,
+    /// The attempt failed or found the connection in use; try again later.
+    Failed(String),
 }
 
 impl CoordinatorActions {
@@ -1932,7 +2073,120 @@ impl CoordinatorActions {
                 detail: None,
                 epoch: None,
             }),
+            summary_epoch: AtomicU64::new(0),
+            fresh_baseline: AtomicBool::new(false),
+            reconnect_backoff: Mutex::new(ReconnectBackoff::default()),
         }
+    }
+
+    /// The epoch of the connection summaries go to, None when the core has
+    /// no live connection that accepts them.
+    pub(crate) fn summary_epoch(&self) -> Option<u64> {
+        match self.summary_epoch.load(Ordering::SeqCst) {
+            0 => None,
+            epoch => Some(epoch),
+        }
+    }
+
+    /// Publishes a status summary on the action connection, or clears the
+    /// key when `value` is None. It never waits for an action: while one
+    /// holds the connection the caller is told to retry, and the action's own
+    /// requests keep the core's summaries live meanwhile.
+    pub(crate) async fn publish_summary(&self, key: &str, value: Option<i64>) -> SummaryPublish {
+        if self.stopping.load(Ordering::SeqCst) {
+            return SummaryPublish::Unsupported;
+        }
+        let Ok(client) = self.client.try_lock() else {
+            return SummaryPublish::Failed("a core action holds the connection".into());
+        };
+        self.publish_locked(client, key, value).await
+    }
+
+    /// Like `publish_summary`, for a one-shot publish that nobody retries: it
+    /// waits up to `wait` for an action to release the connection.
+    pub(crate) async fn publish_summary_within(
+        &self,
+        key: &str,
+        value: Option<i64>,
+        wait: Duration,
+    ) -> SummaryPublish {
+        if self.stopping.load(Ordering::SeqCst) {
+            return SummaryPublish::Unsupported;
+        }
+        let Ok(client) = tokio::time::timeout(wait, self.client.lock()).await else {
+            return SummaryPublish::Failed("a core action holds the connection".into());
+        };
+        self.publish_locked(client, key, value).await
+    }
+
+    async fn publish_locked(
+        &self,
+        mut client: tokio::sync::MutexGuard<'_, Option<Client>>,
+        key: &str,
+        value: Option<i64>,
+    ) -> SummaryPublish {
+        let Some(core) = client.as_mut() else {
+            return SummaryPublish::Disconnected;
+        };
+        if core.is_broken() {
+            // As `execute` does: the next connect replaces it.
+            client.take();
+            self.summary_epoch.store(0, Ordering::SeqCst);
+            self.unavailable("the coordinator bridge connection ended");
+            return SummaryPublish::Disconnected;
+        }
+        if !core.supports_summary() {
+            return SummaryPublish::Unsupported;
+        }
+        match core.publish_summary(key, value).await {
+            Ok(_) => SummaryPublish::Published(core.epoch()),
+            Err(error) => SummaryPublish::Failed(error.to_string()),
+        }
+    }
+
+    /// Connects again after the connection was lost, for a caller that needs
+    /// it without an action. It does nothing while an action runs (that
+    /// action connects itself), while stopping, or while a connection lives.
+    pub(crate) async fn reconnect(&self) {
+        let Ok(_serial) = self.serial.try_lock() else {
+            return;
+        };
+        if self.stopping.load(Ordering::SeqCst) || self.client.lock().await.is_some() {
+            return;
+        }
+        if let Ok(backoff) = self.reconnect_backoff.lock()
+            && backoff
+                .not_before
+                .is_some_and(|at| std::time::Instant::now() < at)
+        {
+            return;
+        }
+        let Ok(manager) = Manager::new(self.socket.clone(), None) else {
+            return;
+        };
+        // No SIGUSR1 nudge: a background retry must not poke the server.
+        match self.connect_once(&manager).await {
+            Ok(()) => {
+                self.fresh_baseline.store(true, Ordering::SeqCst);
+                if let Ok(mut backoff) = self.reconnect_backoff.lock() {
+                    *backoff = ReconnectBackoff::default();
+                }
+            }
+            Err(error) => {
+                if let Ok(mut backoff) = self.reconnect_backoff.lock() {
+                    backoff.failures = backoff.failures.saturating_add(1);
+                    backoff.not_before =
+                        Some(std::time::Instant::now() + reconnect_delay(backoff.failures));
+                }
+                self.unavailable(&error);
+            }
+        }
+    }
+
+    /// Consumes the fresh-baseline mark, for a focus only.
+    fn take_fresh_baseline(&self, action: &ControlAction) -> bool {
+        matches!(action, ControlAction::Focus(_))
+            && self.fresh_baseline.swap(false, Ordering::SeqCst)
     }
 
     /// Starts the dedicated connection early when this boot selected the core
@@ -1942,10 +2196,11 @@ impl CoordinatorActions {
         let Ok(manager) = Manager::new(self.socket.clone(), None) else {
             return;
         };
-        if !matches!(
+        let actions = matches!(
             manager.action_path().await,
             Ok(super::ActionPath::CoreLedger)
-        ) {
+        );
+        if !actions && !matches!(manager.summary_capable().await, Ok(true)) {
             return;
         }
         if let Err(error) = self.connect(&manager).await {
@@ -1977,6 +2232,7 @@ impl CoordinatorActions {
             self.idle.notified().await;
         }
         self.client.lock().await.take();
+        self.summary_epoch.store(0, Ordering::SeqCst);
     }
 
     pub(crate) async fn execute(&self, params: &Value) -> Result<Value, String> {
@@ -2008,7 +2264,9 @@ impl CoordinatorActions {
         // The core tracks client views only while this bridge connection
         // exists, and a fresh connection sets a new baseline without bumping
         // revisions, so a revision read before the connect cannot be trusted.
-        if connect_needed && matches!(action, ControlAction::Focus(_)) {
+        // A background reconnect left the same gap; only a focus consumes it.
+        let fresh = self.take_fresh_baseline(&action);
+        if matches!(action, ControlAction::Focus(_)) && (fresh || connect_needed) {
             return Err(RECONNECT_VIEW_CHANGED.into());
         }
         let mut client = self.client.lock().await;
@@ -2090,6 +2348,7 @@ impl CoordinatorActions {
         let old_boot = core.core_boot_id().to_owned();
         if core.is_broken() || boot_mismatch {
             client.take();
+            self.summary_epoch.store(0, Ordering::SeqCst);
             self.unavailable(if boot_mismatch {
                 "the native server restarted while a core action was in flight"
             } else {
@@ -2178,7 +2437,13 @@ impl CoordinatorActions {
             status.detail = None;
             status.epoch = Some(core.epoch());
         }
+        let epoch = if core.supports_summary() {
+            core.epoch()
+        } else {
+            0
+        };
         *self.client.lock().await = Some(core);
+        self.summary_epoch.store(epoch, Ordering::SeqCst);
         Ok(())
     }
 
@@ -6106,6 +6371,8 @@ mod tests {
             input: true,
             launch: true,
             focus: true,
+            summary: true,
+            summary_revision: 0,
             next_seq: 5,
             request_number: 0,
             broken: false,
@@ -6125,6 +6392,44 @@ mod tests {
             "pty_generation": "2",
             "restore_zoom": {"window_id": "@4", "pane_id": "%1", "pty_generation": "3"},
         })
+    }
+
+    #[test]
+    fn reconnect_delay_doubles_from_five_seconds_to_a_sixty_second_cap() {
+        let seconds: Vec<u64> = (1..=8).map(|n| reconnect_delay(n).as_secs()).collect();
+        assert_eq!(seconds, [5, 10, 20, 40, 60, 60, 60, 60]);
+        assert_eq!(reconnect_delay(u32::MAX).as_secs(), 60);
+    }
+
+    #[test]
+    fn only_a_focus_consumes_the_fresh_baseline() {
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        actions.fresh_baseline.store(true, Ordering::SeqCst);
+        let focus = ControlAction::parse(&focus_params()).unwrap();
+        let other = ControlAction::Close {
+            pane: "%1".into(),
+            expected: Expected {
+                pane: "%1".into(),
+                boot: "boot".into(),
+                generation: "1".into(),
+                run: "run".into(),
+                meta_digest: "digest".into(),
+                tracked_digest: None,
+                foreground_pgid: "1".into(),
+                process_epoch: None,
+                output_generation: None,
+                title: None,
+                progress: None,
+            },
+            operation: None,
+        };
+        assert!(!actions.take_fresh_baseline(&other));
+        assert!(actions.fresh_baseline.load(Ordering::SeqCst));
+        assert!(actions.take_fresh_baseline(&focus));
+        assert!(!actions.take_fresh_baseline(&focus));
     }
 
     #[test]
@@ -6308,13 +6613,193 @@ mod tests {
         });
         assert_eq!(
             parse_hello(&hello, "h", &endpoint).unwrap(),
-            (3, true, true, false)
+            (3, true, true, false, false)
         );
         hello["capabilities"]["focus"] = json!(true);
         assert_eq!(
             parse_hello(&hello, "h", &endpoint).unwrap(),
-            (3, true, true, true)
+            (3, true, true, true, false)
         );
+        hello["capabilities"]["summary"] = json!(true);
+        assert_eq!(
+            parse_hello(&hello, "h", &endpoint).unwrap(),
+            (3, true, true, true, true)
+        );
+    }
+
+    #[test]
+    fn summary_requests_clear_with_null_and_parse_the_core_answer() {
+        assert_eq!(
+            summary_fields("inbox", Some(3), 7),
+            json!({"key": "inbox", "value": 3, "revision": 7})
+        );
+        assert_eq!(
+            summary_fields("inbox", None, 8),
+            json!({"key": "inbox", "value": null, "revision": 8})
+        );
+        let answer = |changed: Value| {
+            json!({
+                "v": 1,
+                "kind": "publish_summary",
+                "request_id": "core-action-4",
+                "result": "ok",
+                "changed": changed,
+            })
+        };
+        assert!(parse_summary_reply(&answer(json!(true))).unwrap());
+        assert!(!parse_summary_reply(&answer(json!(false))).unwrap());
+        assert!(parse_summary_reply(&answer(json!("yes"))).is_err());
+        let rejected = json!({
+            "v": 1,
+            "kind": "error",
+            "request_id": "core-action-4",
+            "code": "stale_revision",
+            "message": "revision must exceed the last one for this key",
+        });
+        assert_eq!(
+            parse_summary_reply(&rejected).unwrap_err().rejected_code(),
+            Some("stale_revision")
+        );
+        let mut wrong = answer(json!(true));
+        wrong["kind"] = json!("heartbeat");
+        assert!(parse_summary_reply(&wrong).is_err());
+    }
+
+    #[tokio::test]
+    async fn publishing_without_the_capability_is_refused_before_any_request() {
+        let (mut client, _frames) = test_client();
+        client.summary = false;
+        assert!(matches!(
+            client.publish_summary("inbox", Some(1)).await,
+            Err(Error::Unavailable(_))
+        ));
+        assert_eq!(client.summary_revision, 0);
+    }
+
+    /// A writer over a socket pair; `far` is the fake core's end.
+    struct HeartbeatWriter {
+        far: tokio::net::UnixStream,
+        requests: mpsc::Sender<WireRequest>,
+        answers: mpsc::UnboundedSender<Result<Value, Error>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn heartbeat_writer(every: Option<Duration>) -> HeartbeatWriter {
+        let (near, far) = tokio::net::UnixStream::pair().unwrap();
+        let (_read, write) = near.into_split();
+        let (requests, received) = mpsc::channel(1);
+        let (answers, frames) = mpsc::unbounded_channel();
+        let (launch_events, _launch) = mpsc::unbounded_channel();
+        let task = tokio::spawn(writer_task(
+            write,
+            received,
+            frames,
+            launch_events,
+            Arc::new(FocusRouter::default()),
+            "boot".into(),
+            every,
+        ));
+        HeartbeatWriter {
+            far,
+            requests,
+            answers,
+            task,
+        }
+    }
+
+    async fn next_frame(far: &mut tokio::net::UnixStream) -> Option<Value> {
+        tokio::time::timeout(Duration::from_millis(1_500), read_value(far, false))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_sends_heartbeats_one_at_a_time() {
+        let HeartbeatWriter {
+            mut far,
+            requests: _requests,
+            answers,
+            task: writer,
+        } = heartbeat_writer(Some(Duration::from_millis(50)));
+        let first = next_frame(&mut far).await.expect("a heartbeat");
+        assert_eq!(first["kind"], "heartbeat");
+        assert_eq!(first["v"], 1);
+        let id = first["request_id"].as_str().unwrap().to_owned();
+        assert!(id.starts_with("core-heartbeat-"));
+        // Unanswered, no second one goes out.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), read_value(&mut far, false))
+                .await
+                .is_err()
+        );
+        answers
+            .send(Ok(
+                json!({"v": 1, "kind": "heartbeat", "request_id": id, "result": "ok"}),
+            ))
+            .unwrap();
+        let second = next_frame(&mut far).await.expect("a second heartbeat");
+        assert_eq!(second["kind"], "heartbeat");
+        assert_ne!(second["request_id"], first["request_id"]);
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn no_heartbeat_goes_out_without_the_summary_capability() {
+        let HeartbeatWriter {
+            mut far,
+            requests: _requests,
+            answers: _answers,
+            task: writer,
+        } = heartbeat_writer(None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), read_value(&mut far, false))
+                .await
+                .is_err()
+        );
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn a_request_waits_for_the_heartbeat_answer_and_is_then_sent() {
+        let HeartbeatWriter {
+            mut far,
+            requests,
+            answers,
+            task: writer,
+        } = heartbeat_writer(Some(Duration::from_millis(500)));
+        let heartbeat = next_frame(&mut far).await.expect("a heartbeat");
+        let (reply, answer) = oneshot::channel();
+        requests
+            .send(WireRequest {
+                value: json!({"v": 1, "kind": "ledger_epochs", "request_id": "core-action-1"}),
+                request_id: "core-action-1".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        answers
+            .send(Ok(json!({
+                "v": 1,
+                "kind": "heartbeat",
+                "request_id": heartbeat["request_id"],
+                "result": "ok",
+            })))
+            .unwrap();
+        let request = next_frame(&mut far).await.expect("the queued request");
+        assert_eq!(request["request_id"], "core-action-1");
+        answers
+            .send(Ok(
+                json!({"v": 1, "kind": "ledger_epochs", "request_id": "core-action-1"}),
+            ))
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(1), answer)
+            .await
+            .expect("an answer")
+            .expect("not dropped")
+            .expect("not an error");
+        assert_eq!(reply["request_id"], "core-action-1");
+        writer.abort();
     }
 
     fn focus_event(

@@ -2916,6 +2916,7 @@ union options_value *options_array_item_value(struct options_array_item *);
 int		 options_is_array(struct options_entry *);
 int		 options_is_string(struct options_entry *);
 char		*options_to_string(struct options_entry *, const char *, int);
+int		 options_status_references(struct client *, const char *);
 char		*options_parse(const char *, char **);
 struct options_entry *options_parse_get(struct options *, const char *,
 		     char **, int);

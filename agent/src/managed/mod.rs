@@ -106,6 +106,73 @@ impl ActionPathCache {
     }
 }
 
+/// Whether a boot's core takes status summaries. It is fixed per boot like the
+/// action path, and a core can advertise actions without it, so the two are
+/// read separately.
+#[derive(Default)]
+struct SummaryCache {
+    by_boot: HashMap<String, bool>,
+}
+
+impl SummaryCache {
+    fn get(&self, boot: &str) -> Option<bool> {
+        self.by_boot.get(boot).copied()
+    }
+
+    fn capable(&mut self, boot: &str, advertised: &str) -> Result<bool, String> {
+        if let Some(capable) = self.by_boot.get(boot) {
+            return Ok(*capable);
+        }
+        let capable = match advertised {
+            "1" => true,
+            "" | "0" => false,
+            _ => return Err("invalid native core summary capability".into()),
+        };
+        self.by_boot.insert(boot.to_owned(), capable);
+        Ok(capable)
+    }
+}
+
+static SUMMARY_PATHS: OnceLock<Mutex<SummaryCache>> = OnceLock::new();
+
+/// Reads whether the boot behind `native` takes status summaries. A core
+/// without the format expands it to an empty string, which is "no".
+pub(crate) async fn summary_capable_of(native: &native_ui::Context) -> Result<bool, String> {
+    let output = native
+        .tmux(
+            [
+                "display-message",
+                "-p",
+                "#{masil_core_boot_id}\t#{masil_core_summary}",
+            ]
+            .map(OsString::from),
+            None,
+        )
+        .await
+        .map_err(server_unreachable)?;
+    let value = String::from_utf8(output.stdout).map_err(|_| "native response is not UTF-8")?;
+    let value = value.strip_suffix('\n').unwrap_or(&value);
+    let (boot, advertised) = value
+        .split_once('\t')
+        .ok_or("invalid native core summary capability")?;
+    let boot = valid_boot(boot)?.to_owned();
+    let cache = SUMMARY_PATHS.get_or_init(|| Mutex::new(SummaryCache::default()));
+    if let Some(capable) = cache
+        .lock()
+        .map_err(|_| "core summary cache unavailable")?
+        .get(&boot)
+    {
+        return Ok(capable);
+    }
+    if advertised.chars().any(char::is_control) {
+        return Err("invalid native core summary capability".into());
+    }
+    cache
+        .lock()
+        .map_err(|_| "core summary cache unavailable")?
+        .capable(&boot, advertised)
+}
+
 static ACTION_PATHS: OnceLock<Mutex<ActionPathCache>> = OnceLock::new();
 
 /// Reads the action path for the boot behind `native`. The cache is keyed
@@ -712,6 +779,11 @@ impl Manager {
     /// turn a selected ledger path into a native guarded retry.
     pub(crate) async fn action_path(&self) -> Result<ActionPath, String> {
         action_path_of(&self.native).await
+    }
+
+    /// Whether this boot's core takes status summaries, cached per boot.
+    pub(crate) async fn summary_capable(&self) -> Result<bool, String> {
+        summary_capable_of(&self.native).await
     }
 
     /// The selected path and, when one runs, the coordinator's bridge state.
@@ -3974,6 +4046,16 @@ async fn identify_foreground(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn core_summary_capability_is_cached_by_boot() {
+        let mut cache = SummaryCache::default();
+        assert!(cache.capable("boot-a", "1").unwrap());
+        assert!(cache.capable("boot-a", "0").unwrap());
+        assert!(!cache.capable("boot-b", "").unwrap());
+        assert!(!cache.capable("boot-c", "0").unwrap());
+        assert!(SummaryCache::default().capable("boot-d", "other").is_err());
+    }
+
     #[test]
     fn core_action_path_is_cached_by_boot() {
         let mut cache = ActionPathCache::default();

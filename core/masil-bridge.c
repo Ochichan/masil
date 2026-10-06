@@ -63,6 +63,14 @@
 #define MASIL_BRIDGE_DIRTY_BATCH	64
 #define MASIL_BRIDGE_DIRTY_USEC		250000ULL
 
+/* masil: D2a summary cache published by the coordinator connection. */
+#define MASIL_SUMMARY_SLOTS		8
+#define MASIL_SUMMARY_KEY_MAX		16
+#define MASIL_SUMMARY_VALUE_MAX		64
+#define MASIL_SUMMARY_PREFIX		"masil_summary_"
+#define MASIL_SUMMARY_REDRAW_USEC	250000ULL
+#define MASIL_SUMMARY_STALE_USEC	90000000ULL
+
 /* masil: validity bits keep native UINT_MAX ids distinct from JSON null. */
 #define MASIL_BRIDGE_VIEW_SESSION	0x1
 #define MASIL_BRIDGE_VIEW_WINDOW	0x2
@@ -166,6 +174,14 @@ struct masil_focus {
 	struct event	 timer;
 };
 
+/* masil: a slot keeps its key and last revision after its value is cleared. */
+struct masil_summary_slot {
+	char		 key[MASIL_SUMMARY_KEY_MAX + 1];
+	char		 value[MASIL_SUMMARY_VALUE_MAX + 1];
+	uint64_t	 revision;
+	int		 used;
+};
+
 struct masil_bridge_stats {
 	uint64_t connects;
 	uint64_t disconnects;
@@ -232,6 +248,13 @@ static struct event		 masil_bridge_dirty_event;
 static int			 masil_bridge_dirty_timer_active;
 static uint64_t			 masil_bridge_dirty_timer_due;
 static struct masil_bridge_stats masil_bridge_stats;
+static struct masil_summary_slot masil_summary_slots[MASIL_SUMMARY_SLOTS];
+static uint64_t			 masil_summary_seen;
+static int			 masil_summary_stale;
+static struct event		 masil_summary_redraw_event;
+static int			 masil_summary_redraw_active;
+static struct event		 masil_summary_stale_event;
+static int			 masil_summary_stale_active;
 static u_char			 masil_bridge_codec_pool[MASIL_BRIDGE_CODEC_POOL];
 static char			 masil_bridge_response[MASIL_BRIDGE_TX_MAX];
 
@@ -410,6 +433,10 @@ static void
 masil_bridge_view_hold(void);
 static void
 masil_bridge_view_release(void);
+static void
+masil_bridge_summary_opened(void);
+static void
+masil_bridge_summary_closed(void);
 
 static void
 masil_bridge_client_close(struct masil_bridge_client *client)
@@ -435,6 +462,7 @@ masil_bridge_client_close(struct masil_bridge_client *client)
 			masil_bridge_focus_stop_all();
 			masil_bridge_view_release();
 			masil_bridge_coordinator_connected = 0;
+			masil_bridge_summary_closed();
 		} else if (masil_bridge_ordinary_clients != 0)
 			masil_bridge_ordinary_clients--;
 	}
@@ -678,7 +706,7 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 		masil_json_printf(&builder,
 		    "\"actions\":true,\"dispatch_epoch\":\"%llu\","
 		    "\"input\":true,\"launch\":true,\"focus\":true,"
-		    "\"submit\":false},",
+		    "\"summary\":true,\"submit\":false},",
 		    (unsigned long long)action_epoch);
 	else
 		/* masil: ordinary hello keeps its protocol-1.2 key set unchanged. */
@@ -700,6 +728,7 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 	if (coordinator) {
 		masil_bridge_coordinator_connected = 1;
 		masil_bridge_view_hold();
+		masil_bridge_summary_opened();
 	} else
 		masil_bridge_ordinary_clients++;
 	if (masil_bridge_unauthenticated != 0)
@@ -1489,6 +1518,282 @@ masil_bridge_view_release(void)
 		masil_bridge_view_clients--;
 	if (masil_bridge_view_clients == 0)
 		masil_bridge_view_disable();
+}
+
+/*
+ * masil: D2a summaries. The coordinator publishes a few short values and
+ * formats read this cache only. A value is visible while the coordinator
+ * connection is open and has sent a request within the last 90 seconds.
+ */
+static int
+masil_summary_visible(void)
+{
+	return (masil_bridge_coordinator_connected && !masil_summary_stale);
+}
+
+static int
+masil_summary_has_values(void)
+{
+	u_int	i;
+
+	for (i = 0; i < MASIL_SUMMARY_SLOTS; i++) {
+		if (masil_summary_slots[i].used &&
+		    masil_summary_slots[i].value[0] != '\0')
+			return (1);
+	}
+	return (0);
+}
+
+/* A visible value changed: one timer folds a burst into one redraw. */
+static void
+masil_summary_notify(void)
+{
+	struct timeval	timeout;
+
+	if (masil_summary_redraw_active)
+		return;
+	timeout.tv_sec = MASIL_SUMMARY_REDRAW_USEC / 1000000;
+	timeout.tv_usec = MASIL_SUMMARY_REDRAW_USEC % 1000000;
+	evtimer_add(&masil_summary_redraw_event, &timeout);
+	masil_summary_redraw_active = 1;
+}
+
+static void
+masil_summary_redraw_callback(__unused int fd, __unused short events,
+    __unused void *data)
+{
+	struct client	*c;
+
+	masil_summary_redraw_active = 0;
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->session == NULL ||
+		    (c->flags & (CLIENT_STATUSOFF|CLIENT_CONTROL)) ||
+		    c->session->statuslines == 0)
+			continue;
+		if (options_status_references(c, MASIL_SUMMARY_PREFIX))
+			c->flags |= CLIENT_REDRAWSTATUS;
+	}
+}
+
+static void
+masil_summary_stale_arm(uint64_t delay)
+{
+	struct timeval	timeout;
+
+	if (masil_summary_stale_active)
+		event_del(&masil_summary_stale_event);
+	timeout.tv_sec = delay / 1000000;
+	timeout.tv_usec = delay % 1000000;
+	evtimer_add(&masil_summary_stale_event, &timeout);
+	masil_summary_stale_active = 1;
+}
+
+/* The timer waits out the rest of the 90 seconds when a request came in. */
+static void
+masil_summary_stale_callback(__unused int fd, __unused short events,
+    __unused void *data)
+{
+	uint64_t	idle;
+
+	masil_summary_stale_active = 0;
+	if (!masil_bridge_coordinator_connected)
+		return;
+	idle = masil_bridge_now_usec() - masil_summary_seen;
+	if (idle < MASIL_SUMMARY_STALE_USEC) {
+		masil_summary_stale_arm(MASIL_SUMMARY_STALE_USEC - idle);
+		return;
+	}
+	masil_summary_stale = 1;
+	if (masil_summary_has_values())
+		masil_summary_notify();
+}
+
+/* Any request on the coordinator connection counts as a heartbeat. */
+static void
+masil_bridge_summary_alive(void)
+{
+	masil_summary_seen = masil_bridge_now_usec();
+	if (masil_summary_stale) {
+		masil_summary_stale = 0;
+		if (masil_summary_has_values())
+			masil_summary_notify();
+	}
+	if (!masil_summary_stale_active)
+		masil_summary_stale_arm(MASIL_SUMMARY_STALE_USEC);
+}
+
+static void
+masil_bridge_summary_opened(void)
+{
+	memset(masil_summary_slots, 0, sizeof masil_summary_slots);
+	masil_summary_stale = 0;
+	masil_bridge_summary_alive();
+}
+
+/* A closed coordinator takes its summaries with it at once. */
+static void
+masil_bridge_summary_closed(void)
+{
+	int	had_values = masil_summary_has_values();
+
+	if (masil_summary_stale_active) {
+		event_del(&masil_summary_stale_event);
+		masil_summary_stale_active = 0;
+	}
+	memset(masil_summary_slots, 0, sizeof masil_summary_slots);
+	masil_summary_stale = 0;
+	if (had_values)
+		masil_summary_notify();
+}
+
+/* Read for #{masil_summary_<key>}. An unknown key or a hidden value is "". */
+char *
+masil_bridge_summary_get(const char *key)
+{
+	u_int	i;
+
+	if (masil_summary_visible()) {
+		for (i = 0; i < MASIL_SUMMARY_SLOTS; i++) {
+			if (masil_summary_slots[i].used &&
+			    strcmp(masil_summary_slots[i].key, key) == 0)
+				return (xstrdup(masil_summary_slots[i].value));
+		}
+	}
+	return (xstrdup(""));
+}
+
+static int
+masil_bridge_heartbeat(struct masil_bridge_client *client,
+    const char *request_id, size_t request_id_length)
+{
+	struct masil_json_builder builder = {
+	    masil_bridge_response, 0, sizeof masil_bridge_response, 0
+	};
+
+	masil_json_puts(&builder,
+	    "{\"v\":1,\"kind\":\"heartbeat\",\"request_id\":");
+	masil_json_quote(&builder, request_id, request_id_length);
+	masil_json_puts(&builder, ",\"result\":\"ok\"}");
+	return (masil_bridge_queue_builder(client, &builder));
+}
+
+static int
+masil_bridge_publish_summary(struct masil_bridge_client *client,
+    const char *request_id, size_t request_id_length, yyjson_val *root)
+{
+	struct masil_json_builder builder = {
+	    masil_bridge_response, 0, sizeof masil_bridge_response, 0
+	};
+	struct masil_summary_slot *slot = NULL, *spare = NULL;
+	yyjson_val	*value;
+	char		 key[MASIL_SUMMARY_KEY_MAX + 1];
+	char		 text[MASIL_SUMMARY_VALUE_MAX + 1];
+	const char	*string;
+	size_t		 length, i;
+	uint64_t	 revision;
+	int		 changed;
+
+	/* Check every field before anything is stored. */
+	value = yyjson_obj_get(root, "key");
+	if (!yyjson_is_str(value))
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "invalid_key", "key must be a string"));
+	string = yyjson_get_str(value);
+	length = yyjson_get_len(value);
+	if (length == 0 || length > MASIL_SUMMARY_KEY_MAX)
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "invalid_key", "key must be 1 to 16 bytes"));
+	for (i = 0; i < length; i++) {
+		if (!((string[i] >= 'a' && string[i] <= 'z') ||
+		    (string[i] >= '0' && string[i] <= '9') || string[i] == '_'))
+			return (masil_bridge_error(client, request_id,
+			    request_id_length, "invalid_key",
+			    "key may only use a-z, 0-9, and _"));
+	}
+	memcpy(key, string, length);
+	key[length] = '\0';
+
+	value = yyjson_obj_get(root, "revision");
+	if (value == NULL)
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "invalid_revision", "revision is required"));
+	if (yyjson_is_uint(value))
+		revision = yyjson_get_uint(value);
+	else if (masil_bridge_parse_decimal(value, &revision) != 0)
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "invalid_revision",
+		    "revision must be an unsigned integer"));
+
+	value = yyjson_obj_get(root, "value");
+	if (value == NULL)
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "invalid_value", "value is required"));
+	if (yyjson_is_null(value))
+		text[0] = '\0';
+	else if (yyjson_is_uint(value))
+		snprintf(text, sizeof text, "%llu",
+		    (unsigned long long)yyjson_get_uint(value));
+	else if (yyjson_is_sint(value))
+		snprintf(text, sizeof text, "%lld",
+		    (long long)yyjson_get_sint(value));
+	else if (yyjson_is_str(value)) {
+		string = yyjson_get_str(value);
+		length = yyjson_get_len(value);
+		if (length > MASIL_SUMMARY_VALUE_MAX)
+			return (masil_bridge_error(client, request_id,
+			    request_id_length, "invalid_value",
+			    "value must be at most 64 bytes"));
+		for (i = 0; i < length; i++) {
+			if ((u_char)string[i] < 0x20 || string[i] == 0x7f)
+				return (masil_bridge_error(client, request_id,
+				    request_id_length, "invalid_value",
+				    "value must not contain control characters"));
+		}
+		memcpy(text, string, length);
+		text[length] = '\0';
+	} else
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "invalid_value",
+		    "value must be an integer, a string, or null"));
+
+	for (i = 0; i < MASIL_SUMMARY_SLOTS; i++) {
+		if (masil_summary_slots[i].used &&
+		    strcmp(masil_summary_slots[i].key, key) == 0)
+			slot = &masil_summary_slots[i];
+		else if (spare == NULL && (!masil_summary_slots[i].used ||
+		    masil_summary_slots[i].value[0] == '\0'))
+			spare = &masil_summary_slots[i];
+	}
+	if (slot != NULL && revision <= slot->revision)
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "stale_revision",
+		    "revision must exceed the last one for this key"));
+	if (slot == NULL && text[0] != '\0') {
+		/* A cleared slot is reused, so it forgets its old key. */
+		if (spare == NULL)
+			return (masil_bridge_error(client, request_id,
+			    request_id_length, "summary_full",
+			    "all 8 summary slots are in use"));
+		slot = spare;
+		memset(slot, 0, sizeof *slot);
+		memcpy(slot->key, key, strlen(key) + 1);
+		slot->used = 1;
+	}
+	changed = 0;
+	if (slot != NULL) {
+		changed = (strcmp(slot->value, text) != 0);
+		memcpy(slot->value, text, strlen(text) + 1);
+		slot->revision = revision;
+	}
+	if (changed)
+		masil_summary_notify();
+
+	masil_json_puts(&builder,
+	    "{\"v\":1,\"kind\":\"publish_summary\",\"request_id\":");
+	masil_json_quote(&builder, request_id, request_id_length);
+	masil_json_printf(&builder, ",\"result\":\"ok\",\"changed\":%s}",
+	    changed ? "true" : "false");
+	return (masil_bridge_queue_builder(client, &builder));
 }
 
 /* masil: cover active-pane changes that suppress upstream notifications. */
@@ -2313,6 +2618,9 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 	static const char *const stats_fields[] = {
 	    "v", "kind", "request_id"
 	};
+	static const char *const publish_summary_fields[] = {
+	    "v", "kind", "request_id", "key", "value", "revision"
+	};
 	static const char *const watch_fields[] = {
 	    "v", "kind", "request_id", "expected_core_boot_id", "pane_ids",
 	    "lifecycle", "clients"
@@ -2362,6 +2670,9 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 		    "handshake_required", "hello must be the first request");
 		goto out;
 	}
+	/* masil: any request after hello keeps the coordinator's summaries live. */
+	if (client->coordinator)
+		masil_bridge_summary_alive();
 	if (yyjson_equals_str(kind, "hello")) {
 		if (client->hello_done) {
 			result = masil_bridge_error(client, request_id,
@@ -2414,6 +2725,37 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 				result = masil_bridge_queue(client, masil_bridge_response,
 				    strlen(masil_bridge_response));
 			}
+		}
+	} else if (yyjson_equals_str(kind, "publish_summary") ||
+	    yyjson_equals_str(kind, "heartbeat")) {
+		/* masil: only the coordinator connection owns summaries. */
+		if (!client->coordinator) {
+			result = masil_bridge_error(client, request_id, request_id_length,
+			    "coordinator_required",
+			    "this request requires the coordinator connection");
+		} else if (client->watching) {
+			result = masil_bridge_error(client, request_id, request_id_length,
+			    "stream_active", "watch connection does not accept requests");
+			client->close_after_write = 1;
+		} else if (yyjson_equals_str(kind, "heartbeat")) {
+			if (masil_bridge_schema(root, stats_fields,
+			    nitems(stats_fields), &code) != 0) {
+				result = masil_bridge_error(client, request_id,
+				    request_id_length, code, "heartbeat schema rejected");
+				goto out;
+			}
+			result = masil_bridge_heartbeat(client, request_id,
+			    request_id_length);
+		} else {
+			if (masil_bridge_schema(root, publish_summary_fields,
+			    nitems(publish_summary_fields), &code) != 0) {
+				result = masil_bridge_error(client, request_id,
+				    request_id_length, code,
+				    "publish_summary schema rejected");
+				goto out;
+			}
+			result = masil_bridge_publish_summary(client, request_id,
+			    request_id_length, root);
 		}
 	} else if (client->watching) {
 		result = masil_bridge_error(client, request_id, request_id_length,
@@ -2941,6 +3283,13 @@ masil_bridge_actions_supported(void)
 	return (masil_bridge_enabled && masil_action_supported());
 }
 
+/* masil: summaries need the bridge, so this is fixed for the boot as well. */
+int
+masil_bridge_summary_supported(void)
+{
+	return (masil_bridge_enabled);
+}
+
 /* masil: client ids are stable only within the current core boot. */
 char *
 masil_bridge_client_id(struct client *c)
@@ -3106,6 +3455,15 @@ masil_bridge_start(void)
 	masil_bridge_dirty_timer_active = 0;
 	masil_bridge_dirty_timer_due = 0;
 	evtimer_set(&masil_bridge_dirty_event, masil_bridge_dirty_callback, NULL);
+	/* masil: summary state starts empty, whatever a previous start left. */
+	memset(masil_summary_slots, 0, sizeof masil_summary_slots);
+	masil_summary_stale = 0;
+	masil_summary_redraw_active = 0;
+	masil_summary_stale_active = 0;
+	evtimer_set(&masil_summary_redraw_event, masil_summary_redraw_callback,
+	    NULL);
+	evtimer_set(&masil_summary_stale_event, masil_summary_stale_callback,
+	    NULL);
 	masil_bridge_enabled = 1;
 	event_set(&masil_bridge_event, masil_bridge_fd, EV_READ|EV_PERSIST,
 	    masil_bridge_accept, NULL);
@@ -3238,6 +3596,10 @@ masil_bridge_stop(void)
 	if (masil_bridge_dirty_timer_active) {
 		event_del(&masil_bridge_dirty_event);
 		masil_bridge_dirty_timer_active = 0;
+	}
+	if (masil_summary_redraw_active) {
+		event_del(&masil_summary_redraw_event);
+		masil_summary_redraw_active = 0;
 	}
 	if (lstat(masil_bridge_path, &sb) == 0 &&
 	    sb.st_dev == masil_bridge_socket_dev &&

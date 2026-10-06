@@ -33,6 +33,7 @@ void	masil_bridge_server_exiting(void);
 const char *masil_bridge_get_boot_id(void);
 const char *masil_bridge_get_socket_path(void);
 int	 masil_bridge_actions_supported(void);
+int	 masil_bridge_summary_supported(void);
 char	*masil_bridge_client_id(struct client *);
 char	*masil_bridge_client_profile(struct client *);
 void	 masil_bridge_window_active_changed(struct window *);
@@ -46,6 +47,8 @@ void	masil_bridge_pty_changed(struct window_pane *);
 void	masil_bridge_output_changed(struct window_pane *);
 void	masil_bridge_geometry_changed(struct window_pane *);
 void	masil_bridge_launch(unsigned int, uint64_t, const char *, int);
+
+char	*masil_bridge_summary_get(const char *);
 
 /* masil: D1a focus output phases for the client a focus action moved. */
 enum masil_focus_cause {
