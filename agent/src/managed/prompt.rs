@@ -817,18 +817,18 @@ impl Manager {
         // startup reconciliation once before treating such a record as a
         // prompt-unresolved refusal.
         let mut ensured_dispatching = false;
+        // Opened once: each query reads a fresh snapshot, so the connection
+        // sees what the coordinator reconciles inside the loop.
+        let mut store = self.operation_store().await?;
         loop {
-            let has_core_dispatching = {
-                let store = self.operation_store().await?;
-                store.list(true, 4096)?.iter().any(|record| {
-                    record.action == "prompt"
-                        && record.run.as_deref() == Some(agent.run.as_str())
-                        && record.state == operations::DISPATCHING
-                        && record
-                            .intent()
-                            .is_some_and(|intent| intent["path"] == "core_ledger")
-                })
-            };
+            let has_core_dispatching = store.list(true, 4096)?.iter().any(|record| {
+                record.action == "prompt"
+                    && record.run.as_deref() == Some(agent.run.as_str())
+                    && record.state == operations::DISPATCHING
+                    && record
+                        .intent()
+                        .is_some_and(|intent| intent["path"] == "core_ledger")
+            });
             if !has_core_dispatching || ensured_dispatching {
                 break;
             }
@@ -836,7 +836,6 @@ impl Manager {
             ensured_dispatching = true;
         }
         {
-            let mut store = self.operation_store().await?;
             let next = store.prompt_next(&agent.run)?;
             let slot = operation.unwrap_or(next);
             if slot == 0 || slot > next {
@@ -876,6 +875,7 @@ impl Manager {
                 return Err("a prompt delivery is unresolved; inspect its receipt and the native TUI before any new submission".into());
             }
         }
+        drop(store);
 
         let current = self.get(&agent.pane_id).await?;
         if current.run != agent.run
@@ -941,6 +941,7 @@ impl Manager {
     }
 
     async fn core_prompt_sentinel(&self, agent: &Agent) -> Result<(), String> {
+        // One native command: a standalone ";" separates the two set-options.
         self.command(&[
             "set-option",
             "-p",
@@ -948,9 +949,7 @@ impl Manager {
             &agent.pane_id,
             OPTION,
             CORE_LEDGER_SENTINEL,
-        ])
-        .await?;
-        self.command(&[
+            ";",
             "set-option",
             "-p",
             "-t",

@@ -550,8 +550,8 @@ fn check_action_frame(params: &Value) -> Result<(), String> {
 /// back to native.
 pub(crate) fn action(socket: &Path, params: Value) -> Result<Value, String> {
     check_action_frame(&params)?;
-    ensure(socket)?;
-    action_on_running_coordinator(socket, params)
+    let (_, server) = ensure_checked(socket, true)?;
+    action_on_running_coordinator(socket, &server, params)
 }
 
 /// Sends an action after a caller has already ensured the coordinator.
@@ -559,11 +559,15 @@ pub(crate) fn action(socket: &Path, params: Value) -> Result<Value, String> {
 /// occupies the name-uniqueness lock.
 pub(crate) fn action_after_ensure(socket: &Path, params: Value) -> Result<Value, String> {
     check_action_frame(&params)?;
-    action_on_running_coordinator(socket, params)
+    let server = check_state(socket)?;
+    action_on_running_coordinator(socket, &server, params)
 }
 
-fn action_on_running_coordinator(socket: &Path, params: Value) -> Result<Value, String> {
-    let server = check_state(socket)?;
+fn action_on_running_coordinator(
+    socket: &Path,
+    server: &ServerInfo,
+    params: Value,
+) -> Result<Value, String> {
     let paths = paths(socket, &server.state)?;
     let timeout = if params["operation"].as_str() == Some("launch") {
         LAUNCH_ACTION_TIMEOUT
@@ -731,7 +735,22 @@ pub(crate) fn ensure(socket: &Path) -> Result<Value, String> {
 }
 
 fn ensure_with_autosave(socket: &Path, start_autosave: bool) -> Result<Value, String> {
+    ensure_checked(socket, start_autosave).map(|(value, _)| value)
+}
+
+/// `ensure` plus the server info it checked, so a caller that goes on to
+/// send a request does not run `check_state` a second time.
+fn ensure_checked(socket: &Path, start_autosave: bool) -> Result<(Value, ServerInfo), String> {
     let server = check_state(socket)?;
+    let value = ensure_server(socket, &server, start_autosave)?;
+    Ok((value, server))
+}
+
+fn ensure_server(
+    socket: &Path,
+    server: &ServerInfo,
+    start_autosave: bool,
+) -> Result<Value, String> {
     add_boot_setting_warn(socket, &server.state, start_autosave);
     let paths = paths(socket, &server.state)?;
     private_directory(
@@ -741,7 +760,7 @@ fn ensure_with_autosave(socket: &Path, start_autosave: bool) -> Result<Value, St
             .ok_or("coordinator lock has no directory")?,
     )?;
     match hello(&paths.listen) {
-        Some(value) if current(&value, &server) => return Ok(value),
+        Some(value) if current(&value, server) => return Ok(value),
         Some(_) => {
             let _ = request(&paths.listen, "stop", HELLO_TIMEOUT);
             if !wait_unlocked(&paths.lock, SPAWN_WAIT)? {
@@ -754,7 +773,7 @@ fn ensure_with_autosave(socket: &Path, start_autosave: bool) -> Result<Value, St
             if holder(&paths.lock).is_none_or(|record| record.get("boot").is_none()) {
                 let deadline = Instant::now() + SPAWN_WAIT + COMMAND_TIMEOUT;
                 while Instant::now() < deadline {
-                    if let Some(value) = hello(&paths.listen).filter(|v| current(v, &server)) {
+                    if let Some(value) = hello(&paths.listen).filter(|v| current(v, server)) {
                         return Ok(value);
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -766,14 +785,14 @@ fn ensure_with_autosave(socket: &Path, start_autosave: bool) -> Result<Value, St
                 // The holder rebinds a socket that was removed under it.
                 let deadline = Instant::now() + NUDGE_WAIT;
                 while Instant::now() < deadline {
-                    if let Some(value) = hello(&paths.listen).filter(|v| current(v, &server)) {
+                    if let Some(value) = hello(&paths.listen).filter(|v| current(v, server)) {
                         return Ok(value);
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
             match probe(&paths.listen, COMMAND_TIMEOUT) {
-                Probe::Answer(value) if current(&value, &server) => return Ok(value),
+                Probe::Answer(value) if current(&value, server) => return Ok(value),
                 // Alive but busy: never terminate a working process.
                 Probe::Busy => {
                     return Err("coordinator_unavailable: the coordinator is busy; retry".into());
@@ -790,13 +809,13 @@ fn ensure_with_autosave(socket: &Path, start_autosave: bool) -> Result<Value, St
     let mut spawn_lock = paths.lock.as_os_str().to_owned();
     spawn_lock.push(".spawn");
     let _spawning = acquire(Path::new(&spawn_lock), SPAWN_WAIT + LOCK_RETRY)?;
-    if let Some(value) = hello(&paths.listen).filter(|v| current(v, &server)) {
+    if let Some(value) = hello(&paths.listen).filter(|v| current(v, server)) {
         return Ok(value);
     }
-    spawn(socket, &paths, &server)?;
+    spawn(socket, &paths, server)?;
     let deadline = Instant::now() + SPAWN_WAIT;
     loop {
-        if let Some(value) = hello(&paths.listen).filter(|v| current(v, &server)) {
+        if let Some(value) = hello(&paths.listen).filter(|v| current(v, server)) {
             return Ok(value);
         }
         if Instant::now() >= deadline {

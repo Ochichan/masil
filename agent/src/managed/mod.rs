@@ -671,7 +671,19 @@ impl Manager {
     /// The format is read once for a boot so a disappearing bridge cannot
     /// turn a selected ledger path into a native guarded retry.
     pub(crate) async fn action_path(&self) -> Result<ActionPath, String> {
-        let boot = self.boot().await?;
+        // One native command reads the boot and the advertised capability.
+        let value = self
+            .command(&[
+                "display-message",
+                "-p",
+                "#{masil_core_boot_id}\t#{masil_core_actions}",
+            ])
+            .await?;
+        let value = value.strip_suffix('\n').unwrap_or(&value);
+        let (boot, advertised) = value
+            .split_once('\t')
+            .ok_or("invalid native core action capability")?;
+        let boot = valid_boot(boot)?.to_owned();
         let cache = ACTION_PATHS.get_or_init(|| Mutex::new(ActionPathCache::default()));
         if let Some(path) = cache
             .lock()
@@ -680,10 +692,6 @@ impl Manager {
         {
             return Ok(path);
         }
-        let advertised = self
-            .command(&["display-message", "-p", "#{masil_core_actions}"])
-            .await?;
-        let advertised = advertised.strip_suffix('\n').unwrap_or(&advertised);
         if advertised.chars().any(char::is_control) {
             return Err("invalid native core action capability".into());
         }
