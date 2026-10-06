@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "masil-perf.h" /* masil-perf */
 #include "masil-bridge.h"
 
 static int	tty_log_fd = -1;
@@ -182,6 +183,7 @@ tty_read_callback(__unused int fd, __unused short events, void *data)
 	const char	*name = c->name;
 	size_t		 size = EVBUFFER_LENGTH(tty->in);
 	int		 nread;
+	masil_perf_input_begin(); /* masil-perf */
 
 	nread = evbuffer_read(tty->in, c->fd, -1);
 	if (nread == 0 || nread == -1) {
@@ -194,6 +196,7 @@ tty_read_callback(__unused int fd, __unused short events, void *data)
 		return;
 	}
 	log_debug("%s: read %d bytes (already %zu)", name, nread, size);
+	masil_perf_input_read(); /* masil-perf */
 
 	while (tty_keys_next(tty))
 		;
@@ -242,6 +245,7 @@ tty_block_maybe(struct tty *tty)
 	log_debug("%s: can't keep up, %zu discarded", c->name, size);
 
 	evbuffer_drain(tty->out, size);
+	masil_perf_tty_drained(tty); /* masil-perf */
 	c->discarded += size;
 	/* masil: bytes drained here never reach the fd. */
 	tty->masil_drained += size;
@@ -272,6 +276,7 @@ tty_write_callback(__unused int fd, __unused short events, void *data)
 		masil_bridge_focus_written(c);
 	}
 	log_debug("%s: wrote %d bytes (of %zu)", c->name, nwrite, size);
+	masil_perf_tty_written(tty); /* masil-perf */
 
 	if (c->redraw > 0) {
 		if ((size_t)nwrite >= c->redraw)
@@ -677,6 +682,7 @@ tty_add(struct tty *tty, const char *buf, size_t len)
 
 	size = EVBUFFER_LENGTH(tty->out);
 	evbuffer_add(tty->out, buf, len);
+	masil_perf_tty_queue(tty); /* masil-perf */
 	tty->masil_appended += len;
 	/*
 	 * masil: fresh output does not inherit idle time from an empty tty. A

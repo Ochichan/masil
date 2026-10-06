@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "masil-perf.h" /* masil-perf */
 #include "masil-bridge.h"
 
 static void	server_client_free(int, short, void *);
@@ -2600,7 +2601,9 @@ server_client_check_redraw(struct client *c)
 			server_client_set_path(c);
 		}
 		server_client_set_progress_bar(c);
+		masil_perf_redraw_begin(c); /* masil-perf */
 		redraw_screen(c);
+		masil_perf_redraw_end(); /* masil-perf */
 	}
 
 	/* Put the tty back how it was. */

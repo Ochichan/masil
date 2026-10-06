@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "masil-perf.h" /* masil-perf */
 #include "masil-bridge.h"
 
 /*
@@ -1666,6 +1667,7 @@ window_pane_destroy(struct window_pane *wp)
 		kill(getpid(), SIGCHLD);
 #endif
 		bufferevent_free(wp->event);
+		masil_perf_pty_free(wp->event); /* masil-perf */
 		wp->event = NULL;
 		close(wp->fd);
 		wp->fd = -1;
@@ -1722,6 +1724,7 @@ window_pane_read_callback(__unused struct bufferevent *bufev, void *data)
 	char				*new_data;
 	size_t				 new_size;
 	struct client			*c;
+	masil_perf_pane_read_begin(); /* masil-perf */
 
 	if (wp->pipe_fd != -1) {
 		new_data = window_pane_get_new_data(wp, wpo, &new_size);
@@ -1737,6 +1740,7 @@ window_pane_read_callback(__unused struct bufferevent *bufev, void *data)
 			control_write_output(c, wp);
 	}
 	input_parse_pane(wp);
+	masil_perf_pane_read_end(); /* masil-perf */
 	bufferevent_disable(wp->event, EV_READ);
 }
 
@@ -1766,6 +1770,7 @@ window_pane_set_event(struct window_pane *wp)
 	if (wp->event == NULL)
 		fatalx("out of memory");
 	wp->ictx = input_init(wp, wp->event, &wp->palette);
+	masil_perf_pty_event(wp->event); /* masil-perf */
 
 	bufferevent_enable(wp->event, EV_READ|EV_WRITE);
 }

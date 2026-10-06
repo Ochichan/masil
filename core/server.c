@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "masil-perf.h" /* masil-perf */
 #include "masil-bridge.h"
 
 /*
@@ -254,6 +255,7 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	evtimer_add(&server_ev_tidy, &tv);
 
 	server_acl_init();
+	masil_perf_init(); /* masil-perf */
 	masil_bridge_start();
 
 	server_add_accept(0);
@@ -262,6 +264,7 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	masil_bridge_stop();
 	job_kill_all();
 	prompt_save_history();
+	masil_perf_write(); /* masil-perf */
 
 	exit(0);
 }
@@ -282,6 +285,7 @@ server_loop(void)
 				items += cmdq_next(c);
 		}
 	} while (items != 0);
+	masil_perf_loop_drained(); /* masil-perf */
 
 	server_client_loop();
 

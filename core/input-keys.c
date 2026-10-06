@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "tmux.h"
+#include "masil-perf.h" /* masil-perf */
 
 /*
  * This file is rather misleadingly named, it contains the code which takes a
@@ -416,6 +417,7 @@ input_key_write(const char *from, struct bufferevent *bev, const char *data,
 {
 	log_debug("%s: %.*s", from, (int)size, data);
 	bufferevent_write(bev, data, size);
+	masil_perf_key_write(bev); /* masil-perf */
 }
 
 /*
