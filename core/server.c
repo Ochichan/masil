@@ -209,6 +209,7 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	    "tty ps", NULL) != 0)
 		fatal("pledge failed");
 
+	set_default_options();
 	input_key_build();
 	utf8_update_width_cache();
 	RB_INIT(&windows);

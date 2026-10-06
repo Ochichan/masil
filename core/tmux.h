@@ -2652,6 +2652,7 @@ const char	*sig2name(int);
 const char	*find_cwd(void);
 const char	*find_home(void);
 const char	*getversion(void);
+void		 set_default_options(void);
 
 /* proc.c */
 struct imsg;
