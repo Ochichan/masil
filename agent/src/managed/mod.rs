@@ -162,6 +162,8 @@ struct PreparedLaunch {
     args: Vec<String>,
     /// `--answers`: exec-managed decides the listening options in the pane.
     answers: bool,
+    /// Start chose its effect path before acquiring the name-uniqueness lock.
+    core_path: bool,
     /// The masil worktree the directory is in; its start takes a lease.
     worktree: Option<crate::worktree::Found>,
 }
@@ -1875,6 +1877,7 @@ impl Manager {
             argv,
             args: args.to_vec(),
             answers: false,
+            core_path: false,
             worktree,
         })
     }
@@ -1884,9 +1887,10 @@ impl Manager {
         &self,
         prepared: PreparedLaunch,
         name: &str,
-        run: &str,
+        ticket: &operations::Ticket,
         session: Option<&str>,
         split: Option<&str>,
+        worktree: Option<(i64, &str)>,
     ) -> Result<Value, String> {
         let PreparedLaunch {
             provider,
@@ -1895,8 +1899,12 @@ impl Manager {
             argv,
             args,
             answers,
+            core_path,
             worktree: _,
         } = prepared;
+        let run = ticket.ticket.as_str();
+        let operation_key = ticket.key.as_str();
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let mut command: Vec<OsString> = if let Some(target) = split {
             vec![
                 "split-window".into(),
@@ -1918,7 +1926,12 @@ impl Manager {
         // Without a token (an unwritable state directory) the hooks are
         // checked by their process tree alone, as before tokens.
         let token = tokens::create(&self.native.socket, run).ok();
+        let mut launch_env = Vec::new();
         if let Some((path, _)) = &token {
+            launch_env.push((
+                tokens::VARIABLE.to_owned(),
+                path.to_string_lossy().into_owned(),
+            ));
             command.extend([
                 "-e".into(),
                 format!("{}={}", tokens::VARIABLE, path.display()).into(),
@@ -1930,13 +1943,7 @@ impl Manager {
                 "MASIL_AGENT_SOCKET",
                 self.native.socket.to_string_lossy().into_owned(),
             ),
-            (
-                "MASIL_AGENT_BIN",
-                std::env::current_exe()
-                    .map_err(|e| e.to_string())?
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            ("MASIL_AGENT_BIN", executable.to_string_lossy().into_owned()),
             (
                 LAUNCH_CWD,
                 format!(
@@ -1947,14 +1954,12 @@ impl Manager {
                 ),
             ),
         ] {
+            launch_env.push((key.to_owned(), value.clone()));
             command.extend(["-e".into(), format!("{key}={value}").into()]);
         }
         command.push("--".into());
         command.extend([
-            std::env::current_exe()
-                .map_err(|e| e.to_string())?
-                .as_os_str()
-                .to_owned(),
+            executable.as_os_str().to_owned(),
             "agent".into(),
             "--socket".into(),
             self.native.socket.as_os_str().to_owned(),
@@ -1964,6 +1969,81 @@ impl Manager {
             command.push(answer::EXEC_FLAG.into());
         }
         command.extend(argv.iter().map(OsString::from));
+        let mut launch_argv = vec![
+            executable.to_string_lossy().into_owned(),
+            "agent".into(),
+            "--socket".into(),
+            self.native.socket.to_string_lossy().into_owned(),
+            "exec-managed".into(),
+        ];
+        if answers {
+            launch_argv.push(answer::EXEC_FLAG.into());
+        }
+        launch_argv.extend(argv.iter().cloned());
+        if core_path {
+            let mode = if split.is_some() { "split" } else { "window" };
+            let target = match split {
+                Some(target) => target.to_owned(),
+                None => match self
+                    .command(&["display-message", "-p", "#{session_id}"])
+                    .await
+                {
+                    Ok(target) => target.trim().to_owned(),
+                    Err(error) => {
+                        tokens::remove(&self.native.socket, run);
+                        return Err(error);
+                    }
+                },
+            };
+            let params = json!({
+                "operation": "launch",
+                "operation_key": operation_key,
+                "operation_ticket": run,
+                "name": name,
+                "provider": provider.id,
+                "run": run,
+                "cwd": cwd,
+                "cwd_dev": cwd_identity.0.to_string(),
+                "cwd_ino": cwd_identity.1.to_string(),
+                "argv": launch_argv,
+                "provider_argv": argv,
+                "env": launch_env.into_iter().map(|(key, value)| json!([key, value])).collect::<Vec<_>>(),
+                "session": session,
+                "args": args,
+                "answers": answers,
+                "token": token.as_ref().map(|(_, hash)| hash),
+                "mode": mode,
+                "target": target,
+                "worktree": worktree.map(|(id, name)| json!({"id": id, "name": name})),
+            });
+            let socket = self.native.socket.clone();
+            let launched = match tokio::task::spawn_blocking(move || {
+                crate::coordinator::action_after_ensure(&socket, params)
+            })
+            .await
+            {
+                Ok(launched) => launched,
+                // Tokio can report a join failure while the blocking action
+                // is still unwinding or the runtime is ending. Treat that
+                // exactly like a lost control reply: the durable record may
+                // still need coordinator reconciliation.
+                Err(error) => {
+                    return Err(format!(
+                        "outcome_unknown: coordinator action reply lost: {error}"
+                    ));
+                }
+            };
+            if let Err(error) = &launched
+                && !matches!(failure::classify(error).0, failure::Class::Unknown)
+            {
+                // Keep a proven core-path refusal consistent with native
+                // `tmux` launch failure. An unknown reply may still name a
+                // live provider, whose hooks need this token while the
+                // coordinator reconciles its dispatching receipt.
+                tokens::remove(&self.native.socket, run);
+            }
+            return launched;
+        }
         let result = match self.native.tmux(command, None).await {
             Ok(result) => result,
             Err(error) => {
@@ -1997,6 +2077,7 @@ impl Manager {
             LaunchVerdict::Exited => outcome["process"] = json!("exited"),
             LaunchVerdict::Unanswered => outcome["cwd_check"] = json!("unanswered"),
         }
+        outcome["path"] = json!("native_guard");
         Ok(outcome)
     }
 
@@ -2014,9 +2095,33 @@ impl Manager {
         .await
     }
 
+    /// A missing launch-status event needs the same last liveness check as a
+    /// native unanswered cwd verdict. A dead remain-on-exit pane counts as
+    /// exited; a live pane remains a valid registration target.
+    pub(super) async fn launch_pane_alive(&self, pane: &str) -> Result<bool, String> {
+        let value = self
+            .command(&[
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{pane_id}\t#{pane_dead}",
+            ])
+            .await?;
+        Ok(matches!(
+            value.trim_end_matches('\n').split_once('\t'),
+            Some((id, "0")) if id == pane
+        ))
+    }
+
     /// What the launched `exec-managed` found of its directory: read with
     /// the registration, then for up to 3 s more.
-    async fn launch_verdict(&self, pane: &str, run: &str, first: Option<String>) -> LaunchVerdict {
+    pub(super) async fn launch_verdict(
+        &self,
+        pane: &str,
+        run: &str,
+        first: Option<String>,
+    ) -> LaunchVerdict {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut seen = first;
         loop {
@@ -2066,23 +2171,46 @@ impl Manager {
                 "launch outcome unknown; inspect panes before retrying",
             ));
         }
+        self.finish_launch_fields(
+            fields[0], fields[1], fields[2], fields[3], provider, name, run, session, argv, args,
+            answers, token,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn finish_launch_fields(
+        &self,
+        pane: &str,
+        boot: &str,
+        generation: &str,
+        pid: &str,
+        provider: &'static providers::Provider,
+        name: &str,
+        run: &str,
+        session: Option<&str>,
+        argv: Vec<String>,
+        args: Vec<String>,
+        answers: bool,
+        token: Option<String>,
+    ) -> Result<(Value, Option<String>), failure::AfterEffect> {
         let metadata = Metadata {
             name: name.into(),
             provider: provider.id.into(),
-            boot: fields[1].into(),
-            generation: fields[2].into(),
+            boot: boot.into(),
+            generation: generation.into(),
             run: run.into(),
             argv,
             session: session.map(str::to_owned),
             report: None,
             last_sequence: 0,
-            foreground_group: fields[3]
+            foreground_group: pid
                 .parse()
                 .map_err(|_| failure::AfterEffect::new("invalid launch process identity"))?,
             original_args: args,
         };
         let encoded = encode(&metadata).map_err(failure::AfterEffect::new)?;
-        let mut registration = vec!["set-option", "-p", "-t", fields[0], META, &encoded];
+        let mut registration = vec!["set-option", "-p", "-t", pane, META, &encoded];
         let binding = session.map(|session| Binding {
             session: session.into(),
             source: BindingSource::Requested,
@@ -2108,18 +2236,18 @@ impl Manager {
             None
         };
         if let Some(evidence) = &evidence {
-            registration.extend([";", "set-option", "-p", "-t", fields[0], EVIDENCE, evidence]);
+            registration.extend([";", "set-option", "-p", "-t", pane, EVIDENCE, evidence]);
         }
         // The child's verdict on its directory, usually written already.
-        registration.extend([";", "show-options", "-pqv", "-t", fields[0], LAUNCH_VERDICT]);
+        registration.extend([";", "show-options", "-pqv", "-t", pane, LAUNCH_VERDICT]);
         let verdict = self.command(&registration).await.map_err(|e| {
             failure::AfterEffect::new(format!(
                 "pane {} was launched, but registration failed: {e}; do not blindly retry",
-                fields[0]
+                pane
             ))
         })?;
         Ok((
-            json!({"stage":"process_started","pane_id":fields[0],"run":run,"name":name,"provider":provider.id,"native_session_requested":session,"native_session_verified":false,"provider_accepted":false}),
+            json!({"stage":"process_started","pane_id":pane,"run":run,"name":name,"provider":provider.id,"native_session_requested":session,"native_session_verified":false,"provider_accepted":false}),
             Some(verdict),
         ))
     }

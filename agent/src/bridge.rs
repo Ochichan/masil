@@ -555,17 +555,56 @@ pub(crate) enum PaneReason {
     Created,
 }
 
+/// The child-side result of a strict-cwd launch. This is deliberately not a
+/// pane lifecycle event: the pane may already have exited by the time the
+/// status pipe reports its result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchStage {
+    ExecOk,
+    CwdOpen,
+    CwdIdentity,
+    Exec,
+}
+
+/// A launch status frame delivered both to lifecycle watches and to the
+/// coordinator-role connection. `event_seq` remains useful to consumers
+/// which need to reject reordered coordinator frames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LaunchEvent {
+    pub(crate) pane_id: String,
+    pub(crate) pty_generation: String,
+    pub(crate) stage: LaunchStage,
+    pub(crate) errno: i32,
+    pub(crate) event_seq: u64,
+}
+
 /// A validated bridge event. Generations are checked at the wire boundary;
 /// callers need only the identity and reason to schedule an authoritative
 /// native pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Event {
-    Pane { pane_id: String, reason: PaneReason },
-    WindowRemoved { window_id: String },
-    SessionRemoved { session_id: String },
+    Pane {
+        pane_id: String,
+        reason: PaneReason,
+    },
+    Launch(LaunchEvent),
+    WindowRemoved {
+        window_id: String,
+    },
+    SessionRemoved {
+        session_id: String,
+    },
     /// The native server is tearing down sessions. This terminal event is
     /// delivered to every watch, independent of its pane or lifecycle scope.
     ServerExiting,
+}
+
+/// Frames that only a coordinator-role connection can receive between action
+/// replies. The core uses stream epoch zero for this launch-only journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CoordinatorFrame {
+    Launch(LaunchEvent),
+    Gap,
 }
 
 fn parse_pane_reason(value: &str) -> Option<PaneReason> {
@@ -580,6 +619,123 @@ fn parse_pane_reason(value: &str) -> Option<PaneReason> {
     })
 }
 
+fn parse_launch_stage(value: &str) -> Option<LaunchStage> {
+    Some(match value {
+        "exec_ok" => LaunchStage::ExecOk,
+        "cwd_open" => LaunchStage::CwdOpen,
+        "cwd_identity" => LaunchStage::CwdIdentity,
+        "exec" => LaunchStage::Exec,
+        _ => return None,
+    })
+}
+
+fn parse_launch_event(
+    value: &Value,
+    boot_id: &str,
+    stream_epoch: &str,
+) -> Result<LaunchEvent, Error> {
+    let event = exact_object(
+        value,
+        &[
+            "v",
+            "kind",
+            "core_boot_id",
+            "stream_epoch",
+            "event_seq",
+            "reason",
+            "pane_id",
+            "pty_generation",
+            "stage",
+            "errno",
+        ],
+        "launch event",
+    )?;
+    if event.get("v").and_then(Value::as_u64) != Some(1)
+        || event.get("kind").and_then(Value::as_str) != Some("event")
+        || event.get("core_boot_id").and_then(Value::as_str) != Some(boot_id)
+        || event.get("stream_epoch").and_then(Value::as_str) != Some(stream_epoch)
+        || event.get("reason").and_then(Value::as_str) != Some("launch")
+    {
+        return Err(Error::Protocol(
+            "launch event stream identity mismatch".into(),
+        ));
+    }
+    let pane_id = identifier(event.get("pane_id"), "pane_id")?;
+    object_id(&pane_id, '%', "pane_id")?;
+    decimal(event.get("pty_generation"), "pty_generation")?;
+    let pty_generation = event
+        .get("pty_generation")
+        .and_then(Value::as_str)
+        .expect("decimal accepted a string");
+    let errno = event
+        .get("errno")
+        .and_then(Value::as_i64)
+        .filter(|errno| (0..=i64::from(i32::MAX)).contains(errno))
+        .ok_or_else(|| Error::Protocol("launch errno must be a non-negative integer".into()))?;
+    let stage = event
+        .get("stage")
+        .and_then(Value::as_str)
+        .and_then(parse_launch_stage)
+        .ok_or_else(|| Error::Protocol("invalid launch stage".into()))?;
+    Ok(LaunchEvent {
+        pane_id,
+        pty_generation: pty_generation.to_owned(),
+        stage,
+        errno: errno as i32,
+        event_seq: decimal(event.get("event_seq"), "event_seq")?,
+    })
+}
+
+/// Validates the launch-only frames interleaved with replies on a
+/// coordinator-role connection. These frames intentionally use stream epoch
+/// zero instead of a watch stream epoch.
+pub(crate) fn parse_coordinator_frame(
+    value: &Value,
+    boot_id: &str,
+) -> Result<CoordinatorFrame, Error> {
+    match value.get("kind").and_then(Value::as_str) {
+        Some("event") if value.get("reason").and_then(Value::as_str) == Some("launch") => Ok(
+            CoordinatorFrame::Launch(parse_launch_event(value, boot_id, "0")?),
+        ),
+        Some("gap") => {
+            let gap = exact_object(
+                value,
+                &[
+                    "v",
+                    "kind",
+                    "core_boot_id",
+                    "stream_epoch",
+                    "after_seq",
+                    "first_available_seq",
+                    "last_seq",
+                    "code",
+                ],
+                "coordinator launch gap",
+            )?;
+            if gap.get("v").and_then(Value::as_u64) != Some(1)
+                || gap.get("kind").and_then(Value::as_str) != Some("gap")
+                || gap.get("core_boot_id").and_then(Value::as_str) != Some(boot_id)
+                || gap.get("stream_epoch").and_then(Value::as_str) != Some("0")
+                || gap.get("code").and_then(Value::as_str) != Some("resync_required")
+            {
+                return Err(Error::Protocol("invalid coordinator launch gap".into()));
+            }
+            let after = decimal(gap.get("after_seq"), "after_seq")?;
+            let first = decimal(gap.get("first_available_seq"), "first_available_seq")?;
+            let last = decimal(gap.get("last_seq"), "last_seq")?;
+            if first <= after || last < first {
+                return Err(Error::Protocol(
+                    "invalid coordinator launch gap sequence".into(),
+                ));
+            }
+            Ok(CoordinatorFrame::Gap)
+        }
+        _ => Err(Error::Protocol(
+            "unexpected coordinator stream frame".into(),
+        )),
+    }
+}
+
 fn parse_event(value: &Value, boot_id: &str, state: &WatchState) -> Result<(Event, u64), Error> {
     let object = value
         .as_object()
@@ -588,6 +744,16 @@ fn parse_event(value: &Value, boot_id: &str, state: &WatchState) -> Result<(Even
         .get("reason")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Protocol("event reason must be a string".into()))?;
+    if reason == "launch" {
+        let launch = parse_launch_event(value, boot_id, &state.stream_epoch)?;
+        if launch.event_seq <= state.last_sequence {
+            return Err(Error::Protocol("event sequence is not increasing".into()));
+        }
+        if !state.lifecycle && !state.scope.contains(&launch.pane_id) {
+            return Err(Error::Protocol("launch event outside watch scope".into()));
+        }
+        return Ok((Event::Launch(launch.clone()), launch.event_seq));
+    }
     let fields: &[&str] = match reason {
         "server_exiting" => &[
             "v",
@@ -832,6 +998,86 @@ mod tests {
             parse_event(&event, "boot", &state(&[], false)).unwrap().0,
             Event::ServerExiting
         );
+    }
+
+    #[test]
+    fn lifecycle_and_scoped_watches_accept_exact_launch_frames() {
+        let event = json!({
+            "v": 1,
+            "kind": "event",
+            "core_boot_id": "boot",
+            "stream_epoch": "7",
+            "event_seq": "4",
+            "reason": "launch",
+            "pane_id": "%9",
+            "pty_generation": "2",
+            "stage": "cwd_identity",
+            "errno": 116,
+        });
+        let expected = Event::Launch(LaunchEvent {
+            pane_id: "%9".into(),
+            pty_generation: "2".into(),
+            stage: LaunchStage::CwdIdentity,
+            errno: 116,
+            event_seq: 4,
+        });
+        assert_eq!(
+            parse_event(&event, "boot", &state(&[], true)).unwrap().0,
+            expected
+        );
+        assert_eq!(
+            parse_event(&event, "boot", &state(&["%9"], false))
+                .unwrap()
+                .0,
+            expected
+        );
+        assert!(parse_event(&event, "boot", &state(&["%8"], false)).is_err());
+        let mut malformed = event;
+        malformed["screen_generation"] = json!("3");
+        assert!(parse_event(&malformed, "boot", &state(&[], true)).is_err());
+    }
+
+    #[test]
+    fn coordinator_accepts_launch_frames_and_its_gap_frame() {
+        let launch = json!({
+            "v": 1,
+            "kind": "event",
+            "core_boot_id": "boot",
+            "stream_epoch": "0",
+            "event_seq": "12",
+            "reason": "launch",
+            "pane_id": "%5",
+            "pty_generation": "1",
+            "stage": "exec_ok",
+            "errno": 0,
+        });
+        assert_eq!(
+            parse_coordinator_frame(&launch, "boot").unwrap(),
+            CoordinatorFrame::Launch(LaunchEvent {
+                pane_id: "%5".into(),
+                pty_generation: "1".into(),
+                stage: LaunchStage::ExecOk,
+                errno: 0,
+                event_seq: 12,
+            })
+        );
+        let gap = json!({
+            "v": 1,
+            "kind": "gap",
+            "core_boot_id": "boot",
+            "stream_epoch": "0",
+            "after_seq": "8",
+            "first_available_seq": "10",
+            "last_seq": "14",
+            "code": "resync_required",
+        });
+        assert_eq!(
+            parse_coordinator_frame(&gap, "boot").unwrap(),
+            CoordinatorFrame::Gap
+        );
+        let mut wrong_epoch = gap;
+        wrong_epoch["stream_epoch"] = json!("7");
+        assert!(parse_coordinator_frame(&wrong_epoch, "boot").is_err());
     }
 
     #[test]

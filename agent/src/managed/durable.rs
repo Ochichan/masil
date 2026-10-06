@@ -91,6 +91,33 @@ fn transport_rejected(error: &str) -> bool {
         || error.starts_with("native command exited with exit status")
 }
 
+/// A control-socket read can fail after the coordinator accepted a launch.
+/// Its durable record must remain dispatching for that coordinator (or its
+/// replacement) to reconcile; unlike an error reply, it proves nothing about
+/// whether a core ticket was assigned.
+fn lost_core_launch_reply(error: &str) -> bool {
+    error.starts_with("outcome_unknown: coordinator action reply lost:")
+}
+
+/// These terminal start states prove that no provider run is left to settle.
+/// Return their own leading code so the CLI keeps the native exit class
+/// instead of converting a recorded refusal into `outcome_unknown`.
+fn proven_start_refusal(state: &str) -> bool {
+    matches!(
+        state,
+        "rejected_before_effect" | "not_applied" | "cwd_rejected" | "target_absent" | "expired"
+    )
+}
+
+fn recorded_start_refusal(error: &str, key: &str, state: &str) -> String {
+    let prefix = format!("{state}:");
+    let detail = error
+        .strip_prefix(&prefix)
+        .map(str::trim_start)
+        .unwrap_or(error);
+    format!("{state}: {detail} (operation {key} is {state})")
+}
+
 /// The public receipt of a run-bound effect, rebuilt identically on retry.
 fn effect_receipt(record: &Record) -> Value {
     let path = record
@@ -119,17 +146,24 @@ fn finish_effect(
         })
 }
 
-fn start_receipt(record: &Record) -> Value {
+pub(super) fn start_receipt(record: &Record) -> Value {
     record
         .receipts
         .iter()
         .rev()
         .find(|receipt| receipt.stage == record.state)
         .and_then(|receipt| receipt.evidence.clone())
-        .filter(|evidence| evidence.get("stage").is_some())
+        .and_then(|evidence| {
+            evidence["receipt"]
+                .get("stage")
+                .is_some()
+                .then(|| evidence["receipt"].clone())
+                .or_else(|| evidence.get("stage").is_some().then_some(evidence))
+        })
         .unwrap_or_else(|| {
             json!({"stage":record.state,"name":record.target,"operation_key":record.operation_key,
-                "native_session_verified":false,"provider_accepted":false})
+                "native_session_verified":false,"provider_accepted":false,
+                "path":record.intent().and_then(|intent| intent["path"].as_str()).unwrap_or("native_guard")})
         })
 }
 
@@ -1093,6 +1127,17 @@ impl Manager {
             }
             super::answer::check_start_args(args)?;
         }
+        // Starts alone keep the per-socket flock for name uniqueness, but a
+        // core-path coordinator can take seconds to come up.  Select and
+        // ensure it before taking that flock so another start is never held
+        // behind coordinator startup.
+        let core_path = self.action_path().await? == super::ActionPath::CoreLedger;
+        if core_path {
+            let socket = self.native.socket.clone();
+            tokio::task::spawn_blocking(move || crate::coordinator::ensure(&socket))
+                .await
+                .map_err(|error| format!("coordinator_unavailable: {error}"))??;
+        }
         let _lock = self.lock()?;
         let identity = self
             .command(&[
@@ -1162,6 +1207,7 @@ impl Manager {
             .prepare_launch(name, provider, cwd, args, session, split)
             .await?;
         prepared.answers = answers;
+        prepared.core_path = core_path;
         let mut reconciled = false;
         let ticket = loop {
             let request = NewOperation {
@@ -1175,7 +1221,16 @@ impl Manager {
                 digest: &digest,
                 payload_bytes: 0,
             };
-            match store.admit(&request, json!({}), now_ms())? {
+            let intent = if core_path {
+                json!({
+                    "path": "core_ledger",
+                    "provider": provider_id,
+                    "native_session_requested": session,
+                })
+            } else {
+                json!({})
+            };
+            match store.admit(&request, intent, now_ms())? {
                 Admission::Dispatch(ticket) => break ticket,
                 Admission::Recorded(record) => return Ok(start_receipt(&record)),
                 Admission::NeedsReconcile(record) if !reconciled => {
@@ -1215,8 +1270,32 @@ impl Manager {
         };
         // The ticket is the new run's identity, so reconcile can find the pane.
         let launched = self
-            .launch(prepared, name, &ticket.ticket, session, split)
+            .launch(
+                prepared,
+                name,
+                &ticket,
+                session,
+                split,
+                lease
+                    .as_ref()
+                    .map(|lease| (lease.worktree, lease.name.as_str())),
+            )
             .await;
+        let core_record = if core_path {
+            store.get(&ticket.key)?
+        } else {
+            None
+        };
+        let core_recorded = core_record
+            .as_ref()
+            .is_some_and(|record| record.state != operations::DISPATCHING);
+        let core_dispatching_without_ticket = core_record.as_ref().is_some_and(|record| {
+            record.state == operations::DISPATCHING
+                && !super::core_action::has_current_launch_dispatch(record)
+        });
+        let core_known_not_applied = core_record
+            .as_ref()
+            .is_some_and(|record| core_recorded && proven_start_refusal(&record.state));
         if let Some(lease) = &lease {
             match &launched {
                 Ok(outcome) => {
@@ -1225,7 +1304,9 @@ impl Manager {
                     }
                 }
                 Err(error)
-                    if error.starts_with("cwd_rejected")
+                    if core_known_not_applied
+                        || (core_dispatching_without_ticket && !lost_core_launch_reply(error))
+                        || error.starts_with("cwd_rejected")
                         || (transport_rejected(error) && !error.contains("was launched")) =>
                 {
                     crate::worktree::abandon(lease);
@@ -1240,31 +1321,79 @@ impl Manager {
                 if let Some(lease) = &lease {
                     outcome["worktree"] = json!({"id": lease.worktree, "name": lease.name});
                 }
-                store
-                    .finish(&ticket, "process_started", "registration", Some(&outcome), now_ms())
-                    .map_err(|error| {
-                        String::from(AfterEffect::new(format!(
-                            "agent started, but its durable receipt could not be committed: {error}; query `agent operation {}`",
-                            ticket.key
-                        )))
-                    })?;
+                if !core_recorded {
+                    store
+                        .finish(&ticket, "process_started", "registration", Some(&outcome), now_ms())
+                        .map_err(|error| {
+                            String::from(AfterEffect::new(format!(
+                                "agent started, but its durable receipt could not be committed: {error}; query `agent operation {}`",
+                                ticket.key
+                            )))
+                        })?;
+                }
                 Ok(outcome)
             }
             // The child checked its directory and did not start the agent.
             Err(error) if error.starts_with("cwd_rejected") => {
-                let _ = store.finish(
-                    &ticket,
-                    "cwd_rejected",
-                    "exec_managed",
-                    Some(&json!({"error": error})),
-                    now_ms(),
-                );
-                Err(format!(
-                    "{error} (operation {} is cwd_rejected)",
-                    ticket.key
-                ))
+                let state = if core_recorded {
+                    core_record
+                        .as_ref()
+                        .map(|record| record.state.as_str())
+                        .unwrap_or("cwd_rejected")
+                } else {
+                    let _ = store.finish(
+                        &ticket,
+                        "cwd_rejected",
+                        "exec_managed",
+                        Some(&json!({"error": error})),
+                        now_ms(),
+                    );
+                    "cwd_rejected"
+                };
+                Err(recorded_start_refusal(&error, &ticket.key, state))
             }
             Err(error) => {
+                if core_path
+                    && lost_core_launch_reply(&error)
+                    && core_record
+                        .as_ref()
+                        .is_some_and(|record| record.state == operations::DISPATCHING)
+                {
+                    // The coordinator may still be registering this pane.  A
+                    // replacement coordinator owns reconciliation of its
+                    // dispatching record; do not replace it with a CLI guess.
+                    return Err(error);
+                }
+                if let Some(record) = core_record.filter(|_| core_recorded) {
+                    if proven_start_refusal(&record.state) {
+                        return Err(recorded_start_refusal(&error, &ticket.key, &record.state));
+                    }
+                    return Err(String::from(AfterEffect::new(format!(
+                        "{error} (operation {} is {})",
+                        ticket.key, record.state
+                    ))));
+                }
+                if core_path && core_dispatching_without_ticket {
+                    let record = store
+                        .finish(
+                            &ticket,
+                            "rejected_before_effect",
+                            "coordinator",
+                            Some(&json!({
+                                "path": "core_ledger",
+                                "result": "rejected_before_effect",
+                                "error": error,
+                            })),
+                            now_ms(),
+                        )
+                        .map_err(|finish| {
+                            String::from(AfterEffect::new(format!(
+                                "launch was refused before core dispatch, but its durable receipt could not be committed: {finish}; query `agent operation {}`",
+                                ticket.key
+                            )))
+                        })?;
+                    return Err(recorded_start_refusal(&error, &ticket.key, &record.state));
+                }
                 if transport_rejected(&error) && !error.contains("was launched") {
                     let _ = store.finish(
                         &ticket,
@@ -1504,6 +1633,36 @@ mod tests {
             "native command exited with signal: 9 (SIGKILL)"
         ));
         assert!(!transport_rejected("reading native command: broken pipe"));
+    }
+
+    #[test]
+    fn recorded_core_start_refusals_keep_their_proven_state() {
+        assert!(proven_start_refusal("rejected_before_effect"));
+        assert!(proven_start_refusal("not_applied"));
+        assert!(proven_start_refusal("cwd_rejected"));
+        assert!(!proven_start_refusal("outcome_unknown"));
+        assert_eq!(
+            recorded_start_refusal(
+                "cwd_rejected: the directory changed",
+                "boot:boot/start/cwd",
+                "cwd_rejected",
+            ),
+            "cwd_rejected: the directory changed (operation boot:boot/start/cwd is cwd_rejected)"
+        );
+        assert_eq!(
+            recorded_start_refusal(
+                "bridge_unavailable: no launch bridge",
+                "boot:boot/start/split",
+                "rejected_before_effect",
+            ),
+            "rejected_before_effect: bridge_unavailable: no launch bridge (operation boot:boot/start/split is rejected_before_effect)"
+        );
+        assert!(lost_core_launch_reply(
+            "outcome_unknown: coordinator action reply lost: connection reset"
+        ));
+        assert!(!lost_core_launch_reply(
+            "bridge_unavailable: coordinator action request was not sent: connection refused"
+        ));
     }
 
     #[test]

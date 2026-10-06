@@ -800,6 +800,10 @@ fn bridge_event_action(event: &Event) -> BridgeEventAction {
             invalidate_pane: matches!(reason, PaneReason::PtyChanged | PaneReason::Removed)
                 .then(|| pane_id.clone()),
         },
+        // A launch status is consumed by the action coordinator. It does not
+        // describe a new authoritative lifecycle transition for the resident
+        // projection, so seeing it must not tear down the lifecycle watch.
+        Event::Launch(_) => BridgeEventAction::default(),
         Event::WindowRemoved { .. } | Event::SessionRemoved { .. } => BridgeEventAction {
             lifecycle_changed: true,
             invalidate_pane: None,

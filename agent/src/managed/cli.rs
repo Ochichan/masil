@@ -1880,6 +1880,7 @@ fn bridge_closed_event(target: &ClosedTarget<'_>, event: &bridge::Event) -> bool
         bridge::Event::Pane { pane_id, reason } => {
             target.kind == "pane" && pane_id == target.id && *reason == bridge::PaneReason::Removed
         }
+        bridge::Event::Launch(_) => false,
         bridge::Event::WindowRemoved { window_id } => {
             target.kind == "window" && window_id == target.id
         }

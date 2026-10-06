@@ -52,6 +52,12 @@ const LOCK_RETRY: Duration = Duration::from_secs(1);
 const NUDGE_WAIT: Duration = Duration::from_secs(1);
 const LOG_LIMIT: u64 = 1 << 20;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+/// A core launch waits briefly for its child status, then may still need a
+/// native metadata registration and verdict poll.  This intentionally exceeds
+/// the event wait by a visible margin so the CLI does not abandon a live
+/// registration first.
+const LAUNCH_ACTION_TIMEOUT: Duration =
+    Duration::from_secs(crate::managed::core_action::LAUNCH_EVENT_TIMEOUT_SECS + 9);
 const OUTPUT_LIMIT: u64 = 256 * 1024;
 /// How long a notification test may take: the hook's 5 s, its stop, and
 /// the other routes alongside.
@@ -384,15 +390,103 @@ fn request_with(
     if response["ok"] == true {
         Ok(response["value"].clone())
     } else {
-        Err(format!(
-            "{}: {}",
-            response["error"]["code"]
-                .as_str()
-                .unwrap_or("coordinator_error"),
-            response["error"]["message"]
-                .as_str()
-                .unwrap_or("request failed")
-        ))
+        let code = response["error"]["code"]
+            .as_str()
+            .unwrap_or("coordinator_error");
+        let message = response["error"]["message"]
+            .as_str()
+            .unwrap_or("request failed");
+        Err(coordinator_error_text(code, message))
+    }
+}
+
+/// A coordinator action already includes its classified error in its message.
+/// Preserve that native-facing text instead of producing e.g.
+/// `cwd_rejected: cwd_rejected: ...` at the control-socket boundary.
+fn coordinator_error_text(code: &str, message: &str) -> String {
+    if message
+        .strip_prefix(code)
+        .is_some_and(|suffix| suffix.starts_with(':'))
+    {
+        message.to_owned()
+    } else {
+        format!("{code}: {message}")
+    }
+}
+
+/// A control request that never completed its write cannot have reached the
+/// coordinator. Once the full request was written, only a reply failure is
+/// uncertain: the coordinator might already have dispatched the core action.
+enum ActionRequestError {
+    NotSent(String),
+    ReplyLost(String),
+    Coordinator(String),
+}
+
+fn action_request_failure(error: ActionRequestError) -> String {
+    match error {
+        ActionRequestError::NotSent(error) => {
+            format!("bridge_unavailable: coordinator action request was not sent: {error}")
+        }
+        ActionRequestError::ReplyLost(error) => {
+            format!("outcome_unknown: coordinator action reply lost: {error}")
+        }
+        ActionRequestError::Coordinator(error) => error,
+    }
+}
+
+fn action_control_request(
+    listen: &Path,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, ActionRequestError> {
+    let mut stream = StdUnixStream::connect(listen).map_err(|error| {
+        ActionRequestError::NotSent(format!("coordinator_unavailable: {error}"))
+    })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|error| {
+            ActionRequestError::NotSent(format!("coordinator_unavailable: {error}"))
+        })?;
+    let message = json!({"v": 1, "id": "cli", "method": "action", "params": params});
+    let body = serde_json::to_vec(&message)
+        .map_err(|error| ActionRequestError::NotSent(format!("invalid_action: {error}")))?;
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .and_then(|()| stream.write_all(&body))
+        .map_err(|error| {
+            ActionRequestError::NotSent(format!("coordinator_unavailable: {error}"))
+        })?;
+    let mut header = [0; 4];
+    stream.read_exact(&mut header).map_err(|error| {
+        ActionRequestError::ReplyLost(format!("coordinator_unavailable: {error}"))
+    })?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > RESPONSE_FRAME {
+        return Err(ActionRequestError::ReplyLost(
+            "coordinator_unavailable: invalid response frame".into(),
+        ));
+    }
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).map_err(|error| {
+        ActionRequestError::ReplyLost(format!("coordinator_unavailable: {error}"))
+    })?;
+    let response: Value = serde_json::from_slice(&body).map_err(|_| {
+        ActionRequestError::ReplyLost("coordinator_unavailable: invalid response".into())
+    })?;
+    if response["ok"] == true {
+        Ok(response["value"].clone())
+    } else {
+        let code = response["error"]["code"]
+            .as_str()
+            .unwrap_or("coordinator_error");
+        let message = response["error"]["message"]
+            .as_str()
+            .unwrap_or("request failed");
+        Err(ActionRequestError::Coordinator(coordinator_error_text(
+            code, message,
+        )))
     }
 }
 
@@ -441,34 +535,42 @@ pub(crate) fn endpoint_call(
     }
 }
 
-/// Sends one guarded-action request through the coordinator. The caller
-/// starts or revives the coordinator first; once a core path was selected,
-/// a missing bridge is reported here rather than falling back to native.
-pub(crate) fn action(socket: &Path, params: Value) -> Result<Value, String> {
+fn check_action_frame(params: &Value) -> Result<(), String> {
     let body =
         serde_json::to_vec(&json!({"v": 1, "id": "cli", "method": "action", "params": params}))
             .map_err(|error| format!("invalid_action: {error}"))?;
     if body.len() > ACTION_REQUEST_FRAME {
         return Err("invalid_action: action request exceeds 64 KiB".into());
     }
+    Ok(())
+}
+
+/// Sends one guarded-action request through the coordinator. Once a core
+/// path was selected, a missing bridge is reported here rather than falling
+/// back to native.
+pub(crate) fn action(socket: &Path, params: Value) -> Result<Value, String> {
+    check_action_frame(&params)?;
     ensure(socket)?;
+    action_on_running_coordinator(socket, params)
+}
+
+/// Sends an action after a caller has already ensured the coordinator.
+/// `start` uses this after its pre-flock ensure so coordinator startup never
+/// occupies the name-uniqueness lock.
+pub(crate) fn action_after_ensure(socket: &Path, params: Value) -> Result<Value, String> {
+    check_action_frame(&params)?;
+    action_on_running_coordinator(socket, params)
+}
+
+fn action_on_running_coordinator(socket: &Path, params: Value) -> Result<Value, String> {
     let server = check_state(socket)?;
     let paths = paths(socket, &server.state)?;
-    match request_with(
-        &paths.listen,
-        "action",
-        params,
-        COMMAND_TIMEOUT + Duration::from_secs(2),
-        RESPONSE_FRAME,
-    ) {
-        // Once the control request has been written, a coordinator exit can
-        // race either side of the core effect. The caller must not retry a
-        // non-durable keys action through another path.
-        Err(error) if error.starts_with("coordinator_unavailable:") => Err(format!(
-            "outcome_unknown: coordinator action reply lost: {error}"
-        )),
-        result => result,
-    }
+    let timeout = if params["operation"].as_str() == Some("launch") {
+        LAUNCH_ACTION_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT + Duration::from_secs(2)
+    };
+    action_control_request(&paths.listen, params, timeout).map_err(action_request_failure)
 }
 
 /// The running coordinator's resident extensions; None if none runs.
@@ -2073,6 +2175,38 @@ mod tests {
         ] {
             assert_eq!(call(bad).0["error"]["code"], "invalid_request", "{bad}");
         }
+    }
+
+    #[test]
+    fn action_errors_do_not_duplicate_their_leading_code() {
+        assert_eq!(
+            coordinator_error_text("cwd_rejected", "cwd_rejected: directory changed"),
+            "cwd_rejected: directory changed"
+        );
+        assert_eq!(
+            coordinator_error_text("identity_mismatch", "identity_mismatch: target changed"),
+            "identity_mismatch: target changed"
+        );
+        assert_eq!(
+            coordinator_error_text("bridge_unavailable", "connection ended"),
+            "bridge_unavailable: connection ended"
+        );
+    }
+
+    #[test]
+    fn unsent_actions_are_not_reported_as_lost_replies() {
+        assert_eq!(
+            action_request_failure(ActionRequestError::NotSent(
+                "coordinator_unavailable: connection refused".into(),
+            )),
+            "bridge_unavailable: coordinator action request was not sent: coordinator_unavailable: connection refused"
+        );
+        assert_eq!(
+            action_request_failure(ActionRequestError::ReplyLost(
+                "coordinator_unavailable: connection reset".into(),
+            )),
+            "outcome_unknown: coordinator action reply lost: coordinator_unavailable: connection reset"
+        );
     }
 
     #[test]

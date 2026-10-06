@@ -6,7 +6,7 @@
 
 use super::operations::{Admission, NewOperation, Record, Store, Ticket, UNKNOWN};
 use super::{Agent, Manager, nonce};
-use crate::bridge::Endpoint;
+use crate::bridge::{self, Endpoint, LaunchEvent};
 use crate::observation::now_ms;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -27,6 +27,11 @@ const RESPONSE_FRAME: usize = 64 * 1024;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const BUSY_ATTEMPTS: usize = 5;
 const INTERRUPT_INTER_KEY_PAUSE: Duration = Duration::from_millis(300);
+/// A missing child status is reconciled through the pane registration path.
+/// Keep this decisively below the control-socket launch budget so the caller
+/// receives that reconciliation rather than timing out first.
+pub(crate) const LAUNCH_EVENT_TIMEOUT_SECS: u64 = 3;
+const LAUNCH_EVENT_TIMEOUT: Duration = Duration::from_secs(LAUNCH_EVENT_TIMEOUT_SECS);
 
 /// A boot-local ticket assigned by the coordinator connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -157,7 +162,49 @@ pub(crate) struct GuardedAction {
     pub(crate) payload_digest: String,
     pub(crate) retain: bool,
     pub(crate) preconditions: Preconditions,
+    /// Launches validate either a session or a target pane rather than a
+    /// managed-agent snapshot, so their outer target/preconditions shape is
+    /// different from every other guarded action.
+    pub(crate) launch_target: Option<LaunchTarget>,
     pub(crate) action: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LaunchTarget {
+    Window {
+        core_boot_id: String,
+    },
+    Split {
+        core_boot_id: String,
+        pane_id: String,
+        pty_generation: String,
+    },
+}
+
+impl LaunchTarget {
+    fn target(&self) -> Value {
+        match self {
+            Self::Window { core_boot_id } => json!({"core_boot_id": core_boot_id}),
+            Self::Split {
+                core_boot_id,
+                pane_id,
+                pty_generation,
+            } => json!({
+                "core_boot_id": core_boot_id,
+                "pane_id": pane_id,
+                "pty_generation": pty_generation,
+            }),
+        }
+    }
+}
+
+/// The immutable receipt the core attaches to an applied launch action. The
+/// later launch-status event supplies the exec-stage result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LaunchReceipt {
+    pub(crate) pane_id: String,
+    pub(crate) pid: String,
+    pub(crate) pty_generation: String,
 }
 
 /// Results from the core ledger. The error variants intentionally retain the
@@ -168,6 +215,7 @@ pub(crate) enum LedgerResult {
         ticket: DispatchTicket,
         result_digest: String,
         queued_bytes: Option<u64>,
+        launch: Option<LaunchReceipt>,
     },
     RejectedBeforeEffect {
         ticket: DispatchTicket,
@@ -330,13 +378,20 @@ struct WireRequest {
 const MAX_REQUEST_ID: &str = "core-action-18446744073709551615";
 
 fn guarded_action_fields(request: &GuardedAction) -> Value {
+    let (target, preconditions) = match &request.launch_target {
+        Some(target) => (target.target(), json!({})),
+        None => (
+            request.preconditions.target(),
+            request.preconditions.value(),
+        ),
+    };
     json!({
         "operation_key": request.operation_key.value(),
         "dispatch_ticket": request.ticket.value(),
         "payload_digest": request.payload_digest,
         "retain": request.retain,
-        "target": request.preconditions.target(),
-        "preconditions": request.preconditions.value(),
+        "target": target,
+        "preconditions": preconditions,
         "action": request.action,
     })
 }
@@ -364,9 +419,11 @@ pub(crate) fn validate_guarded_action(request: &GuardedAction) -> Result<(), Str
 /// the bridge cannot close an idle peer for being unable to write to it.
 pub(crate) struct Client {
     requests: mpsc::Sender<WireRequest>,
+    launch_events: mpsc::UnboundedReceiver<Result<bridge::CoordinatorFrame, Error>>,
     core_boot_id: String,
     epoch: u64,
     input: bool,
+    launch: bool,
     next_seq: u64,
     request_number: u64,
     broken: bool,
@@ -392,17 +449,26 @@ impl Client {
         )
         .await?;
         let hello = read_value(&mut stream, false).await?;
-        let (epoch, input) = parse_hello(&hello, hello_id, endpoint)?;
+        let (epoch, input, launch) = parse_hello(&hello, hello_id, endpoint)?;
         let (read, write) = stream.into_split();
         let (requests, received_requests) = mpsc::channel(1);
         let (frames, received_frames) = mpsc::unbounded_channel();
+        let (launch_events, received_launch_events) = mpsc::unbounded_channel();
         let reader = tokio::spawn(reader_task(read, frames));
-        let writer = tokio::spawn(writer_task(write, received_requests, received_frames));
+        let writer = tokio::spawn(writer_task(
+            write,
+            received_requests,
+            received_frames,
+            launch_events,
+            endpoint.core_boot_id.clone(),
+        ));
         Ok(Self {
             requests,
+            launch_events: received_launch_events,
             core_boot_id: endpoint.core_boot_id.clone(),
             epoch,
             input,
+            launch,
             next_seq: 0,
             request_number: 0,
             broken: false,
@@ -417,6 +483,10 @@ impl Client {
 
     pub(crate) const fn supports_input(&self) -> bool {
         self.input
+    }
+
+    pub(crate) const fn supports_launch(&self) -> bool {
+        self.launch
     }
 
     pub(crate) fn core_boot_id(&self) -> &str {
@@ -653,6 +723,64 @@ impl Client {
         }
     }
 
+    /// Waits only for the child result belonging to this applied launch. A
+    /// coordinator-only gap proves the journal cannot answer this wait, but
+    /// it does not make the bridge protocol malformed; callers reconcile the
+    /// pane liveness in the same way as a native unanswered cwd verdict.
+    pub(crate) async fn wait_launch(
+        &mut self,
+        pane_id: &str,
+        pty_generation: &str,
+    ) -> Result<Option<LaunchEvent>, Error> {
+        if !self.supports_launch() {
+            return Err(Error::Unavailable(
+                "the core does not support launch events".into(),
+            ));
+        }
+        let wait = async {
+            loop {
+                match self.launch_events.recv().await {
+                    Some(Ok(bridge::CoordinatorFrame::Launch(event)))
+                        if event.pane_id == pane_id && event.pty_generation == pty_generation =>
+                    {
+                        return Ok(Some(event));
+                    }
+                    Some(Ok(bridge::CoordinatorFrame::Launch(_))) => {}
+                    Some(Ok(bridge::CoordinatorFrame::Gap)) => return Ok(None),
+                    Some(Err(error)) => return Err(error),
+                    None => {
+                        return Err(Error::Lost(
+                            "the coordinator launch-event reader ended".into(),
+                        ));
+                    }
+                }
+            }
+        };
+        match tokio::time::timeout(LAUNCH_EVENT_TIMEOUT, wait).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Launch events belong to the action that caused them, but the stream is
+    /// also long lived across actions.  Discard old events (especially an old
+    /// gap) before a new guarded launch so a prior journal loss cannot settle
+    /// the new action as unanswered immediately.
+    fn drain_launch_events(&mut self) -> Result<(), Error> {
+        loop {
+            match self.launch_events.try_recv() {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(Error::Lost(
+                        "the coordinator launch-event reader ended".into(),
+                    ));
+                }
+            }
+        }
+    }
+
     async fn call(&mut self, kind: &str, fields: Value) -> Result<Value, Error> {
         if self.broken {
             return Err(Error::Lost(
@@ -677,8 +805,9 @@ impl Client {
             })
             .await
             .map_err(|_| Error::Lost("the coordinator bridge writer ended".into()))?;
-        answer
+        tokio::time::timeout(FRAME_TIMEOUT, answer)
             .await
+            .map_err(|_| Error::Lost("reading action response timed out".into()))?
             .map_err(|_| Error::Lost("the coordinator bridge writer ended".into()))?
     }
 
@@ -743,34 +872,109 @@ async fn writer_task(
     mut write: OwnedWriteHalf,
     mut requests: mpsc::Receiver<WireRequest>,
     mut frames: mpsc::UnboundedReceiver<Result<Value, Error>>,
+    launch_events: mpsc::UnboundedSender<Result<bridge::CoordinatorFrame, Error>>,
+    core_boot_id: String,
 ) {
-    while let Some(request) = requests.recv().await {
-        let response = match write_value(&mut write, &request.value).await {
-            Ok(()) => match tokio::time::timeout(FRAME_TIMEOUT, frames.recv()).await {
-                Ok(Some(Ok(value))) => {
-                    if response_id(&value).as_deref() == Some(request.request_id.as_str()) {
-                        Ok(value)
-                    } else {
-                        Err(Error::Protocol(
-                            "action response request_id mismatch".into(),
-                        ))
+    let mut active: Option<WireRequest> = None;
+    let mut requests_open = true;
+    let mut last_launch_sequence = 0;
+    loop {
+        if !requests_open && active.is_none() {
+            return;
+        }
+        tokio::select! {
+            request = requests.recv(), if requests_open && active.is_none() => {
+                let Some(request) = request else {
+                    requests_open = false;
+                    continue;
+                };
+                match write_value(&mut write, &request.value).await {
+                    Ok(()) => active = Some(request),
+                    Err(error) => {
+                        let _ = request.reply.send(Err(error.clone()));
+                        while let Ok(waiting) = requests.try_recv() {
+                            let _ = waiting.reply.send(Err(Error::Lost(
+                                "the coordinator bridge connection ended".into(),
+                            )));
+                        }
+                        return;
                     }
                 }
-                Ok(Some(Err(error))) => Err(error),
-                Ok(None) => Err(Error::Lost("the coordinator bridge reader ended".into())),
-                Err(_) => Err(Error::Lost("reading action response timed out".into())),
-            },
-            Err(error) => Err(error),
-        };
-        let failed = response.is_err();
-        let _ = request.reply.send(response);
-        if failed {
-            while let Ok(request) = requests.try_recv() {
-                let _ = request.reply.send(Err(Error::Lost(
-                    "the coordinator bridge connection ended".into(),
-                )));
             }
-            return;
+            frame = frames.recv() => {
+                let result = match frame {
+                    Some(result) => result,
+                    None => Err(Error::Lost("the coordinator bridge reader ended".into())),
+                };
+                let value = match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if let Some(request) = active.take() {
+                            let _ = request.reply.send(Err(error.clone()));
+                        }
+                        while let Ok(waiting) = requests.try_recv() {
+                            let _ = waiting.reply.send(Err(Error::Lost(
+                                "the coordinator bridge connection ended".into(),
+                            )));
+                        }
+                        let _ = launch_events.send(Err(error));
+                        return;
+                    }
+                };
+                if matches!(value.get("kind").and_then(Value::as_str), Some("event" | "gap")) {
+                    let frame = bridge::parse_coordinator_frame(&value, &core_boot_id)
+                        .map_err(|error| Error::Protocol(error.to_string()));
+                    match frame {
+                        Ok(bridge::CoordinatorFrame::Launch(event)) => {
+                            if event.event_seq <= last_launch_sequence {
+                                let error = Error::Protocol(
+                                    "coordinator launch event sequence is not increasing".into(),
+                                );
+                                if let Some(request) = active.take() {
+                                    let _ = request.reply.send(Err(error.clone()));
+                                }
+                                let _ = launch_events.send(Err(error));
+                                return;
+                            }
+                            last_launch_sequence = event.event_seq;
+                            if launch_events
+                                .send(Ok(bridge::CoordinatorFrame::Launch(event)))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(bridge::CoordinatorFrame::Gap) => {
+                            if launch_events.send(Ok(bridge::CoordinatorFrame::Gap)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(request) = active.take() {
+                                let _ = request.reply.send(Err(error.clone()));
+                            }
+                            let _ = launch_events.send(Err(error));
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                let Some(request) = active.take() else {
+                    let error = Error::Protocol(
+                        "action response arrived without a pending request".into(),
+                    );
+                    let _ = launch_events.send(Err(error));
+                    return;
+                };
+                if response_id(&value).as_deref() == Some(request.request_id.as_str()) {
+                    let _ = request.reply.send(Ok(value));
+                } else {
+                    let error = Error::Protocol("action response request_id mismatch".into());
+                    let _ = request.reply.send(Err(error.clone()));
+                    let _ = launch_events.send(Err(error));
+                    return;
+                }
+            }
         }
     }
 }
@@ -983,7 +1187,11 @@ fn parse_input_chunk(value: &Value, staging_id: &str, received: usize) -> Result
     Ok(())
 }
 
-fn parse_hello(value: &Value, request_id: &str, endpoint: &Endpoint) -> Result<(u64, bool), Error> {
+fn parse_hello(
+    value: &Value,
+    request_id: &str,
+    endpoint: &Endpoint,
+) -> Result<(u64, bool, bool), Error> {
     if let Some(error) = parse_error(value, request_id)? {
         if matches!(&error, Error::Rejected { code, .. } if code == "epoch_exhausted") {
             return Err(Error::Unavailable(
@@ -1015,6 +1223,7 @@ fn parse_hello(value: &Value, request_id: &str, endpoint: &Endpoint) -> Result<(
     Ok((
         decimal(capabilities.get("dispatch_epoch"), "dispatch_epoch")?,
         capabilities.get("input").and_then(Value::as_bool) == Some(true),
+        capabilities.get("launch").and_then(Value::as_bool) == Some(true),
     ))
 }
 
@@ -1091,10 +1300,12 @@ fn parse_ledger_reply(
             None | Some(Value::Null) => None,
             Some(value) => Some(decimal_or_number(Some(value), "queued_bytes")?),
         };
+        let launch = parse_launch_receipt(object)?;
         return Ok(LedgerResult::Applied {
             ticket,
             result_digest: digest,
             queued_bytes,
+            launch,
         });
     }
     if result == "not_applied" {
@@ -1114,6 +1325,52 @@ fn parse_ledger_reply(
         });
     }
     Err(Error::Protocol("unknown ledger result".into()))
+}
+
+fn parse_launch_receipt(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<LaunchReceipt>, Error> {
+    let present = ["pane_id", "pid", "pty_generation"]
+        .iter()
+        .filter(|field| object.get(**field).is_some_and(|value| !value.is_null()))
+        .count();
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != 3 {
+        return Err(Error::Protocol("incomplete launch receipt".into()));
+    }
+    let pane_id = object
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Protocol("launch receipt pane_id is invalid".into()))?;
+    if pane_id.len() < 2
+        || !pane_id.starts_with('%')
+        || !pane_id[1..].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(Error::Protocol("launch receipt pane_id is invalid".into()));
+    }
+    let pid = object
+        .get("pid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Protocol("launch receipt pid is invalid".into()))?;
+    let pty_generation = object
+        .get("pty_generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Protocol("launch receipt pty_generation is invalid".into()))?;
+    if decimal(object.get("pid"), "launch receipt pid")? == 0
+        || decimal(
+            object.get("pty_generation"),
+            "launch receipt pty_generation",
+        )? == 0
+    {
+        return Err(Error::Protocol("launch receipt identity is zero".into()));
+    }
+    Ok(Some(LaunchReceipt {
+        pane_id: pane_id.to_owned(),
+        pid: pid.to_owned(),
+        pty_generation: pty_generation.to_owned(),
+    }))
 }
 
 struct LedgerPage {
@@ -1275,6 +1532,9 @@ fn parse_ledger_list(value: &Value, epoch: u64) -> Result<LedgerPage, Error> {
                     "result": object.get("result").cloned().unwrap_or(Value::Null),
                     "result_digest": object.get("result_digest").cloned().unwrap_or(Value::Null),
                     "queued_bytes": object.get("queued_bytes").cloned().unwrap_or(Value::Null),
+                    "pane_id": object.get("pane_id").cloned().unwrap_or(Value::Null),
+                    "pid": object.get("pid").cloned().unwrap_or(Value::Null),
+                    "pty_generation": object.get("pty_generation").cloned().unwrap_or(Value::Null),
                 }),
                 "ledger_query",
                 ticket,
@@ -1442,7 +1702,11 @@ impl CoordinatorActions {
         }
         let _active = ActiveAction::new(self);
         let action = ControlAction::parse(params)?;
-        let _pane = self.locks.lock(action.pane()).await;
+        let _pane = if action.pane().is_empty() {
+            None
+        } else {
+            Some(self.locks.lock(action.pane()).await)
+        };
         let manager = Manager::new(self.socket.clone(), None)?;
         let connect_needed = {
             let client = self.client.lock().await;
@@ -1519,6 +1783,7 @@ impl CoordinatorActions {
                 )
                 .await
             }
+            ControlAction::Launch(action) => self.launch(&manager, core, action).await,
         };
         let boot_mismatch = outcome
             .as_ref()
@@ -1806,6 +2071,7 @@ impl CoordinatorActions {
             )),
             retain: true,
             preconditions: input_preconditions,
+            launch_target: None,
             action: json!({
                 "kind": "input_commit",
                 "staging_id": staging_id.clone(),
@@ -1902,6 +2168,7 @@ impl CoordinatorActions {
                 ticket: core_ticket,
                 result_digest,
                 queued_bytes: Some(queued_bytes),
+                ..
             }) => {
                 let evidence = input_result_evidence(
                     &key,
@@ -1976,6 +2243,653 @@ impl CoordinatorActions {
         }
     }
 
+    async fn launch(
+        &self,
+        manager: &Manager,
+        core: &mut Client,
+        request: LaunchAction,
+    ) -> Result<Value, String> {
+        let mut store = manager.operation_store().await?;
+        let record = store
+            .get(&request.operation_key)?
+            .ok_or("invalid_action: launch operation is unknown")?;
+        if record.action != "start"
+            || record.ticket != request.operation_ticket
+            || request.run != record.ticket
+            || record.target != request.name
+            || record.boot != core.core_boot_id()
+        {
+            return Err("invalid_action: launch operation does not match its admission".into());
+        }
+        if record.state != super::operations::DISPATCHING {
+            return Ok(super::durable::start_receipt(&record));
+        }
+        if has_current_launch_dispatch(&record) {
+            return Err(format!(
+                "outcome_unknown: launch operation {} already has a core dispatch ticket",
+                record.operation_key
+            ));
+        }
+        if !core.supports_launch() {
+            return Self::reject_launch_before_dispatch(
+                &mut store,
+                &record,
+                "bridge_unavailable: the core does not support launch",
+            );
+        }
+        let provider = match super::providers::find(&request.provider) {
+            Some(provider) => provider,
+            None => {
+                return Self::reject_launch_before_dispatch(
+                    &mut store,
+                    &record,
+                    "invalid_action: launch provider is unavailable",
+                );
+            }
+        };
+        let mut expected_digest = super::durable::launch_digest(
+            &request.name,
+            provider.id,
+            &request.cwd,
+            &request.args,
+            request.session.as_deref(),
+            (request.mode == LaunchMode::Split).then_some(request.target.as_str()),
+        );
+        if request.answers {
+            expected_digest = super::prompt::sha256(&format!("{expected_digest}\nanswers"));
+        }
+        if record.digest != expected_digest {
+            return Err("invalid_action: launch content does not match its admission".into());
+        }
+
+        let outer_ticket = ticket_for(&record);
+        let operation_id = digest(&format!("boot:{}/start/{}", record.boot, record.id));
+        let key_nonce = match nonce() {
+            Ok(nonce) => nonce,
+            Err(error) => return Self::reject_launch_before_dispatch(&mut store, &record, error),
+        };
+        let key = durable_key_for_boot(&self.socket, &record.boot, &key_nonce, &operation_id);
+        let core_ticket = core.next_ticket();
+        let launch_target = match request.mode {
+            LaunchMode::Window => LaunchTarget::Window {
+                core_boot_id: core.core_boot_id().to_owned(),
+            },
+            LaunchMode::Split => {
+                let target = match manager
+                    .command(&[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &request.target,
+                        "#{masil_core_boot_id}\t#{pane_id}\t#{masil_pty_generation}",
+                    ])
+                    .await
+                {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return Self::reject_launch_before_dispatch(&mut store, &record, error);
+                    }
+                };
+                // The boot id is server-wide, so a missing pane shows only as
+                // an empty pane id field.
+                if target.split('\t').nth(1).is_none_or(str::is_empty) {
+                    return Self::reject_launch_before_dispatch(
+                        &mut store,
+                        &record,
+                        format!("can't find pane: {}", request.target),
+                    );
+                }
+                let fields: Vec<_> = target.trim_end_matches('\n').split('\t').collect();
+                if fields.len() != 3
+                    || fields[0] != core.core_boot_id()
+                    || fields[1] != request.target
+                {
+                    return Self::reject_launch_before_dispatch(
+                        &mut store,
+                        &record,
+                        "identity_mismatch: launch split target changed before delivery",
+                    );
+                }
+                if fields[2].is_empty()
+                    || !fields[2].bytes().all(|byte| byte.is_ascii_digit())
+                    || fields[2].parse::<u64>().is_err()
+                {
+                    return Self::reject_launch_before_dispatch(
+                        &mut store,
+                        &record,
+                        "identity_mismatch: launch split target changed before delivery",
+                    );
+                }
+                LaunchTarget::Split {
+                    core_boot_id: fields[0].to_owned(),
+                    pane_id: fields[1].to_owned(),
+                    pty_generation: fields[2].to_owned(),
+                }
+            }
+        };
+        let mut action = json!({
+            "kind": "launch",
+            "mode": match request.mode {
+                LaunchMode::Window => "window",
+                LaunchMode::Split => "split",
+            },
+            "target": request.target,
+            "cwd": request.cwd,
+            "cwd_dev": request.cwd_dev,
+            "cwd_ino": request.cwd_ino,
+            "env": request.env,
+            "argv": request.argv,
+        });
+        if request.mode == LaunchMode::Window {
+            action["name"] = json!(&request.name);
+        }
+        let payload_digest = digest(&action.to_string());
+        let unused_preconditions = Preconditions {
+            core_boot_id: core.core_boot_id().to_owned(),
+            pane_id: String::new(),
+            pty_generation: String::new(),
+            foreground_pgid: String::new(),
+            current_command: String::new(),
+            meta_digest: String::new(),
+            tracked_digest: None,
+            expected_output_generation: None,
+            expected_title: None,
+            expected_progress: None,
+        };
+        let mut guarded = GuardedAction {
+            operation_key: key.clone(),
+            ticket: core_ticket,
+            payload_digest,
+            retain: true,
+            preconditions: unused_preconditions,
+            launch_target: Some(launch_target),
+            action,
+        };
+        let mut staged = None;
+        if let Err(error) = validate_guarded_action(&guarded) {
+            if !error.contains("exceeds the core 8 KiB frame limit") {
+                return Self::reject_launch_before_dispatch(&mut store, &record, error);
+            }
+            let spec = json!({
+                "env": guarded.action["env"].clone(),
+                "argv": guarded.action["argv"].clone(),
+            });
+            let bytes = match serde_json::to_vec(&spec) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Self::reject_launch_before_dispatch(
+                        &mut store,
+                        &record,
+                        format!("invalid_argument: encoding launch staging: {error}"),
+                    );
+                }
+            };
+            if bytes.is_empty() || bytes.len() > 32_768 {
+                return Self::reject_launch_before_dispatch(
+                    &mut store,
+                    &record,
+                    "invalid_argument: launch staging exceeds 32768 bytes",
+                );
+            }
+            let staging_id = format!(
+                "launch-{}-{}-{}",
+                core_ticket.epoch,
+                core_ticket.seq,
+                &key_nonce[..12]
+            );
+            let Some(mut action) = guarded.action.as_object().cloned() else {
+                return Self::reject_launch_before_dispatch(
+                    &mut store,
+                    &record,
+                    "invalid_argument: launch action is not an object",
+                );
+            };
+            action.remove("env");
+            action.remove("argv");
+            action.insert("spec_staging_id".into(), json!(&staging_id));
+            guarded.action = Value::Object(action);
+            if let Err(error) = validate_guarded_action(&guarded) {
+                return Self::reject_launch_before_dispatch(&mut store, &record, error);
+            }
+            staged = Some((staging_id, bytes));
+        }
+
+        if let Err(error) = core.drain_launch_events() {
+            core.broken = true;
+            return Self::reject_launch_before_dispatch(
+                &mut store,
+                &record,
+                format!("bridge_unavailable: {error}"),
+            );
+        }
+        let mut intent = core_intent(&key, core_ticket);
+        intent["operation_ticket"] = json!(&outer_ticket.ticket);
+        store.note_dispatch(
+            &outer_ticket,
+            "core_dispatch_ticket",
+            "core_ledger",
+            Some(&intent),
+            now_ms(),
+        )?;
+        if let Some((staging_id, bytes)) = staged
+            && let Err(error) = core.stage_input(&staging_id, &key, &bytes).await
+        {
+            if !matches!(&error, Error::InvalidArgument(_) | Error::Busy(_)) {
+                core.broken = true;
+            }
+            let evidence = json!({
+                "path": "core_ledger",
+                "core_ticket": core_ticket.value(),
+                "core_operation_key": key.value(),
+                "staging_id": staging_id,
+                "error": error.to_string(),
+                "result": "not_applied",
+            });
+            Self::finish_admitted(
+                &mut store,
+                core,
+                &outer_ticket,
+                "not_applied",
+                &evidence,
+                "the launch staging result could not be committed",
+            )?;
+            return Err(format!(
+                "not_applied: launch input staging ended before launch: {error}"
+            ));
+        }
+
+        let response = core.guarded_action(guarded).await;
+        let (launch, result_digest) = match response {
+            Ok(LedgerResult::Applied {
+                ticket,
+                result_digest,
+                launch: Some(launch),
+                ..
+            }) if ticket == core_ticket => (launch, result_digest),
+            Ok(LedgerResult::Applied { result_digest, .. }) => {
+                let evidence = core_result_evidence(&key, core_ticket, &result_digest, "applied");
+                Self::finish_admitted(
+                    &mut store,
+                    core,
+                    &outer_ticket,
+                    UNKNOWN,
+                    &evidence,
+                    "the core applied launch without a pane receipt",
+                )?;
+                core.broken = true;
+                return Err(
+                    "outcome_unknown: the core applied launch without a pane receipt".into(),
+                );
+            }
+            Ok(result) => {
+                return self
+                    .finish_launch_ledger_failure(&mut store, core, &outer_ticket, &key, result)
+                    .await;
+            }
+            Err(error) => {
+                let state = if matches!(&error, Error::InvalidArgument(_) | Error::Busy(_)) {
+                    "not_applied"
+                } else {
+                    UNKNOWN
+                };
+                if state == UNKNOWN {
+                    core.broken = true;
+                }
+                let evidence = json!({"path": "core_ledger", "error": error.to_string()});
+                Self::finish_admitted(
+                    &mut store,
+                    core,
+                    &outer_ticket,
+                    state,
+                    &evidence,
+                    "the launch action ended without a durable result",
+                )?;
+                return Err(match error {
+                    Error::InvalidArgument(error) => error,
+                    Error::Busy(error) => format!("bridge_unavailable: {error}"),
+                    error => format!("outcome_unknown: {error}"),
+                });
+            }
+        };
+
+        let launch_event = match core
+            .wait_launch(&launch.pane_id, &launch.pty_generation)
+            .await
+        {
+            Ok(event) => event,
+            Err(error) => {
+                core.broken = true;
+                let evidence =
+                    launch_result_evidence(&key, core_ticket, &result_digest, &launch, None);
+                Self::finish_admitted(
+                    &mut store,
+                    core,
+                    &outer_ticket,
+                    UNKNOWN,
+                    &evidence,
+                    "the launch status stream ended before its durable receipt",
+                )?;
+                return Err(format!("outcome_unknown: {error}"));
+            }
+        };
+        let launch_event_stage = launch_event.as_ref().map(|event| event.stage);
+        let result = self
+            .finish_core_launch(manager, provider, &request, &launch, launch_event.clone())
+            .await;
+        match result {
+            Ok((mut outcome, stage)) => {
+                if let Some((id, name)) = &request.worktree {
+                    outcome["worktree"] = json!({"id": id, "name": name});
+                }
+                outcome["path"] = json!("core_ledger");
+                outcome["operation_key"] = json!(&record.operation_key);
+                let mut evidence =
+                    launch_result_evidence(&key, core_ticket, &result_digest, &launch, stage);
+                evidence["receipt"] = outcome.clone();
+                let record = Self::finish_admitted(
+                    &mut store,
+                    core,
+                    &outer_ticket,
+                    "process_started",
+                    &evidence,
+                    "the launch result could not be committed",
+                )?;
+                if core
+                    .retire_receipt(&key, core_ticket, &result_digest, record.updated_ms)
+                    .await
+                    .is_err()
+                {
+                    core.broken = true;
+                }
+                Ok(outcome)
+            }
+            Err(LaunchFinish::CwdRejected { reason, stage }) => {
+                let removal = remove_launch_pane(manager, &launch.pane_id).await;
+                let mut evidence =
+                    launch_result_evidence(&key, core_ticket, &result_digest, &launch, Some(stage));
+                evidence["error"] = json!(&reason);
+                let record = Self::finish_admitted(
+                    &mut store,
+                    core,
+                    &outer_ticket,
+                    "cwd_rejected",
+                    &evidence,
+                    "the cwd rejection could not be committed",
+                )?;
+                if core
+                    .retire_receipt(&key, core_ticket, &result_digest, record.updated_ms)
+                    .await
+                    .is_err()
+                {
+                    core.broken = true;
+                }
+                match removal {
+                    Ok(()) => Err(format!("cwd_rejected: the agent was not started: {reason}")),
+                    Err(error) => Err(format!(
+                        "the agent was not started ({reason}), but its pane {} could not be removed: {error}",
+                        launch.pane_id
+                    )),
+                }
+            }
+            Err(LaunchFinish::Unknown(error)) => {
+                let evidence = launch_result_evidence(
+                    &key,
+                    core_ticket,
+                    &result_digest,
+                    &launch,
+                    launch_event_stage,
+                );
+                Self::finish_admitted(
+                    &mut store,
+                    core,
+                    &outer_ticket,
+                    UNKNOWN,
+                    &evidence,
+                    "the launch effect could not be settled",
+                )?;
+                Err(format!("outcome_unknown: {error}"))
+            }
+        }
+    }
+
+    async fn finish_core_launch(
+        &self,
+        manager: &Manager,
+        provider: &'static super::providers::Provider,
+        request: &LaunchAction,
+        launch: &LaunchReceipt,
+        event: Option<LaunchEvent>,
+    ) -> Result<(Value, Option<bridge::LaunchStage>), LaunchFinish> {
+        let public = || {
+            let mut outcome = json!({
+                "stage": "process_started",
+                "pane_id": launch.pane_id,
+                "run": request.run,
+                "name": request.name,
+                "provider": provider.id,
+                "native_session_requested": request.session,
+                "native_session_verified": false,
+                "provider_accepted": false,
+            });
+            if let Some((id, name)) = &request.worktree {
+                outcome["worktree"] = json!({"id": id, "name": name});
+            }
+            outcome
+        };
+        match event.as_ref().map(|event| {
+            (
+                event.stage,
+                map_launch_stage(event.stage, event.errno, &request.cwd),
+            )
+        }) {
+            Some((stage, LaunchStageOutcome::CwdRejected(reason))) => {
+                Err(LaunchFinish::CwdRejected { reason, stage })
+            }
+            Some((_, LaunchStageOutcome::Exited)) => {
+                let mut outcome = public();
+                outcome["process"] = json!("exited");
+                Ok((outcome, Some(bridge::LaunchStage::Exec)))
+            }
+            Some((_, LaunchStageOutcome::Register)) => {
+                let boot = manager.boot().await.map_err(LaunchFinish::Unknown)?;
+                let (mut outcome, verdict) = manager
+                    .finish_launch_fields(
+                        &launch.pane_id,
+                        &boot,
+                        &launch.pty_generation,
+                        &launch.pid,
+                        provider,
+                        &request.name,
+                        &request.run,
+                        request.session.as_deref(),
+                        request.provider_argv.clone(),
+                        request.args.clone(),
+                        request.answers,
+                        request.token.clone(),
+                    )
+                    .await
+                    .map_err(|error| LaunchFinish::Unknown(error.to_string()))?;
+                match manager
+                    .launch_verdict(&launch.pane_id, &request.run, verdict)
+                    .await
+                {
+                    super::LaunchVerdict::Ok => {}
+                    super::LaunchVerdict::Rejected(reason) => {
+                        return Err(LaunchFinish::CwdRejected {
+                            reason,
+                            stage: bridge::LaunchStage::ExecOk,
+                        });
+                    }
+                    super::LaunchVerdict::Exited => outcome["process"] = json!("exited"),
+                    super::LaunchVerdict::Unanswered => outcome["cwd_check"] = json!("unanswered"),
+                }
+                Ok((outcome, Some(bridge::LaunchStage::ExecOk)))
+            }
+            None => {
+                if !manager
+                    .launch_pane_alive(&launch.pane_id)
+                    .await
+                    .map_err(LaunchFinish::Unknown)?
+                {
+                    let mut outcome = public();
+                    outcome["process"] = json!("exited");
+                    return Ok((outcome, None));
+                }
+                let boot = manager.boot().await.map_err(LaunchFinish::Unknown)?;
+                let (mut outcome, verdict) = manager
+                    .finish_launch_fields(
+                        &launch.pane_id,
+                        &boot,
+                        &launch.pty_generation,
+                        &launch.pid,
+                        provider,
+                        &request.name,
+                        &request.run,
+                        request.session.as_deref(),
+                        request.provider_argv.clone(),
+                        request.args.clone(),
+                        request.answers,
+                        request.token.clone(),
+                    )
+                    .await
+                    .map_err(|error| LaunchFinish::Unknown(error.to_string()))?;
+                match manager
+                    .launch_verdict(&launch.pane_id, &request.run, verdict)
+                    .await
+                {
+                    super::LaunchVerdict::Ok => {}
+                    super::LaunchVerdict::Rejected(reason) => {
+                        return Err(LaunchFinish::CwdRejected {
+                            reason,
+                            stage: bridge::LaunchStage::ExecOk,
+                        });
+                    }
+                    super::LaunchVerdict::Exited => outcome["process"] = json!("exited"),
+                    super::LaunchVerdict::Unanswered => outcome["cwd_check"] = json!("unanswered"),
+                }
+                Ok((outcome, None))
+            }
+        }
+    }
+
+    /// A coordinator refusal before `note_dispatch` proves the launch never
+    /// reached the core.  Finish the admission here so a later keyed retry
+    /// does not turn a known refusal into an unknown outcome.
+    fn reject_launch_before_dispatch(
+        store: &mut Store,
+        record: &Record,
+        error: impl Into<String>,
+    ) -> Result<Value, String> {
+        let error = error.into();
+        if record.state == super::operations::DISPATCHING && !has_current_launch_dispatch(record) {
+            let evidence = json!({
+                "path": "core_ledger",
+                "result": "rejected_before_effect",
+                "error": &error,
+            });
+            store
+                .finish(
+                    &ticket_for(record),
+                    "rejected_before_effect",
+                    "core_ledger",
+                    Some(&evidence),
+                    now_ms(),
+                )
+                .map_err(|finish| {
+                    format!(
+                        "outcome_unknown: launch was refused before dispatch, but its durable receipt could not be committed: {finish}"
+                    )
+                })?;
+        }
+        Err(error)
+    }
+
+    async fn finish_launch_ledger_failure(
+        &self,
+        store: &mut Store,
+        core: &mut Client,
+        ticket: &Ticket,
+        key: &OperationKey,
+        result: LedgerResult,
+    ) -> Result<Value, String> {
+        let (state, message, core_ticket, digest) = match result {
+            LedgerResult::RejectedBeforeEffect {
+                ticket,
+                reason,
+                result_digest,
+            } => (
+                "rejected_before_effect",
+                format!("rejected_before_effect:{reason}"),
+                Some(ticket),
+                Some(result_digest),
+            ),
+            LedgerResult::NotApplied {
+                ticket,
+                result_digest,
+            } => (
+                "not_applied",
+                "not_applied: the core ledger proved this launch did not apply".into(),
+                Some(ticket),
+                Some(result_digest),
+            ),
+            LedgerResult::LedgerFull => (
+                "not_applied",
+                "ledger_full: the core ledger is full before launch".into(),
+                None,
+                None,
+            ),
+            LedgerResult::IdempotencyConflict => (
+                UNKNOWN,
+                "outcome_unknown: idempotency_conflict: the core ledger ticket belongs to a different request".into(),
+                None,
+                None,
+            ),
+            LedgerResult::ReceiptNotRetained => (
+                UNKNOWN,
+                "outcome_unknown: receipt_not_retained: the core ledger cannot prove this launch result".into(),
+                None,
+                None,
+            ),
+            LedgerResult::TicketGap => (
+                UNKNOWN,
+                "outcome_unknown: ticket_gap: the core ledger ticket sequence is out of sync".into(),
+                None,
+                None,
+            ),
+            LedgerResult::EpochClosed => (
+                UNKNOWN,
+                "outcome_unknown: epoch_closed: the core ledger connection epoch closed".into(),
+                None,
+                None,
+            ),
+            LedgerResult::EpochUnknown => (
+                UNKNOWN,
+                "outcome_unknown: epoch_unknown: the core ledger no longer knows this connection epoch".into(),
+                None,
+                None,
+            ),
+            LedgerResult::Applied { .. } => return Err("invalid launch ledger result".into()),
+        };
+        let evidence = json!({"path": "core_ledger", "result": message});
+        let record = Self::finish_admitted(
+            store,
+            core,
+            ticket,
+            state,
+            &evidence,
+            "the core returned a launch result, but its receipt could not be committed",
+        )?;
+        if let (Some(core_ticket), Some(digest)) = (core_ticket, digest)
+            && core
+                .retire_receipt(key, core_ticket, &digest, record.updated_ms)
+                .await
+                .is_err()
+        {
+            core.broken = true;
+        }
+        Err(message)
+    }
+
     async fn send_keys(
         &self,
         core: &mut Client,
@@ -1999,6 +2913,7 @@ impl CoordinatorActions {
             payload_digest: digest(&json!({"keys": keys}).to_string()),
             retain: dispatch.retain,
             preconditions: preconditions(agent, dispatch.tracked_digest),
+            launch_target: None,
             action: json!({"kind": "keys", "keys": keys}),
         };
         validate_guarded_action(&request).map_err(Error::InvalidArgument)?;
@@ -2492,6 +3407,7 @@ impl CoordinatorActions {
                 payload_digest: digest("kill_pane"),
                 retain: true,
                 preconditions: preconditions(&agent, None),
+                launch_target: None,
                 action: json!({"kind": "kill_pane"}),
             })
             .await;
@@ -2595,6 +3511,7 @@ impl CoordinatorActions {
                         agent,
                         (index == 0).then(|| tracked_digest.to_owned()),
                     ),
+                    launch_target: None,
                     action: json!({"kind": "keys", "keys": [key_text]}),
                 };
                 validate_guarded_action(&request)?;
@@ -2789,7 +3706,8 @@ impl CoordinatorActions {
                 && current.state != UNKNOWN)
                 || has_ticket_receipt(&current, entry.ticket, &entry.operation_key);
             let decision = reconcile_decision(has_receipt, &entry.result);
-            let evidence = ledger_result_evidence(entry);
+            let mut evidence = ledger_result_evidence(entry);
+            launch_reconcile_receipt(&mut evidence, &current, &entry.result);
             let current = if current.state == UNKNOWN {
                 // Retaining the ledger result is part of reconciliation, not
                 // just cleanup. Once the slot is retired this receipt is the
@@ -3041,6 +3959,73 @@ impl CoordinatorActions {
     }
 }
 
+enum LaunchFinish {
+    CwdRejected {
+        reason: String,
+        stage: bridge::LaunchStage,
+    },
+    Unknown(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchStageOutcome {
+    Register,
+    CwdRejected(String),
+    Exited,
+}
+
+fn map_launch_stage(stage: bridge::LaunchStage, errno: i32, cwd: &Path) -> LaunchStageOutcome {
+    match stage {
+        bridge::LaunchStage::ExecOk => LaunchStageOutcome::Register,
+        bridge::LaunchStage::CwdOpen => LaunchStageOutcome::CwdRejected(format!(
+            "{} cannot be entered: {}",
+            cwd.display(),
+            std::io::Error::from_raw_os_error(errno)
+        )),
+        bridge::LaunchStage::CwdIdentity => LaunchStageOutcome::CwdRejected(format!(
+            "{} is not the directory the start checked (replaced or recreated)",
+            cwd.display()
+        )),
+        bridge::LaunchStage::Exec => LaunchStageOutcome::Exited,
+    }
+}
+
+async fn remove_launch_pane(manager: &Manager, pane: &str) -> Result<(), String> {
+    if !manager.launch_pane_alive(pane).await? {
+        return Ok(());
+    }
+    manager
+        .command(&["kill-pane", "-t", pane])
+        .await
+        .map(|_| ())
+}
+
+fn launch_stage_name(stage: bridge::LaunchStage) -> &'static str {
+    match stage {
+        bridge::LaunchStage::ExecOk => "exec_ok",
+        bridge::LaunchStage::CwdOpen => "cwd_open",
+        bridge::LaunchStage::CwdIdentity => "cwd_identity",
+        bridge::LaunchStage::Exec => "exec",
+    }
+}
+
+fn launch_result_evidence(
+    operation_key: &OperationKey,
+    ticket: DispatchTicket,
+    result_digest: &str,
+    launch: &LaunchReceipt,
+    stage: Option<bridge::LaunchStage>,
+) -> Value {
+    let mut evidence = core_result_evidence(operation_key, ticket, result_digest, "applied");
+    evidence["pane_id"] = json!(&launch.pane_id);
+    evidence["pid"] = json!(&launch.pid);
+    evidence["pty_generation"] = json!(&launch.pty_generation);
+    if let Some(stage) = stage {
+        evidence["exec_stage"] = json!(launch_stage_name(stage));
+    }
+    evidence
+}
+
 struct ActiveAction<'a> {
     owner: &'a CoordinatorActions,
 }
@@ -3263,6 +4248,41 @@ enum ControlAction {
         needs_bracket: bool,
         checkpoint: bool,
     },
+    Launch(LaunchAction),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchMode {
+    Window,
+    Split,
+}
+
+#[derive(Clone, Debug)]
+struct LaunchAction {
+    operation_key: String,
+    operation_ticket: String,
+    name: String,
+    provider: String,
+    run: String,
+    cwd: PathBuf,
+    cwd_dev: String,
+    cwd_ino: String,
+    /// The command line executed by the core: masil-agent's exec-managed
+    /// wrapper followed by the provider argv.
+    argv: Vec<String>,
+    /// The provider command line itself.  This is what exec-managed compares
+    /// with its registered Metadata after it has peeled off the wrapper.
+    provider_argv: Vec<String>,
+    env: Vec<(String, String)>,
+    session: Option<String>,
+    args: Vec<String>,
+    answers: bool,
+    token: Option<String>,
+    mode: LaunchMode,
+    target: String,
+    /// A launch lease is owned outside the coordinator, but its public
+    /// receipt must retain the same worktree identity for keyed replay.
+    worktree: Option<(i64, String)>,
 }
 
 struct InterruptAction<'a> {
@@ -3305,6 +4325,27 @@ impl ControlAction {
                 "submit",
                 "checkpoint",
             ],
+            "launch" => &[
+                "operation",
+                "operation_key",
+                "operation_ticket",
+                "name",
+                "provider",
+                "run",
+                "cwd",
+                "cwd_dev",
+                "cwd_ino",
+                "argv",
+                "provider_argv",
+                "env",
+                "session",
+                "args",
+                "answers",
+                "token",
+                "mode",
+                "target",
+                "worktree",
+            ],
             _ => return Err("invalid_action: unknown core action".into()),
         };
         if object
@@ -3312,6 +4353,9 @@ impl ControlAction {
             .any(|field| !allowed.contains(&field.as_str()))
         {
             return Err("invalid_action: unknown action field".into());
+        }
+        if operation == "launch" {
+            return Ok(Self::Launch(parse_launch_action(object)?));
         }
         let pane = object
             .get("pane_id")
@@ -3459,8 +4503,200 @@ impl ControlAction {
             | Self::Interrupt { pane, .. }
             | Self::Close { pane, .. }
             | Self::Prompt { pane, .. } => pane,
+            Self::Launch(action) if action.mode == LaunchMode::Split => &action.target,
+            Self::Launch(_) => "",
         }
     }
+}
+
+fn launch_text(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<String, String> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() >= minimum && value.len() <= maximum && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| format!("invalid_action: {field} is invalid"))
+}
+
+fn launch_decimal(object: &serde_json::Map<String, Value>, field: &str) -> Result<String, String> {
+    let value = launch_text(object, field, 1, 20)?;
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) || value.parse::<u64>().is_err() {
+        return Err(format!("invalid_action: {field} is invalid"));
+    }
+    Ok(value)
+}
+
+fn launch_id(value: &str, sigil: char) -> bool {
+    value.len() > 1
+        && value.starts_with(sigil)
+        && value[1..].len() <= 10
+        && value[1..].bytes().all(|byte| byte.is_ascii_digit())
+        && value[1..].parse::<u32>().is_ok()
+}
+
+fn parse_launch_words(value: Option<&Value>, field: &str) -> Result<Vec<String>, String> {
+    let words = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("invalid_action: {field} must be an array"))?;
+    if words.len() > 256 {
+        return Err(format!("invalid_action: {field} exceeds bounds"));
+    }
+    let words = words
+        .iter()
+        .map(|word| {
+            word.as_str()
+                .filter(|word| word.len() <= 8_192 && !word.chars().any(char::is_control))
+                .map(str::to_owned)
+                .ok_or_else(|| format!("invalid_action: {field} item is invalid"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if words.iter().map(String::len).sum::<usize>() > 32_768 {
+        return Err(format!("invalid_action: {field} exceeds bounds"));
+    }
+    Ok(words)
+}
+
+fn parse_launch_env(value: Option<&Value>) -> Result<Vec<(String, String)>, String> {
+    let values = value
+        .and_then(Value::as_array)
+        .ok_or("invalid_action: env must be an array")?;
+    if values.len() > 64 {
+        return Err("invalid_action: env exceeds bounds".into());
+    }
+    let mut bytes = 0;
+    let mut env = Vec::with_capacity(values.len());
+    for value in values {
+        let pair = value
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .ok_or("invalid_action: env entry is invalid")?;
+        let name = pair[0]
+            .as_str()
+            .filter(|name| {
+                !name.is_empty()
+                    && name.len() <= 8_192
+                    && !name.contains('=')
+                    && !name.chars().any(char::is_control)
+            })
+            .ok_or("invalid_action: env name is invalid")?;
+        let entry = pair[1]
+            .as_str()
+            .filter(|entry| entry.len() <= 8_192 && !entry.chars().any(char::is_control))
+            .ok_or("invalid_action: env value is invalid")?;
+        bytes += name.len() + entry.len();
+        if bytes > 32_768 {
+            return Err("invalid_action: env exceeds bounds".into());
+        }
+        env.push((name.to_owned(), entry.to_owned()));
+    }
+    Ok(env)
+}
+
+fn parse_launch_action(object: &serde_json::Map<String, Value>) -> Result<LaunchAction, String> {
+    let operation_key = launch_text(object, "operation_key", 1, 512)?;
+    let operation_ticket = launch_text(object, "operation_ticket", 1, 128)?;
+    let name = launch_text(object, "name", 1, 32)?;
+    let provider = launch_text(object, "provider", 1, 64)?;
+    let run = launch_text(object, "run", 1, 128)?;
+    let cwd = launch_text(object, "cwd", 1, 4_095)?;
+    if !cwd.starts_with('/') {
+        return Err("invalid_action: cwd is invalid".into());
+    }
+    let cwd_dev = launch_decimal(object, "cwd_dev")?;
+    let cwd_ino = launch_decimal(object, "cwd_ino")?;
+    let argv = parse_launch_words(object.get("argv"), "argv")?;
+    if argv.first().is_none_or(String::is_empty) {
+        return Err("invalid_action: argv is invalid".into());
+    }
+    let provider_argv = parse_launch_words(object.get("provider_argv"), "provider_argv")?;
+    if provider_argv.first().is_none_or(String::is_empty) {
+        return Err("invalid_action: provider_argv is invalid".into());
+    }
+    let env = parse_launch_env(object.get("env"))?;
+    let session = match object.get("session") {
+        Some(Value::Null) => None,
+        Some(Value::String(_)) => Some(launch_text(object, "session", 1, 4_096)?),
+        _ => return Err("invalid_action: session is invalid".into()),
+    };
+    let args = parse_launch_words(object.get("args"), "args")?;
+    if args.iter().map(String::len).sum::<usize>() > 8_192 {
+        return Err("invalid_action: args exceeds bounds".into());
+    }
+    let answers = object
+        .get("answers")
+        .and_then(Value::as_bool)
+        .ok_or("invalid_action: answers is invalid")?;
+    let token = match object.get("token") {
+        Some(Value::Null) => None,
+        Some(Value::String(token))
+            if token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Some(token.clone())
+        }
+        _ => return Err("invalid_action: token is invalid".into()),
+    };
+    let mode = match object.get("mode").and_then(Value::as_str) {
+        Some("window") => LaunchMode::Window,
+        Some("split") => LaunchMode::Split,
+        _ => return Err("invalid_action: launch mode is invalid".into()),
+    };
+    let target = launch_text(object, "target", 2, 32)?;
+    if !match mode {
+        LaunchMode::Window => launch_id(&target, '$'),
+        LaunchMode::Split => launch_id(&target, '%'),
+    } {
+        return Err("invalid_action: launch target is invalid".into());
+    }
+    let worktree = match object.get("worktree") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(worktree))
+            if worktree.len() == 2
+                && worktree.contains_key("id")
+                && worktree.contains_key("name") =>
+        {
+            let id = worktree
+                .get("id")
+                .and_then(Value::as_i64)
+                .filter(|id| *id > 0)
+                .ok_or("invalid_action: worktree is invalid")?;
+            let name = worktree
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| {
+                    !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
+                })
+                .ok_or("invalid_action: worktree is invalid")?;
+            Some((id, name.to_owned()))
+        }
+        _ => return Err("invalid_action: worktree is invalid".into()),
+    };
+    Ok(LaunchAction {
+        operation_key,
+        operation_ticket,
+        name,
+        provider,
+        run,
+        cwd: PathBuf::from(cwd),
+        cwd_dev,
+        cwd_ino,
+        argv,
+        provider_argv,
+        env,
+        session,
+        args,
+        answers,
+        token,
+        mode,
+        target,
+        worktree,
+    })
 }
 
 fn parse_keys(value: Option<&Value>) -> Result<Vec<String>, String> {
@@ -3578,6 +4814,15 @@ pub(crate) fn prompt_expected(agent: &Agent) -> Value {
 }
 
 fn durable_key(socket: &Path, agent: &Agent, nonce: &str, operation_id: &str) -> OperationKey {
+    durable_key_for_boot(socket, &agent.boot, nonce, operation_id)
+}
+
+fn durable_key_for_boot(
+    socket: &Path,
+    boot: &str,
+    nonce: &str,
+    operation_id: &str,
+) -> OperationKey {
     let socket = Sha256::digest(socket.as_os_str().as_bytes());
     let environment_id: String = socket[..8]
         .iter()
@@ -3586,7 +4831,7 @@ fn durable_key(socket: &Path, agent: &Agent, nonce: &str, operation_id: &str) ->
     OperationKey {
         environment_id,
         principal: "local".into(),
-        namespace_epoch: agent.boot.clone(),
+        namespace_epoch: boot.into(),
         namespace_nonce: nonce.into(),
         operation_id: operation_id.into(),
     }
@@ -3716,7 +4961,62 @@ fn ledger_result_evidence(entry: &LedgerEntry) -> Value {
     {
         evidence["queued_bytes"] = json!(queued_bytes);
     }
+    if let LedgerResult::Applied {
+        launch: Some(launch),
+        ..
+    } = &entry.result
+    {
+        evidence["pane_id"] = json!(&launch.pane_id);
+        evidence["pid"] = json!(&launch.pid);
+        evidence["pty_generation"] = json!(&launch.pty_generation);
+    }
     evidence
+}
+
+/// A retained launch proves the pane was created even when a coordinator died
+/// before it could observe the exec-stage event. Keep that pane in SQLite so
+/// a keyed retry returns the same attempt instead of opening another one.
+fn launch_reconcile_receipt(evidence: &mut Value, record: &Record, result: &LedgerResult) {
+    let LedgerResult::Applied {
+        launch: Some(launch),
+        ..
+    } = result
+    else {
+        return;
+    };
+    if record.action != "start" {
+        return;
+    }
+    let intent = record.intent();
+    evidence["stage"] = json!(UNKNOWN);
+    evidence["pane_id"] = json!(&launch.pane_id);
+    evidence["run"] = json!(&record.ticket);
+    evidence["name"] = json!(&record.target);
+    evidence["operation_key"] = json!(&record.operation_key);
+    evidence["provider"] = json!(
+        intent
+            .and_then(|intent| intent.get("provider"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    );
+    evidence["native_session_requested"] = intent
+        .and_then(|intent| intent.get("native_session_requested"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    evidence["native_session_verified"] = json!(false);
+    evidence["provider_accepted"] = json!(false);
+    evidence["receipt"] = json!({
+        "stage": UNKNOWN,
+        "pane_id": launch.pane_id,
+        "run": record.ticket,
+        "name": record.target,
+        "provider": evidence["provider"],
+        "native_session_requested": evidence["native_session_requested"],
+        "native_session_verified": false,
+        "provider_accepted": false,
+        "operation_key": record.operation_key,
+        "path": "core_ledger",
+    });
 }
 
 #[derive(Clone)]
@@ -3747,6 +5047,18 @@ fn core_intents(record: &Record) -> Vec<StoredIntent> {
             })
         })
         .collect()
+}
+
+/// Retryable starts retain receipts from older attempts. Only a dispatch
+/// attached to the current SQLite ticket can fence this attempt; an already
+/// settled `not_applied` or `launch_failed` receipt must not block its safe
+/// retry.
+pub(super) fn has_current_launch_dispatch(record: &Record) -> bool {
+    record.receipts.iter().any(|receipt| {
+        receipt.evidence.as_ref().is_some_and(|evidence| {
+            evidence["operation_ticket"] == record.ticket && evidence["core"].is_object()
+        })
+    })
 }
 
 fn ticket_for(record: &Record) -> Ticket {
@@ -3901,13 +5213,22 @@ fn record_orphan(store: &mut Store, boot: &str, entry: &LedgerEntry) -> Result<(
         digest: &entry.payload_digest,
         payload_bytes: 0,
     };
-    let evidence = json!({
+    let mut evidence = json!({
         "path": "core_ledger",
         "orphan_ticket": entry.ticket.value(),
         "operation_key_digest": entry.operation_key_digest,
         "operation_id": entry.operation_id,
         "result": entry.result.result_text(),
     });
+    if let LedgerResult::Applied {
+        launch: Some(launch),
+        ..
+    } = &entry.result
+    {
+        evidence["pane_id"] = json!(&launch.pane_id);
+        evidence["pid"] = json!(&launch.pid);
+        evidence["pty_generation"] = json!(&launch.pty_generation);
+    }
     if let Admission::Dispatch(ticket) = store.admit(&new, evidence.clone(), now_ms())? {
         store.finish(
             &ticket,
@@ -3955,6 +5276,65 @@ mod tests {
             parse_ledger_reply(&reply("not_applied"), "guarded_action", ticket).unwrap(),
             LedgerResult::NotApplied { .. }
         ));
+    }
+
+    #[test]
+    fn launch_action_keeps_the_provider_argv_separate_from_its_wrapper() {
+        let request = json!({
+            "operation": "launch",
+            "operation_key": "boot:boot/start/launch",
+            "operation_ticket": "run",
+            "name": "agent",
+            "provider": "codex",
+            "run": "run",
+            "cwd": "/tmp",
+            "cwd_dev": "1",
+            "cwd_ino": "2",
+            "argv": ["/bin/masil-agent", "agent", "exec-managed", "/bin/codex", "--model", "x"],
+            "provider_argv": ["/bin/codex", "--model", "x"],
+            "env": [],
+            "session": null,
+            "args": ["--model", "x"],
+            "answers": false,
+            "token": null,
+            "mode": "window",
+            "target": "$1",
+            "worktree": {"id": 42, "name": "feature"},
+        });
+
+        match ControlAction::parse(&request).unwrap() {
+            ControlAction::Launch(action) => {
+                assert_eq!(
+                    action.argv,
+                    vec![
+                        "/bin/masil-agent",
+                        "agent",
+                        "exec-managed",
+                        "/bin/codex",
+                        "--model",
+                        "x",
+                    ]
+                );
+                assert_eq!(action.provider_argv, vec!["/bin/codex", "--model", "x"]);
+                assert_eq!(action.worktree, Some((42, "feature".into())));
+            }
+            action => panic!("expected launch action, got {}", action.pane()),
+        }
+    }
+
+    #[test]
+    fn launch_argv_accepts_the_protocol_limit_not_the_user_arg_limit() {
+        let maximum = Value::Array((0..256).map(|_| Value::String("word".into())).collect());
+        assert_eq!(
+            parse_launch_words(Some(&maximum), "argv").unwrap().len(),
+            256
+        );
+        let mut too_many = maximum.as_array().unwrap().clone();
+        too_many.push(Value::String("word".into()));
+        assert_eq!(
+            parse_launch_words(Some(&Value::Array(too_many)), "argv"),
+            Err("invalid_action: argv exceeds bounds".into())
+        );
     }
 
     #[test]
@@ -4062,6 +5442,7 @@ mod tests {
             ticket,
             result_digest: "a".repeat(64),
             queued_bytes: None,
+            launch: None,
         }));
         assert!(consumes_ticket(&LedgerResult::LedgerFull));
         assert!(!consumes_ticket(&LedgerResult::TicketGap));
@@ -4075,6 +5456,7 @@ mod tests {
             ticket,
             result_digest: "b".repeat(64),
             queued_bytes: None,
+            launch: None,
         };
         let not_applied = LedgerResult::NotApplied {
             ticket,
@@ -4175,6 +5557,7 @@ mod tests {
                 ticket,
                 result_digest: "b".repeat(64),
                 queued_bytes: Some(8),
+                launch: None,
             },
         };
 
@@ -4267,6 +5650,60 @@ mod tests {
         }
         assert_eq!(retry.next_delay(), None);
         assert_eq!(retry.attempts(), BUSY_ATTEMPTS);
+    }
+
+    #[test]
+    fn launch_stages_keep_native_cwd_and_exit_outcomes() {
+        let cwd = Path::new("/tmp/launch-cwd");
+        assert_eq!(
+            map_launch_stage(bridge::LaunchStage::ExecOk, 0, cwd),
+            LaunchStageOutcome::Register
+        );
+        assert_eq!(
+            map_launch_stage(bridge::LaunchStage::CwdIdentity, 0, cwd),
+            LaunchStageOutcome::CwdRejected(
+                "/tmp/launch-cwd is not the directory the start checked (replaced or recreated)"
+                    .into()
+            )
+        );
+        assert!(matches!(
+            map_launch_stage(bridge::LaunchStage::CwdOpen, libc::ENOENT, cwd),
+            LaunchStageOutcome::CwdRejected(reason)
+                if reason.starts_with("/tmp/launch-cwd cannot be entered:")
+        ));
+        assert_eq!(
+            map_launch_stage(bridge::LaunchStage::Exec, libc::ENOENT, cwd),
+            LaunchStageOutcome::Exited
+        );
+    }
+
+    #[test]
+    fn launch_ledger_replies_keep_the_pane_receipt() {
+        let ticket = DispatchTicket { epoch: 7, seq: 2 };
+        let reply = json!({
+            "v": 1,
+            "kind": "guarded_action",
+            "request_id": "launch",
+            "dispatch_ticket": ticket.value(),
+            "result": "applied",
+            "result_digest": "a".repeat(64),
+            "pane_id": "%42",
+            "pid": "991",
+            "pty_generation": "3",
+        });
+        assert_eq!(
+            parse_ledger_reply(&reply, "guarded_action", ticket).unwrap(),
+            LedgerResult::Applied {
+                ticket,
+                result_digest: "a".repeat(64),
+                queued_bytes: None,
+                launch: Some(LaunchReceipt {
+                    pane_id: "%42".into(),
+                    pid: "991".into(),
+                    pty_generation: "3".into(),
+                }),
+            }
+        );
     }
 
     #[tokio::test]
