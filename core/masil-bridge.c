@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -71,6 +72,9 @@
 #define MASIL_SUMMARY_REDRAW_USEC	250000ULL
 #define MASIL_SUMMARY_STALE_USEC	90000000ULL
 
+/* masil: D3 a copy event carries at most this much of a paste buffer name. */
+#define MASIL_COPY_NAME_MAX		64
+
 /* masil: validity bits keep native UINT_MAX ids distinct from JSON null. */
 #define MASIL_BRIDGE_VIEW_SESSION	0x1
 #define MASIL_BRIDGE_VIEW_WINDOW	0x2
@@ -91,6 +95,8 @@ enum masil_bridge_event_reason {
 	MASIL_BRIDGE_CLIENT_GONE,
 	/* masil: focus output phases go to the coordinator that asked. */
 	MASIL_BRIDGE_FOCUS,
+	/* masil: the last copy result of a pane, for its watchers. */
+	MASIL_BRIDGE_COPY_RESULT,
 	/* Protocol 1.2 terminal event: it has no object identifier. */
 	MASIL_BRIDGE_SERVER_EXITING
 };
@@ -132,6 +138,41 @@ struct masil_bridge_journal_event {
 	uint8_t			 launch_stage;
 	uint8_t			 focus_phase;
 	uint8_t			 focus_cause;
+	uint8_t			 copy_clip;
+	uint8_t			 copy_os;
+	uint32_t		 copy_sent;
+	int			 copy_rc;
+	uint64_t		 copy_seq;
+	char			 copy_buffer[MASIL_COPY_NAME_MAX];
+};
+
+/* masil: D3 how the last copy of a pane reached the terminal clipboard. */
+enum masil_copy_clip {
+	MASIL_COPY_CLIP_OFF,
+	MASIL_COPY_CLIP_SENT,
+	MASIL_COPY_CLIP_NO_MS,
+	MASIL_COPY_CLIP_NOT_STARTED,
+	MASIL_COPY_CLIP_NOT_READY,
+	MASIL_COPY_CLIP_NO_CLIENT
+};
+
+/* masil: D3 what happened to the copy-pipe helper. */
+enum masil_copy_os {
+	MASIL_COPY_OS_UNKNOWN,
+	MASIL_COPY_OS_PENDING,
+	MASIL_COPY_OS_OK,
+	MASIL_COPY_OS_FAILED,
+	MASIL_COPY_OS_SIGNAL
+};
+
+/* masil: D3 the last copy result of one pane, freed with the pane. */
+struct masil_copy_result {
+	uint64_t	 seq;
+	char		*buffer;
+	uint8_t		 clip;
+	uint32_t	 sent;
+	uint8_t		 os;
+	int		 rc;
 };
 
 struct masil_bridge_client {
@@ -157,6 +198,7 @@ struct masil_bridge_client {
 	int			 watching;
 	int			 lifecycle_all;
 	int			 clients_all;
+	int			 copy_results;
 	int			 watch_reschedule;
 	struct masil_bridge_client *next;
 };
@@ -421,6 +463,57 @@ masil_json_quoted_length(const char *value, size_t length)
 			total++;
 	}
 	return (total);
+}
+
+/* masil: D3 length of the valid UTF-8 sequence at value, 0 when invalid. */
+static size_t
+masil_utf8_valid(const u_char *value, size_t length)
+{
+	u_char	ch = value[0];
+
+	if (ch < 0x80)
+		return (1);
+	if (ch >= 0xc2 && ch <= 0xdf && length >= 2 &&
+	    (value[1] & 0xc0) == 0x80)
+		return (2);
+	if (ch >= 0xe0 && ch <= 0xef && length >= 3 &&
+	    (value[1] & 0xc0) == 0x80 && (value[2] & 0xc0) == 0x80 &&
+	    !(ch == 0xe0 && value[1] < 0xa0) &&
+	    !(ch == 0xed && value[1] >= 0xa0))
+		return (3);
+	if (ch >= 0xf0 && ch <= 0xf4 && length >= 4 &&
+	    (value[1] & 0xc0) == 0x80 && (value[2] & 0xc0) == 0x80 &&
+	    (value[3] & 0xc0) == 0x80 &&
+	    !(ch == 0xf0 && value[1] < 0x90) &&
+	    !(ch == 0xf4 && value[1] >= 0x90))
+		return (4);
+	return (0);
+}
+
+/* masil: D3 quote value, replacing each invalid UTF-8 byte with U+FFFD. */
+static void
+masil_json_quote_utf8(struct masil_json_builder *builder, const char *value,
+    size_t length)
+{
+	char	clean[MASIL_COPY_NAME_MAX * 3 + 1];
+	size_t	i = 0, n, out = 0;
+
+	if (length > MASIL_COPY_NAME_MAX)
+		length = MASIL_COPY_NAME_MAX;
+	while (i < length) {
+		n = masil_utf8_valid((const u_char *)value + i, length - i);
+		if (n == 0) {
+			/* U+FFFD in UTF-8. */
+			memcpy(clean + out, "\xef\xbf\xbd", 3);
+			out += 3;
+			i++;
+			continue;
+		}
+		memcpy(clean + out, value + i, n);
+		out += n;
+		i += n;
+	}
+	masil_json_quote(builder, clean, out);
 }
 
 static void
@@ -706,7 +799,7 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 		masil_json_printf(&builder,
 		    "\"actions\":true,\"dispatch_epoch\":\"%llu\","
 		    "\"input\":true,\"launch\":true,\"focus\":true,"
-		    "\"summary\":true,\"submit\":false},",
+		    "\"summary\":true,\"copy_results\":true,\"submit\":false},",
 		    (unsigned long long)action_epoch);
 	else
 		/* masil: ordinary hello keeps its protocol-1.2 key set unchanged. */
@@ -878,6 +971,8 @@ masil_bridge_reason_string(enum masil_bridge_event_reason reason)
 		return ("client_gone");
 	case MASIL_BRIDGE_FOCUS:
 		return ("focus");
+	case MASIL_BRIDGE_COPY_RESULT:
+		return ("copy_result");
 	case MASIL_BRIDGE_SERVER_EXITING:
 		return ("server_exiting");
 	}
@@ -1058,6 +1153,194 @@ masil_bridge_journal_append_client(struct client *c,
 		record->valid = c->masil_view_valid;
 	}
 	masil_bridge_journal_finish();
+}
+
+/* masil: D3 text of the clipboard stage, as the format and the event show it. */
+static void
+masil_copy_clip_string(uint8_t clip, uint32_t sent, char *out, size_t size)
+{
+	switch (clip) {
+	case MASIL_COPY_CLIP_SENT:
+		snprintf(out, size, "sent:%u", sent);
+		break;
+	case MASIL_COPY_CLIP_NO_MS:
+		snprintf(out, size, "skipped:no_ms");
+		break;
+	case MASIL_COPY_CLIP_NOT_STARTED:
+		snprintf(out, size, "skipped:not_started");
+		break;
+	case MASIL_COPY_CLIP_NOT_READY:
+		snprintf(out, size, "skipped:not_ready");
+		break;
+	case MASIL_COPY_CLIP_NO_CLIENT:
+		snprintf(out, size, "skipped:no_client");
+		break;
+	default:
+		snprintf(out, size, "off");
+		break;
+	}
+}
+
+/* masil: D3 text of the helper stage. */
+static void
+masil_copy_os_string(uint8_t os, int rc, char *out, size_t size)
+{
+	switch (os) {
+	case MASIL_COPY_OS_PENDING:
+		snprintf(out, size, "pending");
+		break;
+	case MASIL_COPY_OS_OK:
+		snprintf(out, size, "helper_ok");
+		break;
+	case MASIL_COPY_OS_FAILED:
+		snprintf(out, size, "helper_failed:%d", rc);
+		break;
+	case MASIL_COPY_OS_SIGNAL:
+		snprintf(out, size, "helper_failed:signal:%d", rc);
+		break;
+	default:
+		snprintf(out, size, "unknown");
+		break;
+	}
+}
+
+/* masil: D3 the event payload; the envelope has already been started. */
+static void
+masil_bridge_copy_json(struct masil_json_builder *builder,
+    const struct masil_bridge_journal_event *record)
+{
+	char	clip[32], os[48];
+
+	masil_copy_clip_string(record->copy_clip, record->copy_sent, clip,
+	    sizeof clip);
+	masil_copy_os_string(record->copy_os, record->copy_rc, os, sizeof os);
+	masil_json_printf(builder, ",\"pane_id\":\"%%%u\",\"copy_seq\":\"%llu\","
+	    "\"buffer\":", record->pane_id,
+	    (unsigned long long)record->copy_seq);
+	masil_json_quote_utf8(builder, record->copy_buffer,
+	    strlen(record->copy_buffer));
+	masil_json_printf(builder, ",\"clipboard\":\"%s\",\"os\":\"%s\"", clip,
+	    os);
+}
+
+/* masil: D3 one journal record per change of a pane's copy result. */
+static void
+masil_bridge_copy_emit(struct window_pane *wp,
+    const struct masil_copy_result *result)
+{
+	struct masil_bridge_watch_slot *slot;
+	struct masil_bridge_journal_event *record;
+	size_t length;
+
+	if (!masil_bridge_enabled || masil_bridge_exiting)
+		return;
+	record = masil_bridge_journal_new(MASIL_BRIDGE_COPY_RESULT);
+	if (record == NULL)
+		return;
+	record->pane_id = wp->id;
+	if ((slot = masil_bridge_watch_slot(wp)) != NULL)
+		record->slot = slot - masil_bridge_watch_slots;
+	record->valid |= MASIL_BRIDGE_VIEW_PANE;
+	record->copy_seq = result->seq;
+	record->copy_clip = result->clip;
+	record->copy_sent = result->sent;
+	record->copy_os = result->os;
+	record->copy_rc = result->rc;
+	/* A longer name is cut at a character boundary. */
+	length = strlen(result->buffer);
+	if (length > sizeof record->copy_buffer - 1) {
+		length = sizeof record->copy_buffer - 1;
+		while (length != 0 && (result->buffer[length] & 0xc0) == 0x80)
+			length--;
+	}
+	memcpy(record->copy_buffer, result->buffer, length);
+	masil_bridge_journal_finish();
+}
+
+/*
+ * masil: D3 start the pane's copy result. The sel counts say what the OSC 52
+ * write did (NULL when the copy did not ask for the clipboard); helper says a
+ * copy-pipe command is running. The result is kept even when the bridge is off.
+ */
+uint64_t
+masil_bridge_copy_record(struct window_pane *wp, const char *buffer,
+    const struct masil_sel_result *sel, int helper)
+{
+	struct masil_copy_result *result = wp->masil_copy;
+
+	if (result == NULL)
+		result = wp->masil_copy = xcalloc(1, sizeof *result);
+	result->seq++;
+	free(result->buffer);
+	result->buffer = xstrdup(buffer != NULL ? buffer : "");
+	result->sent = 0;
+	if (sel == NULL)
+		result->clip = MASIL_COPY_CLIP_OFF;
+	else if (sel->sent != 0) {
+		result->clip = MASIL_COPY_CLIP_SENT;
+		result->sent = sel->sent;
+	} else if (sel->no_ms != 0)
+		result->clip = MASIL_COPY_CLIP_NO_MS;
+	else if (sel->not_started != 0)
+		result->clip = MASIL_COPY_CLIP_NOT_STARTED;
+	else if (sel->not_ready != 0)
+		result->clip = MASIL_COPY_CLIP_NOT_READY;
+	else
+		result->clip = MASIL_COPY_CLIP_NO_CLIENT;
+	result->os = helper ? MASIL_COPY_OS_PENDING : MASIL_COPY_OS_UNKNOWN;
+	result->rc = 0;
+	masil_bridge_copy_emit(wp, result);
+	return (result->seq);
+}
+
+/* masil: D3 a helper exited; only the copy that started it takes the result. */
+void
+masil_bridge_copy_helper_done(unsigned int pane_id, uint64_t seq, int status)
+{
+	struct window_pane	*wp;
+	struct masil_copy_result *result;
+
+	if ((wp = window_pane_find_by_id(pane_id)) == NULL)
+		return;
+	if ((result = wp->masil_copy) == NULL || result->seq != seq)
+		return;
+	if (WIFSIGNALED(status)) {
+		result->os = MASIL_COPY_OS_SIGNAL;
+		result->rc = WTERMSIG(status);
+	} else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+		result->os = MASIL_COPY_OS_FAILED;
+		result->rc = WEXITSTATUS(status);
+	} else
+		result->os = MASIL_COPY_OS_OK;
+	masil_bridge_copy_emit(wp, result);
+}
+
+/* masil: D3 for #{masil_copy_*}; "" before the pane's first copy. */
+char *
+masil_bridge_copy_get(struct window_pane *wp, enum masil_copy_field field)
+{
+	struct masil_copy_result *result = wp->masil_copy;
+	char	text[64];
+
+	if (field == MASIL_COPY_SEQ) {
+		snprintf(text, sizeof text, "%llu", result == NULL ? 0ULL :
+		    (unsigned long long)result->seq);
+		return (xstrdup(text));
+	}
+	if (result == NULL)
+		return (xstrdup(""));
+	switch (field) {
+	case MASIL_COPY_BUFFER:
+		return (xstrdup(result->buffer));
+	case MASIL_COPY_CLIPBOARD:
+		masil_copy_clip_string(result->clip, result->sent, text,
+		    sizeof text);
+		break;
+	default:
+		masil_copy_os_string(result->os, result->rc, text, sizeof text);
+		break;
+	}
+	return (xstrdup(text));
 }
 
 /*
@@ -1873,6 +2156,7 @@ masil_bridge_watch_unsubscribe(struct masil_bridge_client *client)
 		if (masil_bridge_lifecycle_clients == 0)
 			masil_bridge_lifecycle_disable();
 	}
+	client->copy_results = 0;
 	if (client->clients_all) {
 		client->clients_all = 0;
 		if (masil_bridge_view_clients != 0)
@@ -1915,6 +2199,7 @@ masil_bridge_watch(struct masil_bridge_client *client, const char *request_id,
 	uint64_t epoch, fence;
 	size_t count, i, j, new_slots = 0;
 	int lifecycle_all = 0, clients_all = 0, view_enabled = 0;
+	int copy_results = 0;
 
 	if (client->watching)
 		return (masil_bridge_error(client, request_id, request_id_length,
@@ -1942,6 +2227,15 @@ masil_bridge_watch(struct masil_bridge_client *client, const char *request_id,
 			    request_id_length, "invalid_clients",
 			    "clients must be a boolean"));
 		clients_all = yyjson_get_bool(value);
+	}
+	/* masil: D3 copy_result events are opt-in per watch. */
+	value = yyjson_obj_get(root, "copy_results");
+	if (value != NULL) {
+		if (!yyjson_is_bool(value))
+			return (masil_bridge_error(client, request_id,
+			    request_id_length, "invalid_copy_results",
+			    "copy_results must be a boolean"));
+		copy_results = yyjson_get_bool(value);
 	}
 	pane_ids = yyjson_obj_get(root, "pane_ids");
 	if (!yyjson_is_arr(pane_ids) ||
@@ -2074,6 +2368,7 @@ masil_bridge_watch(struct masil_bridge_client *client, const char *request_id,
 	if (lifecycle_all && masil_bridge_lifecycle_clients++ == 0)
 		masil_bridge_lifecycle_enable();
 	client->clients_all = clients_all;
+	client->copy_results = copy_results;
 	if (clients_all)
 		masil_bridge_view_clients++;
 	for (i = 0; i < count; i++) {
@@ -2101,6 +2396,11 @@ masil_bridge_event_visible(struct masil_bridge_client *client,
 	switch (record->reason) {
 	case MASIL_BRIDGE_SCREEN_DIRTY:
 	case MASIL_BRIDGE_RESIZED:
+		break;
+	case MASIL_BRIDGE_COPY_RESULT:
+		/* masil: D3 only a watch that asked with copy_results:true. */
+		if (!client->copy_results)
+			return (0);
 		break;
 	case MASIL_BRIDGE_PTY_CHANGED:
 	case MASIL_BRIDGE_EXITED:
@@ -2272,6 +2572,9 @@ masil_bridge_watch_pump(struct masil_bridge_client *client)
 			break;
 		case MASIL_BRIDGE_FOCUS:
 			masil_bridge_focus_json(&builder, record);
+			break;
+		case MASIL_BRIDGE_COPY_RESULT:
+			masil_bridge_copy_json(&builder, record);
 			break;
 		case MASIL_BRIDGE_SERVER_EXITING:
 			break;
@@ -2623,7 +2926,7 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 	};
 	static const char *const watch_fields[] = {
 	    "v", "kind", "request_id", "expected_core_boot_id", "pane_ids",
-	    "lifecycle", "clients"
+	    "lifecycle", "clients", "copy_results"
 	};
 	yyjson_alc	 allocator;
 	yyjson_doc	*document;
@@ -3652,6 +3955,12 @@ masil_bridge_pane_destroyed(struct window_pane *wp)
 {
 	struct masil_bridge_watch_slot *slot;
 
+	/* masil: the copy result belongs to the pane, bridge or not. */
+	if (wp->masil_copy != NULL) {
+		free(wp->masil_copy->buffer);
+		free(wp->masil_copy);
+		wp->masil_copy = NULL;
+	}
 	if (!masil_bridge_enabled)
 		return;
 	if ((slot = masil_bridge_watch_slot(wp)) != NULL) {

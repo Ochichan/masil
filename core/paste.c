@@ -166,9 +166,21 @@ paste_free(struct paste_buffer *pb)
 void
 paste_add(const char *prefix, char *data, size_t size)
 {
+	paste_add_name(prefix, data, size, NULL);
+}
+
+/*
+ * masil: paste_add that also reports the name of the buffer it made (NULL when
+ * none was made). The caller frees the name.
+ */
+void
+paste_add_name(const char *prefix, char *data, size_t size, char **name)
+{
 	struct paste_buffer	*pb, *pb1;
 	u_int			 limit;
 
+	if (name != NULL)
+		*name = NULL;
 	if (prefix == NULL)
 		prefix = "buffer";
 
@@ -205,6 +217,8 @@ paste_add(const char *prefix, char *data, size_t size)
 	RB_INSERT(paste_name_tree, &paste_by_name, pb);
 	RB_INSERT(paste_time_tree, &paste_by_time, pb);
 
+	if (name != NULL)
+		*name = xstrdup(pb->name);
 	paste_fire_event("paste-buffer-changed", pb->name);
 }
 

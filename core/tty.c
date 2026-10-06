@@ -1646,11 +1646,29 @@ tty_write(void (*cmdfn)(struct tty *, const struct tty_ctx *),
 	TAILQ_FOREACH(c, &clients, entry) {
 		if (tty_client_ready(ctx, c)) {
 			state = ctx->set_client_cb(ctx, c);
-			if (state == -1)
+			if (state == -1) {
+				/* masil: a redraw is pending for the pane. */
+				if (ctx->masil_sel != NULL)
+					ctx->masil_sel->not_ready++;
 				break;
-			if (state == 0)
+			}
+			if (state == 0) {
+				/* masil: this client does not show the pane. */
+				if (ctx->masil_sel != NULL)
+					ctx->masil_sel->not_shown++;
 				continue;
+			}
 			cmdfn(&c->tty, ctx);
+		} else if (ctx->masil_sel != NULL) {
+			/* masil: count why a client was skipped. */
+			if (c->session == NULL || c->tty.term == NULL ||
+			    c->session->curw == NULL ||
+			    ctx->arg == NULL ||
+			    c->session->curw->window !=
+			    ((struct window_pane *)ctx->arg)->window)
+				ctx->masil_sel->not_shown++;
+			else
+				ctx->masil_sel->not_ready++;
 		}
 	}
 }
@@ -2068,10 +2086,35 @@ tty_cmd_cells(struct tty *tty, const struct tty_ctx *ctx)
 void
 tty_cmd_setselection(struct tty *tty, const struct tty_ctx *ctx)
 {
-	tty_set_selection(tty, ctx->sel.clip, ctx->sel.data, ctx->sel.size);
+	int	result;
+
+	result = tty_set_selection(tty, ctx->sel.clip, ctx->sel.data,
+	    ctx->sel.size);
+	/* masil: report each client's outcome to the copy that asked. */
+	if (ctx->masil_sel == NULL)
+		return;
+	switch (result) {
+	case TTY_SELECTION_SENT:
+		/*
+		 * tty_add drops bytes while TTY_BLOCK is set, and it can set
+		 * the flag while adding, so a block here means the sequence
+		 * did not reach the output buffer.
+		 */
+		if (tty->flags & TTY_BLOCK)
+			ctx->masil_sel->not_ready++;
+		else
+			ctx->masil_sel->sent++;
+		break;
+	case TTY_SELECTION_NO_MS:
+		ctx->masil_sel->no_ms++;
+		break;
+	case TTY_SELECTION_NOT_STARTED:
+		ctx->masil_sel->not_started++;
+		break;
+	}
 }
 
-void
+int
 tty_set_selection(struct tty *tty, const char *clip, const char *buf,
     size_t len)
 {
@@ -2079,9 +2122,9 @@ tty_set_selection(struct tty *tty, const char *clip, const char *buf,
 	size_t	 size;
 
 	if (~tty->flags & TTY_STARTED)
-		return;
+		return (TTY_SELECTION_NOT_STARTED);
 	if (!tty_term_has(tty->term, TTYC_MS))
-		return;
+		return (TTY_SELECTION_NO_MS);
 
 	size = 4 * ((len + 2) / 3) + 1; /* storage for base64 */
 	encoded = xmalloc(size);
@@ -2091,6 +2134,7 @@ tty_set_selection(struct tty *tty, const char *clip, const char *buf,
 	tty_putcode_ss(tty, TTYC_MS, clip, encoded);
 
 	free(encoded);
+	return (TTY_SELECTION_SENT);
 }
 
 void

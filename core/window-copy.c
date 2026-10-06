@@ -25,8 +25,15 @@
 #include <time.h>
 
 #include "tmux.h"
+#include "masil-bridge.h"
 
 struct window_copy_mode_data;
+
+/* masil: a copy-pipe helper and the copy whose result it completes. */
+struct window_copy_pipe_job {
+	u_int		 pane_id;
+	uint64_t	 seq;
+};
 
 static const char *window_copy_key_table(struct window_mode_entry *);
 static void	window_copy_command(struct window_mode_entry *, struct client *,
@@ -123,7 +130,8 @@ static void	window_copy_status_message(struct window_pane *, const char *);
 static void	window_copy_invalidate_selection(struct window_mode_entry *,
 		    const char *);
 static void	window_copy_copy_buffer(struct window_mode_entry *,
-		    const char *, void *, size_t, int, int);
+		    const char *, void *, size_t, int, int,
+		    struct window_copy_pipe_job *);
 static void	window_copy_pipe(struct window_mode_entry *,
 		    struct session *, const char *);
 static void	window_copy_copy_pipe(struct window_mode_entry *,
@@ -6230,48 +6238,93 @@ window_copy_get_selection(struct window_mode_entry *wme, size_t *len)
 
 static void
 window_copy_copy_buffer(struct window_mode_entry *wme, const char *prefix,
-    void *buf, size_t len, int set_paste, int set_clip)
+    void *buf, size_t len, int set_paste, int set_clip,
+    struct window_copy_pipe_job *job)
 {
 	struct window_pane	*wp = wme->wp;
 	struct screen_write_ctx	 ctx;
 	int			 redraw = 0;
+	struct masil_sel_result	 sel, *selp = NULL; /* masil: */
+	char			*name = NULL;
+	uint64_t		 seq;
 
 	if (set_clip &&
 	    options_get_number(global_options, "set-clipboard") != 0) {
-		if (window_copy_line_numbers_active(wme) &&
+		/*
+		 * masil: an open menu also leaves PANE_REDRAW set (the draw
+		 * before the copy, or the menu itself), so the write needs it
+		 * cleared there too.
+		 */
+		if ((window_copy_line_numbers_active(wme) ||
+		    wp->window->menu != NULL) &&
 		    (wp->flags & PANE_REDRAW)) {
 			/* Clear PANE_REDRAW so clipboard write not skipped. */
 			redraw = PANE_REDRAW;
 			wp->flags &= ~PANE_REDRAW;
 		}
+		memset(&sel, 0, sizeof sel);
+		selp = &sel;
 		screen_write_start_pane(&ctx, wp, NULL);
-		screen_write_setselection(&ctx, "", buf, len);
+		screen_write_setselection_result(&ctx, "", buf, len, selp);
 		screen_write_stop(&ctx);
 		wp->flags |= redraw;
 		events_fire_pane("pane-set-clipboard", wp);
 	}
 
 	if (set_paste)
-		paste_add(prefix, buf, len);
+		paste_add_name(prefix, buf, len, &name);
 	else
 		free(buf);
+
+	/* masil: keep what this copy did; a late helper finds it by seq. */
+	seq = masil_bridge_copy_record(wp, name, selp, job != NULL);
+	if (job != NULL)
+		job->seq = seq;
+	free(name);
 }
 
+/* masil: a copy-pipe helper exited; tell the copy that started it. */
+static void
+window_copy_pipe_complete(struct job *job)
+{
+	struct window_copy_pipe_job	*pj = job_get_data(job);
+
+	if (pj != NULL && pj->seq != 0)
+		masil_bridge_copy_helper_done(pj->pane_id, pj->seq,
+		    job_get_status(job));
+}
+
+/*
+ * masil: pj is set for a copy (not a plain pipe) so its helper reports back. It
+ * stays valid until the job is freed, which is after the caller returns.
+ */
 static void *
 window_copy_pipe_run(struct window_mode_entry *wme, struct session *s,
-    const char *cmd, size_t *len)
+    const char *cmd, size_t *len, struct window_copy_pipe_job **pj)
 {
-	void		*buf;
-	struct job	*job;
+	void				*buf;
+	struct job			*job;
+	struct window_copy_pipe_job	*data = NULL;
 
+	if (pj != NULL)
+		*pj = NULL;
 	buf = window_copy_get_selection(wme, len);
 	if (cmd == NULL || *cmd == '\0')
 		cmd = options_get_string(global_options, "copy-command");
 	if (cmd != NULL && *cmd != '\0') {
-		job = job_run(cmd, 0, NULL, NULL, s, NULL, NULL, NULL, NULL,
-		    NULL, JOB_NOWAIT, -1, -1);
-		if (job != NULL)
+		if (pj != NULL) {
+			data = xcalloc(1, sizeof *data);
+			data->pane_id = wme->wp->id;
+		}
+		job = job_run(cmd, 0, NULL, NULL, s, NULL, NULL,
+		    data != NULL ? window_copy_pipe_complete : NULL,
+		    data != NULL ? free : NULL, data, JOB_NOWAIT, -1, -1);
+		if (job != NULL) {
 			bufferevent_write(job_get_event(job), buf, *len);
+			if (pj != NULL)
+				*pj = data;
+		} else
+			free(data);
 	}
 	return (buf);
 }
@@ -6283,7 +6336,7 @@ window_copy_pipe(struct window_mode_entry *wme, struct session *s,
 	void	*buf;
 	size_t	len;
 
-	buf = window_copy_pipe_run(wme, s, cmd, &len);
+	buf = window_copy_pipe_run(wme, s, cmd, &len, NULL);
 	free (buf);
 }
 
@@ -6291,13 +6344,14 @@ static void
 window_copy_copy_pipe(struct window_mode_entry *wme, struct session *s,
     const char *prefix, const char *cmd, int set_paste, int set_clip)
 {
-	void	*buf;
-	size_t	 len;
+	void				*buf;
+	size_t				 len;
+	struct window_copy_pipe_job	*pj;
 
-	buf = window_copy_pipe_run(wme, s, cmd, &len);
+	buf = window_copy_pipe_run(wme, s, cmd, &len, &pj);
 	if (buf != NULL) {
 		window_copy_copy_buffer(wme, prefix, buf, len, set_paste,
-		    set_clip);
+		    set_clip, pj);
 	}
 }
 
@@ -6311,7 +6365,7 @@ window_copy_copy_selection(struct window_mode_entry *wme, const char *prefix,
 	buf = window_copy_get_selection(wme, &len);
 	if (buf != NULL) {
 		window_copy_copy_buffer(wme, prefix, buf, len, set_paste,
-		    set_clip);
+		    set_clip, NULL);
 	}
 }
 
@@ -6324,15 +6378,26 @@ window_copy_append_selection(struct window_mode_entry *wme)
 	const char			*bufdata;
 	size_t				 len, bufsize;
 	struct screen_write_ctx		 ctx;
+	struct masil_sel_result		 sel, *selp = NULL; /* masil: */
+	char				*name = NULL;
+	int				 redraw = 0;
 
 	buf = window_copy_get_selection(wme, &len);
 	if (buf == NULL)
 		return;
 
 	if (options_get_number(global_options, "set-clipboard") != 0) {
+		memset(&sel, 0, sizeof sel);
+		selp = &sel;
+		/* masil: as in window_copy_copy_buffer, an open menu. */
+		if (wp->window->menu != NULL && (wp->flags & PANE_REDRAW)) {
+			redraw = PANE_REDRAW;
+			wp->flags &= ~PANE_REDRAW;
+		}
 		screen_write_start_pane(&ctx, wp, NULL);
-		screen_write_setselection(&ctx, "", buf, len);
+		screen_write_setselection_result(&ctx, "", buf, len, selp);
 		screen_write_stop(&ctx);
+		wp->flags |= redraw;
 		events_fire_pane("pane-set-clipboard", wp);
 	}
 
@@ -6346,6 +6411,15 @@ window_copy_append_selection(struct window_mode_entry *wme)
 	}
 	if (paste_set(buf, len, bufname, NULL) != 0)
 		free(buf);
+	else if (len != 0) {
+		/* masil: the buffer appended to, or the one just created. */
+		if (bufname != NULL)
+			name = xstrdup(bufname);
+		else
+			paste_get_top(&name);
+	}
+	masil_bridge_copy_record(wp, name, selp, 0);
+	free(name);
 	free(bufname);
 }
 

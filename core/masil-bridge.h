@@ -64,6 +64,28 @@ void	masil_bridge_focus_written(struct client *);
 void	masil_bridge_focus_invalidate(struct client *, enum masil_focus_cause);
 void	masil_bridge_focus_client_lost(struct client *);
 
+/*
+ * masil: D3 copy destinations. tty_write counts one OSC 52 write per client
+ * here; masil_bridge_copy_record turns the counts into the pane's last result.
+ */
+struct masil_sel_result {
+	unsigned int	sent;
+	unsigned int	no_ms;
+	unsigned int	not_started;
+	unsigned int	not_ready;
+	unsigned int	not_shown;
+};
+enum masil_copy_field {
+	MASIL_COPY_BUFFER,
+	MASIL_COPY_CLIPBOARD,
+	MASIL_COPY_OS,
+	MASIL_COPY_SEQ
+};
+uint64_t masil_bridge_copy_record(struct window_pane *, const char *,
+	     const struct masil_sel_result *, int);
+void	 masil_bridge_copy_helper_done(unsigned int, uint64_t, int);
+char	*masil_bridge_copy_get(struct window_pane *, enum masil_copy_field);
+
 /* masil: C1a ledger, C2a staging, and C3a launch action interface. */
 int	 masil_action_supported(void);
 uint64_t masil_action_coordinator_open(void);

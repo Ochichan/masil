@@ -2401,6 +2401,42 @@ format_cb_masil_client_profile(struct format_tree *ft)
 	return (masil_bridge_client_profile(ft->c));
 }
 
+/* Callback for masil_copy_buffer. */
+static void *
+format_cb_masil_copy_buffer(struct format_tree *ft)
+{
+	if (ft->wp == NULL)
+		return (NULL);
+	return (masil_bridge_copy_get(ft->wp, MASIL_COPY_BUFFER));
+}
+
+/* Callback for masil_copy_clipboard. */
+static void *
+format_cb_masil_copy_clipboard(struct format_tree *ft)
+{
+	if (ft->wp == NULL)
+		return (NULL);
+	return (masil_bridge_copy_get(ft->wp, MASIL_COPY_CLIPBOARD));
+}
+
+/* Callback for masil_copy_os. */
+static void *
+format_cb_masil_copy_os(struct format_tree *ft)
+{
+	if (ft->wp == NULL)
+		return (NULL);
+	return (masil_bridge_copy_get(ft->wp, MASIL_COPY_OS));
+}
+
+/* Callback for masil_copy_seq. */
+static void *
+format_cb_masil_copy_seq(struct format_tree *ft)
+{
+	if (ft->wp == NULL)
+		return (NULL);
+	return (masil_bridge_copy_get(ft->wp, MASIL_COPY_SEQ));
+}
+
 /* Callback for masil_core_boot_id. */
 static void *
 format_cb_masil_core_boot_id(__unused struct format_tree *ft)
@@ -3947,6 +3983,18 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "masil_client_view_revision", FORMAT_TABLE_STRING,
 	  format_cb_masil_client_view_revision
+	},
+	{ "masil_copy_buffer", FORMAT_TABLE_STRING,
+	  format_cb_masil_copy_buffer
+	},
+	{ "masil_copy_clipboard", FORMAT_TABLE_STRING,
+	  format_cb_masil_copy_clipboard
+	},
+	{ "masil_copy_os", FORMAT_TABLE_STRING,
+	  format_cb_masil_copy_os
+	},
+	{ "masil_copy_seq", FORMAT_TABLE_STRING,
+	  format_cb_masil_copy_seq
 	},
 	{ "masil_core_actions", FORMAT_TABLE_STRING,
 	  format_cb_masil_core_actions

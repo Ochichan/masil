@@ -149,8 +149,12 @@ screen_write_set_client_cb(struct tty_ctx *ttyctx, struct client *c)
 	if (wp->layout_cell == NULL)
 		return (0);
 
-	/* A menu is drawn above every pane, including floating panes. */
-	if (wp->window->menu != NULL) {
+	/*
+	 * A menu is drawn above every pane, including floating panes. masil: a
+	 * clipboard write is not drawing, so it does not wait for the menu.
+	 */
+	if (wp->window->menu != NULL &&
+	    (~ttyctx->flags & TTY_CTX_MASIL_SELECTION)) {
 		wp->flags |= (PANE_REDRAW|PANE_REDRAWSCROLLBAR);
 		return (-1);
 	}
@@ -284,6 +288,10 @@ screen_write_initctx(struct screen_write_ctx *ctx, struct tty_ctx *ttyctx,
 	struct colour_palette	*palette = NULL;
 
 	memset(ttyctx, 0, sizeof *ttyctx);
+
+	/* masil: the synchronized-update start of a selection follows it. */
+	if (ctx->flags & SCREEN_WRITE_MASIL_SELECTION)
+		ttyctx->flags |= TTY_CTX_MASIL_SELECTION;
 
 	ttyctx->s = s;
 	ttyctx->sx = screen_size_x(s);
@@ -3190,9 +3198,20 @@ void
 screen_write_setselection(struct screen_write_ctx *ctx, const char *clip,
     u_char *str, u_int len)
 {
+	screen_write_setselection_result(ctx, clip, str, len, NULL);
+}
+
+/* masil: set external clipboard and count what each client did with it. */
+void
+screen_write_setselection_result(struct screen_write_ctx *ctx,
+    const char *clip, u_char *str, u_int len, struct masil_sel_result *result)
+{
 	struct tty_ctx	ttyctx;
 
+	ctx->flags |= SCREEN_WRITE_MASIL_SELECTION;
 	screen_write_initctx(ctx, &ttyctx, 0, 0);
+	ctx->flags &= ~SCREEN_WRITE_MASIL_SELECTION;
+	ttyctx.masil_sel = result;
 	ttyctx.sel.clip = clip;
 	ttyctx.sel.data = str;
 	ttyctx.sel.size = len;

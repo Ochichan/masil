@@ -64,6 +64,8 @@ struct json_node;
 struct menu_data;
 struct masil_launch_context;
 struct masil_focus;
+struct masil_sel_result;
+struct masil_copy_result;
 struct mode_tree_data;
 struct mouse_event;
 struct options;
@@ -1126,6 +1128,7 @@ struct screen_write_ctx {
 #define SCREEN_WRITE_SYNC 0x1
 #define SCREEN_WRITE_OBSCURED 0x2
 #define SCREEN_WRITE_CHECKED_IF_OBSCURED 0x4
+#define SCREEN_WRITE_MASIL_SELECTION 0x8 /* masil: not a drawing command */
 
 	screen_write_init_ctx_cb	 init_ctx_cb;
 	void				*arg;
@@ -1378,6 +1381,7 @@ struct window_pane {
 	uint64_t	 masil_screen_generation;
 	int		 masil_generation_exhausted;
 	uint16_t	 masil_watch_slot;
+	struct masil_copy_result *masil_copy; /* masil: last copy result */
 	time_t		 last_output_time;
 	time_t		 last_prompt_time;
 	time_t		 cmd_start_time;
@@ -1900,6 +1904,7 @@ struct tty_ctx {
 #define TTY_CTX_SYNC 0x8
 #define TTY_CTX_CELL_INVALIDATE 0x20
 #define TTY_CTX_PANE_OBSCURED 0x40
+#define TTY_CTX_MASIL_SELECTION 0x80 /* masil: a menu does not hold it back */
 
 	union {
 		u_int			 n;
@@ -1951,6 +1956,9 @@ struct tty_ctx {
 	u_int			 woy;
 	u_int			 wsx;
 	u_int			 wsy;
+
+	/* masil: where tty_write and tty_cmd_setselection count outcomes. */
+	struct masil_sel_result	*masil_sel;
 };
 
 /* Saved message entry. */
@@ -2718,6 +2726,7 @@ struct paste_buffer *paste_get_top(char **);
 struct paste_buffer *paste_get_name(const char *);
 void		 paste_free(struct paste_buffer *);
 void		 paste_add(const char *, char *, size_t);
+void		 paste_add_name(const char *, char *, size_t, char **);
 int		 paste_rename(const char *, const char *, char **);
 int		 paste_set(char *, size_t, const char *, char **);
 void		 paste_replace(struct paste_buffer *, char *, size_t);
@@ -3047,7 +3056,13 @@ int	tty_open(struct tty *, char **);
 void	tty_close(struct tty *);
 void	tty_free(struct tty *);
 void	tty_update_features(struct tty *);
-void	tty_set_selection(struct tty *, const char *, const char *, size_t);
+/* masil: what tty_set_selection did with the sequence. */
+enum tty_selection_result {
+	TTY_SELECTION_SENT,
+	TTY_SELECTION_NO_MS,
+	TTY_SELECTION_NOT_STARTED
+};
+int	tty_set_selection(struct tty *, const char *, const char *, size_t);
 void	tty_write(void (*)(struct tty *, const struct tty_ctx *),
 	    struct tty_ctx *);
 void	tty_cmd_alignmenttest(struct tty *, const struct tty_ctx *);
@@ -3723,6 +3738,8 @@ void	 screen_write_collect_add(struct screen_write_ctx *,
 void	 screen_write_cell(struct screen_write_ctx *, const struct grid_cell *);
 void	 screen_write_setselection(struct screen_write_ctx *, const char *,
 	     u_char *, u_int);
+void	 screen_write_setselection_result(struct screen_write_ctx *,
+	     const char *, u_char *, u_int, struct masil_sel_result *);
 void	 screen_write_rawstring(struct screen_write_ctx *, u_char *, u_int,
 	     int);
 #ifdef ENABLE_SIXEL
