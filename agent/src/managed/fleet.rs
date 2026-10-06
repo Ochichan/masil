@@ -556,7 +556,7 @@ impl Fleet {
     }
     pub async fn focus_from(&self, agent: &Agent, origin: Option<&str>) -> Result<(), String> {
         let Some(endpoint) = self.remote(agent)? else {
-            return self.local.focus_from(agent, origin).await;
+            return self.local.focus_from(agent, origin).await.map(|_| ());
         };
         // Revalidate before creating a connection window; no remote process is started by polling.
         self.action(endpoint.clone(), agent, Action::Read { history: false })

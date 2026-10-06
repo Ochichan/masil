@@ -54,6 +54,9 @@
 #define MASIL_ACTION_LAUNCH_MAX_ARGV	256
 #define MASIL_ACTION_LAUNCH_MAX_ENV	64
 #define MASIL_ACTION_LAUNCH_BYTES	(32 * 1024)
+/* masil: D1a answers list this many affected clients and flag the rest. */
+#define MASIL_ACTION_FOCUS_AFFECTED	64
+#define MASIL_ACTION_FOCUS_CLIENT_ID	96
 
 enum masil_action_result {
 	MASIL_ACTION_RESULT_NONE,
@@ -85,7 +88,12 @@ enum masil_action_reason {
 	MASIL_ACTION_REASON_STAGING_DIGEST_MISMATCH,
 	MASIL_ACTION_REASON_STAGING_KEY_MISMATCH,
 	MASIL_ACTION_REASON_BRACKET_MODE_OFF,
-	MASIL_ACTION_REASON_LAUNCH_FAILED
+	MASIL_ACTION_REASON_LAUNCH_FAILED,
+	MASIL_ACTION_REASON_CLIENT_ABSENT,
+	MASIL_ACTION_REASON_CLIENT_READONLY,
+	MASIL_ACTION_REASON_VIEW_CHANGED,
+	MASIL_ACTION_REASON_ZOOM_CHANGED,
+	MASIL_ACTION_REASON_SHARED_FOCUS_CONFLICT
 };
 
 enum masil_action_kind {
@@ -190,6 +198,16 @@ struct masil_action_data {
 	const char		*launch_spec_staging_id;
 	size_t			 launch_spec_staging_id_length;
 	int			 launch_staged;
+	/* masil: D1a focus; an argument-free focus stays an unsupported stub. */
+	int			 focus_args;
+	const char		*focus_client_id;
+	size_t			 focus_client_id_length;
+	uint64_t		 focus_view_revision;
+	int			 focus_shared;
+	int			 focus_restore_zoom;
+	u_int			 focus_zoom_window;
+	u_int			 focus_zoom_pane;
+	uint64_t		 focus_zoom_generation;
 };
 
 struct masil_action_request {
@@ -208,6 +226,15 @@ struct masil_action_outcome {
 	pid_t		 pid;
 	uint64_t	 pty_generation;
 	int		 launch;
+	/* masil: D1a focus answers. */
+	int		 focus_applied;
+	int		 focus_affected_listed;
+	uint64_t	 focus_view_revision;
+	size_t		 focus_affected_count;
+	struct {
+		uint64_t serial;
+		int	 stalled;
+	}		 focus_affected[MASIL_ACTION_FOCUS_AFFECTED];
 };
 
 /* masil: C3 context survives its cmdq item until the child status pipe EOF. */
@@ -641,6 +668,16 @@ masil_action_reason_name(enum masil_action_reason reason)
 		return ("bracket_mode_off");
 	case MASIL_ACTION_REASON_LAUNCH_FAILED:
 		return ("launch_failed");
+	case MASIL_ACTION_REASON_CLIENT_ABSENT:
+		return ("client_absent");
+	case MASIL_ACTION_REASON_CLIENT_READONLY:
+		return ("client_readonly");
+	case MASIL_ACTION_REASON_VIEW_CHANGED:
+		return ("view_changed");
+	case MASIL_ACTION_REASON_ZOOM_CHANGED:
+		return ("zoom_changed");
+	case MASIL_ACTION_REASON_SHARED_FOCUS_CONFLICT:
+		return ("shared_focus_conflict");
 	case MASIL_ACTION_REASON_NONE:
 		break;
 	}
@@ -687,6 +724,7 @@ masil_action_response_result(char *response, size_t response_size,
 	struct masil_action_json json = { response, 0, response_size, 0 };
 	unsigned char digest[32];
 	char result_text[128], digest_text[65];
+	size_t i;
 
 	if (masil_action_result_text(result, reason, result_text,
 	    sizeof result_text) != 0)
@@ -714,6 +752,24 @@ masil_action_response_result(char *response, size_t response_size,
 		    "\"pty_generation\":\"%llu\"", outcome->pane_id,
 		    (long)outcome->pid,
 		    (unsigned long long)outcome->pty_generation);
+	}
+	if (outcome->focus_applied)
+		masil_action_json_printf(&json,
+		    ",\"phase\":\"logical_selection_applied\","
+		    "\"view_revision\":\"%llu\"",
+		    (unsigned long long)outcome->focus_view_revision);
+	if (outcome->focus_affected_listed) {
+		masil_action_json_puts(&json, ",\"affected\":[");
+		for (i = 0; i < outcome->focus_affected_count &&
+		    i < MASIL_ACTION_FOCUS_AFFECTED; i++)
+			masil_action_json_printf(&json,
+			    "%s{\"client_id\":\"%s:%llu\",\"stalled\":%s}",
+			    i == 0 ? "" : ",", masil_bridge_get_boot_id(),
+			    (unsigned long long)outcome->focus_affected[i].serial,
+			    outcome->focus_affected[i].stalled ? "true" : "false");
+		masil_action_json_puts(&json, "]");
+		if (outcome->focus_affected_count > MASIL_ACTION_FOCUS_AFFECTED)
+			masil_action_json_puts(&json, ",\"affected_truncated\":true");
 	}
 	masil_action_json_puts(&json, "}");
 	return (masil_action_json_done(&json));
@@ -896,6 +952,23 @@ static int
 masil_action_launch_preconditions_valid(yyjson_val *value)
 {
 	return (yyjson_is_obj(value) && yyjson_obj_size(value) == 0 ? 0 : -1);
+}
+
+/* masil: focus checks only the target pane, so pane_dead is its sole entry. */
+static int
+masil_action_parse_focus_preconditions(yyjson_val *value,
+    struct masil_action_preconditions *preconditions)
+{
+	static const char *const fields[] = { "pane_dead" };
+	yyjson_val *item;
+
+	if (masil_action_schema(value, fields, nitems(fields)) != 0)
+		return (-1);
+	item = yyjson_obj_get(value, "pane_dead");
+	if (!yyjson_is_bool(item))
+		return (-1);
+	preconditions->pane_dead = yyjson_get_bool(item);
+	return (0);
 }
 
 static int
@@ -1134,6 +1207,64 @@ masil_action_parse_launch(struct masil_action_data *action, yyjson_val *value)
 	return (0);
 }
 
+static int masil_action_parse_id(const char *, size_t, char, u_int *);
+
+/* masil: D1a focus arguments; restore_zoom names the zoomed window, pane and pty generation. */
+static int
+masil_action_parse_focus(struct masil_action_data *action, yyjson_val *value)
+{
+	static const char *const focus_fields[] = {
+		"kind", "type", "client_id", "expected_view_revision", "scope",
+		"restore_zoom"
+	};
+	static const char *const zoom_fields[] = {
+		"window_id", "pane_id", "pty_generation"
+	};
+	yyjson_val *item;
+	const char *string;
+	size_t length;
+
+	if (masil_action_schema(value, focus_fields, nitems(focus_fields)) != 0 ||
+	    masil_action_parse_string(value, "client_id", &action->focus_client_id,
+	    &action->focus_client_id_length) != 0 ||
+	    action->focus_client_id_length == 0 ||
+	    action->focus_client_id_length > MASIL_ACTION_FOCUS_CLIENT_ID ||
+	    memchr(action->focus_client_id, '\0',
+	    action->focus_client_id_length) != NULL ||
+	    masil_action_parse_u64(yyjson_obj_get(value,
+	    "expected_view_revision"), &action->focus_view_revision) != 0)
+		return (-1);
+	item = yyjson_obj_get(value, "scope");
+	if (!yyjson_is_str(item))
+		return (-1);
+	string = yyjson_get_str(item);
+	length = yyjson_get_len(item);
+	if (length == 6 && memcmp(string, "client", length) == 0)
+		action->focus_shared = 0;
+	else if (length == 6 && memcmp(string, "shared", length) == 0)
+		action->focus_shared = 1;
+	else
+		return (-1);
+	item = yyjson_obj_get(value, "restore_zoom");
+	if (item != NULL) {
+		if (masil_action_schema(item, zoom_fields, nitems(zoom_fields)) != 0 ||
+		    masil_action_parse_string(item, "window_id", &string,
+		    &length) != 0 ||
+		    masil_action_parse_id(string, length, '@',
+		    &action->focus_zoom_window) != 0 ||
+		    masil_action_parse_string(item, "pane_id", &string,
+		    &length) != 0 ||
+		    masil_action_parse_id(string, length, '%',
+		    &action->focus_zoom_pane) != 0 ||
+		    masil_action_parse_u64(yyjson_obj_get(item, "pty_generation"),
+		    &action->focus_zoom_generation) != 0)
+			return (-1);
+		action->focus_restore_zoom = 1;
+	}
+	action->focus_args = 1;
+	return (0);
+}
+
 static int
 masil_action_parse_action(yyjson_val *value, struct masil_action_data *action)
 {
@@ -1225,6 +1356,13 @@ masil_action_parse_action(yyjson_val *value, struct masil_action_data *action)
 		    nitems(no_argument_fields)) == 0)
 			return (0);
 		if (masil_action_parse_launch(action, value) != 0)
+			return (-1);
+	} else if (action->kind == MASIL_ACTION_FOCUS) {
+		/* Keep the no-argument placeholder non-effectful. */
+		if (masil_action_schema(value, no_argument_fields,
+		    nitems(no_argument_fields)) == 0)
+			return (0);
+		if (masil_action_parse_focus(action, value) != 0)
 			return (-1);
 	}
 	return (0);
@@ -1723,6 +1861,32 @@ masil_action_check_launch_preconditions(const struct masil_action_request *reque
 	if (wp->masil_generation_exhausted ||
 	    wp->masil_pty_generation != request->target.pty_generation)
 		return (MASIL_ACTION_REASON_PTY_GENERATION_CHANGED);
+	return (MASIL_ACTION_REASON_NONE);
+}
+
+/* masil: a focus target needs only boot, identity, generation and liveness. */
+static enum masil_action_reason
+masil_action_check_focus_preconditions(const struct masil_action_request *request,
+    struct window_pane **wpp)
+{
+	struct window_pane	*wp;
+	u_int			 pane_id;
+
+	if (!masil_action_string_equal(masil_bridge_get_boot_id(),
+	    request->target.core_boot_id, request->target.core_boot_id_length))
+		return (MASIL_ACTION_REASON_CORE_BOOT_CHANGED);
+	if (masil_action_parse_pane_id(request->target.pane_id,
+	    request->target.pane_id_length, &pane_id) != 0)
+		return (MASIL_ACTION_REASON_TARGET_GONE);
+	wp = window_pane_find_by_id(pane_id);
+	if (wp == NULL)
+		return (MASIL_ACTION_REASON_TARGET_GONE);
+	if (request->preconditions.pane_dead || wp->fd == -1)
+		return (MASIL_ACTION_REASON_PANE_DEAD);
+	if (wp->masil_generation_exhausted ||
+	    wp->masil_pty_generation != request->target.pty_generation)
+		return (MASIL_ACTION_REASON_PTY_GENERATION_CHANGED);
+	*wpp = wp;
 	return (MASIL_ACTION_REASON_NONE);
 }
 
@@ -2361,6 +2525,134 @@ masil_action_apply_launch(const struct masil_action_request *request,
 	return (MASIL_ACTION_RESULT_APPLIED);
 }
 
+/* masil: only a live attached-or-attaching client with a session can focus. */
+static int
+masil_action_client_live(struct client *c)
+{
+	return ((c->flags & CLIENT_DEAD) == 0 && c->session != NULL &&
+	    c->session->curw != NULL);
+}
+
+/* The id is the bridge client id, "<core boot id>:<client serial>". */
+static struct client *
+masil_action_find_client(const char *id, size_t length)
+{
+	const char	*boot = masil_bridge_get_boot_id();
+	size_t		 boot_length = strlen(boot), i;
+	uint64_t	 serial = 0, digit;
+	struct client	*c;
+
+	if (boot_length == 0 || length <= boot_length + 1 ||
+	    memcmp(id, boot, boot_length) != 0 || id[boot_length] != ':')
+		return (NULL);
+	for (i = boot_length + 1; i < length; i++) {
+		if (id[i] < '0' || id[i] > '9')
+			return (NULL);
+		digit = id[i] - '0';
+		if (serial > (UINT64_MAX - digit) / 10)
+			return (NULL);
+		serial = serial * 10 + digit;
+	}
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->masil_serial == serial)
+			return (masil_action_client_live(c) ? c : NULL);
+	}
+	return (NULL);
+}
+
+/*
+ * masil: D1a focus equals switch-client -E -c <client> -t <pane>. Every check
+ * and the affected-client list come before the first change.
+ */
+static enum masil_action_result
+masil_action_apply_focus(const struct masil_action_request *request,
+    struct window_pane *wp, enum masil_action_reason *reason,
+    struct masil_action_outcome *outcome)
+{
+	const struct masil_action_data	*action = &request->action;
+	struct client			*tc, *other;
+	struct cmd_find_state		 fs;
+	struct session			*s;
+	struct winlink			*wl;
+	struct window			*w, *zoomed = NULL;
+	int				 affected;
+
+	tc = masil_action_find_client(action->focus_client_id,
+	    action->focus_client_id_length);
+	if (tc == NULL) {
+		*reason = MASIL_ACTION_REASON_CLIENT_ABSENT;
+		return (MASIL_ACTION_RESULT_REJECTED);
+	}
+	if (tc->flags & CLIENT_READONLY) {
+		*reason = MASIL_ACTION_REASON_CLIENT_READONLY;
+		return (MASIL_ACTION_RESULT_REJECTED);
+	}
+	if (tc->masil_view_revision != action->focus_view_revision) {
+		*reason = MASIL_ACTION_REASON_VIEW_CHANGED;
+		return (MASIL_ACTION_RESULT_REJECTED);
+	}
+	if (action->focus_restore_zoom) {
+		zoomed = window_find_by_id(action->focus_zoom_window);
+		if (zoomed == NULL || (~zoomed->flags & WINDOW_ZOOMED) ||
+		    zoomed->active == NULL ||
+		    zoomed->active->id != action->focus_zoom_pane ||
+		    zoomed->active->masil_pty_generation !=
+		    action->focus_zoom_generation) {
+			*reason = MASIL_ACTION_REASON_ZOOM_CHANGED;
+			return (MASIL_ACTION_RESULT_REJECTED);
+		}
+	}
+	/* The session choice is the one switch-client -t %N would make. */
+	if (cmd_find_from_pane(&fs, wp, 0) != 0) {
+		*reason = MASIL_ACTION_REASON_WINDOW_UNLINKED;
+		return (MASIL_ACTION_RESULT_REJECTED);
+	}
+	s = fs.s;
+	wl = fs.wl;
+	w = wl->window;
+
+	TAILQ_FOREACH(other, &clients, entry) {
+		if (other == tc || !masil_action_client_live(other))
+			continue;
+		affected = 0;
+		if (other->session == s && s->curw != wl)
+			affected = 1;
+		if (wp != w->active && other->session->curw->window == w)
+			affected = 1;
+		/* Unzooming changes the view of every client on that window. */
+		if (zoomed != NULL && other->session->curw->window == zoomed)
+			affected = 1;
+		if (!affected)
+			continue;
+		if (outcome->focus_affected_count < MASIL_ACTION_FOCUS_AFFECTED) {
+			outcome->focus_affected[outcome->focus_affected_count].serial =
+			    other->masil_serial;
+			outcome->focus_affected[outcome->focus_affected_count].stalled =
+			    masil_client_stalled(other);
+		}
+		outcome->focus_affected_count++;
+	}
+	outcome->focus_affected_listed = 1;
+	if (!action->focus_shared && outcome->focus_affected_count != 0) {
+		*reason = MASIL_ACTION_REASON_SHARED_FOCUS_CONFLICT;
+		return (MASIL_ACTION_RESULT_REJECTED);
+	}
+
+	if (zoomed != NULL) {
+		/* As resize-pane -Z unzooms. */
+		window_unzoom(zoomed, 1);
+		server_redraw_window(zoomed);
+	}
+	cmd_switch_client_select(s, wl, wp, 0, NULL);
+	server_client_set_session(tc, s);
+	server_client_set_key_table(tc, NULL);
+
+	outcome->focus_applied = 1;
+	outcome->focus_view_revision = tc->masil_view_revision;
+	masil_bridge_focus_begin(tc, request->ticket.epoch, request->ticket.seq);
+	return (MASIL_ACTION_RESULT_APPLIED);
+}
+
 static enum masil_action_result
 masil_action_apply(const struct masil_action_request *request,
     struct window_pane *wp, struct masil_action_staging_slot *staging,
@@ -2428,6 +2720,9 @@ masil_action_apply(const struct masil_action_request *request,
 			return (MASIL_ACTION_RESULT_UNSUPPORTED);
 		return (masil_action_apply_launch(request, staging, reason, outcome));
 	case MASIL_ACTION_FOCUS:
+		if (!request->action.focus_args)
+			return (MASIL_ACTION_RESULT_UNSUPPORTED);
+		return (masil_action_apply_focus(request, wp, reason, outcome));
 	case MASIL_ACTION_UNKNOWN:
 		return (MASIL_ACTION_RESULT_UNSUPPORTED);
 	}
@@ -2525,6 +2820,9 @@ masil_action_guarded_execute(uint64_t connection_epoch,
 		if (request->action.kind == MASIL_ACTION_LAUNCH &&
 		    request->action.launch_target != NULL)
 			reason = masil_action_check_launch_preconditions(request);
+		else if (request->action.kind == MASIL_ACTION_FOCUS &&
+		    request->action.focus_args)
+			reason = masil_action_check_focus_preconditions(request, &wp);
 		else
 			reason = masil_action_check_preconditions(request, &wp);
 		if (reason != MASIL_ACTION_REASON_NONE)
@@ -2823,8 +3121,12 @@ masil_action_guarded_request(uint64_t connection_epoch,
 		    &request.target) != 0)
 			return (masil_action_response_error(response, response_size,
 			    request_id, request_id_length, "invalid_target"));
-		if (masil_action_parse_preconditions(yyjson_obj_get(root,
-		    "preconditions"), &request.preconditions) != 0)
+		if ((request.action.kind == MASIL_ACTION_FOCUS &&
+		    request.action.focus_args ?
+		    masil_action_parse_focus_preconditions(yyjson_obj_get(root,
+		    "preconditions"), &request.preconditions) :
+		    masil_action_parse_preconditions(yyjson_obj_get(root,
+		    "preconditions"), &request.preconditions)) != 0)
 			return (masil_action_response_error(response, response_size,
 			    request_id, request_id_length, "invalid_preconditions"));
 	}

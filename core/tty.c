@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "masil-bridge.h"
 
 static int	tty_log_fd = -1;
 
@@ -164,6 +165,9 @@ tty_resize(struct tty *tty)
 void
 tty_set_size(struct tty *tty, u_int sx, u_int sy, u_int xpixel, u_int ypixel)
 {
+	/* masil: only a changed size invalidates a tracked focus frame. */
+	if (tty->client != NULL && (tty->sx != sx || tty->sy != sy))
+		masil_bridge_focus_invalidate(tty->client, MASIL_FOCUS_RESIZE);
 	tty->sx = sx;
 	tty->sy = sy;
 	tty->xpixel = xpixel;
@@ -239,6 +243,9 @@ tty_block_maybe(struct tty *tty)
 
 	evbuffer_drain(tty->out, size);
 	c->discarded += size;
+	/* masil: bytes drained here never reach the fd. */
+	tty->masil_drained += size;
+	masil_bridge_focus_invalidate(c, MASIL_FOCUS_DISCARDED);
 
 	tty->discarded = 0;
 	evtimer_add(&tty->timer, &tv);
@@ -261,6 +268,8 @@ tty_write_callback(__unused int fd, __unused short events, void *data)
 		tty->masil_progress = get_timer();
 		if (EVBUFFER_LENGTH(tty->out) == 0)
 			tty->masil_owed = 0;
+		tty->masil_written += nwrite;
+		masil_bridge_focus_written(c);
 	}
 	log_debug("%s: wrote %d bytes (of %zu)", c->name, nwrite, size);
 
@@ -349,6 +358,7 @@ tty_start_tty(struct tty *tty)
 
 	/* masil: each tty start begins a fresh output-progress interval. */
 	tty->masil_progress = get_timer();
+	masil_bridge_focus_invalidate(c, MASIL_FOCUS_TTY_RESET);
 	setblocking(c->fd, 0);
 	event_add(&tty->event_in, NULL);
 
@@ -469,6 +479,7 @@ tty_stop_tty(struct tty *tty)
 	if (!(tty->flags & TTY_STARTED))
 		return;
 	tty->flags &= ~TTY_STARTED;
+	masil_bridge_focus_invalidate(c, MASIL_FOCUS_TTY_RESET);
 
 	evtimer_del(&tty->start_timer);
 	evtimer_del(&tty->clipboard_timer);
@@ -656,13 +667,17 @@ tty_add(struct tty *tty, const char *buf, size_t len)
 
 	if (tty->flags & TTY_BLOCK) {
 		tty->discarded += len;
-		if (len != 0)
+		if (len != 0) {
 			tty->masil_owed = 1;
+			tty->masil_dropped += len;
+			masil_bridge_focus_invalidate(c, MASIL_FOCUS_DISCARDED);
+		}
 		return;
 	}
 
 	size = EVBUFFER_LENGTH(tty->out);
 	evbuffer_add(tty->out, buf, len);
+	tty->masil_appended += len;
 	/*
 	 * masil: fresh output does not inherit idle time from an empty tty. A
 	 * tty that still owes output (its buffer was emptied by discarding, not

@@ -599,11 +599,49 @@ pub(crate) enum Event {
     ServerExiting,
 }
 
+/// An output phase of one focus action, sent only to the coordinator
+/// connection that issued it. `epoch` and `seq` are the action's dispatch
+/// ticket; `cause` is present for an `invalidated` phase only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FocusEvent {
+    pub(crate) epoch: u64,
+    pub(crate) seq: u64,
+    pub(crate) client_id: String,
+    pub(crate) phase: FocusPhase,
+    pub(crate) event_seq: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FocusPhase {
+    RedrawQueued,
+    TtyOutputDrained,
+    TtyOutputPending,
+    Invalidated(String),
+}
+
+impl FocusPhase {
+    /// The phase as the coordinator reports it to its caller.
+    pub(crate) fn name(&self) -> String {
+        match self {
+            Self::RedrawQueued => "redraw_queued".into(),
+            Self::TtyOutputDrained => "tty_output_drained".into(),
+            Self::TtyOutputPending => "tty_output_pending".into(),
+            Self::Invalidated(cause) => format!("invalidated:{cause}"),
+        }
+    }
+
+    /// Whether the core stops tracking the action after this phase.
+    pub(crate) const fn is_final(&self) -> bool {
+        !matches!(self, Self::RedrawQueued)
+    }
+}
+
 /// Frames that only a coordinator-role connection can receive between action
-/// replies. The core uses stream epoch zero for this launch-only journal.
+/// replies. The core uses stream epoch zero for this launch and focus journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CoordinatorFrame {
     Launch(LaunchEvent),
+    Focus(FocusEvent),
     Gap,
 }
 
@@ -686,7 +724,63 @@ fn parse_launch_event(
     })
 }
 
-/// Validates the launch-only frames interleaved with replies on a
+fn parse_focus_event(value: &Value, boot_id: &str) -> Result<FocusEvent, Error> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Protocol("focus event must be an object".into()))?;
+    let invalidated = object.get("phase").and_then(Value::as_str) == Some("invalidated");
+    let event = exact_object(
+        value,
+        &[
+            "v",
+            "kind",
+            "core_boot_id",
+            "stream_epoch",
+            "event_seq",
+            "reason",
+            "epoch",
+            "seq",
+            "client_id",
+            "phase",
+        ]
+        .iter()
+        .copied()
+        .chain(invalidated.then_some("cause"))
+        .collect::<Vec<_>>(),
+        "focus event",
+    )?;
+    if event.get("v").and_then(Value::as_u64) != Some(1)
+        || event.get("kind").and_then(Value::as_str) != Some("event")
+        || event.get("core_boot_id").and_then(Value::as_str) != Some(boot_id)
+        || event.get("stream_epoch").and_then(Value::as_str) != Some("0")
+        || event.get("reason").and_then(Value::as_str) != Some("focus")
+    {
+        return Err(Error::Protocol(
+            "focus event stream identity mismatch".into(),
+        ));
+    }
+    let phase = match event.get("phase").and_then(Value::as_str) {
+        Some("redraw_queued") => FocusPhase::RedrawQueued,
+        Some("tty_output_drained") => FocusPhase::TtyOutputDrained,
+        Some("tty_output_pending") => FocusPhase::TtyOutputPending,
+        Some("invalidated") => match event.get("cause").and_then(Value::as_str) {
+            Some(cause @ ("discarded" | "tty_reset" | "resize" | "detach" | "superseded")) => {
+                FocusPhase::Invalidated(cause.to_owned())
+            }
+            _ => return Err(Error::Protocol("invalid focus invalidation cause".into())),
+        },
+        _ => return Err(Error::Protocol("invalid focus phase".into())),
+    };
+    Ok(FocusEvent {
+        epoch: decimal(event.get("epoch"), "epoch")?,
+        seq: decimal(event.get("seq"), "seq")?,
+        client_id: identifier(event.get("client_id"), "client_id")?,
+        phase,
+        event_seq: decimal(event.get("event_seq"), "event_seq")?,
+    })
+}
+
+/// Validates the launch and focus frames interleaved with replies on a
 /// coordinator-role connection. These frames intentionally use stream epoch
 /// zero instead of a watch stream epoch.
 pub(crate) fn parse_coordinator_frame(
@@ -697,6 +791,9 @@ pub(crate) fn parse_coordinator_frame(
         Some("event") if value.get("reason").and_then(Value::as_str) == Some("launch") => Ok(
             CoordinatorFrame::Launch(parse_launch_event(value, boot_id, "0")?),
         ),
+        Some("event") if value.get("reason").and_then(Value::as_str) == Some("focus") => {
+            Ok(CoordinatorFrame::Focus(parse_focus_event(value, boot_id)?))
+        }
         Some("gap") => {
             let gap = exact_object(
                 value,
@@ -1078,6 +1175,52 @@ mod tests {
         let mut wrong_epoch = gap;
         wrong_epoch["stream_epoch"] = json!("7");
         assert!(parse_coordinator_frame(&wrong_epoch, "boot").is_err());
+    }
+
+    #[test]
+    fn coordinator_accepts_focus_phases_and_names_an_invalidation() {
+        let mut focus = json!({
+            "v": 1,
+            "kind": "event",
+            "core_boot_id": "boot",
+            "stream_epoch": "0",
+            "event_seq": "13",
+            "reason": "focus",
+            "epoch": "2",
+            "seq": "5",
+            "client_id": "boot:3",
+            "phase": "redraw_queued",
+        });
+        let parsed = parse_coordinator_frame(&focus, "boot").unwrap();
+        assert_eq!(
+            parsed,
+            CoordinatorFrame::Focus(FocusEvent {
+                epoch: 2,
+                seq: 5,
+                client_id: "boot:3".into(),
+                phase: FocusPhase::RedrawQueued,
+                event_seq: 13,
+            })
+        );
+        focus["phase"] = json!("invalidated");
+        assert!(parse_coordinator_frame(&focus, "boot").is_err());
+        focus["cause"] = json!("superseded");
+        let CoordinatorFrame::Focus(event) = parse_coordinator_frame(&focus, "boot").unwrap()
+        else {
+            panic!("not a focus frame");
+        };
+        assert_eq!(event.phase.name(), "invalidated:superseded");
+        assert!(event.phase.is_final());
+        focus["cause"] = json!("unheard_of");
+        assert!(parse_coordinator_frame(&focus, "boot").is_err());
+        focus["phase"] = json!("tty_output_drained");
+        focus.as_object_mut().unwrap().remove("cause");
+        assert!(parse_coordinator_frame(&focus, "other").is_err());
+        let CoordinatorFrame::Focus(event) = parse_coordinator_frame(&focus, "boot").unwrap()
+        else {
+            panic!("not a focus frame");
+        };
+        assert_eq!(event.phase.name(), "tty_output_drained");
     }
 
     #[test]

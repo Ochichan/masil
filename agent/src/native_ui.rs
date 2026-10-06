@@ -1,4 +1,5 @@
-use serde_json::Value;
+use crate::managed::core_action::RECONNECT_VIEW_CHANGED;
+use serde_json::{Value, json};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -35,8 +36,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type GuardedGroup = (String, String, Vec<Vec<String>>, String);
 
-const CLIENT_FORMAT: &str =
-    "#{client_name}\t#{client_readonly}\t#{client_control_mode}\t#{pane_id}\t#{window_id}";
+const CLIENT_FORMAT: &str = "#{client_name}\t#{client_readonly}\t#{client_control_mode}\t#{pane_id}\t#{window_id}\t#{masil_client_id}\t#{masil_client_view_revision}";
 const TARGET_FORMAT: &str = "#{masil_core_boot_id}\t#{masil_pty_generation}\t#{pane_id}\t#{window_id}\t#{window_width}\t#{window_zoomed_flag}\t#{pane_zoomed_flag}\t#{window_modal_pane}\t#{window_active_clients}\t#{pane_dead}";
 const OWNED_FORMAT: &str = "#{masil_core_boot_id}\t#{masil_pty_generation}\t#{pane_id}\t#{window_id}\t#{window_zoomed_flag}\t#{pane_zoomed_flag}\t#{window_modal_pane}\t#{window_active_clients}\t#{pane_dead}\t#{@masil-sidebar-owned}\t#{@masil-sidebar-core-boot}\t#{@masil-sidebar-manager}\t#{@masil-sidebar-pty-generation}";
 
@@ -70,6 +70,15 @@ pub enum NavigationOutcome {
     FocusedAfterRestoringSidebar,
 }
 
+/// A completed navigation. `output` is how far the requesting client's
+/// terminal output got after the selection, as the core reports it; it is
+/// `None` when the native guarded path made the selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Navigation {
+    pub outcome: NavigationOutcome,
+    pub output: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ProcessOutput {
     pub(crate) stdout: Vec<u8>,
@@ -80,6 +89,9 @@ pub(crate) struct ProcessOutput {
 struct ClientInfo {
     name: String,
     pane_id: String,
+    /// The bridge client id and view revision; empty without a core bridge.
+    id: String,
+    view_revision: String,
 }
 
 #[derive(Debug)]
@@ -97,6 +109,7 @@ struct TargetInfo {
 
 #[derive(Debug)]
 struct OwnedInfo {
+    window_id: String,
     generation: String,
     window_zoomed: bool,
     pane_zoomed: bool,
@@ -353,17 +366,41 @@ impl Context {
         expected_pty_generation: &str,
         originating_owned_ui_pane: Option<&str>,
         manager_socket: &Path,
-    ) -> Result<NavigationOutcome, String> {
+    ) -> Result<Navigation, String> {
         require_boot(expected_core_boot_id)?;
         require_pane(pane_id)?;
         require_generation(expected_pty_generation)?;
+        // On a core-path server the core judges other clients' views.
+        let core =
+            crate::managed::action_path_of(self).await? == crate::managed::ActionPath::CoreLedger;
+        if core {
+            // View tracking only runs while a coordinator is connected, so the
+            // coordinator must be up before the view revision is read. A
+            // revision read before it starts could not detect a change made
+            // during the start.
+            let socket = self.socket.clone();
+            tokio::task::spawn_blocking(move || crate::coordinator::ensure(&socket))
+                .await
+                .map_err(|error| format!("coordinator_unavailable: {error}"))?
+                .map_err(focus_error)?;
+        }
         let client = self.resolve_client().await?;
         let target = self.target_info(pane_id).await?;
         if target.boot != expected_core_boot_id || target.generation != expected_pty_generation {
             return Err("native pane identity is stale".into());
         }
-        if target.dead || target.modal || target.active_clients > 1 {
+        if target.dead || target.modal || (!core && target.active_clients > 1) {
             return Err("native pane cannot be focused in the current window state".into());
+        }
+        if core {
+            return self
+                .navigate_core(
+                    &client,
+                    (pane_id, expected_pty_generation),
+                    originating_owned_ui_pane,
+                    (expected_core_boot_id, manager_socket),
+                )
+                .await;
         }
         let target_guard = and(
             core_guard(expected_core_boot_id, expected_pty_generation),
@@ -473,13 +510,88 @@ impl Context {
                 .await?
         };
         match output_line(&output)? {
-            value if value == expected => Ok(if value == FOCUSED_RESTORED {
-                NavigationOutcome::FocusedAfterRestoringSidebar
-            } else {
-                NavigationOutcome::Focused
+            value if value == expected => Ok(Navigation {
+                outcome: if value == FOCUSED_RESTORED {
+                    NavigationOutcome::FocusedAfterRestoringSidebar
+                } else {
+                    NavigationOutcome::Focused
+                },
+                output: None,
             }),
             _ => Err("native focus guard rejected changed state".into()),
         }
+    }
+
+    /// Navigation on a core-path server: one coordinator `focus` action
+    /// carries the zoom restore and the selection, and the core refuses it
+    /// whole when another client's view would change.
+    async fn navigate_core(
+        &self,
+        client: &ClientInfo,
+        (pane_id, generation): (&str, &str),
+        origin: Option<&str>,
+        (expected_boot, manager_socket): (&str, &Path),
+    ) -> Result<Navigation, String> {
+        let mut params = json!({
+            "operation": "focus",
+            "client_id": client.id,
+            "expected_view_revision": client.view_revision,
+            "scope": "client",
+            "pane_id": pane_id,
+            "pty_generation": generation,
+        });
+        if client.id.is_empty() || client.view_revision.is_empty() {
+            return Err("native client is detached, read-only, or ineligible".into());
+        }
+        let mut restored = false;
+        if let Some(origin) = origin {
+            require_pane(origin)?;
+            if origin == pane_id {
+                return Err("native sidebar cannot navigate to itself".into());
+            }
+            let owned = self
+                .owned_info(expected_boot, manager_socket, origin)
+                .await?;
+            if owned.window_zoomed && !owned.pane_zoomed {
+                return Err("refusing to restore a zoom owned by another pane".into());
+            }
+            if owned.pane_zoomed {
+                params["restore_zoom"] = json!({
+                    "window_id": owned.window_id,
+                    "pane_id": origin,
+                    "pty_generation": owned.generation,
+                });
+                restored = true;
+            }
+        }
+        let mut answer = self.core_focus_action(params.clone()).await;
+        if matches!(&answer, Err(error) if error.starts_with(RECONNECT_VIEW_CHANGED)) {
+            let fresh = self.resolve_client().await?;
+            if fresh.id.is_empty() || fresh.view_revision.is_empty() {
+                return Err("native client is detached, read-only, or ineligible".into());
+            }
+            params["client_id"] = json!(fresh.id);
+            params["expected_view_revision"] = json!(fresh.view_revision);
+            answer = self.core_focus_action(params).await;
+        }
+        let answer = answer.map_err(focus_error)?;
+        Ok(Navigation {
+            outcome: if restored {
+                NavigationOutcome::FocusedAfterRestoringSidebar
+            } else {
+                NavigationOutcome::Focused
+            },
+            output: answer["phase"].as_str().map(str::to_owned),
+        })
+    }
+
+    async fn core_focus_action(&self, params: Value) -> Result<Value, String> {
+        let socket = self.socket.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::coordinator::action_after_ensure(&socket, params)
+        })
+        .await
+        .map_err(|error| format!("coordinator_unavailable: {error}"))?
     }
 
     pub async fn toggle_zoom(
@@ -643,7 +755,7 @@ impl Context {
             let mut eligible = Vec::new();
             for line in text.lines() {
                 let fields: Vec<_> = line.split('\t').collect();
-                if fields.len() != 5 {
+                if fields.len() != 7 {
                     return Err("native client list contains an unsafe client name".into());
                 }
                 if fields[1] == "0" && fields[2] == "0" {
@@ -671,7 +783,7 @@ impl Context {
             .await?;
         let line = output_line(&output)?;
         let fields: Vec<_> = line.split('\t').collect();
-        if fields.len() != 5
+        if fields.len() != 7
             || fields[0] != name
             || fields[1] != "0"
             || fields[2] != "0"
@@ -683,6 +795,8 @@ impl Context {
         Ok(ClientInfo {
             name,
             pane_id: fields[3].to_owned(),
+            id: fields[5].to_owned(),
+            view_revision: fields[6].to_owned(),
         })
     }
 
@@ -1129,6 +1243,27 @@ fn write_command(script: &mut String, command: &[String]) {
     script.push('\n');
 }
 
+/// The native wording for a core focus rejection, so callers read the same
+/// text on either path. Errors that are not core rejections pass through.
+fn focus_error(error: String) -> String {
+    let code = error
+        .split_once(':')
+        .map_or(error.as_str(), |(code, _)| code);
+    match code {
+        "shared_focus_conflict" => {
+            "native pane cannot be focused in the current window state".into()
+        }
+        "identity_mismatch" => "native pane identity is stale".into(),
+        "client_absent" | "client_readonly" => {
+            "native client is detached, read-only, or ineligible".into()
+        }
+        "view_changed" | "zoom_changed" | "pane_dead" | "window_unlinked" | "unknown" => {
+            "native focus guard rejected changed state".into()
+        }
+        _ => error,
+    }
+}
+
 pub(crate) fn tmux_quote(value: &str) -> String {
     let mut quoted = String::from("'");
     for character in value.chars() {
@@ -1272,6 +1407,7 @@ fn parse_owned(line: &str, boot: &str, manager_marker: &str) -> Result<OwnedInfo
         .parse::<u32>()
         .map_err(|_| "native active client count is invalid")?;
     Ok(OwnedInfo {
+        window_id: fields[3].into(),
         generation: fields[1].into(),
         window_zoomed: fields[4] == "1",
         pane_zoomed: fields[5] == "1",
@@ -1419,6 +1555,37 @@ mod tests {
     use super::*;
 
     const BOOT: &str = "01234567-89ab-4def-8123-456789abcdef";
+
+    #[test]
+    fn core_focus_rejections_read_like_the_native_guard() {
+        let conflict =
+            "shared_focus_conflict: the selection would change 1 other client(s): boot:4";
+        assert_eq!(
+            focus_error(conflict.into()),
+            "native pane cannot be focused in the current window state"
+        );
+        for rejected in [
+            "view_changed: focus was rejected before any change",
+            "zoom_changed: focus was rejected before any change",
+            "pane_dead: focus was rejected before any change",
+        ] {
+            assert_eq!(
+                focus_error(rejected.into()),
+                "native focus guard rejected changed state"
+            );
+        }
+        assert_eq!(
+            focus_error("identity_mismatch: focus target changed before delivery".into()),
+            "native pane identity is stale"
+        );
+        assert_eq!(
+            focus_error("client_readonly: focus was rejected before any change".into()),
+            "native client is detached, read-only, or ineligible"
+        );
+        // Not a core rejection: the caller sees the coordinator's own text.
+        let unavailable = "bridge_unavailable: coordinator action request was not sent";
+        assert_eq!(focus_error(unavailable.into()), unavailable);
+    }
 
     #[test]
     fn tmux_quoting_preserves_parser_boundaries() {

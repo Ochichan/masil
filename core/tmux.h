@@ -63,6 +63,7 @@ struct job;
 struct json_node;
 struct menu_data;
 struct masil_launch_context;
+struct masil_focus;
 struct mode_tree_data;
 struct mouse_event;
 struct options;
@@ -1825,6 +1826,14 @@ struct tty {
 	uint64_t	 masil_progress;
 	/* masil: output owed since the last completed tty write. */
 	int		 masil_owed;
+	/*
+	 * masil: cumulative byte counters for focus phases. They always satisfy
+	 * appended == written + drained + (bytes still in out).
+	 */
+	uint64_t	 masil_appended;
+	uint64_t	 masil_written;
+	uint64_t	 masil_drained;
+	uint64_t	 masil_dropped;
 
 	struct termios	 tio;
 
@@ -2256,6 +2265,9 @@ struct client {
 	u_char			 masil_view_valid;
 	int			 masil_view_known;
 	int			 masil_gone_emitted;
+	/* masil: redraws generated so far, and the focus action being tracked. */
+	uint64_t		 masil_redraw_seq;
+	struct masil_focus	*masil_focus;
 
 	struct control_state	*control_state;
 	u_int			 pause_age;
@@ -2783,6 +2795,7 @@ void		 format_defaults_pane(struct format_tree *,
 void		 format_defaults_paste_buffer(struct format_tree *,
 		     struct paste_buffer *);
 void		 format_lost_client(struct client *);
+int		 masil_client_stalled(struct client *);
 char		*format_grid_word(struct grid *, u_int, u_int);
 char		*format_grid_hyperlink(struct grid *, u_int, u_int,
 		     struct screen *);
@@ -3227,6 +3240,10 @@ struct winlink	*cmd_mouse_window(struct mouse_event *, struct session **);
 struct window_pane *cmd_mouse_pane(struct mouse_event *, struct session **,
 		     struct winlink **);
 char		*cmd_template_replace(const char *, const char *, int);
+
+/* cmd-switch-client.c */
+void		 cmd_switch_client_select(struct session *, struct winlink *,
+		     struct window_pane *, int, struct cmd_find_state *);
 
 /* cmd-attach-session.c */
 enum cmd_retval	 cmd_attach_session(struct cmdq_item *, const char *, int, int,

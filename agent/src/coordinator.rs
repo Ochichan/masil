@@ -569,10 +569,15 @@ fn action_on_running_coordinator(
     params: Value,
 ) -> Result<Value, String> {
     let paths = paths(socket, &server.state)?;
-    let timeout = if params["operation"].as_str() == Some("launch") {
-        LAUNCH_ACTION_TIMEOUT
-    } else {
-        COMMAND_TIMEOUT + Duration::from_secs(2)
+    let timeout = match params["operation"].as_str() {
+        Some("launch") => LAUNCH_ACTION_TIMEOUT,
+        // The answer, then up to the event wait for the output phases.
+        Some("focus") => {
+            COMMAND_TIMEOUT
+                + Duration::from_secs(2)
+                + crate::managed::core_action::FOCUS_EVENT_TIMEOUT
+        }
+        _ => COMMAND_TIMEOUT + Duration::from_secs(2),
     };
     action_control_request(&paths.listen, params, timeout).map_err(action_request_failure)
 }

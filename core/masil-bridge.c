@@ -81,8 +81,17 @@ enum masil_bridge_event_reason {
 	MASIL_BRIDGE_SESSION_REMOVED,
 	MASIL_BRIDGE_CLIENT_VIEW,
 	MASIL_BRIDGE_CLIENT_GONE,
+	/* masil: focus output phases go to the coordinator that asked. */
+	MASIL_BRIDGE_FOCUS,
 	/* Protocol 1.2 terminal event: it has no object identifier. */
 	MASIL_BRIDGE_SERVER_EXITING
+};
+
+enum masil_focus_phase {
+	MASIL_FOCUS_REDRAW_QUEUED,
+	MASIL_FOCUS_DRAINED,
+	MASIL_FOCUS_INVALIDATED,
+	MASIL_FOCUS_PENDING
 };
 
 struct masil_bridge_watch_slot {
@@ -103,6 +112,8 @@ struct masil_bridge_journal_event {
 	uint64_t		 screen_generation;
 	uint64_t		 client_serial;
 	uint64_t		 view_revision;
+	uint64_t		 action_epoch;
+	uint64_t		 action_seq;
 	int			 launch_errno;
 	u_int			 pane_id;
 	u_int			 window_id;
@@ -111,6 +122,8 @@ struct masil_bridge_journal_event {
 	uint8_t			 reason;
 	uint8_t			 valid;
 	uint8_t			 launch_stage;
+	uint8_t			 focus_phase;
+	uint8_t			 focus_cause;
 };
 
 struct masil_bridge_client {
@@ -138,6 +151,19 @@ struct masil_bridge_client {
 	int			 clients_all;
 	int			 watch_reschedule;
 	struct masil_bridge_client *next;
+};
+
+/* masil: one tracked focus per client, owned by that client's masil_focus. */
+struct masil_focus {
+	struct client	*client;
+	uint64_t	 epoch;
+	uint64_t	 seq;
+	uint64_t	 redraw_base;
+	uint64_t	 mark;
+	uint64_t	 drained_base;
+	uint64_t	 dropped_base;
+	int		 marked;
+	struct event	 timer;
 };
 
 struct masil_bridge_stats {
@@ -378,6 +404,12 @@ static void
 masil_bridge_client_update(struct masil_bridge_client *client);
 static void
 masil_bridge_watch_unsubscribe(struct masil_bridge_client *client);
+static void
+masil_bridge_focus_stop_all(void);
+static void
+masil_bridge_view_hold(void);
+static void
+masil_bridge_view_release(void);
 
 static void
 masil_bridge_client_close(struct masil_bridge_client *client)
@@ -400,6 +432,8 @@ masil_bridge_client_close(struct masil_bridge_client *client)
 		if (client->coordinator) {
 			/* masil: closing a coordinator fences its action epoch. */
 			masil_action_coordinator_close(client->action_epoch);
+			masil_bridge_focus_stop_all();
+			masil_bridge_view_release();
 			masil_bridge_coordinator_connected = 0;
 		} else if (masil_bridge_ordinary_clients != 0)
 			masil_bridge_ordinary_clients--;
@@ -643,7 +677,8 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 	if (coordinator)
 		masil_json_printf(&builder,
 		    "\"actions\":true,\"dispatch_epoch\":\"%llu\","
-		    "\"input\":true,\"launch\":true,\"submit\":false},",
+		    "\"input\":true,\"launch\":true,\"focus\":true,"
+		    "\"submit\":false},",
 		    (unsigned long long)action_epoch);
 	else
 		/* masil: ordinary hello keeps its protocol-1.2 key set unchanged. */
@@ -662,9 +697,10 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 	client->action_epoch = action_epoch;
 	client->coordinator_cursor = masil_bridge_event_seq;
 	client->hello_done = 1;
-	if (coordinator)
+	if (coordinator) {
 		masil_bridge_coordinator_connected = 1;
-	else
+		masil_bridge_view_hold();
+	} else
 		masil_bridge_ordinary_clients++;
 	if (masil_bridge_unauthenticated != 0)
 		masil_bridge_unauthenticated--;
@@ -811,6 +847,8 @@ masil_bridge_reason_string(enum masil_bridge_event_reason reason)
 		return ("client_view");
 	case MASIL_BRIDGE_CLIENT_GONE:
 		return ("client_gone");
+	case MASIL_BRIDGE_FOCUS:
+		return ("focus");
 	case MASIL_BRIDGE_SERVER_EXITING:
 		return ("server_exiting");
 	}
@@ -991,6 +1029,145 @@ masil_bridge_journal_append_client(struct client *c,
 		record->valid = c->masil_view_valid;
 	}
 	masil_bridge_journal_finish();
+}
+
+/*
+ * masil: D1a tracks the output of one focus action per client. The phases only
+ * describe core buffers and the tty fd; they never claim pixels are visible.
+ */
+#define MASIL_FOCUS_PENDING_SECONDS	2
+
+static void
+masil_bridge_focus_stop(struct client *c)
+{
+	struct masil_focus *focus = c->masil_focus;
+
+	if (focus == NULL)
+		return;
+	evtimer_del(&focus->timer);
+	c->masil_focus = NULL;
+	free(focus);
+}
+
+static void
+masil_bridge_focus_emit(struct masil_focus *focus,
+    enum masil_focus_phase phase, enum masil_focus_cause cause)
+{
+	struct masil_bridge_journal_event *record;
+
+	if (!masil_bridge_enabled || masil_bridge_exiting)
+		return;
+	record = masil_bridge_journal_new(MASIL_BRIDGE_FOCUS);
+	if (record == NULL)
+		return;
+	record->client_serial = focus->client->masil_serial;
+	record->action_epoch = focus->epoch;
+	record->action_seq = focus->seq;
+	record->focus_phase = phase;
+	record->focus_cause = cause;
+	masil_bridge_journal_finish();
+}
+
+/* Drained means every byte up to the mark left the buffer by a write. */
+static void
+masil_bridge_focus_check(struct client *c)
+{
+	struct masil_focus	*focus = c->masil_focus;
+	struct tty		*tty = &c->tty;
+
+	if (focus == NULL || !focus->marked)
+		return;
+	if (tty->masil_drained != focus->drained_base ||
+	    tty->masil_dropped != focus->dropped_base) {
+		masil_bridge_focus_emit(focus, MASIL_FOCUS_INVALIDATED,
+		    MASIL_FOCUS_DISCARDED);
+		masil_bridge_focus_stop(c);
+		return;
+	}
+	if (tty->masil_written + tty->masil_drained >= focus->mark) {
+		masil_bridge_focus_emit(focus, MASIL_FOCUS_DRAINED, 0);
+		masil_bridge_focus_stop(c);
+	}
+}
+
+static void
+masil_bridge_focus_timeout(__unused int fd, __unused short events, void *data)
+{
+	struct masil_focus *focus = data;
+
+	masil_bridge_focus_emit(focus, MASIL_FOCUS_PENDING, 0);
+	masil_bridge_focus_stop(focus->client);
+}
+
+void
+masil_bridge_focus_begin(struct client *c, uint64_t epoch, uint64_t seq)
+{
+	struct masil_focus	*focus;
+	struct timeval		 tv = { .tv_sec = MASIL_FOCUS_PENDING_SECONDS };
+
+	if (!masil_bridge_enabled)
+		return;
+	if (c->masil_focus != NULL) {
+		masil_bridge_focus_emit(c->masil_focus, MASIL_FOCUS_INVALIDATED,
+		    MASIL_FOCUS_SUPERSEDED);
+		masil_bridge_focus_stop(c);
+	}
+	focus = xcalloc(1, sizeof *focus);
+	focus->client = c;
+	focus->epoch = epoch;
+	focus->seq = seq;
+	focus->redraw_base = c->masil_redraw_seq;
+	focus->drained_base = c->tty.masil_drained;
+	focus->dropped_base = c->tty.masil_dropped;
+	evtimer_set(&focus->timer, masil_bridge_focus_timeout, focus);
+	evtimer_add(&focus->timer, &tv);
+	c->masil_focus = focus;
+}
+
+/* The next completed redraw after the action fixes the mark. */
+void
+masil_bridge_focus_redraw(struct client *c)
+{
+	struct masil_focus *focus = c->masil_focus;
+
+	if (focus == NULL || focus->marked ||
+	    c->masil_redraw_seq == focus->redraw_base)
+		return;
+	focus->mark = c->tty.masil_appended;
+	focus->marked = 1;
+	masil_bridge_focus_emit(focus, MASIL_FOCUS_REDRAW_QUEUED, 0);
+	masil_bridge_focus_check(c);
+}
+
+void
+masil_bridge_focus_written(struct client *c)
+{
+	masil_bridge_focus_check(c);
+}
+
+void
+masil_bridge_focus_invalidate(struct client *c, enum masil_focus_cause cause)
+{
+	if (c->masil_focus == NULL)
+		return;
+	masil_bridge_focus_emit(c->masil_focus, MASIL_FOCUS_INVALIDATED, cause);
+	masil_bridge_focus_stop(c);
+}
+
+void
+masil_bridge_focus_client_lost(struct client *c)
+{
+	masil_bridge_focus_invalidate(c, MASIL_FOCUS_DETACH);
+}
+
+/* masil: a closed coordinator has nobody to tell, so tracking just ends. */
+static void
+masil_bridge_focus_stop_all(void)
+{
+	struct client *c;
+
+	TAILQ_FOREACH(c, &clients, entry)
+		masil_bridge_focus_stop(c);
 }
 
 static void masil_bridge_dirty_callback(int, short, void *);
@@ -1292,6 +1469,26 @@ masil_bridge_view_disable(void)
 		c->masil_view_known = 0;
 		c->masil_gone_emitted = 0;
 	}
+}
+
+/*
+ * masil: a coordinator keeps client views tracked, so the view revision a
+ * focus action compares moves even when no watch asks for client events.
+ */
+static void
+masil_bridge_view_hold(void)
+{
+	if (masil_bridge_view_clients++ == 0)
+		masil_bridge_view_enable();
+}
+
+static void
+masil_bridge_view_release(void)
+{
+	if (masil_bridge_view_clients != 0)
+		masil_bridge_view_clients--;
+	if (masil_bridge_view_clients == 0)
+		masil_bridge_view_disable();
 }
 
 /* masil: cover active-pane changes that suppress upstream notifications. */
@@ -1614,6 +1811,10 @@ masil_bridge_event_visible(struct masil_bridge_client *client,
 	case MASIL_BRIDGE_CLIENT_VIEW:
 	case MASIL_BRIDGE_CLIENT_GONE:
 		return (client->clients_all);
+	case MASIL_BRIDGE_FOCUS:
+		/* Only the coordinator whose action started the tracking sees it. */
+		return (client->coordinator &&
+		    client->action_epoch == record->action_epoch);
 	case MASIL_BRIDGE_SERVER_EXITING:
 		/* A shutdown is terminal for every watch scope. */
 		return (1);
@@ -1633,6 +1834,31 @@ masil_bridge_json_id(struct masil_json_builder *builder, u_int id, char sigil,
 		masil_json_puts(builder, "null");
 	else
 		masil_json_printf(builder, "\"%c%u\"", sigil, id);
+}
+
+/* masil: the focus payload follows the envelope's own reason field. */
+static void
+masil_bridge_focus_json(struct masil_json_builder *builder,
+    const struct masil_bridge_journal_event *record)
+{
+	static const char *const phases[] = {
+		"redraw_queued", "tty_output_drained", "invalidated",
+		"tty_output_pending"
+	};
+	static const char *const causes[] = {
+		"discarded", "tty_reset", "resize", "detach", "superseded"
+	};
+
+	masil_json_printf(builder,
+	    ",\"epoch\":\"%llu\",\"seq\":\"%llu\",\"client_id\":\"%s:%llu\","
+	    "\"phase\":\"%s\"", (unsigned long long)record->action_epoch,
+	    (unsigned long long)record->action_seq, masil_bridge_boot_id,
+	    (unsigned long long)record->client_serial,
+	    phases[record->focus_phase]);
+	/* masil: "cause" because the envelope already uses "reason". */
+	if (record->focus_phase == MASIL_FOCUS_INVALIDATED)
+		masil_json_printf(builder, ",\"cause\":\"%s\"",
+		    causes[record->focus_cause]);
 }
 
 static int
@@ -1739,6 +1965,9 @@ masil_bridge_watch_pump(struct masil_bridge_client *client)
 			    masil_bridge_boot_id,
 			    (unsigned long long)record->client_serial);
 			break;
+		case MASIL_BRIDGE_FOCUS:
+			masil_bridge_focus_json(&builder, record);
+			break;
 		case MASIL_BRIDGE_SERVER_EXITING:
 			break;
 		}
@@ -1789,6 +2018,21 @@ masil_bridge_coordinator_launch_pump(struct masil_bridge_client *client)
 		index = (masil_bridge_journal_head + offset) %
 		    MASIL_BRIDGE_JOURNAL_EVENTS;
 		record = &masil_bridge_journal[index];
+		if (record->reason == MASIL_BRIDGE_FOCUS &&
+		    record->action_epoch == client->action_epoch) {
+			/* masil: focus phases share the launch event's delivery. */
+			masil_json_printf(&builder,
+			    "{\"v\":1,\"kind\":\"event\",\"core_boot_id\":\"%s\","
+			    "\"stream_epoch\":\"0\",\"event_seq\":\"%llu\","
+			    "\"reason\":\"focus\"", masil_bridge_boot_id,
+			    (unsigned long long)record->seq);
+			masil_bridge_focus_json(&builder, record);
+			masil_json_puts(&builder, "}");
+			if (masil_bridge_queue_builder(client, &builder) != 0)
+				return (-1);
+			client->coordinator_cursor = record->seq;
+			return (0);
+		}
 		if (record->reason != MASIL_BRIDGE_LAUNCH) {
 			client->coordinator_cursor = record->seq;
 			continue;

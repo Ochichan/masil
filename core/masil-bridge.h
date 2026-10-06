@@ -47,6 +47,20 @@ void	masil_bridge_output_changed(struct window_pane *);
 void	masil_bridge_geometry_changed(struct window_pane *);
 void	masil_bridge_launch(unsigned int, uint64_t, const char *, int);
 
+/* masil: D1a focus output phases for the client a focus action moved. */
+enum masil_focus_cause {
+	MASIL_FOCUS_DISCARDED,
+	MASIL_FOCUS_TTY_RESET,
+	MASIL_FOCUS_RESIZE,
+	MASIL_FOCUS_DETACH,
+	MASIL_FOCUS_SUPERSEDED
+};
+void	masil_bridge_focus_begin(struct client *, uint64_t, uint64_t);
+void	masil_bridge_focus_redraw(struct client *);
+void	masil_bridge_focus_written(struct client *);
+void	masil_bridge_focus_invalidate(struct client *, enum masil_focus_cause);
+void	masil_bridge_focus_client_lost(struct client *);
+
 /* masil: C1a ledger, C2a staging, and C3a launch action interface. */
 int	 masil_action_supported(void);
 uint64_t masil_action_coordinator_open(void);

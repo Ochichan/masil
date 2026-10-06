@@ -45,6 +45,37 @@ const struct cmd_entry cmd_switch_client_entry = {
 	.exec = cmd_switch_client_exec
 };
 
+/*
+ * masil: select a pane and its window in a session. switch-client and the core
+ * focus action share this so notifications and hooks fire the same way.
+ */
+void
+cmd_switch_client_select(struct session *s, struct winlink *wl,
+    struct window_pane *wp, int Zflag, struct cmd_find_state *current)
+{
+	struct window	*w;
+	int		 visible;
+
+	if (wl != NULL && wp != NULL && wp != wl->window->active) {
+		w = wl->window;
+		if (w->modal != NULL && wp != w->modal)
+			visible = 1;
+		else
+			visible = window_pane_is_visible(wp);
+		if (!visible && window_push_zoom(w, 0, Zflag))
+			server_redraw_window(w);
+		window_redraw_active_switch(w, wp);
+		window_set_active_pane(w, wp, 1);
+		if (!visible && window_pop_zoom(w))
+			server_redraw_window(w);
+	}
+	if (wl != NULL) {
+		session_set_current(s, wl);
+		if (current != NULL)
+			cmd_find_from_session(current, s, 0);
+	}
+}
+
 static enum cmd_retval
 cmd_switch_client_exec(struct cmd *self, struct cmdq_item *item)
 {
@@ -53,12 +84,11 @@ cmd_switch_client_exec(struct cmd *self, struct cmdq_item *item)
 	struct cmd_find_state	 target;
 	const char		*tflag = args_get(args, 't');
 	enum cmd_find_type	 type;
-	int			 flags, visible, Zflag = args_has(args, 'Z');
+	int			 flags, Zflag = args_has(args, 'Z');
 	struct client		*c = cmdq_get_client(item);
 	struct client		*tc = cmdq_get_target_client(item);
 	struct session		*s;
 	struct winlink		*wl;
-	struct window		*w;
 	struct window_pane	*wp;
 	const char		*tablename;
 	struct key_table	*table;
@@ -137,23 +167,7 @@ cmd_switch_client_exec(struct cmd *self, struct cmdq_item *item)
 	} else {
 		if (cmdq_get_client(item) == NULL)
 			return (CMD_RETURN_NORMAL);
-		if (wl != NULL && wp != NULL && wp != wl->window->active) {
-			w = wl->window;
-			if (w->modal != NULL && wp != w->modal)
-				visible = 1;
-			else
-				visible = window_pane_is_visible(wp);
-			if (!visible && window_push_zoom(w, 0, Zflag))
-				server_redraw_window(w);
-			window_redraw_active_switch(w, wp);
-			window_set_active_pane(w, wp, 1);
-			if (!visible && window_pop_zoom(w))
-				server_redraw_window(w);
-		}
-		if (wl != NULL) {
-			session_set_current(s, wl);
-			cmd_find_from_session(current, s, 0);
-		}
+		cmd_switch_client_select(s, wl, wp, Zflag, current);
 	}
 
 	if (!args_has(args, 'E'))

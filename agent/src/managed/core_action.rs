@@ -10,7 +10,7 @@ use crate::bridge::{self, Endpoint, LaunchEvent};
 use crate::observation::now_ms;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,13 @@ const INTERRUPT_INTER_KEY_PAUSE: Duration = Duration::from_millis(300);
 /// receives that reconciliation rather than timing out first.
 pub(crate) const LAUNCH_EVENT_TIMEOUT_SECS: u64 = 3;
 const LAUNCH_EVENT_TIMEOUT: Duration = Duration::from_secs(LAUNCH_EVENT_TIMEOUT_SECS);
+/// Returned by a focus action that had to reconnect the coordinator to the
+/// core; the caller reads the client view again and retries once.
+pub(crate) const RECONNECT_VIEW_CHANGED: &str =
+    "view_changed: the coordinator reconnected to the core; read the client view again";
+/// How long a focus answer waits for the output phases of its action. The
+/// core itself ends tracking with `tty_output_pending` after 2 s.
+pub(crate) const FOCUS_EVENT_TIMEOUT: Duration = Duration::from_millis(2_500);
 
 /// A boot-local ticket assigned by the coordinator connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -166,6 +173,9 @@ pub(crate) struct GuardedAction {
     /// managed-agent snapshot, so their outer target/preconditions shape is
     /// different from every other guarded action.
     pub(crate) launch_target: Option<LaunchTarget>,
+    /// A focus names its target pane in `target` and takes `pane_dead:false`
+    /// as its only precondition; the agent-state fields do not apply.
+    pub(crate) focus: bool,
     pub(crate) action: Value,
 }
 
@@ -380,6 +390,7 @@ const MAX_REQUEST_ID: &str = "core-action-18446744073709551615";
 fn guarded_action_fields(request: &GuardedAction) -> Value {
     let (target, preconditions) = match &request.launch_target {
         Some(target) => (target.target(), json!({})),
+        None if request.focus => (request.preconditions.target(), json!({"pane_dead": false})),
         None => (
             request.preconditions.target(),
             request.preconditions.value(),
@@ -420,10 +431,12 @@ pub(crate) fn validate_guarded_action(request: &GuardedAction) -> Result<(), Str
 pub(crate) struct Client {
     requests: mpsc::Sender<WireRequest>,
     launch_events: mpsc::UnboundedReceiver<Result<bridge::CoordinatorFrame, Error>>,
+    focus_router: Arc<FocusRouter>,
     core_boot_id: String,
     epoch: u64,
     input: bool,
     launch: bool,
+    focus: bool,
     next_seq: u64,
     request_number: u64,
     broken: bool,
@@ -449,26 +462,30 @@ impl Client {
         )
         .await?;
         let hello = read_value(&mut stream, false).await?;
-        let (epoch, input, launch) = parse_hello(&hello, hello_id, endpoint)?;
+        let (epoch, input, launch, focus) = parse_hello(&hello, hello_id, endpoint)?;
         let (read, write) = stream.into_split();
         let (requests, received_requests) = mpsc::channel(1);
         let (frames, received_frames) = mpsc::unbounded_channel();
         let (launch_events, received_launch_events) = mpsc::unbounded_channel();
+        let focus_router = Arc::new(FocusRouter::default());
         let reader = tokio::spawn(reader_task(read, frames));
         let writer = tokio::spawn(writer_task(
             write,
             received_requests,
             received_frames,
             launch_events,
+            Arc::clone(&focus_router),
             endpoint.core_boot_id.clone(),
         ));
         Ok(Self {
             requests,
             launch_events: received_launch_events,
+            focus_router,
             core_boot_id: endpoint.core_boot_id.clone(),
             epoch,
             input,
             launch,
+            focus,
             next_seq: 0,
             request_number: 0,
             broken: false,
@@ -489,6 +506,10 @@ impl Client {
         self.launch
     }
 
+    pub(crate) const fn supports_focus(&self) -> bool {
+        self.focus
+    }
+
     pub(crate) fn core_boot_id(&self) -> &str {
         &self.core_boot_id
     }
@@ -501,13 +522,24 @@ impl Client {
     }
 
     pub(crate) fn is_broken(&self) -> bool {
-        self.broken
+        self.broken || self.focus_router.is_closed()
     }
 
     pub(crate) async fn guarded_action(
         &mut self,
         request: GuardedAction,
     ) -> Result<LedgerResult, Error> {
+        self.guarded_action_reply(request)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Like `guarded_action`, and also returns the core's answer for the
+    /// fields only some kinds carry (a focus answer's `affected` list).
+    pub(crate) async fn guarded_action_reply(
+        &mut self,
+        request: GuardedAction,
+    ) -> Result<(LedgerResult, Value), Error> {
         validate_guarded_action(&request).map_err(Error::InvalidArgument)?;
         if request.ticket != self.next_ticket() {
             return Err(Error::Protocol(
@@ -544,7 +576,7 @@ impl Client {
         ) {
             self.broken = true;
         }
-        Ok(result)
+        Ok((result, reply))
     }
 
     /// Stages one prompt body on this coordinator connection.  The core owns
@@ -745,7 +777,9 @@ impl Client {
                     {
                         return Ok(Some(event));
                     }
-                    Some(Ok(bridge::CoordinatorFrame::Launch(_))) => {}
+                    Some(Ok(
+                        bridge::CoordinatorFrame::Launch(_) | bridge::CoordinatorFrame::Focus(_),
+                    )) => {}
                     Some(Ok(bridge::CoordinatorFrame::Gap)) => return Ok(None),
                     Some(Err(error)) => return Err(error),
                     None => {
@@ -760,6 +794,13 @@ impl Client {
             Ok(result) => result,
             Err(_) => Ok(None),
         }
+    }
+
+    /// Registers the wait for the output phases of the focus action `ticket`.
+    /// Call it before the action is sent so no frame can arrive unrouted; the
+    /// wait itself needs neither this client nor the action lock.
+    pub(crate) fn focus_waiter(&self, ticket: DispatchTicket) -> FocusWaiter {
+        self.focus_router.register(ticket)
     }
 
     /// Launch events belong to the action that caused them, but the stream is
@@ -782,7 +823,7 @@ impl Client {
     }
 
     async fn call(&mut self, kind: &str, fields: Value) -> Result<Value, Error> {
-        if self.broken {
+        if self.is_broken() {
             return Err(Error::Lost(
                 "the coordinator bridge connection is closed".into(),
             ));
@@ -855,6 +896,123 @@ impl Drop for Client {
     fn drop(&mut self) {
         self._reader.abort();
         self._writer.abort();
+        self.focus_router.close();
+    }
+}
+
+/// What a pending focus wait is told about its own ticket.
+enum FocusSignal {
+    Event(bridge::FocusEvent),
+    Gap,
+}
+
+#[derive(Default)]
+struct FocusRoutes {
+    waiters: HashMap<(u64, u64), mpsc::UnboundedSender<FocusSignal>>,
+    closed: bool,
+}
+
+/// Routes focus frames by (epoch, seq) to the wait registered for that
+/// ticket, so a focus wait never reads the shared launch-event channel. A
+/// frame for a ticket nobody waits on is dropped.
+#[derive(Default)]
+pub(crate) struct FocusRouter {
+    routes: Mutex<FocusRoutes>,
+}
+
+impl FocusRouter {
+    fn register(self: &Arc<Self>, ticket: DispatchTicket) -> FocusWaiter {
+        let (sender, signals) = mpsc::unbounded_channel();
+        let key = (ticket.epoch, ticket.seq);
+        if let Ok(mut routes) = self.routes.lock()
+            && !routes.closed
+        {
+            routes.waiters.insert(key, sender);
+        }
+        // With the router closed (or poisoned) the sender is dropped here and
+        // the wait ends at once with `unknown`.
+        FocusWaiter {
+            router: Arc::clone(self),
+            key,
+            signals,
+        }
+    }
+
+    fn deliver(&self, event: bridge::FocusEvent) {
+        if let Ok(routes) = self.routes.lock()
+            && let Some(sender) = routes.waiters.get(&(event.epoch, event.seq))
+        {
+            let _ = sender.send(FocusSignal::Event(event));
+        }
+    }
+
+    fn gap(&self) {
+        if let Ok(routes) = self.routes.lock() {
+            for sender in routes.waiters.values() {
+                let _ = sender.send(FocusSignal::Gap);
+            }
+        }
+    }
+
+    /// The reader or writer is gone: every pending wait ends as lost, and a
+    /// later registration ends the same way.
+    fn close(&self) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.closed = true;
+            routes.waiters.clear();
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.routes.lock().map_or(true, |routes| routes.closed)
+    }
+
+    fn remove(&self, key: (u64, u64)) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.waiters.remove(&key);
+        }
+    }
+}
+
+/// The pending output-phase wait of one applied focus action.
+pub(crate) struct FocusWaiter {
+    router: Arc<FocusRouter>,
+    key: (u64, u64),
+    signals: mpsc::UnboundedReceiver<FocusSignal>,
+}
+
+impl FocusWaiter {
+    /// Collects the phases of this ticket for up to `FOCUS_EVENT_TIMEOUT`.
+    /// The last phase seen wins and a final phase ends the wait at once. With
+    /// nothing seen the selection is all that is known; a gap frame means the
+    /// journal lost events that may have covered this action, and a lost
+    /// reader only ends the report because the effect is already applied.
+    pub(crate) async fn wait(mut self) -> String {
+        let mut phase = "logical_selection_applied".to_owned();
+        let wait = async {
+            loop {
+                match self.signals.recv().await {
+                    Some(FocusSignal::Event(event)) => {
+                        phase = event.phase.name();
+                        if event.phase.is_final() {
+                            return;
+                        }
+                    }
+                    Some(FocusSignal::Gap) | None => {
+                        phase = "unknown".into();
+                        return;
+                    }
+                }
+            }
+        };
+        let _ = tokio::time::timeout(FOCUS_EVENT_TIMEOUT, wait).await;
+        phase
+    }
+}
+
+impl Drop for FocusWaiter {
+    fn drop(&mut self) {
+        self.router.remove(self.key);
     }
 }
 
@@ -869,10 +1027,32 @@ async fn reader_task(mut read: OwnedReadHalf, frames: mpsc::UnboundedSender<Resu
 }
 
 async fn writer_task(
+    write: OwnedWriteHalf,
+    requests: mpsc::Receiver<WireRequest>,
+    frames: mpsc::UnboundedReceiver<Result<Value, Error>>,
+    launch_events: mpsc::UnboundedSender<Result<bridge::CoordinatorFrame, Error>>,
+    focus_router: Arc<FocusRouter>,
+    core_boot_id: String,
+) {
+    writer_loop(
+        write,
+        requests,
+        frames,
+        launch_events,
+        &focus_router,
+        core_boot_id,
+    )
+    .await;
+    // However the loop ended, no further focus frame can arrive.
+    focus_router.close();
+}
+
+async fn writer_loop(
     mut write: OwnedWriteHalf,
     mut requests: mpsc::Receiver<WireRequest>,
     mut frames: mpsc::UnboundedReceiver<Result<Value, Error>>,
     launch_events: mpsc::UnboundedSender<Result<bridge::CoordinatorFrame, Error>>,
+    focus_router: &FocusRouter,
     core_boot_id: String,
 ) {
     let mut active: Option<WireRequest> = None;
@@ -925,10 +1105,18 @@ async fn writer_task(
                     let frame = bridge::parse_coordinator_frame(&value, &core_boot_id)
                         .map_err(|error| Error::Protocol(error.to_string()));
                     match frame {
-                        Ok(bridge::CoordinatorFrame::Launch(event)) => {
-                            if event.event_seq <= last_launch_sequence {
+                        Ok(
+                            frame @ (bridge::CoordinatorFrame::Launch(_)
+                            | bridge::CoordinatorFrame::Focus(_)),
+                        ) => {
+                            let event_seq = match &frame {
+                                bridge::CoordinatorFrame::Launch(event) => event.event_seq,
+                                bridge::CoordinatorFrame::Focus(event) => event.event_seq,
+                                bridge::CoordinatorFrame::Gap => unreachable!(),
+                            };
+                            if event_seq <= last_launch_sequence {
                                 let error = Error::Protocol(
-                                    "coordinator launch event sequence is not increasing".into(),
+                                    "coordinator event sequence is not increasing".into(),
                                 );
                                 if let Some(request) = active.take() {
                                     let _ = request.reply.send(Err(error.clone()));
@@ -936,15 +1124,20 @@ async fn writer_task(
                                 let _ = launch_events.send(Err(error));
                                 return;
                             }
-                            last_launch_sequence = event.event_seq;
-                            if launch_events
-                                .send(Ok(bridge::CoordinatorFrame::Launch(event)))
-                                .is_err()
-                            {
-                                return;
+                            last_launch_sequence = event_seq;
+                            match frame {
+                                bridge::CoordinatorFrame::Focus(event) => {
+                                    focus_router.deliver(event);
+                                }
+                                frame => {
+                                    if launch_events.send(Ok(frame)).is_err() {
+                                        return;
+                                    }
+                                }
                             }
                         }
                         Ok(bridge::CoordinatorFrame::Gap) => {
+                            focus_router.gap();
                             if launch_events.send(Ok(bridge::CoordinatorFrame::Gap)).is_err() {
                                 return;
                             }
@@ -1191,7 +1384,7 @@ fn parse_hello(
     value: &Value,
     request_id: &str,
     endpoint: &Endpoint,
-) -> Result<(u64, bool, bool), Error> {
+) -> Result<(u64, bool, bool, bool), Error> {
     if let Some(error) = parse_error(value, request_id)? {
         if matches!(&error, Error::Rejected { code, .. } if code == "epoch_exhausted") {
             return Err(Error::Unavailable(
@@ -1224,6 +1417,7 @@ fn parse_hello(
         decimal(capabilities.get("dispatch_epoch"), "dispatch_epoch")?,
         capabilities.get("input").and_then(Value::as_bool) == Some(true),
         capabilities.get("launch").and_then(Value::as_bool) == Some(true),
+        capabilities.get("focus").and_then(Value::as_bool) == Some(true),
     ))
 }
 
@@ -1371,6 +1565,96 @@ fn parse_launch_receipt(
         pid: pid.to_owned(),
         pty_generation: pty_generation.to_owned(),
     }))
+}
+
+/// The fields a focus answer adds to the ledger answer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct FocusAnswer {
+    view_revision: String,
+    /// `(client_id, stalled)` for each other client the change reached or
+    /// would have reached.
+    affected: Vec<(String, bool)>,
+}
+
+impl FocusAnswer {
+    fn affected_value(&self) -> Value {
+        Value::Array(
+            self.affected
+                .iter()
+                .map(|(client_id, stalled)| json!({"client_id": client_id, "stalled": stalled}))
+                .collect(),
+        )
+    }
+}
+
+/// An applied focus answer carries `phase`, `view_revision` and `affected`;
+/// a rejection carries `affected` only when it names clients.
+fn parse_focus_answer(value: &Value, applied: bool) -> Result<FocusAnswer, Error> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Protocol("focus answer is not an object".into()))?;
+    let affected = match object.get("affected") {
+        None if !applied => return Ok(FocusAnswer::default()),
+        Some(Value::Array(list)) if list.len() <= 64 => list
+            .iter()
+            .map(|item| {
+                let item = item
+                    .as_object()
+                    .filter(|item| item.len() == 2)
+                    .ok_or_else(|| Error::Protocol("focus affected entry is invalid".into()))?;
+                let client_id = item
+                    .get("client_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| {
+                        !id.is_empty() && id.len() <= 64 && !id.chars().any(char::is_control)
+                    })
+                    .ok_or_else(|| Error::Protocol("focus affected client_id is invalid".into()))?;
+                let stalled = item
+                    .get("stalled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| Error::Protocol("focus affected stalled is invalid".into()))?;
+                Ok((client_id.to_owned(), stalled))
+            })
+            .collect::<Result<Vec<_>, Error>>()?,
+        _ => return Err(Error::Protocol("focus answer affected is invalid".into())),
+    };
+    if !applied {
+        return Ok(FocusAnswer {
+            view_revision: String::new(),
+            affected,
+        });
+    }
+    if object.get("phase").and_then(Value::as_str) != Some("logical_selection_applied") {
+        return Err(Error::Protocol("focus answer phase is invalid".into()));
+    }
+    decimal(object.get("view_revision"), "view_revision")?;
+    Ok(FocusAnswer {
+        view_revision: object["view_revision"]
+            .as_str()
+            .expect("decimal accepted a string")
+            .to_owned(),
+        affected,
+    })
+}
+
+/// A focus rejection keeps the core's reason as its code. Identity and
+/// liveness failures read like the other actions' `identity_mismatch`; a
+/// shared-client conflict names the clients that stopped it.
+fn focus_rejection(reason: &str, affected: &[(String, bool)]) -> String {
+    match reason {
+        "core_boot_changed" | "target_gone" | "pty_generation_changed" => {
+            format!("identity_mismatch: focus target changed before delivery ({reason})")
+        }
+        "shared_focus_conflict" => {
+            let clients: Vec<_> = affected.iter().map(|(id, _)| id.as_str()).collect();
+            format!(
+                "shared_focus_conflict: the selection would change {} other client(s): {}",
+                clients.len(),
+                clients.join(",")
+            )
+        }
+        reason => format!("{reason}: focus was rejected before any change"),
+    }
 }
 
 struct LedgerPage {
@@ -1696,13 +1980,13 @@ impl CoordinatorActions {
     }
 
     pub(crate) async fn execute(&self, params: &Value) -> Result<Value, String> {
-        let _serial = self.serial.lock().await;
+        let serial = self.serial.lock().await;
         if self.stopping.load(Ordering::SeqCst) {
             return Err("coordinator_unavailable: the coordinator is stopping".into());
         }
-        let _active = ActiveAction::new(self);
+        let active = ActiveAction::new(self);
         let action = ControlAction::parse(params)?;
-        let _pane = if action.pane().is_empty() {
+        let pane_lock = if action.pane().is_empty() {
             None
         } else {
             Some(self.locks.lock(action.pane()).await)
@@ -1721,11 +2005,18 @@ impl CoordinatorActions {
             self.unavailable(&error);
             return Err(format!("bridge_unavailable: {error}"));
         }
+        // The core tracks client views only while this bridge connection
+        // exists, and a fresh connection sets a new baseline without bumping
+        // revisions, so a revision read before the connect cannot be trusted.
+        if connect_needed && matches!(action, ControlAction::Focus(_)) {
+            return Err(RECONNECT_VIEW_CHANGED.into());
+        }
         let mut client = self.client.lock().await;
         let Some(core) = client.as_mut() else {
             return Err("bridge_unavailable: coordinator action connection is unavailable".into());
         };
-        let outcome = match action {
+        let mut focus_wait = None;
+        let mut outcome = match action {
             ControlAction::Keys {
                 pane,
                 expected,
@@ -1784,6 +2075,13 @@ impl CoordinatorActions {
                 .await
             }
             ControlAction::Launch(action) => self.launch(&manager, core, action).await,
+            ControlAction::Focus(action) => match self.focus(core, &action).await {
+                Ok((applied, waiter)) => {
+                    focus_wait = Some(waiter);
+                    Ok(applied)
+                }
+                Err(error) => Err(error),
+            },
         };
         let boot_mismatch = outcome
             .as_ref()
@@ -1803,6 +2101,20 @@ impl CoordinatorActions {
             && let Err(error) = self.mark_boot_outcomes_unknown(&manager, &old_boot).await
         {
             self.unavailable(&error);
+        }
+        // A focus reports its output phases without holding anything another
+        // action needs: the serial lock, the pane lock, the client and the
+        // stop fence are all released, and the waiter reads only its own
+        // ticket's frames. A stalled client must not delay a later action.
+        let Some(waiter) = focus_wait else {
+            return outcome;
+        };
+        drop(pane_lock);
+        drop(active);
+        drop(serial);
+        let phase = waiter.wait().await;
+        if let Ok(applied) = outcome.as_mut() {
+            applied["phase"] = json!(phase);
         }
         outcome
     }
@@ -1956,6 +2268,89 @@ impl CoordinatorActions {
         }
     }
 
+    /// A focus is not a durable effect: it sends no SQLite record and asks
+    /// the core not to retain its ledger entry. After the answer it reports
+    /// how far the requesting client's output got, never that pixels are
+    /// visible.
+    async fn focus(
+        &self,
+        core: &mut Client,
+        action: &FocusAction,
+    ) -> Result<(Value, FocusWaiter), String> {
+        if !core.supports_focus() {
+            return Err("bridge_unavailable: the core does not support focus actions".into());
+        }
+        let nonce = nonce().map_err(|error| format!("bridge_unavailable: {error}"))?;
+        let operation_key = durable_key_for_boot(
+            &self.socket,
+            core.core_boot_id(),
+            &nonce,
+            &digest(&format!("focus:{}:{}", action.client_id, action.pane)),
+        );
+        let wire = action.wire();
+        let ticket = core.next_ticket();
+        let request = GuardedAction {
+            operation_key,
+            ticket,
+            payload_digest: digest(&wire.to_string()),
+            retain: false,
+            preconditions: Preconditions {
+                core_boot_id: core.core_boot_id().to_owned(),
+                pane_id: action.pane.clone(),
+                pty_generation: action.generation.clone(),
+                foreground_pgid: String::new(),
+                current_command: String::new(),
+                meta_digest: String::new(),
+                tracked_digest: None,
+                expected_output_generation: None,
+                expected_title: None,
+                expected_progress: None,
+            },
+            launch_target: None,
+            focus: true,
+            action: wire,
+        };
+        validate_guarded_action(&request)?;
+        // A lost reader is found here, before anything is sent.
+        if let Err(error) = core.drain_launch_events() {
+            core.broken = true;
+            return Err(format!("bridge_unavailable: {error}"));
+        }
+        // Registered before the request goes out so that no phase frame can
+        // arrive for a ticket nobody waits on. A rejection or error drops it.
+        let waiter = core.focus_waiter(ticket);
+        let (result, reply) = match core.guarded_action_reply(request).await {
+            Ok(answer) => answer,
+            Err(Error::InvalidArgument(error)) => return Err(error),
+            Err(Error::Busy(error)) => return Err(format!("bridge_unavailable: {error}")),
+            Err(error) => return Err(format!("outcome_unknown: {error}")),
+        };
+        match result {
+            LedgerResult::Applied { .. } => {
+                let answer = parse_focus_answer(&reply, true).map_err(|error| {
+                    core.broken = true;
+                    format!("outcome_unknown: {error}")
+                })?;
+                Ok((
+                    json!({
+                        "result": "applied",
+                        "phase": "logical_selection_applied",
+                        "affected": answer.affected_value(),
+                        "view_revision": answer.view_revision,
+                    }),
+                    waiter,
+                ))
+            }
+            LedgerResult::RejectedBeforeEffect { reason, .. } => {
+                let affected = parse_focus_answer(&reply, false)
+                    .map(|answer| answer.affected)
+                    .unwrap_or_default();
+                Err(focus_rejection(&reason, &affected))
+            }
+            other => Err(other.result_text().into()),
+        }
+    }
+
     async fn interrupt(
         &self,
         manager: &Manager,
@@ -2072,6 +2467,7 @@ impl CoordinatorActions {
             retain: true,
             preconditions: input_preconditions,
             launch_target: None,
+            focus: false,
             action: json!({
                 "kind": "input_commit",
                 "staging_id": staging_id.clone(),
@@ -2403,6 +2799,7 @@ impl CoordinatorActions {
             retain: true,
             preconditions: unused_preconditions,
             launch_target: Some(launch_target),
+            focus: false,
             action,
         };
         let mut staged = None;
@@ -2914,6 +3311,7 @@ impl CoordinatorActions {
             retain: dispatch.retain,
             preconditions: preconditions(agent, dispatch.tracked_digest),
             launch_target: None,
+            focus: false,
             action: json!({"kind": "keys", "keys": keys}),
         };
         validate_guarded_action(&request).map_err(Error::InvalidArgument)?;
@@ -3408,6 +3806,7 @@ impl CoordinatorActions {
                 retain: true,
                 preconditions: preconditions(&agent, None),
                 launch_target: None,
+                focus: false,
                 action: json!({"kind": "kill_pane"}),
             })
             .await;
@@ -3512,6 +3911,7 @@ impl CoordinatorActions {
                         (index == 0).then(|| tracked_digest.to_owned()),
                     ),
                     launch_target: None,
+                    focus: false,
                     action: json!({"kind": "keys", "keys": [key_text]}),
                 };
                 validate_guarded_action(&request)?;
@@ -4249,6 +4649,40 @@ enum ControlAction {
         checkpoint: bool,
     },
     Launch(LaunchAction),
+    Focus(FocusAction),
+}
+
+/// One focus request. The caller (navigation) has already judged the
+/// window state it can see; the core decides the shared-client question.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FocusAction {
+    client_id: String,
+    view_revision: String,
+    shared: bool,
+    pane: String,
+    generation: String,
+    /// The window, the pane that owns its zoom, and that pane's PTY
+    /// generation, restored in the same core turn as the selection.
+    restore_zoom: Option<(String, String, String)>,
+}
+
+impl FocusAction {
+    fn wire(&self) -> Value {
+        let mut action = json!({
+            "kind": "focus",
+            "client_id": self.client_id,
+            "expected_view_revision": self.view_revision,
+            "scope": if self.shared { "shared" } else { "client" },
+        });
+        if let Some((window_id, pane_id, pty_generation)) = &self.restore_zoom {
+            action["restore_zoom"] = json!({
+                "window_id": window_id,
+                "pane_id": pane_id,
+                "pty_generation": pty_generation,
+            });
+        }
+        action
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4346,6 +4780,15 @@ impl ControlAction {
                 "target",
                 "worktree",
             ],
+            "focus" => &[
+                "operation",
+                "client_id",
+                "expected_view_revision",
+                "scope",
+                "pane_id",
+                "pty_generation",
+                "restore_zoom",
+            ],
             _ => return Err("invalid_action: unknown core action".into()),
         };
         if object
@@ -4356,6 +4799,9 @@ impl ControlAction {
         }
         if operation == "launch" {
             return Ok(Self::Launch(parse_launch_action(object)?));
+        }
+        if operation == "focus" {
+            return Ok(Self::Focus(parse_focus_action(object)?));
         }
         let pane = object
             .get("pane_id")
@@ -4503,6 +4949,7 @@ impl ControlAction {
             | Self::Interrupt { pane, .. }
             | Self::Close { pane, .. }
             | Self::Prompt { pane, .. } => pane,
+            Self::Focus(action) => &action.pane,
             Self::Launch(action) if action.mode == LaunchMode::Split => &action.target,
             Self::Launch(_) => "",
         }
@@ -4531,6 +4978,48 @@ fn launch_decimal(object: &serde_json::Map<String, Value>, field: &str) -> Resul
         return Err(format!("invalid_action: {field} is invalid"));
     }
     Ok(value)
+}
+
+fn parse_focus_action(object: &serde_json::Map<String, Value>) -> Result<FocusAction, String> {
+    let client_id = launch_text(object, "client_id", 1, 64)?;
+    if client_id.chars().any(char::is_whitespace) {
+        return Err("invalid_action: client_id is invalid".into());
+    }
+    let shared = match object.get("scope").and_then(Value::as_str) {
+        Some("client") => false,
+        Some("shared") => true,
+        _ => return Err("invalid_action: scope is invalid".into()),
+    };
+    let pane = launch_text(object, "pane_id", 2, 11)?;
+    if !launch_id(&pane, '%') {
+        return Err("invalid_action: pane_id is invalid".into());
+    }
+    let restore_zoom = match object.get("restore_zoom") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(zoom))
+            if zoom.len() == 3
+                && zoom.contains_key("window_id")
+                && zoom.contains_key("pane_id")
+                && zoom.contains_key("pty_generation") =>
+        {
+            let window_id = launch_text(zoom, "window_id", 2, 11)?;
+            let owner = launch_text(zoom, "pane_id", 2, 11)?;
+            if !launch_id(&window_id, '@') || !launch_id(&owner, '%') {
+                return Err("invalid_action: restore_zoom is invalid".into());
+            }
+            let generation = launch_decimal(zoom, "pty_generation")?;
+            Some((window_id, owner, generation))
+        }
+        _ => return Err("invalid_action: restore_zoom is invalid".into()),
+    };
+    Ok(FocusAction {
+        client_id,
+        view_revision: launch_decimal(object, "expected_view_revision")?,
+        shared,
+        pane,
+        generation: launch_decimal(object, "pty_generation")?,
+        restore_zoom,
+    })
 }
 
 fn launch_id(value: &str, sigil: char) -> bool {
@@ -5600,6 +6089,363 @@ mod tests {
         let mut stale_shape = plan;
         stale_shape["any_state"] = json!(true);
         assert!(ControlAction::parse(&stale_shape).is_err());
+    }
+
+    fn test_client() -> (
+        Client,
+        mpsc::UnboundedSender<Result<bridge::CoordinatorFrame, Error>>,
+    ) {
+        let (requests, _received) = mpsc::channel(1);
+        let (frames, launch_events) = mpsc::unbounded_channel();
+        let client = Client {
+            requests,
+            launch_events,
+            focus_router: Arc::new(FocusRouter::default()),
+            core_boot_id: "boot".into(),
+            epoch: 2,
+            input: true,
+            launch: true,
+            focus: true,
+            next_seq: 5,
+            request_number: 0,
+            broken: false,
+            _reader: tokio::spawn(async {}),
+            _writer: tokio::spawn(async {}),
+        };
+        (client, frames)
+    }
+
+    fn focus_params() -> Value {
+        json!({
+            "operation": "focus",
+            "client_id": "boot:3",
+            "expected_view_revision": "12",
+            "scope": "client",
+            "pane_id": "%7",
+            "pty_generation": "2",
+            "restore_zoom": {"window_id": "@4", "pane_id": "%1", "pty_generation": "3"},
+        })
+    }
+
+    #[test]
+    fn focus_action_validates_its_shape_strictly() {
+        let ControlAction::Focus(action) = ControlAction::parse(&focus_params()).unwrap() else {
+            panic!("not a focus action");
+        };
+        assert_eq!(action.pane, "%7");
+        assert_eq!(
+            action.restore_zoom,
+            Some(("@4".to_owned(), "%1".to_owned(), "3".to_owned()))
+        );
+        let wire = action.wire();
+        assert_eq!(wire["kind"], "focus");
+        assert_eq!(wire["scope"], "client");
+        assert_eq!(wire["expected_view_revision"], "12");
+        assert_eq!(wire["restore_zoom"]["window_id"], "@4");
+        assert_eq!(wire["restore_zoom"]["pty_generation"], "3");
+        let mut shared = focus_params();
+        shared["scope"] = json!("shared");
+        shared.as_object_mut().unwrap().remove("restore_zoom");
+        let ControlAction::Focus(action) = ControlAction::parse(&shared).unwrap() else {
+            panic!("not a focus action");
+        };
+        assert!(action.shared && action.wire().get("restore_zoom").is_none());
+
+        for (field, value) in [
+            ("client_id", json!("")),
+            ("client_id", json!("two words")),
+            ("expected_view_revision", json!("-1")),
+            ("expected_view_revision", json!(12)),
+            ("scope", json!("everyone")),
+            ("pane_id", json!("7")),
+            ("pty_generation", json!("x")),
+            ("restore_zoom", json!({"window_id": "@4"})),
+            ("restore_zoom", json!({"window_id": "@4", "pane_id": "%1"})),
+            (
+                "restore_zoom",
+                json!({"window_id": "%4", "pane_id": "%1", "pty_generation": "3"}),
+            ),
+            (
+                "restore_zoom",
+                json!({"window_id": "@4", "pane_id": "@1", "pty_generation": "3"}),
+            ),
+            (
+                "restore_zoom",
+                json!({"window_id": "@4", "pane_id": "%1", "pty_generation": "x"}),
+            ),
+            (
+                "restore_zoom",
+                json!({"window_id": "@4", "pane_id": "%1", "pty_generation": 3}),
+            ),
+            (
+                "restore_zoom",
+                json!({"window_id": "@4", "pane_id": "%1", "pty_generation": "3", "x": 1}),
+            ),
+            ("expected", json!({})),
+        ] {
+            let mut params = focus_params();
+            params[field] = value;
+            assert!(ControlAction::parse(&params).is_err(), "{field}");
+        }
+        for field in [
+            "client_id",
+            "expected_view_revision",
+            "scope",
+            "pane_id",
+            "pty_generation",
+        ] {
+            let mut params = focus_params();
+            params.as_object_mut().unwrap().remove(field);
+            assert!(ControlAction::parse(&params).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn focus_request_takes_only_the_target_and_dead_pane_preconditions() {
+        let ControlAction::Focus(action) = ControlAction::parse(&focus_params()).unwrap() else {
+            panic!("not a focus action");
+        };
+        let request = GuardedAction {
+            operation_key: durable_key_for_boot(Path::new("/tmp/s"), "boot", "nonce", "op"),
+            ticket: DispatchTicket { epoch: 1, seq: 0 },
+            payload_digest: digest("x"),
+            retain: false,
+            preconditions: Preconditions {
+                core_boot_id: "boot".into(),
+                pane_id: action.pane.clone(),
+                pty_generation: action.generation.clone(),
+                foreground_pgid: String::new(),
+                current_command: String::new(),
+                meta_digest: String::new(),
+                tracked_digest: None,
+                expected_output_generation: None,
+                expected_title: None,
+                expected_progress: None,
+            },
+            launch_target: None,
+            focus: true,
+            action: action.wire(),
+        };
+        let fields = guarded_action_fields(&request);
+        assert_eq!(fields["retain"], false);
+        assert_eq!(
+            fields["target"],
+            json!({"core_boot_id": "boot", "pane_id": "%7", "pty_generation": "2"})
+        );
+        assert_eq!(fields["preconditions"], json!({"pane_dead": false}));
+        validate_guarded_action(&request).unwrap();
+    }
+
+    #[test]
+    fn focus_answers_carry_their_phase_revision_and_affected_clients() {
+        let applied = json!({
+            "phase": "logical_selection_applied",
+            "view_revision": "13",
+            "affected": [{"client_id": "boot:4", "stalled": true}],
+        });
+        let answer = parse_focus_answer(&applied, true).unwrap();
+        assert_eq!(answer.view_revision, "13");
+        assert_eq!(
+            answer.affected_value(),
+            json!([{"client_id": "boot:4", "stalled": true}])
+        );
+        for broken in [
+            json!({"phase": "redraw_queued", "view_revision": "13", "affected": []}),
+            json!({"phase": "logical_selection_applied", "view_revision": 13, "affected": []}),
+            json!({"phase": "logical_selection_applied", "view_revision": "13"}),
+            json!({"phase": "logical_selection_applied", "view_revision": "13",
+                "affected": [{"client_id": "boot:4"}]}),
+        ] {
+            assert!(parse_focus_answer(&broken, true).is_err());
+        }
+        // A rejection that names no clients is still a rejection.
+        assert_eq!(
+            parse_focus_answer(&json!({}), false).unwrap(),
+            FocusAnswer::default()
+        );
+        let conflict = parse_focus_answer(
+            &json!({"affected": [{"client_id": "boot:4", "stalled": false}]}),
+            false,
+        )
+        .unwrap();
+        let text = focus_rejection("shared_focus_conflict", &conflict.affected);
+        assert!(text.starts_with("shared_focus_conflict: "));
+        assert!(text.contains("boot:4"));
+    }
+
+    #[test]
+    fn focus_rejections_keep_the_core_reason_as_their_code() {
+        for reason in [
+            "view_changed",
+            "client_readonly",
+            "client_absent",
+            "zoom_changed",
+        ] {
+            assert!(focus_rejection(reason, &[]).starts_with(&format!("{reason}: ")));
+        }
+        for reason in ["core_boot_changed", "target_gone", "pty_generation_changed"] {
+            assert!(focus_rejection(reason, &[]).starts_with("identity_mismatch: "));
+        }
+    }
+
+    #[test]
+    fn hello_reports_the_focus_capability() {
+        let endpoint = Endpoint {
+            path: PathBuf::from("/tmp/bridge"),
+            core_boot_id: "boot".into(),
+        };
+        let mut hello = json!({
+            "v": 1,
+            "kind": "hello",
+            "request_id": "h",
+            "core_boot_id": "boot",
+            "capabilities": {
+                "actions": true,
+                "dispatch_epoch": "3",
+                "input": true,
+                "launch": true,
+            },
+        });
+        assert_eq!(
+            parse_hello(&hello, "h", &endpoint).unwrap(),
+            (3, true, true, false)
+        );
+        hello["capabilities"]["focus"] = json!(true);
+        assert_eq!(
+            parse_hello(&hello, "h", &endpoint).unwrap(),
+            (3, true, true, true)
+        );
+    }
+
+    fn focus_event(
+        epoch: u64,
+        seq: u64,
+        phase: bridge::FocusPhase,
+        event_seq: u64,
+    ) -> bridge::FocusEvent {
+        bridge::FocusEvent {
+            epoch,
+            seq,
+            client_id: "boot:3".into(),
+            phase,
+            event_seq,
+        }
+    }
+
+    #[tokio::test]
+    async fn focus_wait_keeps_the_last_phase_of_its_own_ticket() {
+        use bridge::FocusPhase;
+        let ticket = DispatchTicket { epoch: 2, seq: 5 };
+        let (client, _frames) = test_client();
+        let router = &client.focus_router;
+
+        let waiter = client.focus_waiter(ticket);
+        router.deliver(focus_event(2, 4, FocusPhase::TtyOutputDrained, 1));
+        router.deliver(focus_event(2, 5, FocusPhase::RedrawQueued, 2));
+        router.deliver(focus_event(2, 5, FocusPhase::TtyOutputDrained, 3));
+        assert_eq!(waiter.wait().await, "tty_output_drained");
+
+        let waiter = client.focus_waiter(ticket);
+        router.deliver(focus_event(
+            2,
+            5,
+            FocusPhase::Invalidated("superseded".into()),
+            4,
+        ));
+        assert_eq!(waiter.wait().await, "invalidated:superseded");
+    }
+
+    #[tokio::test]
+    async fn focus_wait_reports_what_it_saw_when_time_runs_out() {
+        use bridge::FocusPhase;
+        let ticket = DispatchTicket { epoch: 2, seq: 5 };
+        let (client, _frames) = test_client();
+        let waiter = client.focus_waiter(ticket);
+        assert_eq!(waiter.wait().await, "logical_selection_applied");
+        let waiter = client.focus_waiter(ticket);
+        client
+            .focus_router
+            .deliver(focus_event(2, 5, FocusPhase::RedrawQueued, 1));
+        assert_eq!(waiter.wait().await, "redraw_queued");
+    }
+
+    #[tokio::test]
+    async fn a_gap_or_lost_reader_ends_a_pending_focus_wait_as_unknown() {
+        use bridge::FocusPhase;
+        let (client, _frames) = test_client();
+        let router = &client.focus_router;
+        let first = client.focus_waiter(DispatchTicket { epoch: 2, seq: 5 });
+        let second = client.focus_waiter(DispatchTicket { epoch: 2, seq: 6 });
+        router.deliver(focus_event(2, 5, FocusPhase::RedrawQueued, 1));
+        router.gap();
+        assert_eq!(first.wait().await, "unknown");
+        assert_eq!(second.wait().await, "unknown");
+        assert!(!client.is_broken());
+
+        let pending = client.focus_waiter(DispatchTicket { epoch: 2, seq: 7 });
+        router.close();
+        assert_eq!(pending.wait().await, "unknown");
+        assert!(client.is_broken());
+        // A wait registered after the loss ends at once as well.
+        let late = client.focus_waiter(DispatchTicket { epoch: 2, seq: 8 });
+        assert_eq!(late.wait().await, "unknown");
+    }
+
+    #[tokio::test]
+    async fn focus_waits_route_events_and_launch_frames_per_ticket() {
+        use bridge::FocusPhase;
+        let (mut client, frames) = test_client();
+        let pending = client.focus_waiter(DispatchTicket { epoch: 2, seq: 5 });
+        let next = client.focus_waiter(DispatchTicket { epoch: 2, seq: 6 });
+
+        // The later ticket settles while the earlier one is still waiting,
+        // and the earlier ticket's frames were not taken by it.
+        client
+            .focus_router
+            .deliver(focus_event(2, 6, FocusPhase::TtyOutputDrained, 1));
+        assert_eq!(next.wait().await, "tty_output_drained");
+        client
+            .focus_router
+            .deliver(focus_event(2, 5, FocusPhase::RedrawQueued, 2));
+        client
+            .focus_router
+            .deliver(focus_event(2, 5, FocusPhase::TtyOutputDrained, 3));
+        assert_eq!(pending.wait().await, "tty_output_drained");
+
+        // A launch wait still reads its own frames from the shared channel
+        // while a focus wait is registered, and a focus wait is unaffected.
+        let waiting = client.focus_waiter(DispatchTicket { epoch: 2, seq: 7 });
+        frames
+            .send(Ok(bridge::CoordinatorFrame::Launch(LaunchEvent {
+                pane_id: "%9".into(),
+                pty_generation: "4".into(),
+                stage: bridge::LaunchStage::ExecOk,
+                errno: 0,
+                event_seq: 4,
+            })))
+            .unwrap();
+        let event = client.wait_launch("%9", "4").await.unwrap();
+        assert!(event.is_some());
+        client
+            .focus_router
+            .deliver(focus_event(2, 7, FocusPhase::TtyOutputDrained, 5));
+        assert_eq!(waiting.wait().await, "tty_output_drained");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_focus_wait_is_unregistered() {
+        let (client, _frames) = test_client();
+        let waiter = client.focus_waiter(DispatchTicket { epoch: 2, seq: 5 });
+        drop(waiter);
+        assert!(
+            client
+                .focus_router
+                .routes
+                .lock()
+                .unwrap()
+                .waiters
+                .is_empty()
+        );
     }
 
     #[test]

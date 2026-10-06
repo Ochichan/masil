@@ -2357,6 +2357,12 @@ format_cb_masil_bracketed_paste(struct format_tree *ft)
 }
 
 /* masil: stalled clients have output owed for five seconds. */
+int
+masil_client_stalled(struct client *c)
+{
+	return (c->tty.masil_owed && get_timer() - c->tty.masil_progress >= 5000);
+}
+
 static void *
 format_cb_masil_client_stalled(struct format_tree *ft)
 {
@@ -2364,8 +2370,17 @@ format_cb_masil_client_stalled(struct format_tree *ft)
 
 	if (c == NULL)
 		return (xstrdup("0"));
-	return (format_printf("%d", c->tty.masil_owed &&
-	    get_timer() - c->tty.masil_progress >= 5000));
+	return (format_printf("%d", masil_client_stalled(c)));
+}
+
+/* masil: the same decimal revision the client_view event carries. */
+static void *
+format_cb_masil_client_view_revision(struct format_tree *ft)
+{
+	if (ft->c == NULL)
+		return (xstrdup(""));
+	return (format_printf("%llu",
+	    (unsigned long long)ft->c->masil_view_revision));
 }
 
 /* masil: stable opaque identity for the requesting tmux client. */
@@ -3919,6 +3934,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "masil_client_stalled", FORMAT_TABLE_STRING,
 	  format_cb_masil_client_stalled
+	},
+	{ "masil_client_view_revision", FORMAT_TABLE_STRING,
+	  format_cb_masil_client_view_revision
 	},
 	{ "masil_core_actions", FORMAT_TABLE_STRING,
 	  format_cb_masil_core_actions

@@ -425,6 +425,8 @@ server_client_lost(struct client *c)
 
 	if (c->flags & CLIENT_CONTROL)
 		control_stop(c);
+	/* masil: stop tracking a focus before its tty goes away. */
+	masil_bridge_focus_client_lost(c);
 	if (c->flags & CLIENT_TERMINAL)
 		tty_free(&c->tty);
 	free(c->ttyname);
@@ -529,6 +531,8 @@ server_client_detach(struct client *c, enum msgtype msgtype)
 	if (s == NULL || (c->flags & CLIENT_NODETACHFLAGS))
 		return;
 
+	/* masil: a detaching client gets no further frames from this focus. */
+	masil_bridge_focus_invalidate(c, MASIL_FOCUS_DETACH);
 	c->flags |= CLIENT_EXIT;
 
 	c->exit_type = CLIENT_EXIT_DETACH;
@@ -2613,6 +2617,10 @@ server_client_check_redraw(struct client *c)
 	    CLIENT_STATUSFORCE);
 	c->redraw = EVBUFFER_LENGTH(tty->out);
 	log_debug("%s: redraw added %zu bytes", c->name, c->redraw);
+
+	/* masil: a completed screen redraw lets a tracked focus take its mark. */
+	c->masil_redraw_seq++;
+	masil_bridge_focus_redraw(c);
 }
 
 /* Set client title. */

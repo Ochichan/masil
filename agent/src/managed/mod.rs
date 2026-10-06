@@ -108,6 +108,46 @@ impl ActionPathCache {
 
 static ACTION_PATHS: OnceLock<Mutex<ActionPathCache>> = OnceLock::new();
 
+/// Reads the action path for the boot behind `native`. The cache is keyed
+/// by boot, so every caller (the Manager and the native UI) sees one choice
+/// per boot.
+pub(crate) async fn action_path_of(native: &native_ui::Context) -> Result<ActionPath, String> {
+    // One native command reads the boot and the advertised capability.
+    let output = native
+        .tmux(
+            [
+                "display-message",
+                "-p",
+                "#{masil_core_boot_id}\t#{masil_core_actions}",
+            ]
+            .map(OsString::from),
+            None,
+        )
+        .await
+        .map_err(server_unreachable)?;
+    let value = String::from_utf8(output.stdout).map_err(|_| "native response is not UTF-8")?;
+    let value = value.strip_suffix('\n').unwrap_or(&value);
+    let (boot, advertised) = value
+        .split_once('\t')
+        .ok_or("invalid native core action capability")?;
+    let boot = valid_boot(boot)?.to_owned();
+    let cache = ACTION_PATHS.get_or_init(|| Mutex::new(ActionPathCache::default()));
+    if let Some(path) = cache
+        .lock()
+        .map_err(|_| "core action path cache unavailable")?
+        .get(&boot)
+    {
+        return Ok(path);
+    }
+    if advertised.chars().any(char::is_control) {
+        return Err("invalid native core action capability".into());
+    }
+    cache
+        .lock()
+        .map_err(|_| "core action path cache unavailable")?
+        .path(&boot, advertised)
+}
+
 pub(super) fn server_unreachable(error: String) -> String {
     if [
         "starting native command:",
@@ -671,34 +711,7 @@ impl Manager {
     /// The format is read once for a boot so a disappearing bridge cannot
     /// turn a selected ledger path into a native guarded retry.
     pub(crate) async fn action_path(&self) -> Result<ActionPath, String> {
-        // One native command reads the boot and the advertised capability.
-        let value = self
-            .command(&[
-                "display-message",
-                "-p",
-                "#{masil_core_boot_id}\t#{masil_core_actions}",
-            ])
-            .await?;
-        let value = value.strip_suffix('\n').unwrap_or(&value);
-        let (boot, advertised) = value
-            .split_once('\t')
-            .ok_or("invalid native core action capability")?;
-        let boot = valid_boot(boot)?.to_owned();
-        let cache = ACTION_PATHS.get_or_init(|| Mutex::new(ActionPathCache::default()));
-        if let Some(path) = cache
-            .lock()
-            .map_err(|_| "core action path cache unavailable")?
-            .get(&boot)
-        {
-            return Ok(path);
-        }
-        if advertised.chars().any(char::is_control) {
-            return Err("invalid native core action capability".into());
-        }
-        cache
-            .lock()
-            .map_err(|_| "core action path cache unavailable")?
-            .path(&boot, advertised)
+        action_path_of(&self.native).await
     }
 
     /// The selected path and, when one runs, the coordinator's bridge state.
@@ -2312,11 +2325,17 @@ impl Manager {
         Ok(groups.len() - uncommitted.len())
     }
 
-    pub async fn focus(&self, agent: &Agent) -> Result<(), String> {
+    /// Selects the agent's pane. The output phase is what the core reported
+    /// after the selection, and `None` on the native path.
+    pub async fn focus(&self, agent: &Agent) -> Result<Option<String>, String> {
         self.focus_from(agent, None).await
     }
 
-    pub async fn focus_from(&self, agent: &Agent, origin: Option<&str>) -> Result<(), String> {
+    pub async fn focus_from(
+        &self,
+        agent: &Agent,
+        origin: Option<&str>,
+    ) -> Result<Option<String>, String> {
         self.native
             .navigate(
                 &agent.boot,
@@ -2333,7 +2352,7 @@ impl Manager {
                     server_unreachable(error)
                 }
             })
-            .map(|_| ())
+            .map(|navigation| navigation.output)
     }
 
     /// `retry` decides what a tracked-state change between the caller's read

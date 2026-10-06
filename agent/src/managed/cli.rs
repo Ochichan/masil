@@ -837,8 +837,12 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "focus" if args.len() == 1 => {
             let agent = manager.get(&args[0]).await?;
-            manager.focus(&agent).await?;
-            print(&json!({"stage":"selected","pane_id":agent.pane_id,"run":agent.run}))?;
+            let output = manager.focus(&agent).await?;
+            let mut selected = json!({"stage":"selected","pane_id":agent.pane_id,"run":agent.run});
+            if let Some(output) = output {
+                selected["output"] = json!(output);
+            }
+            print(&selected)?;
         }
         "interrupt" if !args.is_empty() => {
             let mut asked = super::durable::InterruptRequest::default();
