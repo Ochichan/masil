@@ -272,7 +272,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	char			  path[PATH_MAX];
 	const char		 *cmd, *tmp, *home = find_home();
 	const char		 *actual_cwd = NULL;
-	int			  argc, cwd_fd, status_pipe[2] = { -1, -1 };
+	int			  argc, status_pipe[2] = { -1, -1 };
 	int			  strict = (sc->flags & SPAWN_MASIL_STRICT_CWD) != 0;
 	u_int			  idx;
 	struct stat		  sb;
@@ -558,14 +558,19 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	}
 	if (strict) {
 		close(status_pipe[0]);
-		cwd_fd = open(new_wp->cwd, O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
-		if (cwd_fd == -1)
+		if (lstat(new_wp->cwd, &sb) != 0)
 			spawn_masil_launch_failure(status_pipe[1],
 			    MASIL_LAUNCH_STAGE_CWD_OPEN, errno);
-		if (fchdir(cwd_fd) != 0)
+		if (S_ISLNK(sb.st_mode))
+			spawn_masil_launch_failure(status_pipe[1],
+			    MASIL_LAUNCH_STAGE_CWD_OPEN, ELOOP);
+		if (!S_ISDIR(sb.st_mode))
+			spawn_masil_launch_failure(status_pipe[1],
+			    MASIL_LAUNCH_STAGE_CWD_OPEN, ENOTDIR);
+		if (chdir(new_wp->cwd) != 0)
 			spawn_masil_launch_failure(status_pipe[1],
 			    MASIL_LAUNCH_STAGE_CWD_OPEN, errno);
-		if (fstat(cwd_fd, &sb) != 0)
+		if (stat(".", &sb) != 0)
 			spawn_masil_launch_failure(status_pipe[1],
 			    MASIL_LAUNCH_STAGE_CWD_IDENTITY, errno);
 		if ((uint64_t)sb.st_dev != masil_launch_context_cwd_dev(
@@ -573,7 +578,6 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		    masil_launch_context_cwd_ino(sc->masil_launch))
 			spawn_masil_launch_failure(status_pipe[1],
 			    MASIL_LAUNCH_STAGE_CWD_IDENTITY, ESTALE);
-		close(cwd_fd);
 		/* masil: do not let fclose of a preexisting fd 3 close status. */
 		log_close();
 		if (dup2(status_pipe[1], MASIL_LAUNCH_STATUS_FD) == -1)
