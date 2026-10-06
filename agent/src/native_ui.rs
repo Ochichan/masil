@@ -1475,7 +1475,7 @@ fn require_window(value: &str) -> Result<(), String> {
     }
 }
 
-fn require_client_name(value: &str) -> Result<(), String> {
+pub(crate) fn require_client_name(value: &str) -> Result<(), String> {
     if !value.is_empty()
         && value.len() <= 1024
         && value.bytes().all(|byte| {
