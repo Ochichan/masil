@@ -516,6 +516,35 @@ masil_json_quote_utf8(struct masil_json_builder *builder, const char *value,
 	masil_json_quote(builder, clean, out);
 }
 
+/*
+ * masil: quote value with invalid UTF-8 bytes replaced by U+FFFD, without
+ * the 64 byte cap of masil_json_quote_utf8. The builder fails when the
+ * result does not fit.
+ */
+static void
+masil_json_quote_utf8_full(struct masil_json_builder *builder,
+    const char *value, size_t length)
+{
+	char	*clean;
+	size_t	 i = 0, n, out = 0;
+
+	clean = xmalloc(length * 3 + 1);
+	while (i < length) {
+		n = masil_utf8_valid((const u_char *)value + i, length - i);
+		if (n == 0) {
+			memcpy(clean + out, "\xef\xbf\xbd", 3);
+			out += 3;
+			i++;
+			continue;
+		}
+		memcpy(clean + out, value + i, n);
+		out += n;
+		i += n;
+	}
+	masil_json_quote(builder, clean, out);
+	free(clean);
+}
+
 static void
 masil_bridge_client_update(struct masil_bridge_client *client);
 static void
@@ -799,7 +828,8 @@ masil_bridge_hello(struct masil_bridge_client *client, const char *request_id,
 		masil_json_printf(&builder,
 		    "\"actions\":true,\"dispatch_epoch\":\"%llu\","
 		    "\"input\":true,\"launch\":true,\"focus\":true,"
-		    "\"summary\":true,\"copy_results\":true,\"submit\":false},",
+		    "\"summary\":true,\"copy_results\":true,"
+		    "\"format_digest\":true,\"submit\":false},",
 		    (unsigned long long)action_epoch);
 	else
 		/* masil: ordinary hello keeps its protocol-1.2 key set unchanged. */
@@ -1960,6 +1990,123 @@ masil_bridge_heartbeat(struct masil_bridge_client *client,
 	return (masil_bridge_queue_builder(client, &builder));
 }
 
+/*
+ * masil: format_digest. The coordinator sends a pane format and the core
+ * expands it once per pane exactly as `list-panes -a -F <format>` does (same
+ * iteration, same format_defaults arguments, each line followed by a
+ * newline), then answers the SHA-256 of those bytes and the line count. An
+ * optional global format is expanded once without pane context and returned
+ * as is. A format containing "#(" would run a shell command, so it is
+ * refused, and every format_create passes FORMAT_NOJOBS (inherited by loop
+ * subtrees), so a #() that reaches the expander through an option value or
+ * pane title expands to nothing and no job ever runs.
+ */
+#define MASIL_FORMAT_DIGEST_PANE_MAX	4096
+#define MASIL_FORMAT_DIGEST_GLOBAL_MAX	1024
+
+static int
+masil_bridge_format_digest(struct masil_bridge_client *client,
+    const char *request_id, size_t request_id_length, yyjson_val *root)
+{
+	struct masil_json_builder builder = {
+	    masil_bridge_response, 0, sizeof masil_bridge_response, 0
+	};
+	struct session		*s;
+	struct winlink		*wl;
+	struct window_pane	*wp, **l;
+	struct format_tree	*ft;
+	struct sort_criteria	 sort_crit;
+	yyjson_val		*value;
+	unsigned char		 digest[32];
+	const char		*pane_format, *global_format = NULL;
+	char			*line, *text = NULL, *global = NULL;
+	size_t			 length, used = 0, size = 0, i;
+	u_int			 n, j, lines = 0;
+
+	value = yyjson_obj_get(root, "pane_format");
+	if (!yyjson_is_str(value))
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "invalid_format", "pane_format must be a string"));
+	pane_format = yyjson_get_str(value);
+	length = yyjson_get_len(value);
+	if (length > MASIL_FORMAT_DIGEST_PANE_MAX ||
+	    strlen(pane_format) != length || strstr(pane_format, "#(") != NULL)
+		return (masil_bridge_error(client, request_id, request_id_length,
+		    "invalid_format",
+		    "pane_format must be at most 4096 bytes without #("));
+	value = yyjson_obj_get(root, "global_format");
+	if (value != NULL) {
+		if (!yyjson_is_str(value))
+			return (masil_bridge_error(client, request_id,
+			    request_id_length, "invalid_format",
+			    "global_format must be a string"));
+		global_format = yyjson_get_str(value);
+		length = yyjson_get_len(value);
+		if (length > MASIL_FORMAT_DIGEST_GLOBAL_MAX ||
+		    strlen(global_format) != length ||
+		    strstr(global_format, "#(") != NULL)
+			return (masil_bridge_error(client, request_id,
+			    request_id_length, "invalid_format",
+			    "global_format must be at most 1024 bytes "
+			    "without #("));
+	}
+
+	sort_crit.order = sort_order_from_string(NULL);
+	sort_crit.reversed = 0;
+	RB_FOREACH(s, sessions, &sessions) {
+		RB_FOREACH(wl, winlinks, &s->windows) {
+			l = sort_get_panes_window(wl->window, &n, &sort_crit);
+			for (j = 0; j < n; j++) {
+				wp = l[j];
+				ft = format_create(NULL, NULL, FORMAT_NONE,
+				    FORMAT_NOJOBS);
+				format_add(ft, "line", "%u", n);
+				format_defaults(ft, NULL, s, wl, wp);
+				line = format_expand(ft, pane_format);
+				format_free(ft);
+				length = strlen(line);
+				if (used + length + 1 > size) {
+					size = (used + length + 1) * 2;
+					text = xrealloc(text, size);
+				}
+				memcpy(text + used, line, length);
+				text[used + length] = '\n';
+				used += length + 1;
+				free(line);
+				lines++;
+			}
+		}
+	}
+	masil_action_sha256(text != NULL ? text : "", used, digest);
+	free(text);
+
+	if (global_format != NULL) {
+		ft = format_create(NULL, NULL, FORMAT_NONE, FORMAT_NOJOBS);
+		format_defaults(ft, NULL, NULL, NULL, NULL);
+		global = format_expand(ft, global_format);
+		format_free(ft);
+	}
+
+	masil_json_puts(&builder,
+	    "{\"v\":1,\"kind\":\"format_digest\",\"request_id\":");
+	masil_json_quote(&builder, request_id, request_id_length);
+	masil_json_puts(&builder, ",\"digest\":\"");
+	for (i = 0; i < sizeof digest; i++)
+		masil_json_printf(&builder, "%02x", digest[i]);
+	masil_json_printf(&builder, "\",\"lines\":%u", lines);
+	if (global != NULL) {
+		masil_json_puts(&builder, ",\"global\":");
+		masil_json_quote_utf8_full(&builder, global, strlen(global));
+		free(global);
+	}
+	masil_json_puts(&builder, "}");
+	if (builder.failed)
+		return (masil_bridge_error(client, request_id,
+		    request_id_length, "format_too_large",
+		    "the digest reply does not fit in one frame"));
+	return (masil_bridge_queue_builder(client, &builder));
+}
+
 static int
 masil_bridge_publish_summary(struct masil_bridge_client *client,
     const char *request_id, size_t request_id_length, yyjson_val *root)
@@ -2921,6 +3068,9 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 	static const char *const stats_fields[] = {
 	    "v", "kind", "request_id"
 	};
+	static const char *const format_digest_fields[] = {
+	    "v", "kind", "request_id", "pane_format", "global_format"
+	};
 	static const char *const publish_summary_fields[] = {
 	    "v", "kind", "request_id", "key", "value", "revision"
 	};
@@ -3030,8 +3180,9 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 			}
 		}
 	} else if (yyjson_equals_str(kind, "publish_summary") ||
-	    yyjson_equals_str(kind, "heartbeat")) {
-		/* masil: only the coordinator connection owns summaries. */
+	    yyjson_equals_str(kind, "heartbeat") ||
+	    yyjson_equals_str(kind, "format_digest")) {
+		/* masil: only the coordinator connection owns summaries and digests. */
 		if (!client->coordinator) {
 			result = masil_bridge_error(client, request_id, request_id_length,
 			    "coordinator_required",
@@ -3040,6 +3191,16 @@ masil_bridge_process(struct masil_bridge_client *client, u_char *payload,
 			result = masil_bridge_error(client, request_id, request_id_length,
 			    "stream_active", "watch connection does not accept requests");
 			client->close_after_write = 1;
+		} else if (yyjson_equals_str(kind, "format_digest")) {
+			if (masil_bridge_schema(root, format_digest_fields,
+			    nitems(format_digest_fields), &code) != 0) {
+				result = masil_bridge_error(client, request_id,
+				    request_id_length, code,
+				    "format_digest schema rejected");
+				goto out;
+			}
+			result = masil_bridge_format_digest(client, request_id,
+			    request_id_length, root);
 		} else if (yyjson_equals_str(kind, "heartbeat")) {
 			if (masil_bridge_schema(root, stats_fields,
 			    nitems(stats_fields), &code) != 0) {

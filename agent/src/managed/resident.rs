@@ -63,7 +63,7 @@ impl Timing {
 /// One line per pane. Output counts only for panes that hold an agent or
 /// did (META or TRACKED), so a busy shell or `tail -f` does not wake the
 /// watch; a new agent shows up as a new command or foreground group.
-const SIGNATURE: &str = "#{pane_id} #{masil_core_boot_id} #{pane_dead} #{masil_pty_generation} #{masil_foreground_pgid} #{pane_current_command} #{?#{||:#{@masil-managed-agent},#{@masil-managed-observation}},#{pane_output_generation} #{pane_tty},- -}";
+pub(crate) const SIGNATURE: &str = "#{pane_id} #{masil_core_boot_id} #{pane_dead} #{masil_pty_generation} #{masil_foreground_pgid} #{pane_current_command} #{?#{||:#{@masil-managed-agent},#{@masil-managed-observation}},#{pane_output_generation} #{pane_tty},- -}";
 /// Whether output shows in a tty's mtime promptly enough to skip listing.
 const TTY_TIMES: bool = cfg!(target_os = "macos");
 /// Core dirty notifications are leading-edge; one pass per 300 ms keeps
@@ -876,6 +876,51 @@ impl Manager {
     }
 }
 
+/// Lowercase SHA-256 hex of the bytes `list-panes -a -F SIGNATURE` prints,
+/// which is also what the core's `format_digest` answers.
+fn signature_digest(output: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(output.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Stores `digest` as the healthy path's previous digest and says whether it
+/// differs from the one before.
+fn note_digest(previous: &mut String, digest: String) -> bool {
+    let changed = digest != *previous;
+    *previous = digest;
+    changed
+}
+
+/// The core's digest when it has one, else the hash of the listed output.
+async fn digest_or_list(
+    core: Option<String>,
+    list: impl std::future::Future<Output = Result<String, String>>,
+) -> Result<String, String> {
+    match core {
+        Some(digest) => Ok(digest),
+        None => list.await.map(|output| signature_digest(&output)),
+    }
+}
+
+/// The healthy-bridge signature as a digest. The core answers on the action
+/// connection when it is free and capable; otherwise this tick lists panes.
+pub(crate) async fn healthy_signature(
+    actions: Option<&super::core_action::CoordinatorActions>,
+    list: impl std::future::Future<Output = Result<String, String>>,
+) -> Result<String, String> {
+    let core = match actions {
+        Some(actions) => actions
+            .format_digest(SIGNATURE, None)
+            .await
+            .map(|answer| answer.digest),
+        None => None,
+    };
+    digest_or_list(core, list).await
+}
+
 /// Watches the agent panes of the coordinator's server until `stopping` is
 /// set or `stop` fires. `base` is the quiet tick; ticks run twice as often
 /// while busy.
@@ -889,6 +934,8 @@ pub(crate) async fn watch(
     let timing = Timing::new(base);
     let mut errors = ErrorLog::default();
     let mut previous = String::new();
+    // Healthy-bridge digests only; the unhealthy path keeps the raw `previous`.
+    let mut previous_digest = String::new();
     let mut previous_panes = HashSet::new();
     let mut last_pass = 0_u64;
     let mut last_list = 0_u64;
@@ -1114,15 +1161,15 @@ pub(crate) async fn watch(
         let bridge_healthy = bridge.healthy;
         let signature_changed =
             if bridge_healthy && started.saturating_sub(last_list) >= timing.list_every {
-                match manager
-                    .command(&["list-panes", "-a", "-F", SIGNATURE])
-                    .await
+                match healthy_signature(
+                    control.actions.as_deref(),
+                    manager.command(&["list-panes", "-a", "-F", SIGNATURE]),
+                )
+                .await
                 {
-                    Ok(signature) => {
+                    Ok(digest) => {
                         last_list = started;
-                        let changed = signature != previous;
-                        previous = signature;
-                        changed
+                        note_digest(&mut previous_digest, digest)
                     }
                     Err(error) => {
                         errors.note(&error, &log, &control);
@@ -1189,6 +1236,9 @@ pub(crate) async fn watch(
                 }
             };
             last_list = started;
+            // Seed the healthy path's digest, so the first healthy tick after
+            // this one does not see a change from an empty digest.
+            previous_digest = signature_digest(&signature);
             let changed = signature != previous;
             let listed: HashMap<String, Option<i128>> = signature
                 .lines()
@@ -2699,5 +2749,49 @@ mod tests {
             })
             .lifecycle_changed
         );
+    }
+
+    #[test]
+    fn the_signature_digest_is_the_sha256_hex_of_the_listed_bytes() {
+        assert_eq!(
+            signature_digest(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            signature_digest("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_ne!(signature_digest("%1 a\n"), signature_digest("%1 b\n"));
+    }
+
+    #[test]
+    fn an_unhealthy_listing_seeds_the_healthy_digest() {
+        let listed = "%1 boot 0 1 10 zsh - -\n";
+        // Unhealthy tick lists, then the bridge recovers and the core answers
+        // with the digest of the same bytes: no change.
+        let mut previous = String::new();
+        let seeded = signature_digest(listed);
+        previous.clone_from(&seeded);
+        assert!(!note_digest(&mut previous, signature_digest(listed)));
+        // Without the seed the first healthy tick always reads as a change.
+        let mut unseeded = String::new();
+        assert!(note_digest(&mut unseeded, signature_digest(listed)));
+        assert!(note_digest(&mut previous, signature_digest("%1 other\n")));
+    }
+
+    #[tokio::test]
+    async fn the_digest_falls_back_to_hashing_the_listing() {
+        let listed = async { Ok::<_, String>("abc".to_owned()) };
+        assert_eq!(
+            digest_or_list(None, listed).await.unwrap(),
+            signature_digest("abc")
+        );
+        let core = digest_or_list(Some("from-core".into()), async {
+            Err::<String, _>("must not list".to_owned())
+        })
+        .await;
+        assert_eq!(core.unwrap(), "from-core");
+        let failed = digest_or_list(None, async { Err::<String, _>("down".to_owned()) }).await;
+        assert_eq!(failed.unwrap_err(), "down");
     }
 }

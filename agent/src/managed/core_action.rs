@@ -441,6 +441,7 @@ pub(crate) struct Client {
     launch: bool,
     focus: bool,
     summary: bool,
+    format_digest: bool,
     summary_revision: u64,
     next_seq: u64,
     request_number: u64,
@@ -468,6 +469,7 @@ impl Client {
         .await?;
         let hello = read_value(&mut stream, false).await?;
         let (epoch, input, launch, focus, summary) = parse_hello(&hello, hello_id, endpoint)?;
+        let format_digest = hello_format_digest(&hello);
         let (read, write) = stream.into_split();
         let (requests, received_requests) = mpsc::channel(1);
         let (frames, received_frames) = mpsc::unbounded_channel();
@@ -493,6 +495,7 @@ impl Client {
             launch,
             focus,
             summary,
+            format_digest,
             summary_revision: 0,
             next_seq: 0,
             request_number: 0,
@@ -520,6 +523,10 @@ impl Client {
 
     pub(crate) const fn supports_summary(&self) -> bool {
         self.summary
+    }
+
+    pub(crate) const fn supports_format_digest(&self) -> bool {
+        self.format_digest
     }
 
     pub(crate) fn core_boot_id(&self) -> &str {
@@ -716,6 +723,29 @@ impl Client {
             )
             .await?;
         parse_summary_reply(&reply)
+    }
+
+    /// Asks the core to expand `pane_format` for every pane the way
+    /// `list-panes -a -F` does and return the SHA-256 of those lines, plus
+    /// the optional `global_format` expanded once. Any failure marks nothing
+    /// beyond what `call_with_busy` already does; the caller falls back.
+    pub(crate) async fn format_digest(
+        &mut self,
+        pane_format: &str,
+        global_format: Option<&str>,
+    ) -> Result<FormatDigest, Error> {
+        if !self.format_digest {
+            return Err(Error::Unavailable(
+                "the core does not support format digests".into(),
+            ));
+        }
+        let reply = self
+            .call_with_busy(
+                "format_digest",
+                format_digest_fields(pane_format, global_format),
+            )
+            .await?;
+        parse_format_digest_reply(&reply)
     }
 
     pub(crate) async fn ledger_query(
@@ -1534,6 +1564,70 @@ fn summary_fields(key: &str, value: Option<i64>, revision: u64) -> Value {
     })
 }
 
+/// The answer of `format_digest`: the digest is lowercase SHA-256 hex.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FormatDigest {
+    pub(crate) digest: String,
+    pub(crate) lines: u64,
+    pub(crate) global: Option<String>,
+}
+
+fn hello_format_digest(hello: &Value) -> bool {
+    hello
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("format_digest"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn format_digest_fields(pane_format: &str, global_format: Option<&str>) -> Value {
+    let mut fields = json!({ "pane_format": pane_format });
+    if let (Some(global), Some(object)) = (global_format, fields.as_object_mut()) {
+        object.insert("global_format".into(), json!(global));
+    }
+    fields
+}
+
+fn parse_format_digest_reply(value: &Value) -> Result<FormatDigest, Error> {
+    let request_id = response_id(value)
+        .ok_or_else(|| Error::Protocol("format digest response has no request_id".into()))?;
+    if let Some(error) = parse_error(value, &request_id)? {
+        return Err(error);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Protocol("format digest response is not an object".into()))?;
+    let digest = object
+        .get("digest")
+        .and_then(Value::as_str)
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        .ok_or_else(|| Error::Protocol("invalid format digest".into()))?;
+    if object.get("v").and_then(Value::as_u64) != Some(1)
+        || object.get("kind").and_then(Value::as_str) != Some("format_digest")
+    {
+        return Err(Error::Protocol("invalid format digest response".into()));
+    }
+    let lines = object
+        .get("lines")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| Error::Protocol("format digest response has no line count".into()))?;
+    let global = match object.get("global") {
+        None => None,
+        Some(Value::String(global)) => Some(global.clone()),
+        Some(_) => return Err(Error::Protocol("invalid global format value".into())),
+    };
+    Ok(FormatDigest {
+        digest: digest.into(),
+        lines,
+        global,
+    })
+}
+
 fn parse_summary_reply(value: &Value) -> Result<bool, Error> {
     let request_id = response_id(value)
         .ok_or_else(|| Error::Protocol("summary response has no request_id".into()))?;
@@ -2142,6 +2236,34 @@ impl CoordinatorActions {
             Ok(_) => SummaryPublish::Published(core.epoch()),
             Err(error) => SummaryPublish::Failed(error.to_string()),
         }
+    }
+
+    /// The core's digest of `pane_format` over every pane, on the action
+    /// connection, or None when the caller must list panes itself: no live
+    /// connection, a core without the request, an action holding the
+    /// connection, or a failed request. It never waits for an action and
+    /// never reconnects. A request that fails or times out leaves the
+    /// connection broken, and the next call drops it as `publish_locked` does.
+    pub(crate) async fn format_digest(
+        &self,
+        pane_format: &str,
+        global_format: Option<&str>,
+    ) -> Option<FormatDigest> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut client = self.client.try_lock().ok()?;
+        let core = client.as_mut()?;
+        if core.is_broken() {
+            client.take();
+            self.summary_epoch.store(0, Ordering::SeqCst);
+            self.unavailable("the coordinator bridge connection ended");
+            return None;
+        }
+        if !core.supports_format_digest() {
+            return None;
+        }
+        core.format_digest(pane_format, global_format).await.ok()
     }
 
     /// Connects again after the connection was lost, for a caller that needs
@@ -6360,7 +6482,17 @@ mod tests {
         Client,
         mpsc::UnboundedSender<Result<bridge::CoordinatorFrame, Error>>,
     ) {
-        let (requests, _received) = mpsc::channel(1);
+        let (client, frames, _received) = wired_test_client();
+        (client, frames)
+    }
+
+    /// A test client whose requests the caller can read and answer.
+    fn wired_test_client() -> (
+        Client,
+        mpsc::UnboundedSender<Result<bridge::CoordinatorFrame, Error>>,
+        mpsc::Receiver<WireRequest>,
+    ) {
+        let (requests, received) = mpsc::channel(1);
         let (frames, launch_events) = mpsc::unbounded_channel();
         let client = Client {
             requests,
@@ -6372,6 +6504,7 @@ mod tests {
             launch: true,
             focus: true,
             summary: true,
+            format_digest: true,
             summary_revision: 0,
             next_seq: 5,
             request_number: 0,
@@ -6379,7 +6512,7 @@ mod tests {
             _reader: tokio::spawn(async {}),
             _writer: tokio::spawn(async {}),
         };
-        (client, frames)
+        (client, frames, received)
     }
 
     fn focus_params() -> Value {
@@ -6663,6 +6796,138 @@ mod tests {
         let mut wrong = answer(json!(true));
         wrong["kind"] = json!("heartbeat");
         assert!(parse_summary_reply(&wrong).is_err());
+    }
+
+    #[test]
+    fn format_digest_requests_and_replies_are_checked() {
+        assert_eq!(
+            format_digest_fields("#{pane_id}", None),
+            json!({"pane_format": "#{pane_id}"})
+        );
+        assert_eq!(
+            format_digest_fields("#{pane_id}", Some("#{@x}")),
+            json!({"pane_format": "#{pane_id}", "global_format": "#{@x}"})
+        );
+        let digest = "ab".repeat(32);
+        let reply = json!({
+            "v": 1, "kind": "format_digest", "request_id": "r",
+            "digest": digest, "lines": 3, "global": "g",
+        });
+        assert_eq!(
+            parse_format_digest_reply(&reply).unwrap(),
+            FormatDigest {
+                digest: digest.clone(),
+                lines: 3,
+                global: Some("g".into())
+            }
+        );
+        let mut bare = reply.clone();
+        bare.as_object_mut().unwrap().remove("global");
+        assert_eq!(parse_format_digest_reply(&bare).unwrap().global, None);
+        for bad in [json!("short"), json!("AB".repeat(32)), json!(5)] {
+            let mut wrong = reply.clone();
+            wrong["digest"] = bad;
+            assert!(parse_format_digest_reply(&wrong).is_err());
+        }
+        let mut wrong = reply.clone();
+        wrong["kind"] = json!("heartbeat");
+        assert!(parse_format_digest_reply(&wrong).is_err());
+        let rejected = json!({
+            "v": 1, "kind": "error", "request_id": "r",
+            "code": "invalid_format", "message": "no",
+        });
+        assert_eq!(
+            parse_format_digest_reply(&rejected)
+                .unwrap_err()
+                .rejected_code(),
+            Some("invalid_format")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_digest_without_the_capability_is_refused_before_any_request() {
+        let (mut client, _frames) = test_client();
+        client.format_digest = false;
+        assert!(matches!(
+            client.format_digest("#{pane_id}", None).await,
+            Err(Error::Unavailable(_))
+        ));
+        assert_eq!(client.request_number, 0);
+    }
+
+    #[tokio::test]
+    async fn the_coordinator_digest_falls_back_when_busy_absent_or_stopping() {
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        // No connection: nothing is connected for this call.
+        assert_eq!(actions.format_digest("#{pane_id}", None).await, None);
+        // An action holds the connection: no waiting.
+        let held = actions.client.lock().await;
+        assert_eq!(actions.format_digest("#{pane_id}", None).await, None);
+        drop(held);
+        // A connection the core lacks the request for.
+        let (mut client, _frames) = test_client();
+        client.format_digest = false;
+        *actions.client.lock().await = Some(client);
+        assert_eq!(actions.format_digest("#{pane_id}", None).await, None);
+        // A broken connection is dropped, never reconnected.
+        let (mut client, _frames) = test_client();
+        client.broken = true;
+        *actions.client.lock().await = Some(client);
+        assert_eq!(actions.format_digest("#{pane_id}", None).await, None);
+        assert!(actions.client.lock().await.is_none());
+        actions.stopping.store(true, Ordering::SeqCst);
+        assert_eq!(actions.format_digest("#{pane_id}", None).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_connected_core_answers_the_digest_and_the_signature_skips_listing() {
+        let digest = "ab".repeat(32);
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        let (client, _frames, mut received) = wired_test_client();
+        *actions.client.lock().await = Some(client);
+        let answer = digest.clone();
+        let core = tokio::spawn(async move {
+            let request = received.recv().await.unwrap();
+            assert_eq!(request.value["kind"], "format_digest");
+            assert_eq!(request.value["pane_format"], "#{pane_id}");
+            assert_eq!(request.value["global_format"], "#{@x}");
+            let reply = json!({
+                "v": 1, "kind": "format_digest", "request_id": request.request_id,
+                "digest": answer, "lines": 2, "global": "g",
+            });
+            request.reply.send(Ok(reply)).unwrap();
+            // The second request is the signature's.
+            let request = received.recv().await.unwrap();
+            assert_eq!(
+                request.value["pane_format"],
+                super::super::resident::SIGNATURE
+            );
+            let reply = json!({
+                "v": 1, "kind": "format_digest", "request_id": request.request_id,
+                "digest": answer, "lines": 0,
+            });
+            request.reply.send(Ok(reply)).unwrap();
+        });
+        assert_eq!(
+            actions.format_digest("#{pane_id}", Some("#{@x}")).await,
+            Some(FormatDigest {
+                digest: digest.clone(),
+                lines: 2,
+                global: Some("g".into()),
+            })
+        );
+        let signature = super::super::resident::healthy_signature(Some(&actions), async {
+            Err::<String, _>("must not list".to_owned())
+        })
+        .await;
+        assert_eq!(signature, Ok(digest));
+        core.await.unwrap();
     }
 
     #[tokio::test]
