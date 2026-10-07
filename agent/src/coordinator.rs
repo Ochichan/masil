@@ -540,6 +540,74 @@ pub(crate) fn endpoint_call(
     }
 }
 
+/// How long `agent list` and `agent get` give the coordinator, in all.
+const QUERY_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// What the running coordinator answers to `agent list` or `agent get`: the
+/// text to print. None for anything else (no coordinator, no live watch, a
+/// refusal, a slow or malformed answer), and the caller runs the query
+/// itself. It starts nothing and spawns nothing.
+pub(crate) fn query(socket: &Path, kind: &str, target: Option<&str>) -> Option<String> {
+    let started = Instant::now();
+    let params = crate::managed::query::request_params(kind, target)?;
+    let state = crate::managed::state_base().ok()?;
+    let listen = paths(socket, &state).ok()?.listen;
+    let value = query_request_within(&listen, params, started + QUERY_TIMEOUT)?;
+    value["text"].as_str().map(str::to_owned)
+}
+
+/// One `query` request that must be answered before `deadline`.
+fn query_request_within(listen: &Path, params: Value, deadline: Instant) -> Option<Value> {
+    // A zero timeout is an error and none is forever: time up is a refusal.
+    let left = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+    };
+    let mut stream = StdUnixStream::connect(listen).ok()?;
+    let body =
+        serde_json::to_vec(&json!({"v": 1, "id": "cli", "method": "query", "params": params}))
+            .ok()?;
+    // Both set while the peer is surely connected: on macOS a socket whose
+    // peer has gone refuses a timeout.
+    stream.set_write_timeout(Some(left()?)).ok()?;
+    stream.set_read_timeout(Some(left()?)).ok()?;
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .and_then(|()| stream.write_all(&body))
+        .ok()?;
+    let mut header = [0; 4];
+    let mut have = 0;
+    let mut body: Vec<u8> = Vec::new();
+    // The deadline covers the whole answer: each read gets what time is
+    // left, when the socket takes the new timeout.
+    loop {
+        let remaining = left()?;
+        let _ = stream.set_read_timeout(Some(remaining));
+        let wanted = if have < 4 {
+            &mut header[have..]
+        } else {
+            &mut body[have - 4..]
+        };
+        match stream.read(wanted) {
+            Ok(0) | Err(_) => return None,
+            Ok(count) => have += count,
+        }
+        if have == 4 && body.is_empty() {
+            let length = u32::from_be_bytes(header) as usize;
+            if length == 0 || length > crate::managed::query::FRAME {
+                return None;
+            }
+            body = vec![0; length];
+        }
+        if have >= 4 && have - 4 == body.len() && !body.is_empty() {
+            break;
+        }
+    }
+    let mut response: Value = serde_json::from_slice(&body).ok()?;
+    (response["ok"] == true).then(|| response["value"].take())
+}
+
 fn check_action_frame(params: &Value) -> Result<(), String> {
     let body =
         serde_json::to_vec(&json!({"v": 1, "id": "cli", "method": "action", "params": params}))
@@ -1348,8 +1416,19 @@ fn serve_locked(
             schedule_wake: Arc::new(tokio::sync::Notify::new()),
             links: Arc::default(),
             residents: Arc::default(),
+            query: Arc::new(crate::managed::query::Service::new(
+                options.socket.clone(),
+                options.state.clone(),
+                exe_identity(),
+                crate::detection::override_directory(),
+                {
+                    let path = paths.log.clone();
+                    Arc::new(move |message: &str| log(&path, message))
+                },
+            )),
         });
         shared.actions.start().await;
+        shared.query.reload().await;
         let supervisor = tokio::spawn(supervise(
             shared.clone(),
             options.socket.clone(),
@@ -1410,6 +1489,8 @@ struct Shared {
     links: Arc<crate::managed::links::Links>,
     /// Resident extensions (P9).
     residents: Arc<crate::api::ext::Residents>,
+    /// Answers `agent list` and `agent get` from a snapshot.
+    query: Arc<crate::managed::query::Service>,
 }
 
 impl Shared {
@@ -1588,6 +1669,8 @@ async fn supervise(
                 shared.schedule_wake.notify_one();
                 shared.links.wake();
                 shared.residents.wake();
+                // The query engine reloads with the watch's.
+                shared.query.reload().await;
             }
         }
     }
@@ -1907,6 +1990,13 @@ async fn serve_client(
                 false,
                 LINK_FRAME,
             )
+        } else if let Some((id, params)) = query_request(&body) {
+            // A read: not activity, and no wait for the action lock.
+            (
+                query_reply(shared, id, &params).await,
+                false,
+                crate::managed::query::FRAME,
+            )
         } else {
             count(&mut active);
             let (response, stopping) = respond(&body, shared, clients, idle_seconds);
@@ -1992,6 +2082,56 @@ fn link_request(body: &[u8]) -> Option<(Value, Value)> {
             object.get("params").cloned().unwrap_or(Value::Null),
         )
     })
+}
+
+/// The ID and params of a well-formed `query`.
+fn query_request(body: &[u8]) -> Option<(Value, Value)> {
+    let request = serde_json::from_slice::<Value>(body).ok()?;
+    let object = request.as_object()?;
+    let id = object.get("id")?;
+    (object.get("v") == Some(&json!(1))
+        && id
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && id.len() <= 64)
+        && object.get("method") == Some(&json!("query"))
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "v" | "id" | "method" | "params")))
+    .then(|| {
+        (
+            id.clone(),
+            object.get("params").cloned().unwrap_or(Value::Null),
+        )
+    })
+}
+
+/// The text `agent list` or `agent get` prints, or a refusal that sends the
+/// caller to its local path. A changed override file also starts the
+/// coordinator's normal reload.
+async fn query_reply(shared: &Shared, id: Value, params: &Value) -> Value {
+    let watch_running = shared
+        .watch
+        .lock()
+        .map(|watch| watch.as_ref().is_some_and(|task| !task.is_finished()))
+        .unwrap_or(false);
+    match shared
+        .query
+        .serve(&shared.actions, watch_running, params)
+        .await
+    {
+        Ok(text) => json!({"v": 1, "id": id, "ok": true, "value": {"text": text}}),
+        Err(refusal) => {
+            if refusal.reload {
+                shared.reload.notify_one();
+            }
+            json!({
+                "v": 1,
+                "id": id,
+                "ok": false,
+                "error": {"code": refusal.code, "message": refusal.message},
+            })
+        }
+    }
 }
 
 /// A read through an endpoint's link, or `not_connected`.
@@ -2129,6 +2269,7 @@ fn respond(
             if let Ok(report) = shared.control.report.lock() {
                 value["watch"] = json!(*report);
             }
+            value["query"] = shared.query.status();
             // Names only, to show what the environment allowlist kept.
             let mut names: Vec<String> = std::env::vars_os()
                 .map(|(name, _)| name.to_string_lossy().into_owned())
@@ -2191,6 +2332,13 @@ mod tests {
             schedule_wake: Arc::default(),
             links: Arc::default(),
             residents: Arc::default(),
+            query: Arc::new(crate::managed::query::Service::new(
+                PathBuf::from("/tmp/masil-coordinator-test.sock"),
+                PathBuf::from("/tmp"),
+                json!({}),
+                None,
+                Arc::new(|_: &str| {}),
+            )),
         }
     }
 
@@ -2335,5 +2483,125 @@ mod tests {
         drop(file);
         assert!(!lock_held(&path).unwrap());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A one-connection server that answers with `reply` after `delay`.
+    fn fake_coordinator(
+        name: &str,
+        reply: Option<Vec<u8>>,
+        delay: Duration,
+    ) -> (PathBuf, std::thread::JoinHandle<Vec<u8>>) {
+        let path = std::env::temp_dir().join(format!("mq-{}-{name}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut request).unwrap();
+            std::thread::sleep(delay);
+            if let Some(reply) = reply {
+                let _ = stream.write_all(&(reply.len() as u32).to_be_bytes());
+                let _ = stream.write_all(&reply);
+            }
+            request
+        });
+        (path, handle)
+    }
+
+    fn within(listen: &Path) -> Option<Value> {
+        query_request_within(
+            listen,
+            json!({"kind": "list"}),
+            Instant::now() + QUERY_TIMEOUT,
+        )
+    }
+
+    #[test]
+    fn a_served_query_returns_its_text_and_every_other_outcome_returns_nothing() {
+        let answer = json!({"v": 1, "id": "cli", "ok": true, "value": {"text": "{}\n"}});
+        let (path, server) = fake_coordinator(
+            "ok",
+            Some(serde_json::to_vec(&answer).unwrap()),
+            Duration::ZERO,
+        );
+        let value = within(&path).unwrap();
+        assert_eq!(value["text"], "{}\n");
+        let request: Value = serde_json::from_slice(&server.join().unwrap()).unwrap();
+        assert_eq!(request["method"], "query");
+        assert_eq!(request["params"]["kind"], "list");
+        // A refusal, a malformed answer, an oversize frame and a closed
+        // connection all send the caller to its local path.
+        let refusal = json!({"v": 1, "id": "cli", "ok": false,
+            "error": {"code": "query_refused", "message": "no"}});
+        for (name, reply) in [
+            ("refused", Some(serde_json::to_vec(&refusal).unwrap())),
+            ("garbage", Some(b"not json".to_vec())),
+            ("closed", None),
+        ] {
+            let (path, server) = fake_coordinator(name, reply, Duration::ZERO);
+            assert!(within(&path).is_none(), "{name}");
+            server.join().unwrap();
+        }
+        // Nothing listens.
+        assert!(within(&std::env::temp_dir().join("mq-absent.sock")).is_none());
+    }
+
+    #[test]
+    fn a_slow_coordinator_is_given_up_on_within_the_total_timeout() {
+        let answer = json!({"v": 1, "id": "cli", "ok": true, "value": {"text": "late"}});
+        let (path, server) = fake_coordinator(
+            "slow",
+            Some(serde_json::to_vec(&answer).unwrap()),
+            QUERY_TIMEOUT * 3,
+        );
+        let started = Instant::now();
+        assert!(within(&path).is_none());
+        assert!(
+            started.elapsed() < QUERY_TIMEOUT * 2,
+            "{:?}",
+            started.elapsed()
+        );
+        server.join().unwrap();
+        // A deadline already past is no attempt at all.
+        let (path, server) = fake_coordinator("past", None, Duration::ZERO);
+        assert!(
+            query_request_within(&path, json!({}), Instant::now() - Duration::from_millis(1))
+                .is_none()
+        );
+        // The server's accept was never reached or read nothing: unblock it.
+        drop(StdUnixStream::connect(&path));
+        let _ = server.join();
+    }
+
+    #[test]
+    fn only_a_well_formed_query_envelope_is_a_query() {
+        let good = br#"{"v":1,"id":"cli","method":"query","params":{"kind":"list"}}"#;
+        assert_eq!(query_request(good).unwrap().1["kind"], "list");
+        for bad in [
+            &br#"{"v":2,"id":"cli","method":"query"}"#[..],
+            br#"{"v":1,"id":"","method":"query"}"#,
+            br#"{"v":1,"id":"cli","method":"action"}"#,
+            br#"{"v":1,"id":"cli","method":"query","extra":1}"#,
+            b"nope",
+        ] {
+            assert!(query_request(bad).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_query_without_the_watch_is_refused_and_is_not_activity() {
+        let shared = shared();
+        let reply = query_reply(
+            &shared,
+            json!("cli"),
+            &json!({"kind": "list", "state_dir": "/tmp", "config_fingerprint": "f",
+                    "exe_identity": {}}),
+        )
+        .await;
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"]["code"], "query_refused");
+        assert_eq!(shared.query.status()["refused"], 1);
     }
 }

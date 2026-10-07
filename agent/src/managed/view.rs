@@ -7,14 +7,14 @@ use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-const OPTION: &str = "@masil-agent-view";
+pub(super) const OPTION: &str = "@masil-agent-view";
 const VERSION: u32 = 1;
 const MAX_WORKSPACES: usize = 64;
 const STATES: [&str; 5] = ["idle", "working", "blocked", "unknown", "exited"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SavedView {
+pub(super) struct SavedView {
     version: u32,
     providers: Vec<String>,
     states: Vec<String>,
@@ -55,26 +55,34 @@ impl Manager {
 
     pub async fn list_view(&self) -> Result<Vec<Agent>, String> {
         let view = self.load_view().await?;
-        let mut agents: Vec<_> = self
-            .list()
-            .await?
-            .into_iter()
-            .filter(|agent| matches_view(&view, &agent.provider, &agent.state, &agent.workspace))
-            .collect();
-        agents.sort_by(|left, right| compare_agents(&view.sort, left, right));
-        Ok(agents)
+        Ok(apply_view(&view, self.list().await?))
     }
 
     async fn load_view(&self) -> Result<SavedView, String> {
         let encoded = self.command(&["show-options", "-gqv", OPTION]).await?;
-        if encoded.trim().is_empty() {
-            return Ok(default_view());
-        }
-        let view = super::decode::<SavedView>(encoded.trim())
-            .ok_or("invalid saved agent view; clear it before listing agents")?;
-        validate_view(&view)?;
-        Ok(view)
+        view_from_text(&encoded)
     }
+}
+
+/// The saved view an option value holds; the default view when it is empty.
+pub(super) fn view_from_text(encoded: &str) -> Result<SavedView, String> {
+    if encoded.trim().is_empty() {
+        return Ok(default_view());
+    }
+    let view = super::decode::<SavedView>(encoded.trim())
+        .ok_or("invalid saved agent view; clear it before listing agents")?;
+    validate_view(&view)?;
+    Ok(view)
+}
+
+/// The agents a view shows, in its order.
+pub(super) fn apply_view(view: &SavedView, agents: Vec<Agent>) -> Vec<Agent> {
+    let mut agents: Vec<_> = agents
+        .into_iter()
+        .filter(|agent| matches_view(view, &agent.provider, &agent.state, &agent.workspace))
+        .collect();
+    agents.sort_by(|left, right| compare_agents(&view.sort, left, right));
+    agents
 }
 
 fn default_view() -> SavedView {

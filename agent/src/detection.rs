@@ -68,17 +68,30 @@ impl Engine {
         Self::load_with_override_directory(override_directory())
     }
 
+    /// Like `load`, and also the fingerprint of the override files it read,
+    /// whether or not the load succeeded.
+    pub(crate) fn load_fingerprinted() -> (String, Result<Self, String>) {
+        Self::load_checked(override_directory())
+    }
+
     fn load_with_override_directory(directory: Option<PathBuf>) -> Result<Self, String> {
+        Self::load_checked(directory).1
+    }
+
+    fn load_checked(directory: Option<PathBuf>) -> (String, Result<Self, String>) {
+        let candidates = read_candidates(directory.as_deref());
+        let fingerprint = fingerprint_candidates(directory.as_deref(), &candidates);
+        (fingerprint, Self::load_candidates(candidates))
+    }
+
+    fn load_candidates(candidates: Vec<(PathBuf, Candidate)>) -> Result<Self, String> {
         let mut engine = Self::load_bundled();
-        let Some(directory) = directory else {
-            return Ok(engine);
-        };
-        for (id, _) in BUNDLED_MANIFESTS {
-            let path = directory.join(format!("{id}.toml"));
-            if !path.exists() {
-                continue;
-            }
-            let bytes = read_override(&path)?;
+        for ((id, _), (path, candidate)) in BUNDLED_MANIFESTS.iter().zip(candidates) {
+            let bytes = match candidate {
+                Candidate::Absent => continue,
+                Candidate::Bytes(bytes) => bytes,
+                Candidate::Unreadable(error) => return Err(error),
+            };
             let text = std::str::from_utf8(&bytes)
                 .map_err(|error| format!("override {} is not UTF-8: {error}", path.display()))?;
             let loaded = load_manifest(text, ManifestSource::Override(path.clone()))
@@ -1176,6 +1189,81 @@ pub(crate) fn override_directory() -> Option<PathBuf> {
         .map(|path| path.join(".config").join("masil").join("agent-detection"))
 }
 
+/// What one override candidate file held when it was read.
+enum Candidate {
+    Absent,
+    Bytes(Vec<u8>),
+    Unreadable(String),
+}
+
+/// Every `{id}.toml` the directory could override, in bundled order.
+fn read_candidates(directory: Option<&std::path::Path>) -> Vec<(PathBuf, Candidate)> {
+    let Some(directory) = directory else {
+        return Vec::new();
+    };
+    BUNDLED_MANIFESTS
+        .iter()
+        .map(|(id, _)| {
+            let path = directory.join(format!("{id}.toml"));
+            let candidate = if path.exists() {
+                match read_override(&path) {
+                    Ok(bytes) => Candidate::Bytes(bytes),
+                    Err(error) => Candidate::Unreadable(error),
+                }
+            } else {
+                Candidate::Absent
+            };
+            (path, candidate)
+        })
+        .collect()
+}
+
+/// A SHA-256 over each candidate's path and bytes (absent files count as
+/// absent), so an edit, an add or a delete changes it.
+fn fingerprint_candidates(
+    directory: Option<&std::path::Path>,
+    candidates: &[(PathBuf, Candidate)],
+) -> String {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let mut hasher = Sha256::new();
+    match directory {
+        Some(directory) => {
+            hasher.update([1]);
+            hasher.update(directory.as_os_str().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    for (path, candidate) in candidates {
+        hasher.update([0xff]);
+        hasher.update(path.as_os_str().as_bytes());
+        match candidate {
+            Candidate::Absent => hasher.update([0]),
+            Candidate::Bytes(bytes) => {
+                hasher.update([1]);
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                hasher.update(bytes);
+            }
+            Candidate::Unreadable(error) => {
+                hasher.update([2]);
+                hasher.update(error.as_bytes());
+            }
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The fingerprint of the override files this process would load now.
+pub(crate) fn override_fingerprint() -> String {
+    let directory = override_directory();
+    let candidates = read_candidates(directory.as_deref());
+    fingerprint_candidates(directory.as_deref(), &candidates)
+}
+
 fn read_override(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("could not inspect override {}: {error}", path.display()))?;
@@ -1376,6 +1464,43 @@ contains = ["second version"]
         assert_eq!(
             second.explain("qwen", "second version", "")["state"],
             "working"
+        );
+    }
+
+    #[test]
+    fn the_override_fingerprint_follows_the_bytes_the_load_read() {
+        let directory = TempDirectory::new();
+        let other = TempDirectory::new();
+        let print = |dir: &TempDirectory| {
+            let candidates = read_candidates(Some(dir.path()));
+            fingerprint_candidates(Some(dir.path()), &candidates)
+        };
+        let empty = print(&directory);
+        assert_eq!(empty, print(&directory));
+        assert_ne!(empty, print(&other), "the directory is part of it");
+        let path = directory.path().join("qwen.toml");
+        let text = "id = \"qwen\"\n[[rules]]\nid = \"a\"\nstate = \"idle\"\ncontains = [\"a\"]\n";
+        std::fs::write(&path, text).unwrap();
+        let first = print(&directory);
+        assert_ne!(first, empty, "an added file");
+        let (loaded, engine) = Engine::load_checked(Some(directory.path().to_owned()));
+        assert_eq!(loaded, first);
+        assert!(engine.is_ok());
+        std::fs::write(&path, text.replace("\"a\"", "\"b\"")).unwrap();
+        let second = print(&directory);
+        assert_ne!(second, first, "an edited file");
+        // A file that does not load still has a fingerprint, the same one
+        // a client computes without loading.
+        std::fs::write(&path, "id = \"qwen\"\n[[rules]]\nregex = [\"(\"]\n").unwrap();
+        let (broken, engine) = Engine::load_checked(Some(directory.path().to_owned()));
+        assert!(engine.is_err());
+        assert_eq!(broken, print(&directory));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(print(&directory), empty, "a deleted file");
+        assert_ne!(
+            fingerprint_candidates(None, &[]),
+            empty,
+            "no directory differs from an empty one"
         );
     }
 

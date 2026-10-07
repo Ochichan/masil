@@ -25,6 +25,8 @@ pub(crate) const ACTION_PROTOCOL: u64 = 1;
 const REQUEST_FRAME: usize = 8 * 1024;
 const RESPONSE_FRAME: usize = 64 * 1024;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a query's `format_digest` waits for the core's answer.
+const QUERY_DIGEST_WAIT: Duration = Duration::from_millis(100);
 const BUSY_ATTEMPTS: usize = 5;
 const INTERRUPT_INTER_KEY_PAUSE: Duration = Duration::from_millis(300);
 /// An idle coordinator connection sends a heartbeat this often. The core
@@ -741,6 +743,28 @@ impl Client {
         }
         let reply = self
             .call_with_busy(
+                "format_digest",
+                format_digest_fields(pane_format, global_format),
+            )
+            .await?;
+        parse_format_digest_reply(&reply)
+    }
+
+    /// One `format_digest` request: no retry of a busy refusal. Any error
+    /// other than the core's own rejection leaves the connection in an
+    /// unknown state, and the caller drops it.
+    async fn format_digest_once(
+        &mut self,
+        pane_format: &str,
+        global_format: Option<&str>,
+    ) -> Result<FormatDigest, Error> {
+        if !self.format_digest {
+            return Err(Error::Unavailable(
+                "the core does not support format digests".into(),
+            ));
+        }
+        let reply = self
+            .call(
                 "format_digest",
                 format_digest_fields(pane_format, global_format),
             )
@@ -2126,6 +2150,12 @@ pub(crate) struct CoordinatorActions {
     reconnect_backoff: Mutex<ReconnectBackoff>,
 }
 
+/// Whether an action has to connect first: there is no connection, or the
+/// one it has has ended (a query's failed digest, or a closed bridge).
+fn connection_needed(client: Option<&Client>) -> bool {
+    client.is_none_or(Client::is_broken)
+}
+
 /// Failed-reconnect bookkeeping: 5 s, 10 s, 20 s ... capped at 60 s.
 #[derive(Debug, Default)]
 struct ReconnectBackoff {
@@ -2266,6 +2296,54 @@ impl CoordinatorActions {
         core.format_digest(pane_format, global_format).await.ok()
     }
 
+    /// The digest an `agent list` or `agent get` query checks its snapshot
+    /// with: one request on the action connection, or None when the query
+    /// must be refused. It takes the connection with `try_lock` only, never
+    /// reconnects, never retries a busy refusal and waits `QUERY_DIGEST_WAIT`
+    /// for the answer. Any failure but the core's own rejection drops the
+    /// connection, so the next action connects again.
+    pub(crate) async fn query_digest(
+        &self,
+        pane_format: &str,
+        global_format: Option<&str>,
+    ) -> Option<FormatDigest> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut client = self.client.try_lock().ok()?;
+        let core = client.as_mut()?;
+        if core.is_broken() {
+            client.take();
+            self.summary_epoch.store(0, Ordering::SeqCst);
+            self.unavailable("the coordinator bridge connection ended");
+            return None;
+        }
+        if !core.supports_format_digest() {
+            return None;
+        }
+        let answer = tokio::time::timeout(
+            QUERY_DIGEST_WAIT,
+            core.format_digest_once(pane_format, global_format),
+        )
+        .await;
+        match answer {
+            Ok(Ok(digest)) => Some(digest),
+            Ok(Err(error)) if error.rejected_code().is_some() => None,
+            Ok(Err(error)) => {
+                client.take();
+                self.summary_epoch.store(0, Ordering::SeqCst);
+                self.unavailable(&format!("a query digest failed: {error}"));
+                None
+            }
+            Err(_) => {
+                client.take();
+                self.summary_epoch.store(0, Ordering::SeqCst);
+                self.unavailable("a query digest timed out");
+                None
+            }
+        }
+    }
+
     /// Connects again after the connection was lost, for a caller that needs
     /// it without an action. It does nothing while an action runs (that
     /// action connects itself), while stopping, or while a connection lives.
@@ -2372,7 +2450,7 @@ impl CoordinatorActions {
         let manager = Manager::new(self.socket.clone(), None)?;
         let connect_needed = {
             let client = self.client.lock().await;
-            client.is_none()
+            connection_needed(client.as_ref())
         };
         let connected = if connect_needed {
             self.connect(&manager).await
@@ -2391,7 +2469,18 @@ impl CoordinatorActions {
         if matches!(action, ControlAction::Focus(_)) && (fresh || connect_needed) {
             return Err(RECONNECT_VIEW_CHANGED.into());
         }
-        let mut client = self.client.lock().await;
+        // A query's failed digest may have dropped the connection since the
+        // check above, so connect once more if it did.
+        let (mut client, reconnected) = self
+            .lock_connected(|| async {
+                let error = self.connect(&manager).await.err()?;
+                self.unavailable(&error);
+                Some(format!("bridge_unavailable: {error}"))
+            })
+            .await?;
+        if reconnected && matches!(action, ControlAction::Focus(_)) {
+            return Err(RECONNECT_VIEW_CHANGED.into());
+        }
         let Some(core) = client.as_mut() else {
             return Err("bridge_unavailable: coordinator action connection is unavailable".into());
         };
@@ -2513,6 +2602,32 @@ impl CoordinatorActions {
                 self.connect_once(manager).await
             }
         }
+    }
+
+    /// The locked client connection, connecting first through `connect` (at
+    /// most once) when the lock finds it missing or ended. `connect` returns
+    /// the error to report when it fails. The flag says it connected here.
+    async fn lock_connected<F, Fut>(
+        &self,
+        connect: F,
+    ) -> Result<(tokio::sync::MutexGuard<'_, Option<Client>>, bool), String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<String>>,
+    {
+        let guard = self.client.lock().await;
+        if !connection_needed(guard.as_ref()) {
+            return Ok((guard, false));
+        }
+        drop(guard);
+        if let Some(error) = connect().await {
+            return Err(error);
+        }
+        let guard = self.client.lock().await;
+        if connection_needed(guard.as_ref()) {
+            return Err("bridge_unavailable: coordinator action connection is unavailable".into());
+        }
+        Ok((guard, true))
     }
 
     async fn nudge_native_bridge(&self, manager: &Manager) {
@@ -6841,6 +6956,161 @@ mod tests {
                 .unwrap_err()
                 .rejected_code(),
             Some("invalid_format")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_digest_is_one_request_that_never_waits_or_reconnects() {
+        let digest = "cd".repeat(32);
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        // No connection, and an action holding it: no answer, nothing changed.
+        assert_eq!(actions.query_digest("#{pane_id}", None).await, None);
+        let held = actions.client.lock().await;
+        assert_eq!(actions.query_digest("#{pane_id}", None).await, None);
+        drop(held);
+        // A core that answers.
+        let (client, _frames, mut received) = wired_test_client();
+        *actions.client.lock().await = Some(client);
+        let answer = digest.clone();
+        let core = tokio::spawn(async move {
+            let request = received.recv().await.unwrap();
+            assert_eq!(request.value["kind"], "format_digest");
+            let reply = json!({
+                "v": 1, "kind": "format_digest", "request_id": request.request_id,
+                "digest": answer, "lines": 1, "global": "g",
+            });
+            request.reply.send(Ok(reply)).unwrap();
+            received
+        });
+        assert_eq!(
+            actions.query_digest("#{pane_id}", Some("#{@x}")).await,
+            Some(FormatDigest {
+                digest,
+                lines: 1,
+                global: Some("g".into()),
+            })
+        );
+        let mut received = core.await.unwrap();
+        // A busy refusal is not retried and the connection stays.
+        let core = tokio::spawn(async move {
+            let request = received.recv().await.unwrap();
+            let reply = json!({
+                "v": 1, "kind": "error", "request_id": request.request_id,
+                "code": "bridge_busy", "message": "full",
+            });
+            request.reply.send(Ok(reply)).unwrap();
+            received
+        });
+        assert_eq!(actions.query_digest("#{pane_id}", None).await, None);
+        let mut received = core.await.unwrap();
+        assert!(received.try_recv().is_err(), "no second request");
+        assert!(actions.client.lock().await.is_some());
+        // An answer that is no answer drops the connection, so the next
+        // action connects again.
+        let core = tokio::spawn(async move {
+            let request = received.recv().await.unwrap();
+            request.reply.send(Ok(json!({"v": 1}))).unwrap();
+        });
+        assert_eq!(actions.query_digest("#{pane_id}", None).await, None);
+        core.await.unwrap();
+        assert!(actions.client.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_query_digest_that_times_out_drops_the_connection() {
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        let (client, _frames, received) = wired_test_client();
+        *actions.client.lock().await = Some(client);
+        let started = std::time::Instant::now();
+        // The core reads the request and never answers.
+        let core = tokio::spawn(async move {
+            let mut received = received;
+            let request = received.recv().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(request);
+        });
+        assert_eq!(actions.query_digest("#{pane_id}", None).await, None);
+        assert!(started.elapsed() < Duration::from_millis(900));
+        assert!(actions.client.lock().await.is_none());
+        core.abort();
+        // A connection that lost the capability is left alone.
+        let (mut client, _frames) = test_client();
+        client.format_digest = false;
+        *actions.client.lock().await = Some(client);
+        assert_eq!(actions.query_digest("#{pane_id}", None).await, None);
+        assert!(actions.client.lock().await.is_some());
+        // A broken one is dropped, never reconnected; stopping answers nothing.
+        let (mut client, _frames) = test_client();
+        client.broken = true;
+        *actions.client.lock().await = Some(client);
+        assert_eq!(actions.query_digest("#{pane_id}", None).await, None);
+        assert!(actions.client.lock().await.is_none());
+        actions.stopping.store(true, Ordering::SeqCst);
+        assert_eq!(actions.query_digest("#{pane_id}", None).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_action_connects_again_when_its_connection_is_broken() {
+        assert!(connection_needed(None));
+        let (mut client, _frames) = test_client();
+        assert!(!connection_needed(Some(&client)));
+        client.broken = true;
+        assert!(connection_needed(Some(&client)));
+        let (client, _frames) = test_client();
+        client.focus_router.close();
+        assert!(
+            connection_needed(Some(&client)),
+            "a closed router is broken too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_dropped_in_the_gap_is_connected_again_once() {
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        // A live connection is used as it is.
+        let (client, _frames) = test_client();
+        *actions.client.lock().await = Some(client);
+        let (guard, reconnected) = actions
+            .lock_connected(|| async { panic!("no connect needed") })
+            .await
+            .unwrap();
+        assert!(!reconnected && guard.is_some());
+        drop(guard);
+        // One dropped by a query connects once and is then used.
+        actions.client.lock().await.take();
+        let (guard, reconnected) = actions
+            .lock_connected(|| async {
+                let (client, _frames) = test_client();
+                *actions.client.lock().await = Some(client);
+                None
+            })
+            .await
+            .unwrap();
+        assert!(reconnected && guard.is_some());
+        drop(guard);
+        // A connect that fails, or leaves nothing behind, is an error.
+        actions.client.lock().await.take();
+        let failed = actions
+            .lock_connected(|| async { Some("bridge_unavailable: no socket".to_owned()) })
+            .await;
+        assert_eq!(
+            failed.err().as_deref(),
+            Some("bridge_unavailable: no socket")
+        );
+        let empty = actions.lock_connected(|| async { None }).await;
+        assert!(
+            empty
+                .err()
+                .is_some_and(|e| e.starts_with("bridge_unavailable"))
         );
     }
 

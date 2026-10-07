@@ -18,6 +18,7 @@ mod notifications;
 mod observe;
 mod operations;
 mod prompt;
+pub(crate) mod query;
 pub(crate) mod queue;
 mod remote_cli;
 pub(crate) mod resident;
@@ -725,6 +726,17 @@ pub(crate) struct Manager {
     resident: Option<resident::Resident>,
     /// How long `lock` waits for another operation; zero refuses at once.
     lock_wait: std::time::Duration,
+    /// Set only for the coordinator's query Manager (`query.rs`).
+    queries: Option<QueryState>,
+}
+
+/// What the query Manager keeps beyond a CLI Manager: when each cached
+/// screen was captured, so an old one is captured again, and the inventory
+/// text its last pass used.
+struct QueryState {
+    max_screen_age: std::time::Duration,
+    captured: Mutex<HashMap<String, std::time::Instant>>,
+    inventory: Mutex<Option<String>>,
 }
 
 impl Manager {
@@ -738,6 +750,36 @@ impl Manager {
             cache: Mutex::new(HashMap::new()),
             resident: None,
             lock_wait: std::time::Duration::ZERO,
+            queries: None,
+        })
+    }
+
+    /// The coordinator's Manager for `agent list` and `agent get` queries.
+    /// It has no resident memory and only collects read-only; a cached
+    /// screen older than `max_screen_age` is captured again even when its
+    /// observation key is unchanged.
+    pub(crate) fn for_queries(
+        socket: PathBuf,
+        engine: Engine,
+        max_screen_age: std::time::Duration,
+    ) -> Result<Self, String> {
+        let socket = socket
+            .canonicalize()
+            .map_err(|e| format!("server_unreachable: native socket: {e}"))?;
+        Ok(Self {
+            native: native_ui::Context {
+                socket,
+                client: None,
+            },
+            engine,
+            cache: Mutex::new(HashMap::new()),
+            resident: None,
+            lock_wait: std::time::Duration::ZERO,
+            queries: Some(QueryState {
+                max_screen_age,
+                captured: Mutex::new(HashMap::new()),
+                inventory: Mutex::new(None),
+            }),
         })
     }
 
@@ -842,12 +884,17 @@ impl Manager {
     }
 
     async fn inventory(&self) -> Result<Vec<Vec<String>>, String> {
+        self.inventory_text().await.map(|(records, _)| records)
+    }
+
+    /// The inventory and the text of `list-panes` it was parsed from.
+    async fn inventory_text(&self) -> Result<(Vec<Vec<String>>, String), String> {
         let output = self.command(&["list-panes", "-a", "-F", FORMAT]).await?;
         let records = records(&output)?;
         if records.len() > MAX_PANES {
             return Err("agent management supports at most 64 panes per server".into());
         }
-        Ok(records)
+        Ok((records, output))
     }
 
     async fn capture_cache_misses(
@@ -867,11 +914,34 @@ impl Manager {
             cache.retain(|pane, _| live_panes.contains(pane.as_str()));
             cache.clone()
         };
+        // A query Manager captures a screen again once it is old, so evidence
+        // never outlives `max_screen_age` on an unchanged observation key.
+        let expired: HashSet<String> = match &self.queries {
+            Some(queries) => {
+                let mut captured = queries
+                    .captured
+                    .lock()
+                    .map_err(|_| "detection cache unavailable")?;
+                captured.retain(|pane, _| live_panes.contains(pane.as_str()));
+                cached_snapshot
+                    .keys()
+                    .filter(|pane| {
+                        captured
+                            .get(pane.as_str())
+                            .is_none_or(|at| at.elapsed() > queries.max_screen_age)
+                    })
+                    .cloned()
+                    .collect()
+            }
+            None => HashSet::new(),
+        };
         let mut prepared = HashMap::new();
         for fields in inventory {
             if fields[4] == "1"
                 || !seen.insert(fields[0].clone())
-                || target.is_some_and(|value| value.starts_with('%') && value != fields[0])
+                || target.is_some_and(|value| {
+                    !selects_pane(value, fields, identified.get(&fields[0]).copied())
+                })
             {
                 continue;
             }
@@ -881,7 +951,7 @@ impl Manager {
             let key = observation_key(fields, provider.id);
             if let Some((_, evidence)) = cached_snapshot
                 .remove(&fields[0])
-                .filter(|(candidate, _)| candidate == &key)
+                .filter(|(candidate, _)| candidate == &key && !expired.contains(&fields[0]))
             {
                 prepared.insert(fields[0].clone(), PreparedEvidence::Cached(evidence));
             } else {
@@ -1031,6 +1101,23 @@ impl Manager {
         Ok(agent)
     }
 
+    /// Every agent as a read-only pass sees it (nothing is written), with
+    /// the `list-panes` text that pass used. Only on a query Manager.
+    pub(crate) async fn collect_snapshot(&self) -> Result<(Vec<Agent>, String), String> {
+        let queries = self
+            .queries
+            .as_ref()
+            .ok_or("query_unavailable: not a query manager")?;
+        let agents = self.collect_with_bridge_scope(None, true).await?.0;
+        let text = queries
+            .inventory
+            .lock()
+            .map_err(|_| "detection cache unavailable")?
+            .take()
+            .ok_or("query_unavailable: no inventory text")?;
+        Ok((agents, text))
+    }
+
     async fn collect_with_bridge_scope(
         &self,
         target: Option<&str>,
@@ -1080,8 +1167,14 @@ impl Manager {
         ),
         String,
     > {
-        let inventory = self.inventory().await?;
+        let (inventory, inventory_text) = self.inventory_text().await?;
         validate_inventory(&inventory)?;
+        if let Some(queries) = &self.queries {
+            *queries
+                .inventory
+                .lock()
+                .map_err(|_| "detection cache unavailable")? = Some(inventory_text);
+        }
         let core_boot_id = inventory.first().map(|fields| fields[5].clone());
         let mut bridge_scope: HashSet<String> = inventory
             .iter()
@@ -1106,25 +1199,16 @@ impl Manager {
             if !seen_panes.insert(fields[0].clone()) {
                 continue;
             }
-            if target.is_some_and(|t| t.starts_with('%') && t != fields[0]) {
+            if target
+                .is_some_and(|t| !selects_pane(t, &fields, identified.get(&fields[0]).copied()))
+            {
                 continue;
             }
             let encoded = &fields[11];
-            let metadata = decode::<Metadata>(encoded).filter(|m| {
-                m.boot == fields[5]
-                    && m.generation == fields[6]
-                    && valid_name(&m.name)
-                    && m.run.len() <= 128
-                    && !m.run.chars().any(char::is_control)
-                    && providers::find(&m.provider).is_some()
-            });
             let dead = fields[4] == "1";
             let foreground_group = fields[13].parse::<i32>().unwrap_or(0);
-            let metadata = metadata.filter(|m| dead || m.foreground_group == foreground_group);
             let identified = identified.get(&fields[0]).copied();
-            let Some(provider) =
-                identified.or_else(|| metadata.as_ref().and_then(|m| providers::find(&m.provider)))
-            else {
+            let Some((provider, metadata)) = resolve_pane(&fields, identified) else {
                 continue;
             };
             let foreground = identified.is_some_and(|p| p.id == provider.id);
@@ -1148,6 +1232,11 @@ impl Manager {
                             .lock()
                             .map_err(|_| "detection cache unavailable")?;
                         store_cached_evidence(&mut cache, fields[0].clone(), key, evidence.clone());
+                        if let Some(queries) = &self.queries
+                            && let Ok(mut captured) = queries.captured.lock()
+                        {
+                            captured.insert(fields[0].clone(), std::time::Instant::now());
+                        }
                         evidence
                     }
                 }
@@ -1157,9 +1246,6 @@ impl Manager {
                 ))
             };
             let mut state = evidence.state().to_owned();
-            let metadata = metadata.filter(|m| {
-                m.provider == provider.id && (dead || m.foreground_group == foreground_group)
-            });
             let run_evidence = metadata
                 .as_ref()
                 .and_then(|m| decode::<RunEvidence>(&fields[16]).filter(|e| e.run == m.run));
@@ -1282,12 +1368,7 @@ impl Manager {
                 ));
             }
             let revision = tracked.revision.to_string();
-            let name = metadata
-                .as_ref()
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| {
-                    format!("{}-{}", provider.id, fields[0].trim_start_matches('%'))
-                });
+            let name = derived_name(&fields[0], provider, metadata.as_ref());
             let process = if dead {
                 "exited"
             } else if foreground {
@@ -3727,6 +3808,59 @@ fn validate_inventory(inventory: &[Vec<String>]) -> Result<(), String> {
     Ok(())
 }
 
+/// A pane's registration when it belongs to this run of the pane.
+fn valid_metadata(fields: &[String]) -> Option<Metadata> {
+    let dead = fields[4] == "1";
+    let foreground_group = fields[13].parse::<i32>().unwrap_or(0);
+    decode::<Metadata>(&fields[11])
+        .filter(|m| {
+            m.boot == fields[5]
+                && m.generation == fields[6]
+                && valid_name(&m.name)
+                && m.run.len() <= 128
+                && !m.run.chars().any(char::is_control)
+                && providers::find(&m.provider).is_some()
+        })
+        .filter(|m| dead || m.foreground_group == foreground_group)
+}
+
+/// The provider an inventory row is an agent of, and its registration when
+/// that is for the same provider. None for a pane that is no agent.
+fn resolve_pane(
+    fields: &[String],
+    identified: Option<&'static providers::Provider>,
+) -> Option<(&'static providers::Provider, Option<Metadata>)> {
+    let metadata = valid_metadata(fields);
+    let provider =
+        identified.or_else(|| metadata.as_ref().and_then(|m| providers::find(&m.provider)))?;
+    let metadata = metadata.filter(|m| m.provider == provider.id);
+    Some((provider, metadata))
+}
+
+/// An agent's name: its registered name, else the provider and pane number.
+/// The listing, `get` and the capture filter all derive names here.
+fn derived_name(pane: &str, provider: &providers::Provider, metadata: Option<&Metadata>) -> String {
+    metadata.map_or_else(
+        || format!("{}-{}", provider.id, pane.trim_start_matches('%')),
+        |m| m.name.clone(),
+    )
+}
+
+/// Whether a pane can be the target of `get`: a pane ID target selects by
+/// ID, a name target by the name the listing would give the pane.
+fn selects_pane(
+    target: &str,
+    fields: &[String],
+    identified: Option<&'static providers::Provider>,
+) -> bool {
+    if target.starts_with('%') {
+        return target == fields[0];
+    }
+    resolve_pane(fields, identified).is_some_and(|(provider, metadata)| {
+        derived_name(&fields[0], provider, metadata.as_ref()) == target
+    })
+}
+
 fn observation_key(fields: &[String], provider: &str) -> String {
     json!([
         fields[5], fields[6], fields[13], fields[14], provider, fields[7], fields[9], fields[15]
@@ -4188,6 +4322,53 @@ mod tests {
         assert!(parse_verdict("r10 ok", "r1").is_none());
         assert!(parse_verdict("", "r1").is_none());
     }
+    #[test]
+    fn a_name_target_selects_the_pane_the_listing_names_that() {
+        let codex = providers::find("codex");
+        let boot = "00000000-0000-0000-0000-000000000000";
+        let row = |pane: &str, metadata: Option<&Metadata>, group: &str| {
+            let mut row = vec![String::new(); 19];
+            row[0] = pane.into();
+            row[5] = boot.into();
+            row[6] = "1".into();
+            row[11] = metadata.map(|m| encode(m).unwrap()).unwrap_or_default();
+            row[13] = group.into();
+            row
+        };
+        let registered = Metadata {
+            name: "build".into(),
+            provider: "codex".into(),
+            boot: boot.into(),
+            generation: "1".into(),
+            run: "r1".into(),
+            foreground_group: 7,
+            ..Metadata::default()
+        };
+        let named = row("%3", Some(&registered), "7");
+        // The registered name, by the screen's provider or the registration's.
+        assert!(selects_pane("build", &named, codex));
+        assert!(selects_pane("build", &named, None));
+        assert!(!selects_pane("codex-3", &named, codex));
+        // A pane ID selects by ID alone.
+        assert!(selects_pane("%3", &named, codex));
+        assert!(!selects_pane("%4", &named, codex));
+        // A registration for another foreground group is not this run's, so
+        // the pane has the provider-and-number name.
+        let moved = row("%3", Some(&registered), "9");
+        assert!(!selects_pane("build", &moved, codex));
+        assert!(selects_pane("codex-3", &moved, codex));
+        // An unmanaged pane the screen identified; one that is no agent.
+        let plain = row("%5", None, "1");
+        assert!(selects_pane("codex-5", &plain, codex));
+        assert!(!selects_pane("codex-5", &plain, None));
+        assert!(!selects_pane("build", &plain, codex));
+        // The listing derives its names with the same function.
+        let (provider, metadata) = resolve_pane(&named, codex).unwrap();
+        assert_eq!(derived_name("%3", provider, metadata.as_ref()), "build");
+        let (provider, metadata) = resolve_pane(&plain, codex).unwrap();
+        assert_eq!(derived_name("%5", provider, metadata.as_ref()), "codex-5");
+    }
+
     #[test]
     fn native_escaping_preserves_delimiters_and_never_executes() {
         assert_eq!(

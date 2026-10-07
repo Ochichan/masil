@@ -150,6 +150,15 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
     if command == "receive" && rest.is_empty() {
         return super::transfer::receive();
     }
+    // Before a Manager: the coordinator answers `list` and `get` from its
+    // snapshot, and any refusal or failure leaves the local path below.
+    if client.is_none()
+        && let Some((kind, target)) = coordinator_query(command, rest)
+        && let Some(text) = crate::coordinator::query(std::path::Path::new(&socket), kind, target)
+    {
+        print_text(&text);
+        return Ok(0);
+    }
     let manager = Manager::new(PathBuf::from(socket), client)?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -685,6 +694,24 @@ fn restore_op(args: &[String]) -> Result<super::changes::ChangesOp, String> {
     })
 }
 
+/// The queries the coordinator can answer: the kind and the target.
+fn coordinator_query<'a>(
+    command: &str,
+    args: &'a [String],
+) -> Option<(&'static str, Option<&'a str>)> {
+    match (command, args) {
+        ("list", []) => Some(("list", None)),
+        ("list", [flag]) if flag == "--json" => Some(("list", None)),
+        ("get", [target]) => Some(("get", Some(target.as_str()))),
+        _ => None,
+    }
+}
+
+/// Prints text that already ends its last line.
+fn print_text(text: &str) {
+    print!("{text}");
+}
+
 fn print<T: Serialize + ?Sized>(value: &T) -> Result<(), String> {
     println!(
         "{}",
@@ -743,14 +770,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             }
         }
         "list" if args.is_empty() || args == ["--json"] => {
-            #[derive(Serialize)]
-            struct AgentList {
-                agents: Vec<Agent>,
-            }
-
-            print(&AgentList {
-                agents: manager.list_view().await?,
-            })?
+            print_text(&super::query::render_list(&manager.list_view().await?)?)
         }
         "capabilities" if args.len() == 1 => {
             let agent = manager.get(&args[0]).await?;
@@ -758,17 +778,17 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         }
         "get" | "explain" if args.len() == 1 => {
             let agent = manager.get(&args[0]).await?;
-            print(&if command == "get" {
-                json!(agent)
+            if command == "get" {
+                print_text(&super::query::render_get(&agent)?);
             } else {
-                json!({
+                print(&json!({
                     "pane_id":agent.pane_id,
                     "provider":agent.provider,
                     "state":agent.state,
                     "evidence":agent.evidence,
                     "action":manager.action_path_report().await?,
-                })
-            })?;
+                }))?;
+            }
         }
         "read" if args.len() == 1 || (args.len() == 2 && args[1] == "--history") => {
             let agent = manager.get(&args[0]).await?;
@@ -2030,6 +2050,37 @@ async fn wait_closed_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_list_and_get_in_their_plain_forms_go_to_the_coordinator() {
+        let args = |line: &str| {
+            line.split(' ')
+                .filter(|word| !word.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let ask = |command: &str, line: &str| {
+            let args = args(line);
+            coordinator_query(command, &args)
+                .map(|(kind, target)| (kind, target.map(str::to_owned)))
+        };
+        assert_eq!(ask("list", ""), Some(("list", None)));
+        assert_eq!(ask("list", "--json"), Some(("list", None)));
+        assert_eq!(ask("get", "build"), Some(("get", Some("build".into()))));
+        assert_eq!(ask("get", "%3"), Some(("get", Some("%3".into()))));
+        // `list --all` is the fleet; explain and capabilities run locally.
+        for (command, line) in [
+            ("list", "--all"),
+            ("list", "--json x"),
+            ("get", ""),
+            ("get", "a b"),
+            ("explain", "build"),
+            ("capabilities", "build"),
+            ("read", "build"),
+        ] {
+            assert_eq!(ask(command, line), None, "{command} {line}");
+        }
+    }
 
     #[test]
     fn wait_takes_one_form_at_a_time() {
