@@ -258,10 +258,13 @@ key_bindings_add(const char *name, key_code key, const char *note, int repeat,
 		bd->flags |= KEY_BINDING_REPEAT;
 	bd->cmdlist = cmdlist;
 
-	s = cmd_list_print(bd->cmdlist, 0);
-	log_debug("%s: %#llx %s = %s", __func__, bd->key,
-	    key_string_lookup_key(bd->key, 1), s);
-	free(s);
+	/* masil: printing a large list is costly; skip it when not logging. */
+	if (log_get_level() != 0) {
+		s = cmd_list_print(bd->cmdlist, 0);
+		log_debug("%s: %#llx %s = %s", __func__, bd->key,
+		    key_string_lookup_key(bd->key, 1), s);
+		free(s);
+	}
 }
 
 void

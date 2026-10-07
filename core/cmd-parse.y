@@ -738,6 +738,9 @@ cmd_parse_log_commands(struct cmd_parse_commands *cmds, const char *prefix)
 	u_int				 i, j;
 	char				*s;
 
+	/* masil: printing a large list is costly; skip it when not logging. */
+	if (log_get_level() == 0)
+		return;
 	i = 0;
 	TAILQ_FOREACH(cmd, cmds, entry) {
 		j = 0;
@@ -929,9 +932,12 @@ cmd_parse_build_commands(struct cmd_parse_commands *cmds,
 		cmd_list_free(current);
 	}
 
-	s = cmd_list_print(result, 0);
-	log_debug("%s: %s", __func__, s);
-	free(s);
+	/* masil: printing a large list is costly; skip it when not logging. */
+	if (log_get_level() != 0) {
+		s = cmd_list_print(result, 0);
+		log_debug("%s: %s", __func__, s);
+		free(s);
+	}
 
 	pr->status = CMD_PARSE_SUCCESS;
 	pr->cmdlist = result;
