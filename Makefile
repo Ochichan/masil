@@ -11,30 +11,14 @@ agent:
 baseline:
 	python3 scripts/build.py --baseline
 
+# Every tests/test_*.py runs, so a new suite is never left out. A failure
+# does not stop the rest; the failed suites are listed at the end.
 test: core baseline agent benchmark-env
-	python3 tests/test_compatibility.py
-	python3 tests/test_bridge.py
-	python3 tests/test_watch.py
-	python3 tests/test_watch_cli.py
-	python3 tests/test_agentd.py
-	python3 tests/test_attention.py
-	python3 tests/test_agent_stream_cli.py
-	python3 tests/test_native_identity.py
-	python3 tests/test_managed_agents.py
-	python3 tests/test_managed_restore.py
-	python3 tests/test_managed_integration.py
-	python3 tests/test_agent_endpoints.py
-	.build/bench-venv/bin/python tests/test_agent_fleet.py
-	python3 tests/test_managed_view.py
-	python3 tests/test_float_groups.py
-	@if [ "$$(uname -s)" = Darwin ]; then python3 tests/test_respawn_failure.py; fi
-	.build/bench-venv/bin/python tests/test_benchmark_harness.py
-	.build/bench-venv/bin/python tests/test_ui.py
-	.build/bench-venv/bin/python tests/test_mouse_ui.py
-	.build/bench-venv/bin/python tests/test_agent_titles.py
-	.build/bench-venv/bin/python tests/test_terminal_colors.py
-	.build/bench-venv/bin/python tests/test_managed_ui.py
-	.build/bench-venv/bin/python tests/test_managed_stress.py
+	@failed=; for suite in tests/test_*.py; do \
+		echo "== $$suite"; \
+		.build/bench-venv/bin/python "$$suite" || failed="$$failed $$suite"; \
+	done; \
+	if [ -n "$$failed" ]; then echo "failed:$$failed"; exit 1; fi
 	cargo test --locked --manifest-path agent/Cargo.toml
 
 benchmark-env:
