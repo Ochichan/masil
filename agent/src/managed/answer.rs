@@ -580,6 +580,19 @@ pub(super) fn requested(agent: &Agent) -> bool {
             == Some(CHANNEL)
 }
 
+/// Whether an inventory row is a pane of an `--answers` run, read from the
+/// row's own registration and run evidence. A watch that serves only these
+/// runs picks their panes with it before it captures anything.
+pub(super) fn requested_in(fields: &[String]) -> bool {
+    let Some(metadata) = super::valid_metadata(fields) else {
+        return false;
+    };
+    metadata.provider == PROVIDER
+        && super::decode::<super::RunEvidence>(&fields[16]).is_some_and(|evidence| {
+            evidence.run == metadata.run && evidence.answer_channel.as_deref() == Some(CHANNEL)
+        })
+}
+
 impl Manager {
     /// The run's OpenCode server and bound session, for ending its turn
     /// (`POST /session/ID/abort`). None when the run has no answer channel
@@ -1246,6 +1259,49 @@ mod tests {
 
     fn args(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn only_a_registered_opencode_run_with_the_channel_is_an_answers_pane() {
+        use super::super::{Metadata, RunEvidence, encode};
+        let boot = "00000000-0000-0000-0000-000000000000";
+        let row = |provider: &str, run: &str, channel: Option<&str>, evidence_run: &str| {
+            let mut row = vec![String::new(); 19];
+            row[0] = "%3".into();
+            row[5] = boot.into();
+            row[6] = "1".into();
+            row[13] = "7".into();
+            row[11] = encode(&Metadata {
+                name: "oc".into(),
+                provider: provider.into(),
+                boot: boot.into(),
+                generation: "1".into(),
+                run: run.into(),
+                foreground_group: 7,
+                ..Metadata::default()
+            })
+            .unwrap();
+            row[16] = encode(&RunEvidence {
+                run: evidence_run.into(),
+                answer_channel: channel.map(str::to_owned),
+                ..RunEvidence::default()
+            })
+            .unwrap();
+            row
+        };
+        assert!(requested_in(&row("opencode", "r1", Some(CHANNEL), "r1")));
+        // No channel asked, or evidence of another run.
+        assert!(!requested_in(&row("opencode", "r1", None, "r1")));
+        assert!(!requested_in(&row("opencode", "r1", Some(CHANNEL), "r0")));
+        // The channel is OpenCode's alone.
+        assert!(!requested_in(&row("codex", "r1", Some(CHANNEL), "r1")));
+        // No registration, or no evidence at all.
+        let mut bare = row("opencode", "r1", Some(CHANNEL), "r1");
+        bare[11].clear();
+        assert!(!requested_in(&bare));
+        let mut plain = row("opencode", "r1", Some(CHANNEL), "r1");
+        plain[16].clear();
+        assert!(!requested_in(&plain));
     }
 
     #[test]

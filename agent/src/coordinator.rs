@@ -1552,6 +1552,21 @@ async fn supervise(
             .features()
             .iter()
             .any(|feature| feature == "inbox" || feature == "answers");
+        // Without the inbox, only the panes of `--answers` runs need the
+        // watch. Set before a watch starts, so its first pass already knows.
+        let answers_only = {
+            let features = shared.features();
+            features.iter().any(|feature| feature == "answers")
+                && !features.iter().any(|feature| feature == "inbox")
+        };
+        if shared
+            .control
+            .answers_only
+            .swap(answers_only, Ordering::SeqCst)
+            != answers_only
+        {
+            shared.control.wake.notify_one();
+        }
         let stopped = match shared.watch.lock() {
             Ok(mut watcher) => {
                 if wanted
@@ -2109,11 +2124,16 @@ fn query_request(body: &[u8]) -> Option<(Value, Value)> {
 /// caller to its local path. A changed override file also starts the
 /// coordinator's normal reload.
 async fn query_reply(shared: &Shared, id: Value, params: &Value) -> Value {
-    let watch_running = shared
+    // A snapshot assumes the watch writes every pane's tracked state. While
+    // it covers only `--answers` panes it does not, so the query is refused
+    // and the caller's local path writes what it needs.
+    let alive = shared
         .watch
         .lock()
         .map(|watch| watch.as_ref().is_some_and(|task| !task.is_finished()))
         .unwrap_or(false);
+    let answers_only = shared.control.answers_only.load(Ordering::SeqCst);
+    let watch_running = alive && !answers_only;
     match shared
         .query
         .serve(&shared.actions, watch_running, params)
@@ -2124,11 +2144,19 @@ async fn query_reply(shared: &Shared, id: Value, params: &Value) -> Value {
             if refusal.reload {
                 shared.reload.notify_one();
             }
+            // A live watch counted as not running is refused first, so that
+            // is the reason unless the coordinator was busy. A dead watch
+            // keeps the ordinary message.
+            let message = if alive && answers_only && refusal.code == "query_refused" {
+                "the screen watch covers only --answers panes".to_owned()
+            } else {
+                refusal.message
+            };
             json!({
                 "v": 1,
                 "id": id,
                 "ok": false,
-                "error": {"code": refusal.code, "message": refusal.message},
+                "error": {"code": refusal.code, "message": message},
             })
         }
     }
@@ -2603,5 +2631,40 @@ mod tests {
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["error"]["code"], "query_refused");
         assert_eq!(shared.query.status()["refused"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_query_is_refused_while_the_watch_covers_only_answers_panes() {
+        let shared = shared();
+        let params = json!({"kind": "list", "state_dir": "/tmp", "config_fingerprint": "f",
+                            "exe_identity": {}});
+        shared.control.answers_only.store(true, Ordering::SeqCst);
+        // A watch that is not running keeps the ordinary refusal.
+        let reply = query_reply(&shared, json!("cli"), &params).await;
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"]["message"], "the screen watch is not running");
+        // A live watch on `--answers` panes alone has its own.
+        *shared.watch.lock().unwrap() = Some(tokio::spawn(std::future::pending::<()>()));
+        let reply = query_reply(&shared, json!("cli"), &params).await;
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"]["code"], "query_refused");
+        assert_eq!(
+            reply["error"]["message"],
+            "the screen watch covers only --answers panes"
+        );
+        assert_eq!(shared.query.status()["refused"], 2);
+        assert_eq!(shared.query.status()["served"], 0);
+        // With the inbox features back, the live watch is not the reason.
+        shared.control.answers_only.store(false, Ordering::SeqCst);
+        let reply = query_reply(&shared, json!("cli"), &params).await;
+        assert_eq!(reply["ok"], false);
+        assert_ne!(
+            reply["error"]["message"],
+            "the screen watch covers only --answers panes"
+        );
+        assert_ne!(reply["error"]["message"], "the screen watch is not running");
+        if let Some(watch) = shared.watch.lock().unwrap().take() {
+            watch.abort();
+        }
     }
 }

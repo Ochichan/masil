@@ -1167,7 +1167,7 @@ impl Manager {
         ),
         String,
     > {
-        let (inventory, inventory_text) = self.inventory_text().await?;
+        let (mut inventory, inventory_text) = self.inventory_text().await?;
         validate_inventory(&inventory)?;
         if let Some(queries) = &self.queries {
             *queries
@@ -1176,6 +1176,16 @@ impl Manager {
                 .map_err(|_| "detection cache unavailable")? = Some(inventory_text);
         }
         let core_boot_id = inventory.first().map(|fields| fields[5].clone());
+        // A coordinator that serves only `--answers` runs (the inbox is off)
+        // leaves every other pane alone: not captured, not judged, no tracked
+        // write, and not in the bridge scope below.
+        if self
+            .resident
+            .as_ref()
+            .is_some_and(resident::Resident::answers_only)
+        {
+            inventory.retain(|fields| answer::requested_in(fields));
+        }
         let mut bridge_scope: HashSet<String> = inventory
             .iter()
             .filter(|fields| !fields[11].is_empty() || !fields[12].is_empty())

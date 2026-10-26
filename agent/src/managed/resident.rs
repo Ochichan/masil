@@ -93,6 +93,9 @@ pub(crate) struct Resident {
     /// An inbox write needs the coordinator's badge, extension, and route
     /// follow-up even when it happened outside the current screen pass.
     inbox_dirty: AtomicBool,
+    /// The coordinator has no inbox and serves only `--answers` runs: a pass
+    /// collects, judges, and records the panes of those runs alone.
+    answers_only: AtomicBool,
     stood_back: AtomicUsize,
     /// The pane and time of the last stand-back, for `status`.
     last_stood_back: Mutex<Option<(String, u64)>>,
@@ -108,6 +111,7 @@ impl Resident {
             panes: Mutex::new(HashMap::new()),
             store: Arc::new(Mutex::new(None)),
             inbox_dirty: AtomicBool::new(false),
+            answers_only: AtomicBool::new(false),
             stood_back: AtomicUsize::new(0),
             last_stood_back: Mutex::new(None),
             action_locks,
@@ -183,6 +187,14 @@ impl Resident {
     fn take_inbox_dirty(&self) -> bool {
         self.inbox_dirty.swap(false, Ordering::SeqCst)
     }
+
+    fn set_answers_only(&self, on: bool) {
+        self.answers_only.store(on, Ordering::SeqCst);
+    }
+
+    pub(super) fn answers_only(&self) -> bool {
+        self.answers_only.load(Ordering::SeqCst)
+    }
 }
 
 /// `(allowed, newly stood back)` for one pane.
@@ -241,6 +253,9 @@ pub(crate) struct WatchControl {
     pub recount: AtomicBool,
     /// The coordinator is ending: finish the current pass and return.
     pub stopping: AtomicBool,
+    /// The inbox is off and an `--answers` run keeps the watch: the watch
+    /// covers the panes of `--answers` runs only. Set by the supervisor.
+    pub answers_only: AtomicBool,
     /// `agent notify test` waits here for the routes' results.
     pub test: Mutex<Option<tokio::sync::oneshot::Sender<serde_json::Value>>>,
     pub report: Mutex<WatchReport>,
@@ -949,6 +964,7 @@ pub(crate) async fn watch(
     let mut busy = false;
     let mut absent: HashMap<String, u64> = HashMap::new();
     let mut stood_back = 0;
+    let mut last_answers_only = false;
     let mut badge = Badge::read(&manager, control.actions.clone()).await;
     let mut first = true;
     // `--answers` OpenCode runs: their tasks read the servers, this loop
@@ -1091,6 +1107,15 @@ pub(crate) async fn watch(
         }
         if let Some(observer) = observer {
             reports.flush(&manager, observer).await;
+        }
+        let answers_only = control.answers_only.load(Ordering::SeqCst);
+        if let Some(resident) = &manager.resident {
+            resident.set_answers_only(answers_only);
+        }
+        if answers_only != last_answers_only {
+            // The set of panes to watch changed: look at all of them again.
+            last_answers_only = answers_only;
+            force_pass = true;
         }
         let poked = control.poked.swap(false, Ordering::SeqCst);
         let (inbox_changed, recounted) = take_inbox_changes(&control, manager.resident.as_ref());
@@ -1451,6 +1476,15 @@ pub(crate) async fn watch(
                 Ok(ended) => {
                     if let Ok(mut report) = control.report.lock() {
                         report.ended_runs += ended as u64;
+                    }
+                    // The sweep resolved events outside a screen pass, so the
+                    // badge is recounted in the next iteration, not at the
+                    // periodic reread. `ended` is nonzero only after the
+                    // resident store ran the work, so the resident exists.
+                    if ended > 0
+                        && let Some(resident) = &manager.resident
+                    {
+                        resident.mark_inbox_dirty();
                     }
                 }
                 Err(error) => {
