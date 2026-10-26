@@ -7,7 +7,8 @@
 //! native-path servers.
 use super::operations::{self, Admission, NewOperation, Record, Store, Ticket};
 use super::{
-    ActionPath, Agent, Guarded, Manager, and, decode, encode, failure::AfterEffect, nonce,
+    ActionContext, ActionPath, Agent, Guarded, Manager, and, decode, encode, failure::AfterEffect,
+    nonce,
 };
 use crate::observation::now_ms;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,29 @@ const FENCE: &str = "@masil-agent-prompt-fence";
 /// This is deliberately not valid hex.  The pre-C2 decoder rejects it before
 /// it can treat a stale pane ledger as authoritative.
 const CORE_LEDGER_SENTINEL: &str = "core-ledger-c2";
+
+/// The two option writes that mark a pane's prompt ledger as the core's, as
+/// the tail of a native command: a standalone `;` separates every command.
+/// The coordinator runs them in the command that lists the panes, before it
+/// admits a prompt.
+pub(super) fn sentinel_tail(pane: &str) -> [&str; 14] {
+    [
+        ";",
+        "set-option",
+        "-p",
+        "-t",
+        pane,
+        OPTION,
+        CORE_LEDGER_SENTINEL,
+        ";",
+        "set-option",
+        "-p",
+        "-t",
+        pane,
+        TICKETS,
+        CORE_LEDGER_SENTINEL,
+    ]
+}
 const MAX_RETAINED: usize = 16;
 /// How long after delivery a provider's report can still accept a prompt.
 const ACCEPT_WINDOW_MS: u64 = 120_000;
@@ -511,9 +535,10 @@ impl Manager {
                 agent.provider
             ));
         }
-        if self.action_path().await? == ActionPath::CoreLedger {
+        let context = self.action_context().await?;
+        if context.path == ActionPath::CoreLedger {
             return self
-                .deliver_core(agent, text, operation, queued, checkpoint)
+                .deliver_core(agent, text, operation, queued, checkpoint, &context)
                 .await;
         }
         let _lock = self.lock()?;
@@ -810,6 +835,7 @@ impl Manager {
         operation: Option<u64>,
         queued: Option<(i64, i64)>,
         checkpoint: bool,
+        context: &ActionContext,
     ) -> Result<Value, String> {
         let digest = sha256(text);
         // A killed coordinator leaves a dispatching SQLite record until its
@@ -818,8 +844,11 @@ impl Manager {
         // prompt-unresolved refusal.
         let mut ensured_dispatching = false;
         // Opened once: each query reads a fresh snapshot, so the connection
-        // sees what the coordinator reconciles inside the loop.
-        let mut store = self.operation_store().await?;
+        // sees what the coordinator reconciles inside the loop. The server's
+        // record of the store came with the action context.
+        let mut store = self
+            .operation_store_recorded(&context.recorded_store)
+            .await?;
         loop {
             let has_core_dispatching = store.list(true, 4096)?.iter().any(|record| {
                 record.action == "prompt"
@@ -914,8 +943,8 @@ impl Manager {
                 "multiline prompt requires native bracketed paste; prepare a draft instead".into(),
             );
         }
-        self.core_prompt_sentinel(&current).await?;
         let socket = self.native.socket.clone();
+        let server = context.server()?;
         let params = json!({
             "operation": "prompt",
             "pane_id": current.pane_id,
@@ -927,9 +956,11 @@ impl Manager {
             "submit": "enter",
             "checkpoint": checkpoint,
         });
-        tokio::task::spawn_blocking(move || crate::coordinator::action(&socket, params))
-            .await
-            .map_err(|error| format!("coordinator_unavailable: {error}"))?
+        tokio::task::spawn_blocking(move || {
+            crate::coordinator::action_known(&socket, params, server)
+        })
+        .await
+        .map_err(|error| format!("coordinator_unavailable: {error}"))?
     }
 
     async fn ensure_core_coordinator(&self) -> Result<(), String> {
@@ -938,27 +969,6 @@ impl Manager {
             .await
             .map_err(|error| format!("coordinator_unavailable: {error}"))?
             .map(drop)
-    }
-
-    async fn core_prompt_sentinel(&self, agent: &Agent) -> Result<(), String> {
-        // One native command: a standalone ";" separates the two set-options.
-        self.command(&[
-            "set-option",
-            "-p",
-            "-t",
-            &agent.pane_id,
-            OPTION,
-            CORE_LEDGER_SENTINEL,
-            ";",
-            "set-option",
-            "-p",
-            "-t",
-            &agent.pane_id,
-            TICKETS,
-            CORE_LEDGER_SENTINEL,
-        ])
-        .await
-        .map(|_| ())
     }
 
     /// Judge one attempt from the pane. If its ticket is absent, a fence

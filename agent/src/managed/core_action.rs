@@ -2774,7 +2774,7 @@ impl CoordinatorActions {
         retry: Retry,
     ) -> Result<Value, String> {
         validate_keys(keys)?;
-        let current = manager.get_readonly(pane).await?;
+        let current = manager.get_identity(pane).await?;
         expected.matches(&current, matches!(retry, Retry::Never))?;
         let first = self
             .send_keys(core, &current, keys, KeyDispatch::ephemeral(&current, true))
@@ -2783,7 +2783,7 @@ impl CoordinatorActions {
             Ok(LedgerResult::RejectedBeforeEffect { reason, .. })
                 if reason == "tracked_changed" && matches!(retry, Retry::SameRun) =>
             {
-                let fresh = manager.get_readonly(pane).await?;
+                let fresh = manager.get_identity(pane).await?;
                 expected.matches(&fresh, false)?;
                 self.send_keys(core, &fresh, keys, KeyDispatch::ephemeral(&fresh, true))
                     .await
@@ -2901,7 +2901,7 @@ impl CoordinatorActions {
         core: &mut Client,
         action: InterruptAction<'_>,
     ) -> Result<Value, String> {
-        let current = manager.get_readonly(action.pane).await?;
+        let current = manager.get_identity(action.pane).await?;
         // The caller owns screen judgment. The coordinator only verifies the
         // run identity before it commits the durable intent. In particular,
         // a resident TRACKED write is not a reason to discard a caller's
@@ -2934,7 +2934,7 @@ impl CoordinatorActions {
         expected: &Expected,
         operation: Option<&str>,
     ) -> Result<Value, String> {
-        let current = manager.get_readonly(pane).await?;
+        let current = manager.get_identity(pane).await?;
         // Like the native close, a TRACKED rewrite within the same run does
         // not stop a close.
         expected.matches(&current, false)?;
@@ -2957,13 +2957,18 @@ impl CoordinatorActions {
         if !core.supports_input() {
             return Err("bridge_unavailable: the core does not support staged input".into());
         }
-        let current = manager.get_readonly(pane).await?;
+        // The same native command that lists the panes writes the markers
+        // that make a pre-core masil-agent refuse this pane's option ledger,
+        // and prints the store instance the server records.
+        let (current, recorded) = manager
+            .get_identity_recording(pane, &super::prompt::sentinel_tail(pane))
+            .await?;
         // The caller supplied its freshly read idle screen snapshot. The
         // coordinator confirms identity before durable admission, then gives
         // those exact guards to core for the commit boundary.
         expected.matches(&current, false)?;
 
-        let mut store = manager.operation_store().await?;
+        let mut store = manager.operation_store_recorded(&recorded).await?;
         let next = store.prompt_next(&current.run)?;
         let slot = operation.unwrap_or(next);
         if slot == 0 || slot > next {
@@ -4049,7 +4054,7 @@ impl CoordinatorActions {
         }
         let ticket = ticket.expect("durable dispatch ticket");
         let key = key.expect("durable operation key");
-        let fresh = match manager.get_readonly(&agent.pane_id).await {
+        let fresh = match manager.get_identity(&agent.pane_id).await {
             Ok(fresh) => fresh,
             Err(error) => {
                 let evidence = json!({"path": "core_ledger", "error": error});
@@ -4087,7 +4092,7 @@ impl CoordinatorActions {
                 // coordinator can reconcile the recorded first ticket before
                 // another key is dispatched.
                 tokio::time::sleep(INTERRUPT_INTER_KEY_PAUSE).await;
-                let fresh = match manager.get_readonly(&initial.pane_id).await {
+                let fresh = match manager.get_identity(&initial.pane_id).await {
                     Ok(fresh) => fresh,
                     Err(error) => {
                         let evidence = json!({"path": "core_ledger", "error": error});
@@ -4312,7 +4317,7 @@ impl CoordinatorActions {
         }
         let ticket = ticket.expect("durable dispatch ticket");
         let key = key.expect("durable operation key");
-        let agent = match manager.get_readonly(&agent.pane_id).await {
+        let agent = match manager.get_identity(&agent.pane_id).await {
             Ok(fresh) if same_core_run(&agent, &fresh) => fresh,
             Ok(_) => {
                 let evidence = json!({"path": "core_ledger", "reason": "target_changed"});

@@ -201,11 +201,17 @@ pub(crate) async fn action_path_of(native: &native_ui::Context) -> Result<Action
         .split_once('\t')
         .ok_or("invalid native core action capability")?;
     let boot = valid_boot(boot)?.to_owned();
+    action_path_for(&boot, advertised)
+}
+
+/// The path chosen for `boot`, from the cache or from what the core
+/// advertised.
+fn action_path_for(boot: &str, advertised: &str) -> Result<ActionPath, String> {
     let cache = ACTION_PATHS.get_or_init(|| Mutex::new(ActionPathCache::default()));
     if let Some(path) = cache
         .lock()
         .map_err(|_| "core action path cache unavailable")?
-        .get(&boot)
+        .get(boot)
     {
         return Ok(path);
     }
@@ -215,7 +221,83 @@ pub(crate) async fn action_path_of(native: &native_ui::Context) -> Result<Action
     cache
         .lock()
         .map_err(|_| "core action path cache unavailable")?
-        .path(&boot, advertised)
+        .path(boot, advertised)
+}
+
+/// What one native command tells a core-path action: the action path, and
+/// what the operation store and the coordinator call would each read again
+/// with a command of their own. It is read for every action and never kept;
+/// the environment in particular is only resolved on the core path
+/// (`server`), so a server without an absolute HOME still runs native-path
+/// commands.
+pub(crate) struct ActionContext {
+    pub(crate) path: ActionPath,
+    boot: String,
+    pid: String,
+    /// The operation store instance the server records; empty before one
+    /// was recorded.
+    pub(crate) recorded_store: String,
+    /// The text of `show-environment -g`.
+    environment: String,
+}
+
+impl ActionContext {
+    /// The server's identity and state directory, for `coordinator::action_known`.
+    pub(crate) fn server(&self) -> Result<crate::coordinator::ServerInfo, String> {
+        crate::coordinator::server_info_from(&self.pid, &self.boot, &self.environment)
+    }
+}
+
+/// The action path, the server pid, the recorded operation store instance
+/// and the server's global environment, in one native command.
+pub(crate) async fn action_context_of(
+    native: &native_ui::Context,
+) -> Result<ActionContext, String> {
+    let format =
+        format!("#{{masil_core_boot_id}}\t#{{masil_core_actions}}\t#{{pid}}\t#{{{STORE_OPTION}}}");
+    let output = native
+        .tmux(
+            [
+                "display-message",
+                "-p",
+                format.as_str(),
+                ";",
+                "show-environment",
+                "-g",
+            ]
+            .map(OsString::from),
+            None,
+        )
+        .await
+        .map_err(server_unreachable)?;
+    parse_action_context(&output.stdout)
+}
+
+/// The context from the command's output. The first line is decoded
+/// strictly. The environment is read lossily, so a global variable that is
+/// not UTF-8 cannot fail a native-path command that never looks at it; on
+/// the core path only the HOME and XDG_STATE_HOME lines matter.
+fn parse_action_context(output: &[u8]) -> Result<ActionContext, String> {
+    let (first, environment) = match output.iter().position(|byte| *byte == b'\n') {
+        Some(end) => (&output[..end], &output[end + 1..]),
+        None => (output, &[][..]),
+    };
+    let first = std::str::from_utf8(first).map_err(|_| "native response is not UTF-8")?;
+    let environment = String::from_utf8_lossy(environment);
+    let mut fields = first.splitn(4, '\t');
+    let (Some(boot), Some(advertised), Some(pid), Some(recorded)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err("invalid native core action capability".into());
+    };
+    let boot = valid_boot(boot)?.to_owned();
+    Ok(ActionContext {
+        path: action_path_for(&boot, advertised)?,
+        boot,
+        pid: pid.to_owned(),
+        recorded_store: recorded.to_owned(),
+        environment: environment.into_owned(),
+    })
 }
 
 pub(super) fn server_unreachable(error: String) -> String {
@@ -1096,26 +1178,94 @@ impl Manager {
             .map(|(agents, _, _, _)| agents)
     }
 
-    /// An action coordinator needs a fresh view to validate an effect, but
-    /// it must not replace TRACKED with a judgment made from its own
-    /// manifests. The caller that selected the effect owns that write.
-    pub(crate) async fn get_readonly(&self, target: &str) -> Result<Agent, String> {
+    /// The agent as the action coordinator checks it before an effect, from
+    /// the pane listing and the foreground judgment alone: no screen is
+    /// captured, nothing is written. It has what `Expected::matches` and
+    /// `preconditions` read (boot, generation, run, process, process epoch,
+    /// registration and tracked text, foreground group) and what the effects
+    /// name it by (provider, name, cwd, run evidence). `state`, `evidence`,
+    /// `binding` and `capabilities` are placeholders for the screen's
+    /// judgment, which the caller owns and no coordinator action reads.
+    pub(crate) async fn get_identity(&self, target: &str) -> Result<Agent, String> {
+        self.identity_read(target, &[], false)
+            .await
+            .map(|(agent, _)| agent)
+    }
+
+    /// `get_identity` for a prompt. The same native command also runs the
+    /// commands in `after` (a flat list, each led by `;`) and prints the
+    /// operation store instance the server records, which comes back for
+    /// `operation_store_recorded`.
+    pub(crate) async fn get_identity_recording(
+        &self,
+        target: &str,
+        after: &[&str],
+    ) -> Result<(Agent, String), String> {
+        self.identity_read(target, after, true).await
+    }
+
+    async fn identity_read(
+        &self,
+        target: &str,
+        after: &[&str],
+        with_store: bool,
+    ) -> Result<(Agent, String), String> {
         if target.starts_with('%') {
             crate::pane_id(target).map_err(|error| format!("unknown_target_syntax: {error}"))?;
         }
-        let mut matches = self
-            .collect_with_bridge_scope(Some(target), true)
-            .await?
-            .0
-            .into_iter()
-            .filter(|agent| agent.pane_id == target || agent.name == target);
+        let store_format = format!("#{{{STORE_OPTION}}}");
+        let mut command = vec!["list-panes", "-a", "-F", FORMAT];
+        command.extend_from_slice(after);
+        if with_store {
+            command.extend([";", "display-message", "-p", store_format.as_str()]);
+        }
+        let output = self.command(&command).await.map_err(|error| {
+            // The commands after the listing name the pane, which can be
+            // gone by now.
+            if !after.is_empty() && error.contains("can't find pane") {
+                "target_absent: agent target not found".to_owned()
+            } else {
+                error
+            }
+        })?;
+        let (listing, recorded) = if with_store {
+            split_store_line(&output)?
+        } else {
+            (output.as_str(), "")
+        };
+        let inventory = records(listing)?;
+        if inventory.len() > MAX_PANES {
+            return Err("agent management supports at most 64 panes per server".into());
+        }
+        validate_inventory(&inventory)?;
+        let identified = identify_foregrounds(&inventory).await;
+        let mut seen_panes = HashSet::new();
+        let mut matches = Vec::new();
+        for fields in &inventory {
+            // A linked window can occur in more than one session.
+            if !seen_panes.insert(fields[0].clone()) {
+                continue;
+            }
+            let identified = identified.get(&fields[0]).copied();
+            if !selects_pane(target, fields, identified) {
+                continue;
+            }
+            let Some((provider, metadata)) = resolve_pane(fields, identified) else {
+                continue;
+            };
+            let agent = identity_agent(fields, provider, metadata, identified)?;
+            if agent.pane_id == target || agent.name == target {
+                matches.push(agent);
+            }
+        }
+        let mut matches = matches.into_iter();
         let agent = matches
             .next()
             .ok_or("target_absent: agent target not found")?;
         if matches.next().is_some() {
             return Err("unknown_target_syntax: ambiguous agent name; use a pane ID".into());
         }
-        Ok(agent)
+        Ok((agent, recorded.to_owned()))
     }
 
     /// Every agent as a read-only pass sees it (nothing is written), with
@@ -1955,6 +2105,12 @@ impl Manager {
         let mut store = store;
         self.maintain(&mut store).await?;
         Ok(store)
+    }
+
+    /// The action path and what a core-path action reads with it, in one
+    /// native command.
+    pub(crate) async fn action_context(&self) -> Result<ActionContext, String> {
+        action_context_of(&self.native).await
     }
 
     /// The session a resume would reopen. A conflicting binding is refused:
@@ -4058,6 +4214,112 @@ const EPOCH: &str = "@masil-agent-epoch";
 /// Runs remembered per pane: jobs a person switches between (Ctrl-Z, `fg`).
 const EPOCH_RECORDS: usize = 4;
 
+/// Splits the output of a pane listing followed by `display-message -p` of
+/// the store option: the last line is the recorded instance (empty when the
+/// server has none), the rest is the listing. A listing row has tabs and a
+/// recorded instance does not, so output that lost its last line fails
+/// instead of passing a row off as the instance.
+fn split_store_line(output: &str) -> Result<(&str, &str), String> {
+    let body = output
+        .strip_suffix('\n')
+        .ok_or("truncated native inventory")?;
+    let (listing, recorded) = match body.rfind('\n') {
+        Some(end) => body.split_at(end + 1),
+        None => ("", body),
+    };
+    if recorded.contains('\t') {
+        return Err("truncated native inventory".into());
+    }
+    Ok((listing, recorded))
+}
+
+/// An agent from its inventory row alone, as `get_identity` returns it. The
+/// run, process and process epoch are judged as `collect_once` judges them;
+/// what only the screen could tell is a placeholder.
+fn identity_agent(
+    fields: &[String],
+    provider: &'static providers::Provider,
+    metadata: Option<Metadata>,
+    identified: Option<&'static providers::Provider>,
+) -> Result<Agent, String> {
+    let dead = fields[4] == "1";
+    let foreground = identified.is_some_and(|p| p.id == provider.id);
+    let foreground_group = fields[13].parse::<i32>().unwrap_or(0);
+    let process_epoch = (foreground_group > 1)
+        .then(|| crate::process::info(foreground_group))
+        .flatten()
+        .map(|info| format!("{foreground_group}:{}", info.started));
+    // The recorded epoch is part of the run of an agent masil did not start.
+    let (synthetic, _) = unmanaged_run(
+        &format!(
+            "{}-{}-{}-{foreground_group}",
+            fields[5], fields[0], fields[6]
+        ),
+        process_epoch.as_deref(),
+        &fields[17],
+    );
+    let run = metadata
+        .as_ref()
+        .map(|m| m.run.clone())
+        .unwrap_or(synthetic);
+    let process = if dead {
+        "exited"
+    } else if foreground {
+        "running"
+    } else {
+        "unknown"
+    };
+    let state = if dead { "exited" } else { "unknown" };
+    let run_evidence = metadata
+        .as_ref()
+        .and_then(|m| decode::<RunEvidence>(&fields[16]).filter(|e| e.run == m.run));
+    let output_generation = fields[14]
+        .parse::<u64>()
+        .map_err(|_| "invalid output generation")?;
+    let tracked = decode::<Tracked>(&fields[12]).unwrap_or_default();
+    let name = derived_name(&fields[0], provider, metadata.as_ref());
+    Ok(Agent {
+        id: name.clone(),
+        name,
+        provider: provider.id.into(),
+        pane_id: fields[0].clone(),
+        window_id: fields[1].clone(),
+        workspace: fields[2].clone(),
+        cwd: fields[8].clone(),
+        boot: fields[5].clone(),
+        generation: fields[6].clone(),
+        run,
+        process: process.into(),
+        state: state.into(),
+        session_id: metadata.as_ref().and_then(|m| m.session.clone()),
+        evidence: Arc::new(Evidence::from_value(
+            json!({"state": state, "source": "identity"}),
+        )),
+        seen: tracked.seen,
+        revision: tracked.revision.to_string(),
+        returned_idle: tracked.returned_idle,
+        endpoint_id: String::new(),
+        endpoint_label: String::new(),
+        endpoint_key: String::new(),
+        stale: false,
+        binding: BindingView::default(),
+        capabilities: CapabilityView::default(),
+        metadata,
+        run_evidence,
+        encoded: fields[11].clone(),
+        foreground_command: fields[7].clone(),
+        tracked,
+        tracked_encoded: fields[12].clone(),
+        process_epoch,
+        foreground_group,
+        output_generation,
+        permission_count: 0,
+        question_count: 0,
+        title: fields[9].clone(),
+        progress: fields[15].clone(),
+    })
+}
+
 /// The run of an agent masil did not start, and the `EPOCH` value to write
 /// when it differs. The name is `base` (`{boot}-{pane}-{generation}-{group}`,
 /// as earlier binaries name it, so the two agree). Only when the recorded
@@ -5533,5 +5795,133 @@ mod tests {
             serde_json::to_value(&cache["%1"].1).unwrap()["explanations"][0]["detail"],
             "Generating"
         );
+    }
+
+    #[test]
+    fn the_action_context_reads_path_pid_store_and_environment_from_one_output() {
+        let boot = "0c1d2e3f-0000-4000-8000-0000000000a1";
+        let text = format!("{boot}\t1\t4242\t77\nHOME=/home/test\nXDG_STATE_HOME=/var/state\n");
+        let context = parse_action_context(text.as_bytes()).unwrap();
+        assert_eq!(context.path, ActionPath::CoreLedger);
+        assert_eq!(context.recorded_store, "77");
+        let server = context.server().unwrap();
+        assert_eq!((server.pid, server.boot.as_str()), (4242, boot));
+        assert_eq!(server.state, std::path::Path::new("/var/state"));
+    }
+
+    #[test]
+    fn a_native_path_server_without_an_absolute_home_still_has_a_context() {
+        // The environment is only resolved when a core-path caller asks.
+        let boot = "0c1d2e3f-0000-4000-8000-0000000000a2";
+        let text = format!("{boot}\t0\t4242\t\nHOME=relative\nTERM=xterm\n");
+        let context = parse_action_context(text.as_bytes()).unwrap();
+        assert_eq!(context.path, ActionPath::NativeGuard);
+        assert_eq!(context.recorded_store, "");
+        assert!(context.server().is_err());
+        // A core without the format prints nothing for the capability.
+        let boot = "0c1d2e3f-0000-4000-8000-0000000000a3";
+        let context = parse_action_context(format!("{boot}\t\t4242\t\n").as_bytes()).unwrap();
+        assert_eq!(context.path, ActionPath::NativeGuard);
+    }
+
+    #[test]
+    fn a_malformed_action_context_is_refused() {
+        let boot = "0c1d2e3f-0000-4000-8000-0000000000a4";
+        assert!(parse_action_context(format!("{boot}\t1\t4242\n").as_bytes()).is_err());
+        assert!(parse_action_context(b"").is_err());
+        assert!(parse_action_context(b"not-a-boot\t1\t4242\t\n").is_err());
+    }
+
+    #[test]
+    fn a_non_utf8_global_environment_does_not_fail_a_native_path_context() {
+        let boot = "0c1d2e3f-0000-4000-8000-0000000000a5";
+        let mut output = format!("{boot}\t0\t4242\t\nTERM=xterm\n").into_bytes();
+        output.extend_from_slice(b"LEGACY=caf\xe9\nHOME=/home/test\n");
+        let context = parse_action_context(&output).unwrap();
+        assert_eq!(context.path, ActionPath::NativeGuard);
+        // The core path still reads its state directory from the same text.
+        assert_eq!(
+            context.server().unwrap().state,
+            std::path::Path::new("/home/test/.local/state")
+        );
+        // The first line is not lossy: a boot that is not UTF-8 is refused.
+        let mut first = b"\xff".to_vec();
+        first.extend_from_slice(b"\t0\t4242\t\n");
+        assert!(parse_action_context(&first).is_err());
+    }
+
+    #[test]
+    fn the_store_line_is_split_off_the_listing() {
+        let row = "%3\t@1\tmain\t10\t0\tboot\t2\tcodex\t/tmp\t\t\t\t\t0\t5\t\t\t\t0\n";
+        // With a recorded instance.
+        let output = format!("{row}{row}77\n");
+        let (listing, recorded) = split_store_line(&output).unwrap();
+        assert_eq!((listing, recorded), (format!("{row}{row}").as_str(), "77"));
+        assert_eq!(records(listing).unwrap().len(), 2);
+        // An unset option prints an empty line.
+        let output = format!("{row}\n");
+        assert_eq!(split_store_line(&output).unwrap(), (row, ""));
+        // No panes.
+        assert_eq!(split_store_line("77\n").unwrap(), ("", "77"));
+        assert_eq!(split_store_line("\n").unwrap(), ("", ""));
+    }
+
+    #[test]
+    fn a_listing_without_its_store_line_is_refused() {
+        let row = "%3\t@1\tmain\t10\t0\tboot\t2\tcodex\t/tmp\t\t\t\t\t0\t5\t\t\t\t0\n";
+        // Nothing printed, or an unterminated last line.
+        assert!(split_store_line("").is_err());
+        assert!(split_store_line("77").is_err());
+        // The last row standing in for the store line: no empty line follows.
+        let truncated = row.trim_end_matches('\n');
+        assert!(split_store_line(&format!("{row}{truncated}\n")).is_err());
+        assert!(split_store_line(row.trim_end_matches('\n')).is_err());
+    }
+
+    fn inventory_row(pane: &str, dead: bool) -> Vec<String> {
+        let mut fields = vec![String::new(); 19];
+        fields[0] = pane.into();
+        fields[1] = "@1".into();
+        fields[2] = "main".into();
+        fields[3] = "10".into();
+        fields[4] = if dead { "1" } else { "0" }.into();
+        fields[5] = "0c1d2e3f-0000-4000-8000-0000000000b1".into();
+        fields[6] = "2".into();
+        fields[7] = "codex".into();
+        fields[8] = "/tmp".into();
+        fields[13] = "0".into();
+        fields[14] = "5".into();
+        fields
+    }
+
+    #[test]
+    fn an_identity_agent_has_the_fields_the_coordinator_checks() {
+        let codex = providers::find("codex").unwrap();
+        let fields = inventory_row("%3", false);
+        let agent = identity_agent(&fields, codex, None, Some(codex)).unwrap();
+        assert_eq!(agent.pane_id, "%3");
+        assert_eq!(agent.boot, fields[5]);
+        assert_eq!(agent.generation, "2");
+        assert_eq!(agent.process, "running");
+        assert_eq!(agent.name, "codex-3");
+        assert_eq!(agent.cwd, "/tmp");
+        assert_eq!(agent.output_generation, 5);
+        // An agent masil did not start is named by boot, pane, generation and group.
+        assert_eq!(agent.run, format!("{}-%3-2-0", fields[5]));
+        assert_eq!(agent.process_epoch, None);
+        // The foreground is not the provider's, or the pane is dead.
+        let unknown = identity_agent(&fields, codex, None, None).unwrap();
+        assert_eq!(
+            (unknown.process.as_str(), unknown.state.as_str()),
+            ("unknown", "unknown")
+        );
+        let dead = identity_agent(&inventory_row("%3", true), codex, None, Some(codex)).unwrap();
+        assert_eq!(
+            (dead.process.as_str(), dead.state.as_str()),
+            ("exited", "exited")
+        );
+        let mut bad = fields.clone();
+        bad[14] = "x".into();
+        assert!(identity_agent(&bad, codex, None, Some(codex)).is_err());
     }
 }

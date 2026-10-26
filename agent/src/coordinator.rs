@@ -28,7 +28,9 @@ static POKES: AtomicUsize = AtomicUsize::new(0);
 /// Protocol and feature generation; a client replaces an older coordinator.
 /// 3: features, `reload`, the screen watch, executable identity, and the
 /// core guarded-action control RPC.
-pub(crate) const GENERATION: u64 = 3;
+/// 4: the coordinator writes the prompt ledger markers; a client no longer
+/// does, so it must not prompt through an older coordinator.
+pub(crate) const GENERATION: u64 = 4;
 const REQUEST_FRAME: usize = 8 * 1024;
 const ACTION_REQUEST_FRAME: usize = 64 * 1024;
 const RESPONSE_FRAME: usize = 64 * 1024;
@@ -148,6 +150,7 @@ pub(crate) fn paths(socket: &Path, state: &Path) -> Result<Paths, String> {
     })
 }
 
+#[derive(Debug)]
 pub(crate) struct ServerInfo {
     pub(crate) pid: libc::pid_t,
     pub(crate) boot: String,
@@ -218,18 +221,28 @@ pub(crate) fn server_info(socket: &Path) -> Result<ServerInfo, String> {
             "-g",
         ],
     )?;
-    let mut lines = text.lines();
-    let first = lines.next().unwrap_or_default();
+    let (first, environment) = text.split_once('\n').unwrap_or((text.as_str(), ""));
     let (pid, boot) = first
         .split_once(' ')
         .ok_or("server_unreachable: unexpected server identity")?;
+    server_info_from(pid, boot, environment)
+}
+
+/// `server_info` from what a native command already printed: the server's
+/// pid and boot, and the text of `show-environment -g`. The caller reads them
+/// again for every action; nothing here is remembered.
+pub(crate) fn server_info_from(
+    pid: &str,
+    boot: &str,
+    environment: &str,
+) -> Result<ServerInfo, String> {
     let pid: libc::pid_t = pid
         .parse()
         .map_err(|_| "server_unreachable: unexpected server pid")?;
     if boot.is_empty() {
         return Err("server_unreachable: the server has no boot id".into());
     }
-    let state = state_of(lines)
+    let state = state_of(environment.lines())
         .ok_or("server_unreachable: the server has no absolute XDG_STATE_HOME or HOME")?;
     Ok(ServerInfo {
         pid,
@@ -795,6 +808,20 @@ fn action_within(
     action_on_running_coordinator(socket, &server, params, budget, cap)
 }
 
+/// As `action`, for a caller that read the server's identity and
+/// environment with its own native command (`server_info_from`), so this
+/// call runs none. The info is for this call only.
+pub(crate) fn action_known(
+    socket: &Path,
+    params: Value,
+    server: ServerInfo,
+) -> Result<Value, String> {
+    check_action_frame(&params)?;
+    let server = check_server_state(server)?;
+    ensure_server(socket, &server, true)?;
+    action_on_running_coordinator(socket, &server, params, busy_budget(), Duration::MAX)
+}
+
 /// Sends an action after a caller has already ensured the coordinator.
 /// `start` uses this after its pre-flock ensure so coordinator startup never
 /// occupies the name-uniqueness lock.
@@ -1158,7 +1185,11 @@ pub(crate) fn status(socket: &Path) -> Result<Value, String> {
 /// The server, if this process uses its state directory; a command with
 /// another one would act on a store the server never reads.
 pub(crate) fn check_state(socket: &Path) -> Result<ServerInfo, String> {
-    let server = server_info(socket)?;
+    check_server_state(server_info(socket)?)
+}
+
+/// `check_state` for a server whose info the caller already has.
+fn check_server_state(server: ServerInfo) -> Result<ServerInfo, String> {
     let own = crate::managed::state_base()?;
     // Canonical even before the directory exists: an endpoint that took the
     // server's directory holds it as /private/tmp/... where the server's
@@ -3281,6 +3312,33 @@ mod tests {
             none.limit_with_room_at(usual, Duration::from_secs(60)),
             Some(usual)
         );
+    }
+
+    #[test]
+    fn server_info_reads_the_state_directory_from_the_printed_environment() {
+        let boot = "0c1d2e3f-0000-4000-8000-000000000001";
+        // An absolute XDG_STATE_HOME wins over HOME.
+        let server = server_info_from(
+            "4242",
+            boot,
+            "HOME=/home/test\nXDG_STATE_HOME=/var/state\nTERM=xterm\n",
+        )
+        .unwrap();
+        assert_eq!((server.pid, server.boot.as_str()), (4242, boot));
+        assert_eq!(server.state, Path::new("/var/state"));
+        // Else HOME/.local/state; a relative value of either is ignored.
+        let server =
+            server_info_from("1", boot, "XDG_STATE_HOME=state\nHOME=/home/test\n").unwrap();
+        assert_eq!(server.state, Path::new("/home/test/.local/state"));
+        for environment in ["", "HOME=home\n", "XDG_STATE_HOME=state\n", "-HOME\n"] {
+            let error = server_info_from("1", boot, environment).unwrap_err();
+            assert!(
+                error.contains("no absolute XDG_STATE_HOME or HOME"),
+                "{error}"
+            );
+        }
+        assert!(server_info_from("x", boot, "HOME=/h\n").is_err());
+        assert!(server_info_from("1", "", "HOME=/h\n").is_err());
     }
 
     #[test]
