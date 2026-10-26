@@ -266,8 +266,8 @@ fn state_at(
         }
         return Err(last_error("cannot read", path));
     }
-    let mode = stat.st_mode as u32 & libc::S_IFMT as u32;
-    if mode == libc::S_IFLNK as u32 {
+    let mode = stat.st_mode & libc::S_IFMT;
+    if mode == libc::S_IFLNK {
         let mut target = vec![0u8; 4096];
         // SAFETY: valid descriptor, C string and buffer of that length.
         let length = unsafe {
@@ -285,8 +285,8 @@ fn state_at(
         let oid = hash_bytes(store, target, write, deadline)?;
         return Ok((State::Link { oid }, None));
     }
-    if mode != libc::S_IFREG as u32 {
-        let kind = if mode == libc::S_IFDIR as u32 {
+    if mode != libc::S_IFREG {
+        let kind = if mode == libc::S_IFDIR {
             "directory"
         } else {
             "special"
