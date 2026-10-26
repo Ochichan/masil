@@ -1494,32 +1494,34 @@ async fn accept_claude_prompt(
 /// The source recorded for an acceptance a hook reported.
 const REPORT_SOURCE: &str = "native_callback";
 
-/// Inbox effects of an OpenCode event the coordinator read from the pane's
-/// own server (`observe.rs`). They share the plugin's key, `hook:opencode`
-/// and `request:<id>`, so a request seen both ways is one event.
+/// Inbox effects of an OpenCode or Kilo event the coordinator read from the
+/// pane's own server (`observe.rs`). They share the plugin's key,
+/// `hook:<provider>` and `request:<id>`, so a request seen both ways is one
+/// event.
 pub(super) fn api_request_effects(
+    provider: &str,
     pane: &str,
     run: &str,
     frame: &Map<String, Value>,
 ) -> Vec<super::inbox::Effect> {
     let event = normalize_event(&callback_event(frame).unwrap_or_default());
-    let source = "hook:opencode";
+    let source = format!("hook:{provider}");
     let request = |kind: &'static str| {
         open_code_property(frame, &["id"]).map(|id| {
             callback_event_effect(
-                "opencode",
+                provider,
                 pane,
                 run,
                 kind,
                 request_ref(&id),
                 Some(id),
-                callback_summary("opencode", &event, frame),
+                callback_summary(provider, &event, frame),
             )
         })
     };
     let answered = |resolution: &'static str| {
         open_code_property(frame, &["requestID", "requestId", "request_id"])
-            .map(|id| resolve_effect(source, &id, resolution))
+            .map(|id| resolve_effect(&source, &id, resolution))
     };
     match event.as_str() {
         "permissionasked" => request("approval_requested"),
@@ -2679,6 +2681,57 @@ mod tests {
         let payload = object(source);
         let mapped = map_callback(target(provider).unwrap(), Some(action), &payload).unwrap();
         callback_effects(provider, "%1", "run-1", 7, &mapped, &payload)
+    }
+
+    #[test]
+    fn a_request_read_from_the_server_has_the_plugins_key_for_its_provider() {
+        let frame = object(
+            r#"{"type":"permission.asked","properties":{"id":"permission-1","sessionID":"session-1","permission":"bash"}}"#,
+        );
+        let replied = object(
+            r#"{"type":"permission.replied","properties":{"requestID":"permission-1","sessionID":"session-1"}}"#,
+        );
+        for provider in ["opencode", "kilo"] {
+            let read = api_request_effects(provider, "%1", "run-1", &frame);
+            match read.as_slice() {
+                [
+                    Effect::Event {
+                        source,
+                        source_ref,
+                        provider: event_provider,
+                        kind: "approval_requested",
+                        native_ref,
+                        ..
+                    },
+                ] => {
+                    assert_eq!(source, &format!("hook:{provider}"));
+                    assert_eq!(event_provider, provider);
+                    assert_eq!(source_ref, "request:permission-1");
+                    assert_eq!(native_ref.as_deref(), Some("permission-1"));
+                }
+                other => panic!("unexpected effects: {other:?}"),
+            }
+            // The plugin's event for the same request has the same key.
+            let plugin = effects(
+                provider,
+                r#"{"event":{"id":"evt_1","type":"permission.asked","properties":{"id":"permission-1","sessionID":"session-1","permission":"bash"}}}"#,
+            );
+            assert!(matches!(
+                (read.as_slice(), plugin.as_slice()),
+                (
+                    [Effect::Event { source: a, source_ref: x, .. }],
+                    [Effect::Event { source: b, source_ref: y, .. }]
+                ) if a == b && x == y
+            ));
+            assert_eq!(
+                api_request_effects(provider, "%1", "run-1", &replied),
+                vec![Effect::Resolve {
+                    source: format!("hook:{provider}"),
+                    source_ref: "request:permission-1".into(),
+                    resolution: "replied",
+                }]
+            );
+        }
     }
 
     #[test]

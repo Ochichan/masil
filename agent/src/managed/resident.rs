@@ -1579,13 +1579,17 @@ impl Reports {
                 manager.inbox_apply(effects).await;
             }
             // One event per loss: a later loss in the same run is new.
-            Update::Lost { run, since } => {
+            Update::Lost {
+                run,
+                provider,
+                since,
+            } => {
                 if let Some(pane) = self.panes.get(&run) {
                     manager
                         .inbox_apply(vec![super::inbox::Effect::Event {
-                            source: "api:opencode".into(),
+                            source: format!("api:{provider}"),
                             source_ref: format!("observation:{run}:{since}"),
-                            provider: "opencode".into(),
+                            provider: provider.into(),
                             pane: pane.clone(),
                             run: run.clone(),
                             revision: None,

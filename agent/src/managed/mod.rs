@@ -416,7 +416,7 @@ struct RunEvidence {
     /// Origin of the metadata report with the same sequence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     report: Option<ReportSource>,
-    /// A start asked for masil's answer channel (`answer::CHANNEL`).
+    /// A start asked for masil's answer channel (`AnswerProfile::channel`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     answer_channel: Option<String>,
     /// What the start's check found: `ready` or `unavailable`. Only a
@@ -2330,8 +2330,10 @@ impl Manager {
             self.native.socket.as_os_str().to_owned(),
             "exec-managed".into(),
         ]);
-        if answers {
-            command.push(answer::EXEC_FLAG.into());
+        // Only a provider with an answer profile is started with `--answers`.
+        let profile = answers.then(|| answer::profile(provider.id)).flatten();
+        if let Some(profile) = profile {
+            command.push(profile.exec_flag.into());
         }
         command.extend(argv.iter().map(OsString::from));
         let mut launch_argv = vec![
@@ -2341,8 +2343,8 @@ impl Manager {
             self.native.socket.to_string_lossy().into_owned(),
             "exec-managed".into(),
         ];
-        if answers {
-            launch_argv.push(answer::EXEC_FLAG.into());
+        if let Some(profile) = profile {
+            launch_argv.push(profile.exec_flag.into());
         }
         launch_argv.extend(argv.iter().cloned());
         if core_path {
@@ -2591,7 +2593,11 @@ impl Manager {
                 encode(&RunEvidence {
                     run: run.into(),
                     binding,
-                    answer_channel: answers.then(|| answer::CHANNEL.to_owned()),
+                    answer_channel: answers
+                        .then(|| {
+                            answer::profile(provider.id).map(|profile| profile.channel.to_owned())
+                        })
+                        .flatten(),
                     token,
                     ..RunEvidence::default()
                 })
@@ -3828,9 +3834,10 @@ fn capability_view(
     // `agent start --answers`: masil may answer through the provider's own
     // server once it has checked it (docs/agent-answers.md).
     let answers = running
-        && provider == "opencode"
-        && evidence.and_then(|evidence| evidence.answer_channel.as_deref())
-            == Some(answer::CHANNEL);
+        && answer::profile(provider).is_some_and(|profile| {
+            evidence.and_then(|evidence| evidence.answer_channel.as_deref())
+                == Some(profile.channel)
+        });
     // Prompt acceptance and its turn: a coordinator that observes the
     // `--answers` server (and has not lost it); Claude's prompt hook
     // reports them. Whether its report decides the state right now (the
@@ -3840,8 +3847,11 @@ fn capability_view(
         .is_some_and(|source| {
             source.source == REPORT_SOURCE_API && source.generation.is_some() && source.observed()
         });
+    // An observed server reports a prompt only for a provider whose prompt
+    // text masil can match (`prompt::accept_digest`); Kilo's cannot yet.
+    let digest = prompt::accept_digest(provider, "").is_some();
     let prompts = running
-        && ((answers && observed)
+        && ((answers && observed && digest)
             || (provider == "claude" && seen.is_some_and(|seen| seen.prompt)));
     CapabilityView {
         contract: 2,
@@ -5354,6 +5364,47 @@ mod tests {
             )
             .resume
         );
+    }
+
+    #[test]
+    fn an_observed_server_reports_prompts_only_with_a_prompt_digest() {
+        let none = binding_view(None, None);
+        for (provider, channel, prompts) in [
+            ("opencode", "opencode_port", true),
+            ("kilo", "kilo_port", false),
+        ] {
+            let evidence = RunEvidence {
+                answer_channel: Some(channel.into()),
+                report: Some(ReportSource {
+                    sequence: 1,
+                    source: REPORT_SOURCE_API.into(),
+                    observer: Observer::current(),
+                    generation: Some(1),
+                    live: true,
+                    permissions: None,
+                    questions: None,
+                    event: None,
+                    hold: None,
+                }),
+                ..RunEvidence::default()
+            };
+            let view = capability_view(
+                provider,
+                "guarded_paste",
+                true,
+                true,
+                Some(&evidence),
+                "running",
+                Some(REPORT_SOURCE_API),
+                &none,
+            );
+            assert!(
+                view.approval_response && view.question_response,
+                "{provider}"
+            );
+            assert_eq!(view.provider_ack, prompts, "{provider}");
+            assert_eq!(view.turn_identity, prompts, "{provider}");
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The coordinator reads `--answers` OpenCode servers (P3b): the agent's
+//! The coordinator reads `--answers` OpenCode and Kilo servers (P3b): the agent's
 //! state, its requests, turn ends and errors.
 //!
 //! Only the coordinator reads them. A run's task holds `GET /event` while
@@ -27,9 +27,11 @@ const CATCH_UP_PAGES: usize = 3;
 const PAGE: usize = 10;
 /// A run first seen catches up this far back.
 const FIRST_LOOK_BACK_MS: u64 = 120_000;
-/// Turn ends and errors read from the server; requests keep the plugin's
-/// key (`hook:opencode`) so one request is one event.
-const SOURCE: &str = "api:opencode";
+/// The source of turn ends and errors read from the server; requests keep
+/// the plugin's (`hook:<provider>`) so one request is one event.
+fn source(target: &Target) -> String {
+    format!("api:{}", target.profile.id)
+}
 /// A user message older than this is no prompt masil can still accept.
 const PROMPT_RECENT_MS: u64 = 122_000;
 /// Frames read only for their type.
@@ -57,6 +59,7 @@ pub(super) enum Update {
     /// Reading has failed since `since` (ms).
     Lost {
         run: String,
+        provider: &'static str,
         since: u64,
     },
     /// Reading works: any loss of this run is over, including one a previous
@@ -158,11 +161,15 @@ impl Observers {
                 }
                 continue;
             }
-            let Ok(Some(secret)) = manager.run_secret(&agent.run).await else {
+            let Some(profile) = answer::profile(&agent.provider) else {
+                continue;
+            };
+            let Ok(Some(secret)) = manager.run_secret(profile, &agent.run).await else {
                 continue;
             };
             let wake = Arc::new(Notify::new());
             let target = Target {
+                profile,
                 run: agent.run.clone(),
                 pane: agent.pane_id.clone(),
                 pid: agent.foreground_group,
@@ -236,6 +243,7 @@ pub(super) fn observable(agent: &Agent) -> bool {
 }
 
 struct Target {
+    profile: &'static answer::AnswerProfile,
     run: String,
     pane: String,
     pid: i32,
@@ -305,6 +313,7 @@ async fn observe(
                     memory.lost = true;
                     let _ = updates.send(Update::Lost {
                         run: target.run.clone(),
+                        provider: target.profile.id,
                         since: memory.failing_ms,
                     });
                 }
@@ -336,16 +345,19 @@ async fn follow(
         *slot = None;
     }
     if slot.is_none() {
-        *slot = Some(answer::discover(target.secret.clone(), target.pid).await?);
+        *slot = Some(answer::discover(target.profile, target.secret.clone(), target.pid).await?);
     }
     let endpoint = slot.as_ref().ok_or("no endpoint")?;
     let mut response = endpoint.events().await?;
     let mut frames = Frames::default();
     let first = tokio::time::timeout(Duration::from_secs(5), frames.next(&mut response))
         .await
-        .map_err(|_| "OpenCode sent no first event".to_owned())??;
+        .map_err(|_| format!("{} sent no first event", target.profile.label))??;
     if first.get("type").and_then(Value::as_str) != Some("server.connected") {
-        return Err("OpenCode's event stream did not start with server.connected".into());
+        return Err(format!(
+            "{}'s event stream did not start with server.connected",
+            target.profile.label
+        ));
     }
     // Read after the stream is open: events from now on wait on it, and
     // applying one the snapshot already holds changes nothing.
@@ -365,6 +377,7 @@ async fn follow(
         let frame = json!({"type": kind, "properties": request});
         if let Some(frame) = frame.as_object() {
             effects.extend(integration::api_request_effects(
+                target.profile.id,
                 &target.pane,
                 &target.run,
                 frame,
@@ -375,7 +388,7 @@ async fn follow(
     // recorded after the snapshot is not judged by it.
     effects.push(Effect::ResolveAbsent {
         run: target.run.clone(),
-        source: "hook:opencode".into(),
+        source: format!("hook:{}", target.profile.id),
         present: view.request_ids(),
         before: snapshot_ms,
         resolution: "replied",
@@ -397,7 +410,10 @@ async fn follow(
             frame = frames.next(&mut response) => frame?,
             // Heartbeats come every 10 s; the pane drawing does not count.
             _ = tokio::time::sleep_until(silent_at) => {
-                return Err("OpenCode's event stream went silent".into());
+                return Err(format!(
+                    "{}'s event stream went silent",
+                    target.profile.label
+                ));
             }
             _ = wake.notified() => {
                 // The pane drew: someone is at it, so idle is not quiet yet.
@@ -529,7 +545,9 @@ impl View {
             .to_owned();
         let mut effects = Vec::new();
         match kind {
-            "server.instance.disposed" => return Err("OpenCode's instance closed".into()),
+            "server.instance.disposed" => {
+                return Err(format!("{}'s instance closed", target.profile.label));
+            }
             "session.status" => {
                 // A turn's message and parts are saved before it is busy.
                 read_prompt(endpoint, memory, &session).await;
@@ -564,6 +582,7 @@ impl View {
                     self.requests.push((kind, properties.clone()));
                 }
                 effects.extend(integration::api_request_effects(
+                    target.profile.id,
                     &target.pane,
                     &target.run,
                     frame,
@@ -573,6 +592,7 @@ impl View {
                 let id = properties["requestID"].as_str().unwrap_or_default();
                 self.requests.retain(|(_, request)| request["id"] != id);
                 effects.extend(integration::api_request_effects(
+                    target.profile.id,
                     &target.pane,
                     &target.run,
                     frame,
@@ -667,14 +687,15 @@ async fn read_prompt(endpoint: &answer::Endpoint, memory: &mut Memory, session: 
     memory.prompted.push(Prompted {
         session: session.to_owned(),
         message: turn.message.clone(),
-        digest: prompt_digest(&message["parts"]),
+        digest: prompt_digest(endpoint.profile().id, &message["parts"]),
         created_ms: message["info"]["time"]["created"].as_u64().unwrap_or(0),
     });
 }
 
 /// The accept digest of a user message's own text: its text parts, without
-/// what OpenCode added (editor context, file reads).
-fn prompt_digest(parts: &Value) -> String {
+/// what the server added (editor context, file reads). Empty for a provider
+/// whose prompts have no digest (Kilo's, until measured).
+fn prompt_digest(provider: &str, parts: &Value) -> String {
     let text = parts
         .as_array()
         .into_iter()
@@ -683,7 +704,7 @@ fn prompt_digest(parts: &Value) -> String {
         .filter_map(|part| part["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    super::prompt::accept_digest("opencode", &text).unwrap_or_default()
+    super::prompt::accept_digest(provider, &text).unwrap_or_default()
 }
 
 /// A root session that went idle ended its turn; one that failed or was
@@ -723,9 +744,9 @@ async fn root(endpoint: &answer::Endpoint, memory: &mut Memory, session: &str) -
 
 fn turn_completed(target: &Target, message: &str) -> Effect {
     Effect::Event {
-        source: SOURCE.into(),
+        source: source(target),
         source_ref: format!("turn_completed:{}:{message}", target.run),
-        provider: "opencode".into(),
+        provider: target.profile.id.into(),
         pane: target.pane.clone(),
         run: target.run.clone(),
         revision: None,
@@ -756,9 +777,9 @@ fn error_event(target: &Target, source_ref: &str, error: &Value) -> Effect {
         integration::summary_text(&text, chars, bytes)
     };
     Effect::Event {
-        source: SOURCE.into(),
+        source: source(target),
         source_ref: source_ref.to_owned(),
-        provider: "opencode".into(),
+        provider: target.profile.id.into(),
         pane: target.pane.clone(),
         run: target.run.clone(),
         revision: None,
@@ -822,7 +843,7 @@ async fn catch_up(
                 memory.prompted.push(Prompted {
                     session: id.to_owned(),
                     message: message_id.to_owned(),
-                    digest: prompt_digest(&message["parts"]),
+                    digest: prompt_digest(target.profile.id, &message["parts"]),
                     created_ms: created,
                 });
             }

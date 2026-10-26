@@ -1,5 +1,5 @@
-//! The dialog that answers an OpenCode agent's pending permissions and
-//! questions through masil, for agents started with `--answers`.
+//! The dialog that answers an OpenCode or Kilo agent's pending permissions
+//! and questions through masil, for agents started with `--answers`.
 //!
 //! It shows what the provider listed when it opened. The answer itself is
 //! checked again against the provider's pending list, so a request answered
@@ -113,11 +113,22 @@ impl AnswerDialog {
         }
     }
 
-    fn word(&self, english: &'static str, korean: &'static str) -> &'static str {
+    fn word<'a>(&self, english: &'a str, korean: &'a str) -> &'a str {
         match self.language {
             Language::English => english,
             Language::Korean => korean,
         }
+    }
+
+    /// The provider's name, as its answer profile writes it.
+    fn label(&self) -> &str {
+        crate::managed::answer::profile(&self.agent.provider)
+            .map_or(self.agent.provider.as_str(), |profile| profile.label)
+    }
+
+    /// `english` or `korean` with `{}` replaced by the provider's name.
+    fn named(&self, english: &str, korean: &str) -> String {
+        self.word(english, korean).replace("{}", self.label())
     }
 
     fn current(&self) -> Option<&Value> {
@@ -553,9 +564,9 @@ impl AnswerDialog {
                 }
                 push(
                     &mut rows,
-                    self.word(
-                        "While this OpenCode runs, its other sessions' matching requests are allowed without asking.",
-                        "이 OpenCode가 떠 있는 동안 다른 session의 같은 요청도 묻지 않고 허용됩니다.",
+                    &self.named(
+                        "While this {} runs, its other sessions' matching requests are allowed without asking.",
+                        "이 {}가 떠 있는 동안 다른 session의 같은 요청도 묻지 않고 허용됩니다.",
                     ),
                     Tone::Muted,
                 );
@@ -570,7 +581,7 @@ impl AnswerDialog {
                     ),
                     Tone::Text,
                 );
-                // OpenCode rejects the session's other permissions with it;
+                // The server rejects the session's other permissions with it;
                 // the count comes first so a short window still shows it.
                 let others = self
                     .requests
@@ -587,7 +598,8 @@ impl AnswerDialog {
                         &mut rows,
                         &match self.language {
                             Language::English => format!(
-                                "OpenCode also rejects {count} more request(s) of this session:"
+                                "{} also rejects {count} more request(s) of this session:",
+                                self.label()
                             ),
                             Language::Korean => {
                                 format!("같은 session의 요청 {count}개도 함께 거절됩니다:")
@@ -604,9 +616,9 @@ impl AnswerDialog {
                 }
                 push(
                     &mut rows,
-                    self.word(
-                        "OpenCode tells the agent you rejected it.",
-                        "OpenCode가 agent에게 거절했다고 알립니다.",
+                    &self.named(
+                        "{} tells the agent you rejected it.",
+                        "{}가 agent에게 거절했다고 알립니다.",
                     ),
                     Tone::Muted,
                 );
@@ -623,9 +635,9 @@ impl AnswerDialog {
                 );
                 push(
                     &mut rows,
-                    self.word(
-                        "OpenCode tells the agent you dismissed the question.",
-                        "OpenCode가 agent에게 질문을 닫았다고 알립니다.",
+                    &self.named(
+                        "{} tells the agent you dismissed the question.",
+                        "{}가 agent에게 질문을 닫았다고 알립니다.",
                     ),
                     Tone::Muted,
                 );
@@ -861,7 +873,7 @@ fn choices(question: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// OpenCode lets a person type an answer unless the question says no.
+/// The server lets a person type an answer unless the question says no.
 fn custom(question: &Value) -> bool {
     question["custom"] != false
 }

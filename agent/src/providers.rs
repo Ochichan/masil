@@ -126,7 +126,8 @@ const PROVIDERS: [Provider; 24] = [
         id: "kilo",
         command: "kilo",
         aliases: &["kilo-code", "kilo code"],
-        executables: &["kilo", "kilo-code"],
+        // The launcher script runs the compiled `.kilo` as its child.
+        executables: &["kilo", "kilo-code", ".kilo"],
     },
     Provider {
         id: "qodercli",
@@ -725,6 +726,33 @@ mod tests {
         assert!(!is_runtime("claude"));
         assert_eq!(find("qodercn").map(|p| p.id), Some("qodercli"));
         assert_eq!(find("muse-cli").map(|p| p.id), Some("muse"));
+    }
+
+    #[test]
+    fn kilos_compiled_child_is_kilo() {
+        let argv = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>()
+        };
+        for words in [
+            &[
+                "/opt/homebrew/lib/node_modules/@kilocode/cli/bin/.kilo",
+                "--port",
+                "0",
+            ][..],
+            &[".kilo"],
+            // The launcher script under node.
+            &["node", "/opt/homebrew/bin/kilo", "--port", "0"],
+        ] {
+            assert_eq!(
+                identify_process(&argv(words)).map(|p| p.id),
+                Some("kilo"),
+                "{words:?}"
+            );
+        }
+        assert_eq!(identify_process(&argv(&["/x/.kilo2"])), None);
     }
 
     #[test]

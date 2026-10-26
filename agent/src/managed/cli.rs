@@ -191,8 +191,11 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
     // `agent start --answers`: the listening options and password are
     // decided here, in the pane, after registration.
     let (answers, args) = match args.split_first() {
-        Some((flag, rest)) if flag == super::answer::EXEC_FLAG => (true, rest),
-        _ => (false, args),
+        Some((flag, rest)) => match super::answer::profile_for_flag(flag) {
+            Some(profile) => (Some(profile), rest),
+            None => (None, args),
+        },
+        None => (None, args),
     };
     validate_args(args)?;
     let program = args
@@ -269,12 +272,18 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
             })
             .await
             .map_err(|_| "wait_timeout: managed launch registration timed out".to_string())??;
-            if !answers {
+            let Some(profile) = answers else {
                 return Ok(Vec::new());
-            }
+            };
             Ok::<_, String>(
-                super::answer::prepare_exec(&native, std::path::Path::new(socket), &run, &mut argv)
-                    .await,
+                super::answer::prepare_exec(
+                    profile,
+                    &native,
+                    std::path::Path::new(socket),
+                    &run,
+                    &mut argv,
+                )
+                .await,
             )
         })?;
     let mut command = std::process::Command::new(program);

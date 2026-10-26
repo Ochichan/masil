@@ -1142,12 +1142,14 @@ impl Manager {
         answers: bool,
     ) -> Result<Value, String> {
         if answers {
-            // docs/agent-answers.md: only OpenCode's TUI can take the
-            // listening options safely.
-            if crate::providers::find(provider).map(|provider| provider.id) != Some("opencode") {
-                return Err("invalid_argument: --answers is for OpenCode only".into());
-            }
-            super::answer::check_start_args(args)?;
+            // docs/agent-answers.md: only the TUI of a provider with an
+            // answer profile can take the listening options safely.
+            let Some(profile) = crate::providers::find(provider)
+                .and_then(|provider| super::answer::profile(provider.id))
+            else {
+                return Err("invalid_argument: --answers is for OpenCode and Kilo only".into());
+            };
+            super::answer::check_start_args(profile, args)?;
         }
         // Starts alone keep the per-socket flock for name uniqueness, but a
         // core-path coordinator can take seconds to come up.  Select and

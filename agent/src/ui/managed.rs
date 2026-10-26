@@ -1931,7 +1931,7 @@ fn queue_done(
 /// masil can answer.
 fn open_answers(agent: Agent, value: Value, app: &mut App) -> Option<AnswerDialog> {
     let language = app.language;
-    if value["channel"] != crate::managed::answer::CHANNEL {
+    if !crate::managed::answer::is_channel(value["channel"].as_str().unwrap_or("")) {
         let reason = value["reason"].as_str().unwrap_or("no answer channel");
         app.notify(message(
             language,
@@ -1963,18 +1963,22 @@ fn submit_answer(
 ) {
     let epoch = current_epoch.to_owned();
     let target = TargetIdentity::for_agent(&agent);
+    let label = crate::managed::answer::profile(&agent.provider).map_or_else(
+        || agent.provider.clone(),
+        |profile| profile.label.to_owned(),
+    );
     tasks.spawn(async move {
         let result = fleet.answer(&agent, &request, reply).await.map(|value| {
             let accepted = value["provider_accepted"] == true;
             let also = value["also_answered"].as_array().map_or(0, Vec::len);
             let stage = value["stage"].as_str().unwrap_or("unknown");
             let mut english = if accepted {
-                format!("Answered {request}; OpenCode accepted it")
+                format!("Answered {request}; {label} accepted it")
             } else {
                 format!("Answered {request}: {stage}")
             };
             let mut korean = if accepted {
-                format!("{request}에 답했습니다. OpenCode가 받았습니다")
+                format!("{request}에 답했습니다. {label}가 받았습니다")
             } else {
                 format!("{request}에 답했습니다: {stage}")
             };

@@ -588,7 +588,7 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                 Key("X", "Confirm closing the selected pane"),
                 Key(
                     "y",
-                    "Answer an OpenCode permission or question (started with --answers)",
+                    "Answer an OpenCode or Kilo permission or question (started with --answers)",
                 ),
                 Key(
                     "e",
@@ -648,7 +648,7 @@ pub(crate) fn help_items(language: Language, managed: bool) -> Vec<HelpItem> {
                 Key("X", "확인 후 선택한 창 닫기"),
                 Key(
                     "y",
-                    "OpenCode 권한 요청이나 질문에 답하기 (--answers로 시작한 경우)",
+                    "OpenCode, Kilo의 권한 요청이나 질문에 답하기 (--answers로 시작한 경우)",
                 ),
                 Key(
                     "e",
