@@ -1001,7 +1001,13 @@ async fn hook(
 /// prompt's `UserPromptSubmit` holds the run working until `Stop`,
 /// `StopFailure` or the screen's turn-end marker (`TurnReport`). Best effort:
 /// a hook prints nothing and never fails Claude's turn.
-async fn claude_turn(manager: &Manager, agent: super::Agent, pane: &str, sequence: u64, event: &str) {
+async fn claude_turn(
+    manager: &Manager,
+    agent: super::Agent,
+    pane: &str,
+    sequence: u64,
+    event: &str,
+) {
     let report = match event {
         "userpromptsubmit" => super::TurnReport::Begin {
             marker: agent.evidence.turn_end_marker().map(str::to_owned),

@@ -1674,7 +1674,10 @@ ends_turn = true
 contains = ["x"]
 "#;
         let error = load_manifest(early_ends_turn, ManifestSource::Bundled).unwrap_err();
-        assert!(error.contains("ends_turn needs min_engine_version = 5"), "{error}");
+        assert!(
+            error.contains("ends_turn needs min_engine_version = 5"),
+            "{error}"
+        );
 
         let invalid_version = r#"
 id = "codex"
@@ -1809,22 +1812,33 @@ contains = ["x"]
             let explained = engine.explain(provider, &screen, title);
             assert_eq!(explained["state"], state, "{provider}: {screen}");
             if !rule_id.is_empty() {
-                assert_eq!(explained["matched_rule"]["id"], rule_id, "{provider}: {screen}");
+                assert_eq!(
+                    explained["matched_rule"]["id"], rule_id,
+                    "{provider}: {screen}"
+                );
             }
         }
         // Claude 2.1.289 (measured 2026-10-04): the turn-end marker under the
         // prompt box, the streaming screen without it, and dialogs drawn
         // below an old marker.
         let footer = format!("{rule}\n❯ \n{rule}\n  status line\n");
-        let done = format!("❯ Write the numbers.\n⏺ one\n  two\n✻ Worked for 17s · done 8:54 PM\n{footer}");
+        let done = format!(
+            "❯ Write the numbers.\n⏺ one\n  two\n✻ Worked for 17s · done 8:54 PM\n{footer}"
+        );
         let explained = engine.explain("claude", &done, "✳ Numbers");
         assert_eq!(explained["state"], "idle");
         assert_eq!(explained["matched_rule"]["id"], "live_prompt_box");
         let marker = explained["ends_turn"].as_str().unwrap().to_owned();
         assert_eq!(explained["turn_end_marker"], marker.as_str());
-        let interrupted = format!("❯ Write the numbers.\n⏺ one\n  ⎿  Interrupted · What should Claude do instead?\n{footer}");
+        let interrupted = format!(
+            "❯ Write the numbers.\n⏺ one\n  ⎿  Interrupted · What should Claude do instead?\n{footer}"
+        );
         let explained = engine.explain("claude", &interrupted, "✳ Numbers");
-        assert!(explained["ends_turn"].as_str().is_some_and(|other| other != marker));
+        assert!(
+            explained["ends_turn"]
+                .as_str()
+                .is_some_and(|other| other != marker)
+        );
         let streaming = format!("❯ Write the numbers.\n⏺ one\n  two\n{footer}");
         let explained = engine.explain("claude", &streaming, "✳ Numbers");
         assert_eq!(explained["state"], "idle");
@@ -1851,7 +1865,11 @@ contains = ["x"]
         assert!(engine.interrupt_keys("cursor").is_empty());
         assert_eq!(engine.interrupt_keys("agy"), vec!["Escape"]);
         // A model's answer quoting a dialog line is not a dialog.
-        let quoted = engine.explain("gemini", "The CLI asks: how would you like to authenticate?\n", "");
+        let quoted = engine.explain(
+            "gemini",
+            "The CLI asks: how would you like to authenticate?\n",
+            "",
+        );
         assert_ne!(quoted["state"], "blocked");
     }
 }
