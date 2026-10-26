@@ -327,6 +327,14 @@ async fn follow(
     updates: &mpsc::UnboundedSender<Update>,
     memory: &mut Memory,
 ) -> Result<(), String> {
+    // The port kept from the last connection may be someone else's by now;
+    // look for the server again only when the pane's processes no longer
+    // listen on it, since each look starts lsof.
+    if let Some(endpoint) = slot.as_ref()
+        && !endpoint.still_served_by(target.pid).await
+    {
+        *slot = None;
+    }
     if slot.is_none() {
         *slot = Some(answer::discover(target.secret.clone(), target.pid).await?);
     }

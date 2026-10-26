@@ -265,6 +265,128 @@ fn listening(pid: i32) -> Vec<u16> {
     }
 }
 
+/// As `listening`, but starts no process: `lsof` costs one, and a reader that
+/// looks often would spend its budget on it. libproc on macOS, /proc elsewhere
+/// (where `listening` already reads /proc).
+fn listening_quietly(pid: i32) -> Vec<u16> {
+    #[cfg(target_os = "macos")]
+    {
+        libproc_listening(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        listening(pid)
+    }
+}
+
+/// `struct socket_fdinfo` from the macOS SDK's sys/proc_info.h: libc has
+/// `proc_pidinfo`, `proc_pidfdinfo`, `proc_fdinfo` and `PROC_PIDLISTFDS` but
+/// not this struct or `PROC_PIDFDSOCKETINFO`, and its `socket_info` ends in a
+/// union of larger structs that nothing here needs. The call fills a buffer
+/// of this size, and the fields used are read at their offsets in it (taken
+/// from the SDK with `offsetof`). Any other size back is an unknown layout
+/// and counts as no listener.
+const SOCKET_FDINFO_SIZE: usize = 792;
+#[cfg(target_os = "macos")]
+const PROC_PIDFDSOCKETINFO: i32 = 3;
+/// `psi.soi_protocol`, `psi.soi_family` and `psi.soi_kind` (24 + 156, 160, 232).
+const SOI_PROTOCOL: usize = 180;
+const SOI_FAMILY: usize = 184;
+const SOI_KIND: usize = 256;
+/// In `psi.soi_proto.pri_tcp` (at 264): `tcpsi_ini.insi_lport` (+4, an int
+/// holding the port in network byte order), `insi_vflag` (+24), the IPv4
+/// address in the last four bytes of `insi_laddr` (+48+12) and `tcpsi_state`
+/// (+80).
+const TCP_LPORT: usize = 268;
+const TCP_VFLAG: usize = 288;
+const TCP_LADDR4: usize = 324;
+const TCP_STATE: usize = 344;
+/// `SOCKINFO_TCP`, `INI_IPV4` and `TSI_S_LISTEN`.
+const SOCKINFO_TCP: i32 = 2;
+const INI_IPV4: u8 = 1;
+const TSI_S_LISTEN: i32 = 1;
+
+fn read_i32(info: &[u8], at: usize) -> Option<i32> {
+    Some(i32::from_ne_bytes(info.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// The port of a `socket_fdinfo` that is a TCP socket listening on
+/// 127.0.0.1 (the `parse_lsof` filter); None for any other socket.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_listener(info: &[u8]) -> Option<u16> {
+    let listening = info.len() == SOCKET_FDINFO_SIZE
+        && read_i32(info, SOI_FAMILY)? == libc::AF_INET
+        && read_i32(info, SOI_PROTOCOL)? == libc::IPPROTO_TCP
+        && read_i32(info, SOI_KIND)? == SOCKINFO_TCP
+        && info[TCP_VFLAG] & INI_IPV4 != 0
+        && read_i32(info, TCP_STATE)? == TSI_S_LISTEN
+        && info[TCP_LADDR4..TCP_LADDR4 + 4] == [127, 0, 0, 1];
+    if !listening {
+        return None;
+    }
+    Some(u16::from_be(read_i32(info, TCP_LPORT)? as u16))
+}
+
+/// The ports `pid` listens on, from its descriptors, without a process.
+#[cfg(target_os = "macos")]
+fn libproc_listening(pid: i32) -> Vec<u16> {
+    use std::mem::size_of;
+    let entry = size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer of size 0 only asks how much room the list needs.
+    let wanted =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if wanted <= 0 {
+        return Vec::new();
+    }
+    // Room for descriptors opened since the size was asked.
+    let capacity = wanted as usize / entry + 16;
+    let mut fds = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0
+        };
+        capacity
+    ];
+    // SAFETY: the buffer holds `capacity` entries; the call writes at most
+    // the byte count it is given.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast(),
+            (capacity * entry) as libc::c_int,
+        )
+    };
+    if written <= 0 {
+        return Vec::new();
+    }
+    let count = (written as usize / entry).min(capacity);
+    let mut info = vec![0u8; SOCKET_FDINFO_SIZE];
+    let mut ports = Vec::new();
+    for fd in fds[..count]
+        .iter()
+        .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
+    {
+        // SAFETY: `info` holds SOCKET_FDINFO_SIZE bytes, the size passed.
+        let got = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                fd.proc_fd,
+                PROC_PIDFDSOCKETINFO,
+                info.as_mut_ptr().cast(),
+                SOCKET_FDINFO_SIZE as libc::c_int,
+            )
+        };
+        if usize::try_from(got) == Ok(SOCKET_FDINFO_SIZE)
+            && let Some(port) = parse_listener(&info)
+        {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
 /// `lsof -Fn` lines name sockets as `n127.0.0.1:PORT` (macOS; tested on
 /// every system).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -339,7 +461,33 @@ pub(super) struct Endpoint {
     secret: String,
 }
 
+/// Whether `port` is one of the ports the pane's processes listen on.
+fn still_listening(ports: &[u16], port: u16) -> bool {
+    ports.contains(&port)
+}
+
 impl Endpoint {
+    /// Whether the processes `discover` would try for the pane (`pid`) still
+    /// listen on this endpoint's port. A server that closed its port, or one
+    /// that restarted on another, may have left the port to a process that
+    /// is not the pane's, and the password goes only to the pane's own
+    /// server. Starts no process, unlike `discover`.
+    pub(super) async fn still_served_by(&self, pid: i32) -> bool {
+        let port = self.port;
+        tokio::task::spawn_blocking(move || {
+            pid > 1
+                && still_listening(
+                    &candidates(pid)
+                        .into_iter()
+                        .flat_map(listening_quietly)
+                        .collect::<Vec<_>>(),
+                    port,
+                )
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Ends the session's current turn: a positive answer that it stopped.
     pub(super) async fn abort(&self, session: &str) -> Result<(), String> {
         match self
@@ -1358,6 +1506,95 @@ mod tests {
         let inodes = std::collections::HashSet::from(["777".to_owned()]);
         let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1000 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 777 1\n   1: 0100007F:1001 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 888 1\n   2: 00000000:1002 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 777 1\n";
         assert_eq!(parse_proc_tcp(table, &inodes), vec![4096]);
+    }
+
+    /// A `socket_fdinfo` as libproc fills it, with the fields `parse_listener` reads.
+    fn socket_info(listening: bool, address: [u8; 4], port: u16) -> Vec<u8> {
+        let mut info = vec![0u8; SOCKET_FDINFO_SIZE];
+        let mut put =
+            |at: usize, value: i32| info[at..at + 4].copy_from_slice(&value.to_ne_bytes());
+        put(SOI_FAMILY, libc::AF_INET);
+        put(SOI_PROTOCOL, libc::IPPROTO_TCP);
+        put(SOI_KIND, SOCKINFO_TCP);
+        put(TCP_LPORT, i32::from(port.to_be()));
+        put(TCP_STATE, if listening { TSI_S_LISTEN } else { 4 });
+        info[TCP_VFLAG] = INI_IPV4;
+        info[TCP_LADDR4..TCP_LADDR4 + 4].copy_from_slice(&address);
+        info
+    }
+
+    #[test]
+    fn only_a_tcp_socket_listening_on_loopback_has_a_port() {
+        assert_eq!(
+            parse_listener(&socket_info(true, [127, 0, 0, 1], 4096)),
+            Some(4096)
+        );
+        // The port is in network byte order in an int: both bytes count.
+        assert_eq!(
+            parse_listener(&socket_info(true, [127, 0, 0, 1], 61000)),
+            Some(61000)
+        );
+        assert_eq!(
+            parse_listener(&socket_info(true, [127, 0, 0, 1], 258)),
+            Some(258)
+        );
+        // Connected, not listening.
+        assert_eq!(
+            parse_listener(&socket_info(false, [127, 0, 0, 1], 4096)),
+            None
+        );
+        // Not loopback, as `parse_lsof` leaves `*:PORT` out.
+        assert_eq!(parse_listener(&socket_info(true, [0, 0, 0, 0], 4096)), None);
+        assert_eq!(
+            parse_listener(&socket_info(true, [10, 0, 0, 5], 4096)),
+            None
+        );
+        for (at, value) in [(SOI_FAMILY, 30), (SOI_PROTOCOL, 17), (SOI_KIND, 1)] {
+            let mut info = socket_info(true, [127, 0, 0, 1], 4096);
+            info[at..at + 4].copy_from_slice(&i32::to_ne_bytes(value));
+            assert_eq!(parse_listener(&info), None, "{at}");
+        }
+        let mut info = socket_info(true, [127, 0, 0, 1], 4096);
+        info[TCP_VFLAG] = 2;
+        assert_eq!(parse_listener(&info), None);
+        // A size other than the layout this was written for.
+        let mut info = socket_info(true, [127, 0, 0, 1], 4096);
+        info.pop();
+        assert_eq!(parse_listener(&info), None);
+        assert_eq!(parse_listener(&[]), None);
+    }
+
+    #[test]
+    fn the_kept_port_is_reused_only_while_the_pane_still_listens_on_it() {
+        assert!(still_listening(&[4096, 61000], 61000));
+        assert!(!still_listening(&[4096], 61000));
+        assert!(!still_listening(&[], 61000));
+    }
+
+    #[tokio::test]
+    async fn the_listeners_of_a_process_are_read_without_starting_one() {
+        let own = std::process::id() as i32;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wildcard = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let other = wildcard.local_addr().unwrap().port();
+        let _connected = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let ports = listening_quietly(own);
+        assert!(ports.contains(&port), "{ports:?} lacks {port}");
+        // Neither a socket bound to every address nor a connected one.
+        assert!(!ports.contains(&other), "{ports:?}");
+        let endpoint = Endpoint {
+            client: client().unwrap(),
+            port,
+            secret: "secret".into(),
+        };
+        assert!(endpoint.still_served_by(own).await);
+        // A process that is not the pane's, or no process, does not serve it.
+        assert!(!endpoint.still_served_by(1).await);
+        assert!(!endpoint.still_served_by(0).await);
+        drop(listener);
+        assert!(!listening_quietly(own).contains(&port));
+        assert!(!endpoint.still_served_by(own).await);
     }
 
     #[test]
