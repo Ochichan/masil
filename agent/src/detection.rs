@@ -1701,6 +1701,108 @@ contains = ["x"]
         );
     }
 
+    /// Screens measured on 2026-10-26 (C5), cut to the lines the rules read.
+    /// Each case is (provider, screen, state, rule).
+    #[test]
+    fn live_screens_measured_2026_10_26() {
+        let cases: Vec<(&str, String, &str, &str)> = vec![
+            (
+                // 2026.10.01 after a finished turn: the follow-up composer
+                // with no stop hint waits for a prompt.
+                "cursor",
+                "  PINEAPPLE\n\n\n  → Add a follow-up\n\n\n  Auto · 7.1%\n  /private/tmp/project\n".into(),
+                "idle",
+                "composer_idle",
+            ),
+            (
+                // 2026.10.22 while a turn runs: the same composer line ends
+                // in the stop hint.
+                "cursor",
+                "  Write the numbers.\n\n\n ⠰⠰ Working\n\n\n  → Add a follow-up                                         ctrl+c to stop\n\n\n  Auto\n  /private/tmp/project\n".into(),
+                "working",
+                "stop_hint_working",
+            ),
+            (
+                // 2026.10.22 after one C-c: the prompt is back in the composer.
+                "cursor",
+                "  Cursor Agent\n  v2026.10.22-27dcf5f\n\n\n  → Write the numbers from one to one thousand as English words, one per line.\n\n\n  Auto\n  /private/tmp/project\n".into(),
+                "idle",
+                "composer_idle",
+            ),
+            (
+                // 2026.10.22: a long prompt wraps to four composer lines.
+                "cursor",
+                "  Tip: Hit shift+tab to enable Plan Mode.\n  → word000 word001 word002 word003\n    word004 word005 word006 word007\n    word008 word009 word010 word011\n    word012 END-OF-LONG\n  Auto\n  /private/tmp/project\n".into(),
+                "idle",
+                "composer_idle",
+            ),
+            (
+                // 2026.10.22: a bracketed three-line paste.
+                "cursor",
+                "  Tip: Hit shift+tab to enable Plan Mode.\n  → first line of the prompt\n    second line here\n    third line END-OF-MULTI\n  Auto\n  /private/tmp/project\n".into(),
+                "idle",
+                "composer_idle",
+            ),
+            (
+                "gemini",
+                " ╭──────╮\n │ Do you trust the files in this folder?   │\n │ Trusting a folder allows Gemini CLI to load its local configurations.   │\n │ ● 1. Trust folder (project)   │\n │   2. Trust parent folder (tmp)   │\n │   3. Don't trust   │\n ╰──────╯\n".into(),
+                "blocked",
+                "folder_trust",
+            ),
+            (
+                "kilo",
+                "  ┃\n  ┃  ■■■■⬝⬝⬝⬝  esc interrupt                ctrl+t variants  tab agents  ctrl+p commands\n".into(),
+                "working",
+                "esc_interrupt_working",
+            ),
+            (
+                "kilo",
+                "  ┃\n  ┃  △ Reject permission\n  ┃\n  ┃  Tell Kilo what to do differently\n  ┃\n  ┃                          /private/tmp/project\n  ┃                   enter confirm  esc cancel\n  ┃                          • Kilo 7.8.17\n".into(),
+                "blocked",
+                "reject_instruction",
+            ),
+        ];
+        let engine = Engine::load_bundled();
+        for (provider, screen, state, rule_id) in cases {
+            let explained = engine.explain(provider, &screen, "");
+            assert_eq!(explained["state"], state, "{provider}: {screen}");
+            assert_eq!(
+                explained["matched_rule"]["id"], rule_id,
+                "{provider}: {screen}"
+            );
+        }
+        // 2026.10.22: one C-c at an empty composer arms exit; the composer
+        // still waits for a prompt.
+        let armed = "  Tip: Hit shift+tab to enable Plan Mode.\n  → Plan, search, build anything\n  Press Ctrl+C again to exit\n";
+        assert_eq!(engine.explain("cursor", armed, "")["state"], "idle");
+        // An answer that tells the person to press Ctrl+C is not a running
+        // turn, so masil has nothing to interrupt.
+        let answer = "  Run `npm start`. Press Ctrl+C to stop the server.\n\n\n  → Add a follow-up\n\n\n  Auto\n  /private/tmp/project\n";
+        let explained = engine.explain("cursor", answer, "");
+        assert_eq!(explained["state"], "idle", "{explained}");
+        assert_eq!(explained["matched_rule"]["id"], "composer_idle");
+        // The answered trust box stays on screen above the restart line.
+        let answered = " ╭──────╮\n │ Do you trust the files in this folder?   │\n │ ● 1. Trust folder (project)   │\n │   3. Don't trust   │\n ╰──────╯\n\n Gemini CLI is restarting to apply the trust changes...\n\n Gemini CLI v0.46.0\n";
+        assert_eq!(engine.explain("gemini", answered, "")["state"], "unknown");
+        // A model answer quoting the question is not the dialog.
+        let quoted = " ✦ Gemini asks \"Do you trust the files in this folder?\" on a new folder.\n";
+        assert_eq!(engine.explain("gemini", quoted, "")["state"], "unknown");
+        // 2026.10.22: "/help me" opens the command menu, which is not a
+        // composer waiting for a prompt.
+        let menu = "  → /help me\n   → /help copy                Copy message\n     /help model               Model\n     /help rename              Rename Chat\n     ↓ more below\n";
+        assert_eq!(engine.explain("cursor", menu, "")["state"], "unknown");
+        // 2026.10.22: "/model" lists commands and skills; Enter on its entry
+        // opens the model picker. Neither is a composer.
+        let model_menu = "  → /model\n   → /model [filter]           Select model (Tab to edit)\n     /multi-model-review       Pick models (structured question or inline)\n     ↓ more below\n";
+        assert_eq!(engine.explain("cursor", model_menu, "")["state"], "unknown");
+        let picker = " Available models\n Filter:\n →  Auto\n    Composer 2.5             Fast\n    Claude Opus 5.5          300K Medium\n 1-10 of 45\n Type to filter • Enter to select • Tab to edit\n";
+        assert_eq!(engine.explain("cursor", picker, "")["state"], "unknown");
+        // One C-c ends a cursor turn while the stop hint shows.
+        assert_eq!(engine.interrupt_keys("cursor"), vec!["C-c"]);
+        assert!(engine.interruptible_rule("cursor", "stop_hint_working"));
+        assert!(!engine.interruptible_rule("cursor", "spinner_working"));
+    }
+
     /// Screens measured on 2026-10-04 (T2 live table), cut to the lines the
     /// rules read. Each case is (provider, screen, title, state, rule).
     #[test]
@@ -1859,10 +1961,10 @@ contains = ["x"]
         assert_eq!(explained["matched_rule"]["id"], "model_picker_menu");
         assert!(explained["ends_turn"].is_null());
 
-        // Measured keys; omp and cursor screens do not yet allow an interrupt.
+        // Measured keys; omp screens do not yet allow an interrupt (cursor:
+        // `live_screens_measured_2026_10_26`).
         assert_eq!(engine.interrupt_keys("omp"), vec!["Escape"]);
         assert!(!engine.interruptible_rule("omp", "osc_title_working"));
-        assert!(engine.interrupt_keys("cursor").is_empty());
         assert_eq!(engine.interrupt_keys("agy"), vec!["Escape"]);
         // A model's answer quoting a dialog line is not a dialog.
         let quoted = engine.explain(

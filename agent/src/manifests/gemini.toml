@@ -1,7 +1,7 @@
 id = "gemini"
-version = "2026.10.04.1"
+version = "2026.10.26.1"
 min_engine_version = 1
-updated_at = "2026-10-04T12:00:00Z"
+updated_at = "2026-10-26T12:00:00Z"
 
 [[rules]]
 id = "apply_or_allow_change"
@@ -32,3 +32,16 @@ region = "whole_recent"
 visible_blocker = true
 # Measured 2026-10-04 on 0.46.0: sign-in waits for the person.
 line_regex = ['^│ \? Get started\s*│$', '^│\s+How would you like to authenticate for this project\?\s*│$']
+
+[[rules]]
+id = "folder_trust"
+state = "blocked"
+priority = 950
+# Measured 2026-10-26 on 0.46.0: a new folder asks this before sign-in. At
+# width 150 the question is the 11th non-empty line from the bottom; narrower
+# panes wrap the text below it. The answered box stays on screen with
+# "restarting to apply the trust changes" printed under it.
+region = "bottom_non_empty_lines(18)"
+visible_blocker = true
+line_regex = ['^\s*│ Do you trust the files in this folder\?\s*│$']
+not = [{ contains = ["restarting to apply the trust changes"] }]

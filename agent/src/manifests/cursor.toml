@@ -1,10 +1,14 @@
 id = "cursor"
-version = "2026.10.04.1"
-min_engine_version = 1
-updated_at = "2026-10-04T12:00:00Z"
+version = "2026.10.26.1"
+min_engine_version = 4
+updated_at = "2026-10-26T12:00:00Z"
 aliases = ["cursor-agent"]
-# Measured 2026-10-04 on 2026.09.18: one C-c while working ends the turn,
-# but a C-c that lands after the turn ended exits, so no interrupt key here.
+# Measured 2026-10-26 on 2026.10.22: one C-c while working ends the turn at
+# once, keeps the process, and puts the prompt back in the composer. One C-c
+# at an empty composer only shows "Press Ctrl+C again to exit"; a second one
+# within about 0.3 s exits. (2026.09.18 exited on one C-c that landed after
+# the turn ended, measured 2026-10-04.)
+interrupt_keys = ["C-c"]
 
 [[rules]]
 id = "write_file_approval"
@@ -40,7 +44,10 @@ state = "working"
 priority = 100
 region = "bottom_non_empty_lines(6)"
 visible_working = true
-contains = ["ctrl+c to stop"]
+interruptible = true
+# The hint ends the composer line (measured 2026-10-04 and 2026-10-26), so a
+# model answer that says "Ctrl+C to stop" is not a running turn.
+line_regex = ['^\s+→ .*\S\s{2,}ctrl\+c to stop\s*$']
 
 [[rules]]
 id = "background_task_status_working"
@@ -82,9 +89,19 @@ contains = ["tell the agent what to do instead"]
 id = "composer_idle"
 state = "idle"
 priority = 50
-region = "bottom_non_empty_lines(4)"
+# Measured 2026-10-26 on 2026.10.22: a prompt of three or more composer
+# lines (wrapped or multi-line) pushes the arrow line above the bottom four
+# lines, so the region reaches twelve.
+region = "bottom_non_empty_lines(12)"
 visible_idle = true
 # Measured 2026-10-04 on 2026.09.18: the composer line starts with an arrow.
 line_regex = ['^\s+→ \S']
-# "Add a follow-up" is the composer while a turn runs.
-not = [{ contains = ["add a follow-up"] }]
+# Measured 2026-10-26: after a turn (2026.10.01) the composer reads
+# "→ Add a follow-up" with no stop hint; while a turn runs (2026.10.22) the
+# same line ends in "ctrl+c to stop". Text starting with "/" opens the
+# command menu, whose selected entry ("→ /help copy   Copy message") is not
+# a composer.
+not = [
+  { line_regex = ['^\s+→ .*\S\s{2,}ctrl\+c to stop\s*$'] },
+  { line_regex = ['^\s+→ /\S.*\S\s{2,}\S'] },
+]
