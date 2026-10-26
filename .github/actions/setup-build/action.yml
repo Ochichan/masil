@@ -1,0 +1,27 @@
+name: Set up native build
+description: Install the C, Rust and Python tools used by masil CI
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: '3.13'
+    - name: Install Linux dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          build-essential clang autoconf automake m4 bison pkg-config \
+          libevent-dev libncurses-dev libutf8proc-dev libjemalloc-dev
+    - name: Install macOS dependencies
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+      run: brew install autoconf automake m4 pkgconf libevent ncurses utf8proc jemalloc
+    - name: Install Rust
+      shell: bash
+      run: |
+        rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+        echo 'RUSTUP_TOOLCHAIN=1.96.0' >> "$GITHUB_ENV"

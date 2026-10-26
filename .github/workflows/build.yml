@@ -1,0 +1,87 @@
+name: Native build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release tag, or empty for a development artifact
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: macos-arm64
+          - os: ubuntu-24.04
+            target: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path agent/Cargo.toml --check
+      - name: Lint Rust
+        run: cargo clippy --locked --manifest-path agent/Cargo.toml --all-targets -- -D warnings
+      - name: Test Rust
+        run: cargo test --locked --manifest-path agent/Cargo.toml
+      - name: Build both programs
+        run: make all
+      - name: Smoke test
+        run: python3 scripts/ci_smoke.py bin
+      - name: Package and test the extracted archive
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python3 scripts/release.py package --version "$RELEASE_VERSION"
+          mkdir -p .build/extracted
+          tar -xzf .build/release/masil-*.tar.gz -C .build/extracted
+          python3 scripts/ci_smoke.py .build/extracted/masil-*/bin
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: masil-${{ matrix.target }}
+          path: .build/release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-${{ matrix.target }}
+          path: .build/logs/
+          retention-days: 7
+  homebrew:
+    name: Homebrew formula
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Test the formula against this checkout
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          tap="$(brew --repository)/Library/Taps/ochichan/homebrew-masil"
+          mkdir -p "$tap/Formula"
+          python3 scripts/release.py local-formula --output "$tap/Formula/masil.rb"
+          brew install --build-from-source ochichan/masil/masil
+          brew test ochichan/masil/masil
+          brew linkage --test ochichan/masil/masil
