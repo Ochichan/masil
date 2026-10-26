@@ -6,6 +6,51 @@ The repository has two programs. `core/` is tmux at commit `94796f6b1182507efac8
 
 masil is still in development. The tests run on macOS arm64 and Debian 13.7 x86_64.
 
+## Install with Homebrew
+
+This repository is also a Homebrew tap. Until the first stable release is
+published and its formula is promoted, install the current development version:
+
+```sh
+brew tap Ochichan/masil https://github.com/Ochichan/masil
+brew install --HEAD Ochichan/masil/masil
+masil
+```
+
+Homebrew builds both programs from source and installs their dependencies.
+It installs the manual as `masil.1` and leaves the `tmux` command unchanged.
+To update a development installation, run
+`brew upgrade --fetch-HEAD Ochichan/masil/masil`.
+After a stable formula is promoted, new installations can omit `--HEAD`.
+Existing HEAD installations can switch with `brew uninstall masil` followed by
+`brew install Ochichan/masil/masil`.
+
+## Release downloads
+
+The release workflow prepares archives for macOS 15+ on Apple Silicon and
+Ubuntu 24.04 on x86_64. Download the matching archive and `SHA256SUMS` from
+[GitHub Releases](https://github.com/Ochichan/masil/releases). Check the archive
+against its entry in `SHA256SUMS` with `shasum -a 256 ARCHIVE` on macOS or
+`sha256sum ARCHIVE` on Linux before extracting it. Each archive contains both
+programs, a manual, licenses, build metadata and a list of linked libraries.
+
+The binaries need runtime libraries. On macOS with Homebrew in `/opt/homebrew`:
+
+```sh
+brew install libevent ncurses utf8proc jemalloc
+```
+
+On Ubuntu 24.04:
+
+```sh
+sudo apt-get install libevent-core-2.1-7t64 libncursesw6 libtinfo6 libutf8proc3 libjemalloc2
+```
+
+Extract the archive into a directory you own. Keep `bin/masil` and
+`bin/masil-agent` together and add that `bin` directory to `PATH`.
+These are dynamically linked, unsigned binaries. Other OS versions and library
+ABIs are not covered by these archives; use a source build for those systems.
+
 ## Build
 
 The build needs a C compiler, make, Python 3.12 or later, pkg-config, libevent, ncurses, utf8proc and jemalloc. Only `masil-agent` needs Cargo. On macOS the build uses the Homebrew copies of these libraries. If m4, autoconf or automake is missing, the build downloads the official release archive, checks its SHA-256 and builds it under `.build/`. It does not install or replace system packages.
@@ -16,13 +61,60 @@ make core       # bin/masil only
 ./bin/masil -L main new-session -s work
 ```
 
+## CI and releases
+
+GitHub Actions runs on pull requests, pushes to `main`, and manual CI dispatches.
+The native jobs use `macos-15` and `ubuntu-24.04`, Python 3.13 and Rust 1.96.0.
+They run the locked Rust tests, build both programs, exercise an isolated masil
+server and its agent bridge, then package and smoke-test the extracted binaries.
+The Homebrew job builds a formula from the same checkout, runs its test and
+checks dynamic linkage. Successful builds retain archives for 14 days.
+
+The `tests/` directory and upstream comparison checkout are local development
+tools excluded from Git. CI therefore does not run `make test`. Before the Rust
+tests, CI runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
+For the tracked runtime check locally, run:
+
+```sh
+make all
+cargo test --locked --manifest-path agent/Cargo.toml
+python3 scripts/ci_smoke.py bin
+python3 scripts/release.py package
+```
+
+To prepare a release:
+
+1. Update `agent/Cargo.toml`, its lockfile package version, and the version strings
+   in `agent/src/main.rs` together. Commit the release inputs after CI passes.
+2. Create and push a matching tag such as `v0.1.0`. Tags must match the Cargo
+   version. The release workflow runs all native and Homebrew checks again.
+3. Review the resulting **draft** GitHub Release. It contains the two binary
+   archives, a source archive, `SHA256SUMS`, and `masil.rb`. Publish the draft
+   when the files and release notes are ready. For a version with a prerelease
+   suffix, mark it as a prerelease before publishing.
+4. For a stable version, download that release's `masil.rb`, verify its checksum,
+   and copy it to `Formula/masil.rb` in a follow-up PR. Keep the stable metadata
+   marker. Once merged, `brew update` and `brew install Ochichan/masil/masil`
+   install that version from its checksummed source archive.
+
+The workflow never pushes tags, commits a formula update, or publishes the draft.
+Only the final draft job has `contents: write`; build jobs use `contents: read`.
+No personal access token or signing secret is needed. Build or test failures
+stop before draft creation. An upload failure can leave an incomplete draft.
+If a draft already exists, inspect it before deleting that draft and rerunning
+the workflow; the workflow does not overwrite release assets.
+
+The configuration follows GitHub's [runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+and Homebrew's [tap guide](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap)
+and [formula cookbook](https://docs.brew.sh/Formula-Cookbook).
+
 ## Using masil as tmux
 
 The prefix is `C-b` and the key tables are the tmux defaults. masil adds no default key bindings. It reads the same configuration files as tmux, such as `~/.tmux.conf` and `~/.config/tmux/tmux.conf`.
 
 masil keeps its sockets in a `masil-UID` directory, apart from the `tmux-UID` directory that tmux uses. Its native protocol version is 136, so a masil client and a stock tmux server reject each other's connections. `masil -V` prints `tmux next-3.9` because existing scripts parse that string. For scripts that call `tmux` by name, `compat/tmux` is an optional shim. Add `compat/` to `PATH` only in the shells that need it. masil does not modify a system tmux or Herdr installation.
 
-When masil starts without `-f`, it loads a mouse UI layer before the user's configuration. The status line gets a `masil` menu, a `+` button for new windows and panes, and a `Settings` button that opens `masil-agent settings`. Clicking a pane title renames the pane. Dragging a pane title moves a floating pane or a group of floating panes. The layer also adds a scrollbar. `prefix C-s` saves all sessions, and `prefix C-r` opens a menu of snapshots to restore. A background `masil-agent session autosave` process saves a snapshot every 15 minutes until you set `@masil-autosave` to `off`. The layer binds only keys that have no tmux default. The status line can sit at the top, bottom, left or right of the screen. The settings screen stores its choices as `@masil-*` options in `~/.config/masil/settings.conf`. To start with plain tmux defaults, pass `-f FILE`, for example `masil -f /dev/null`.
+When masil starts without `-f`, it loads a mouse UI layer before the user's configuration. The status line gets a `masil` menu, a `+` button for new windows and panes, and a `Settings` button that opens `masil-agent settings`. Clicking a pane title renames the pane. Dragging a pane title moves a floating pane or a group of floating panes. The layer also adds a scrollbar. `prefix C-s` saves all sessions, and `prefix C-r` opens a menu of snapshots to restore. After your first manual save, a background `masil-agent session autosave` process saves a snapshot every 15 minutes, and later servers start it too. `set -g @masil-autosave 30` changes the interval in minutes, and `off` or `0` stops it. The layer binds only keys that have no tmux default. The status line can sit at the top, bottom, left or right of the screen. The settings screen stores its choices as `@masil-*` options in `~/.config/masil/settings.conf`. To start with plain tmux defaults, pass `-f FILE`, for example `masil -f /dev/null`.
 
 ## Coding agents
 
@@ -53,6 +145,18 @@ Callbacks come from optional provider hooks. For 17 providers, `masil-agent agen
 ### Durable operations
 
 `start`, `resume`, `prompt`, `interrupt` and `close` write a record to a SQLite store before they change anything in a pane. The store has one file per server socket under `$XDG_STATE_HOME/masil/operations/`. A client can pass its own key. Actions on a running agent take `--run RUN --operation N`, where RUN comes from `agent get`. Launches take `--boot BOOT --operation ID`, where BOOT is the server's `#{masil_core_boot_id}`. A retry with the same key returns the recorded result and does not repeat the action. When masil cannot tell whether an action took effect, it records `outcome_unknown` and does not send it again. `masil-agent agent operations reconcile` settles expired records from evidence stored in the pane. `masil-agent agent operation resolve KEY --as delivered` or `--as not-delivered` records the user's answer.
+
+### Inbox and other agent tools
+
+Each command below is a `masil-agent` subcommand, and none of these features runs until you use it. The inbox, notifications, answers and schedules run in the coordinator described under Design.
+
+- `agent inbox enable` records approval requests, questions, `blocked` states, finished turns and operations with an unknown outcome for a person to read. `agent notify enable` also reports new inbox items to attached clients, as OS notifications, or to your own command.
+- `agent start NAME opencode --answers`, or `kilo`, lets you answer that agent's permission requests and questions with `agent requests` and `agent answer` without switching to its pane.
+- `agent queue NAME add TEXT` keeps prompts ready. Nothing is sent until you run `agent queue NAME send`.
+- `agent schedule add` applies a layout, starts an agent or queues a draft on a cron or interval schedule. It never sends a prompt.
+- `agent changes NAME` lists an agent's changed files in its git working tree. `agent checkpoint NAME make` saves them, and `checkpoint NAME restore` puts single files back after a preview.
+- `worktree create REPO BRANCH` creates and records a git worktree that an agent can start in.
+- `agent view set --client-view` keeps a separate agent list filter for each terminal client.
 
 ## Layouts and saved sessions
 
@@ -90,6 +194,8 @@ The first pane of a window is always a shell pane, so an agent pane cannot come 
 
 `masil-agent session save`, `list` and `restore` save and restore sessions. `session preview NAME` prints the restore plan without running it.
 
+`masil-agent layout columns on` lays the current window out as a row of full-height columns with a fixed width each. The window can be wider than the screen, and each client's view moves sideways to follow the active column. `columns add`, `width`, `fit` and `close` change the columns. `columns off` puts back the layout from before `on` if the panes have not changed.
+
 ## Diagnostics
 
 `masil-agent doctor` checks the installed binaries, the operating system, the masil server, the operation store, installed providers and local settings, and prints the result as JSON. It makes no network connections and starts nothing in the background. `--versions` also runs each provider's `--version`, all at once, with a 2 second limit. `--bundle DIR` saves the same report to `DIR/doctor.json` for bug reports.
@@ -100,11 +206,11 @@ The first pane of a window is always a shell pane, so an agent pane cannot come 
 
 ## OpenCode observer daemon
 
-`masil-agent serve` is an optional daemon that follows configured OpenCode sessions through the OpenCode HTTP API. Nothing starts it automatically. It adds `attention`, which lists agents waiting on an approval or a question, and `watch-agents`, which streams the agent list. `ack` marks an item as read for every client of the daemon until the daemon exits. An ack never approves a provider request. The daemon reads the core through a bridge socket that the masil server opens only if you set `MASIL_BRIDGE_SOCKET` before starting it.
+`masil-agent serve` is an optional daemon that follows configured OpenCode sessions through the OpenCode HTTP API. Nothing starts it automatically. It adds `attention`, which lists agents waiting on an approval or a question, and `watch-agents`, which streams the agent list. `ack` marks an item as read for every client of the daemon until the daemon exits. An ack never approves a provider request. The daemon reads the core through a bridge socket. The masil server opens it by default at `<socket dir>/.masil/<socket name>.bridge` when only its owner can write to the socket directory. Set `MASIL_BRIDGE_SOCKET` before starting the server to choose another path, or to `off` to turn the bridge off.
 
 ## Design
 
-The tmux C core owns the PTY, the VT parser, the grid and history, key handling and the renderer. Terminal input and output never pass through Rust or a database, and masil has no second terminal parser. `masil-agent` keeps agent metadata in tmux pane options. Without the mouse UI layer, `masil-agent` runs only when you start a command or the UI. The layer adds one `masil-agent session autosave` process per server, and masil starts no other background process by itself.
+The tmux C core owns the PTY, the VT parser, the grid and history, key handling and the renderer. Terminal input and output never pass through Rust or a database, and masil has no second terminal parser. `masil-agent` keeps agent metadata in tmux pane options. Without the mouse UI layer, `masil-agent` runs only when you start a command or the UI. With the layer, each server runs one `masil-agent session autosave` process once you have saved a session. A per-server coordinator, `masil-agent agentd`, starts only on `coordinator start`, `inbox enable`, or `agent start` while a coordinator feature is on, and autosave brings it back after a server restart. It exits 10 minutes after every feature is off and no client is attached. masil starts no other background process by itself.
 
 ## Performance
 
