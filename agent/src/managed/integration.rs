@@ -903,7 +903,7 @@ async fn hook(
             if event == "userpromptsubmit" {
                 accept_claude_prompt(manager, &agent, payload).await;
             }
-            claude_turn(manager, agent, &pane, sequence, &event).await;
+            claude_turn(manager, agent, &pane, sequence, &event, payload).await;
         }
         return Ok(None);
     }
@@ -1011,20 +1011,25 @@ async fn hook(
 
 /// Claude's screen shows nothing while it streams an answer (2.1.289), so a
 /// prompt's `UserPromptSubmit` holds the run working until `Stop`,
-/// `StopFailure` or the screen's turn-end marker (`TurnReport`). Best effort:
-/// a hook prints nothing and never fails Claude's turn.
+/// `StopFailure` or the screen's turn-end marker (`TurnReport`). A `Stop` also
+/// carries the subagents still running (`running_subagents`). Best effort: a
+/// hook prints nothing and never fails Claude's turn.
 async fn claude_turn(
     manager: &Manager,
     agent: super::Agent,
     pane: &str,
     sequence: u64,
     event: &str,
+    payload: &Map<String, Value>,
 ) {
     let report = match event {
         "userpromptsubmit" => super::TurnReport::Begin {
             marker: agent.evidence.turn_end_marker().map(str::to_owned),
         },
-        "stop" | "stopfailure" => super::TurnReport::End,
+        "stop" => super::TurnReport::End {
+            subagents: running_subagents(payload),
+        },
+        "stopfailure" => super::TurnReport::End { subagents: None },
         _ => return,
     };
     // Read again: the prompt acceptance just wrote this run's evidence, and
@@ -1045,6 +1050,22 @@ async fn claude_turn(
             _ => return,
         }
     }
+}
+
+/// The subagents Claude's `Stop` says still run (2.1.310): the entries of
+/// its `background_tasks` with `type` `subagent` and `status` `running`.
+/// `None` when the payload has no such array (an older Claude), which leaves
+/// the recorded count.
+fn running_subagents(payload: &Map<String, Value>) -> Option<u32> {
+    let tasks = payload.get("background_tasks")?.as_array()?;
+    let running = tasks
+        .iter()
+        .filter(|task| {
+            task.get("type").and_then(Value::as_str) == Some("subagent")
+                && task.get("status").and_then(Value::as_str) == Some("running")
+        })
+        .count();
+    Some(u32::try_from(running).unwrap_or(u32::MAX))
 }
 
 /// Inbox effects of one accepted callback. A reported `blocked` is an event
@@ -2579,6 +2600,33 @@ mod tests {
             .as_object()
             .unwrap()
             .clone()
+    }
+
+    #[test]
+    fn a_stop_counts_the_subagents_its_background_tasks_say_still_run() {
+        let count = |source: &str| running_subagents(&object(source));
+        // An older Claude sends no list: the recorded count stays.
+        assert_eq!(count(r#"{"hook_event_name":"Stop"}"#), None);
+        assert_eq!(
+            count(r#"{"hook_event_name":"Stop","background_tasks":[]}"#),
+            Some(0)
+        );
+        // Two running subagents; a finished one and another task type do not count.
+        assert_eq!(
+            count(
+                r#"{"hook_event_name":"Stop","background_tasks":[
+                    {"id":"a","type":"subagent","status":"running"},
+                    {"id":"b","type":"subagent","status":"completed"},
+                    {"id":"c","type":"shell","status":"running"},
+                    {"id":"d","type":"subagent","status":"running"},
+                    "not an object", 7]}"#
+            ),
+            Some(2)
+        );
+        for other in [r#""running""#, "null", r#"{"type":"subagent"}"#, "2"] {
+            let source = format!(r#"{{"hook_event_name":"Stop","background_tasks":{other}}}"#);
+            assert_eq!(count(&source), None, "{source}");
+        }
     }
 
     #[test]

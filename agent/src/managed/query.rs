@@ -685,6 +685,7 @@ mod tests {
             output_generation: 0,
             permission_count: 0,
             question_count: 0,
+            subagent_count: 0,
             title: String::new(),
             progress: String::new(),
         }

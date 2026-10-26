@@ -438,6 +438,14 @@ struct RunEvidence {
     /// oldest first. Kept by `integration::tally_changes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requests: Vec<OpenRequest>,
+    /// Claude subagents still running at the run's last `Stop`, from its
+    /// `background_tasks`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    subagents: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// One request a provider hook raised that no hook has answered yet.
@@ -529,8 +537,14 @@ fn end_turn_hold(metadata: &mut Metadata, evidence: &mut RunEvidence) -> bool {
 
 /// What a provider hook said of a turn (`Manager::report_turn`).
 pub(crate) enum TurnReport {
-    Begin { marker: Option<String> },
-    End,
+    Begin {
+        marker: Option<String>,
+    },
+    /// `subagents`: how many subagents the provider said still run, when its
+    /// event carried a list; `None` leaves the recorded count.
+    End {
+        subagents: Option<u32>,
+    },
 }
 
 /// A process by its ID and start time, which together do not repeat.
@@ -791,6 +805,11 @@ pub(crate) struct Agent {
     pub permission_count: u32,
     #[serde(default)]
     pub question_count: u32,
+    /// Claude subagents still running at the run's last `Stop` that listed
+    /// its background tasks; 0 for other providers, before such a `Stop`,
+    /// and once the process is not running.
+    #[serde(default)]
+    pub subagent_count: u32,
     /// The foreground process group and its leader's start time: another
     /// process under a reused group ID has another epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1578,6 +1597,13 @@ impl Manager {
                 report_authority,
                 &binding,
             );
+            // Subagents end with their parent, so only a running run keeps
+            // the count from its last `Stop`.
+            let subagent_count = if process == "running" {
+                run_evidence.as_ref().map_or(0, |e| e.subagents)
+            } else {
+                0
+            };
             let agent = Agent {
                 id: name.clone(),
                 name,
@@ -1613,6 +1639,7 @@ impl Manager {
                 output_generation,
                 permission_count: counts.0,
                 question_count: counts.1,
+                subagent_count,
                 title: fields[9].clone(),
                 progress: fields[15].clone(),
             };
@@ -3046,11 +3073,18 @@ impl Manager {
                 });
                 integration::clear_open_requests(&mut evidence.requests);
             }
-            TurnReport::End => {
+            TurnReport::End { subagents } => {
                 let held = end_turn_hold(&mut metadata, &mut evidence);
                 // Nothing open outlives the turn, held report or not.
                 let cleared = integration::clear_open_requests(&mut evidence.requests);
-                if !held && !cleared {
+                let counted = match subagents {
+                    Some(count) if *count != evidence.subagents => {
+                        evidence.subagents = *count;
+                        true
+                    }
+                    _ => false,
+                };
+                if !held && !cleared && !counted {
                     return Ok(());
                 }
             }
@@ -4325,6 +4359,7 @@ fn identity_agent(
         output_generation,
         permission_count: 0,
         question_count: 0,
+        subagent_count: 0,
         title: fields[9].clone(),
         progress: fields[15].clone(),
     })
@@ -5451,6 +5486,7 @@ mod tests {
                 at: u64::MAX,
             })
             .collect();
+        evidence.subagents = u32::MAX;
         assert_eq!(
             decode::<RunEvidence>(&encode(&evidence).unwrap()),
             Some(evidence)
@@ -5482,6 +5518,34 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&evidence).unwrap(),
             json!({"run": "r", "requests": [{"key": "request:a", "kind": "question_asked", "at": 3}]})
+        );
+    }
+
+    #[test]
+    fn running_subagents_are_left_out_when_zero_and_default_when_absent() {
+        let mut evidence = RunEvidence {
+            run: "r".into(),
+            ..RunEvidence::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&evidence).unwrap(),
+            json!({"run": "r"})
+        );
+        // Evidence written before the count reads as none running.
+        assert_eq!(
+            serde_json::from_value::<RunEvidence>(json!({"run": "r"}))
+                .unwrap()
+                .subagents,
+            0
+        );
+        evidence.subagents = 2;
+        assert_eq!(
+            serde_json::to_value(&evidence).unwrap(),
+            json!({"run": "r", "subagents": 2})
+        );
+        assert_eq!(
+            decode::<RunEvidence>(&encode(&evidence).unwrap()),
+            Some(evidence)
         );
     }
 
@@ -5792,6 +5856,7 @@ mod tests {
             output_generation: 0,
             permission_count: 0,
             question_count: 0,
+            subagent_count: 0,
             title: String::new(),
             progress: String::new(),
         };
