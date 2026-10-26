@@ -63,7 +63,9 @@ impl Timing {
 /// One line per pane. Output counts only for panes that hold an agent or
 /// did (META or TRACKED), so a busy shell or `tail -f` does not wake the
 /// watch; a new agent shows up as a new command or foreground group.
-pub(crate) const SIGNATURE: &str = "#{pane_id} #{masil_core_boot_id} #{pane_dead} #{masil_pty_generation} #{masil_foreground_pgid} #{pane_current_command} #{?#{||:#{@masil-managed-agent},#{@masil-managed-observation}},#{pane_output_generation} #{pane_tty},- -}";
+/// A window entering or leaving column mode, or a pane moving between
+/// windows, changes `@masil-columns` and so the line.
+pub(crate) const SIGNATURE: &str = "#{pane_id} #{masil_core_boot_id} #{pane_dead} #{masil_pty_generation} #{masil_foreground_pgid} #{pane_current_command} #{@masil-columns} #{?#{||:#{@masil-managed-agent},#{@masil-managed-observation}},#{pane_output_generation} #{pane_tty},- -}";
 /// Whether output shows in a tty's mtime promptly enough to skip listing.
 const TTY_TIMES: bool = cfg!(target_os = "macos");
 /// Core dirty notifications are leading-edge; one pass per 300 ms keeps
@@ -84,10 +86,155 @@ struct PaneMemo {
     since: Option<u64>,
 }
 
+/// The pane option that is `1` on the pane of an agent in a column window
+/// that needs attention, so a status-line format can count those that are
+/// off screen.
+const ATTENTION: &str = "@masil-attention";
+/// The panes with their mark, to read the marks as the server has them.
+const MARKS_FORMAT: &str = "#{pane_id} #{@masil-attention}";
+
+/// A `MARKS_FORMAT` listing: every pane that exists and those marked `1`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PaneMarks {
+    existing: HashSet<String>,
+    marked: HashSet<String>,
+}
+
+/// The panes of a `MARKS_FORMAT` listing. A line without a valid pane ID is
+/// ignored; any value but exactly `1` is no mark.
+fn pane_marks(listing: &str) -> PaneMarks {
+    let mut marks = PaneMarks::default();
+    for line in listing.lines() {
+        let (pane, value) = line.split_once(' ').unwrap_or((line, ""));
+        if crate::pane_id(pane).is_err() {
+            continue;
+        }
+        marks.existing.insert(pane.to_owned());
+        if value == "1" {
+            marks.marked.insert(pane.to_owned());
+        }
+    }
+    marks
+}
+
+/// The tmux command that reads the marks.
+fn marks_argv() -> Vec<String> {
+    ["list-panes", "-a", "-F", MARKS_FORMAT]
+        .map(String::from)
+        .to_vec()
+}
+
+/// Clears every mark the server has, for a watch that was aborted and so
+/// left its marks: only the coordinator's watch writes them. Best effort.
+pub(crate) async fn clear_all_marks<R, Fut>(mut run: R)
+where
+    R: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let Ok(listing) = run(marks_argv()).await else {
+        return;
+    };
+    for argv in clear_argv(&pane_marks(&listing).marked) {
+        let _ = run(argv).await;
+    }
+}
+
+/// The panes that should carry a mark: those of agents in a column window
+/// that need attention, among the panes that `existing` lists.
+fn wanted_marks(agents: &[Agent], existing: &HashSet<String>) -> HashSet<String> {
+    agents
+        .iter()
+        .filter(|agent| agent.columns && agent.needs_attention())
+        .filter(|agent| existing.contains(&agent.pane_id))
+        .map(|agent| agent.pane_id.clone())
+        .collect()
+}
+
+/// The mark writes of one pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AttentionChange {
+    /// Panes to mark, sorted.
+    set: Vec<String>,
+    /// Panes to unmark, sorted.
+    unset: Vec<String>,
+}
+
+fn sorted(panes: impl Iterator<Item = String>) -> Vec<String> {
+    let mut panes: Vec<String> = panes.collect();
+    panes.sort();
+    panes
+}
+
+/// The writes that turn the marks `marked` into `wanted`. A full pass takes
+/// `marked` from the server, so every pane it unmarks exists.
+fn attention_change(marked: &HashSet<String>, wanted: &HashSet<String>) -> AttentionChange {
+    AttentionChange {
+        set: sorted(wanted.difference(marked).cloned()),
+        unset: sorted(marked.difference(wanted).cloned()),
+    }
+}
+
+/// The write of a single-pane pass: only `pane`'s own mark, and only when
+/// its agent is in the pass. `marked` is what this resident remembers, since
+/// a single-pane pass reads nothing; the next full pass corrects a
+/// difference from the server.
+fn pane_change(marked: &HashSet<String>, pane: &str, agents: &[Agent]) -> AttentionChange {
+    let Some(agent) = agents.iter().find(|agent| agent.pane_id == pane) else {
+        return AttentionChange::default();
+    };
+    let wanted = agent.columns && agent.needs_attention();
+    let mut change = AttentionChange::default();
+    match (wanted, marked.contains(pane)) {
+        (true, false) => change.set.push(pane.to_owned()),
+        (false, true) => change.unset.push(pane.to_owned()),
+        _ => {}
+    }
+    change
+}
+
+/// The `;`-separated tmux commands that write a change; empty when there is
+/// nothing to write.
+fn attention_argv(change: &AttentionChange) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut command = |words: &[&str]| {
+        if !argv.is_empty() {
+            argv.push(";".into());
+        }
+        argv.extend(words.iter().map(|word| (*word).to_owned()));
+    };
+    for pane in &change.set {
+        command(&["set-option", "-p", "-t", pane, ATTENTION, "1"]);
+    }
+    for pane in &change.unset {
+        command(&["set-option", "-pu", "-t", pane, ATTENTION]);
+    }
+    argv
+}
+
+/// The commands that clear exactly the marks in `marked`, for the end of
+/// the watch: one per pane, since a pane closed since the last full pass
+/// fails its command, and a failed command drops the rest of its list.
+fn clear_argv(marked: &HashSet<String>) -> Vec<Vec<String>> {
+    sorted(marked.iter().cloned())
+        .into_iter()
+        .map(|pane| {
+            attention_argv(&AttentionChange {
+                set: Vec::new(),
+                unset: vec![pane],
+            })
+        })
+        .collect()
+}
+
 /// State a long-lived Manager keeps across passes.
 pub(crate) struct Resident {
     timing: Timing,
     panes: Mutex<HashMap<String, PaneMemo>>,
+    /// The panes this resident believes carry `@masil-attention`. A full
+    /// pass replaces it with what it read and wrote; a single-pane pass and
+    /// the end of the watch use it as it stands. It also tells a full pass
+    /// that marks remain to clear once no window is in column mode.
+    attention: Mutex<HashSet<String>>,
     /// The operation store, opened once and reused.
     pub(super) store: Arc<Mutex<Option<Store>>>,
     /// An inbox write needs the coordinator's badge, extension, and route
@@ -109,6 +256,7 @@ impl Resident {
         Self {
             timing: Timing::new(tick),
             panes: Mutex::new(HashMap::new()),
+            attention: Mutex::new(HashSet::new()),
             store: Arc::new(Mutex::new(None)),
             inbox_dirty: AtomicBool::new(false),
             answers_only: AtomicBool::new(false),
@@ -169,6 +317,98 @@ impl Resident {
                 agents.iter().map(|agent| agent.pane_id.as_str()).collect();
             panes.retain(|pane, _| present.contains(pane.as_str()));
         }
+    }
+
+    /// The panes this resident believes carry a mark; empty if the lock is
+    /// poisoned.
+    fn remembered(&self) -> HashSet<String> {
+        self.attention
+            .lock()
+            .map(|marked| marked.clone())
+            .unwrap_or_default()
+    }
+
+    fn remember_marks(&self, marked: HashSet<String>) {
+        if let Ok(mut state) = self.attention.lock() {
+            *state = marked;
+        }
+    }
+
+    /// After a full pass, makes `@masil-attention` `1` exactly on the panes
+    /// of agents in a column window that need attention.
+    ///
+    /// `columns` is whether some pane of the inventory is in a column
+    /// window. A pass with neither that nor a remembered mark sends nothing,
+    /// so with column mode unused it costs nothing. Otherwise it trusts no
+    /// memory: it reads the marks from the server (one invocation), sends
+    /// the sets and unsets that differ in one more (none when there is no
+    /// difference), and remembers the wanted marks. That finds a mark an
+    /// earlier resident left and one that `layout columns off` removed. A
+    /// coordinator that serves only `--answers` runs leaves other panes
+    /// alone.
+    ///
+    /// `run` sends one tmux invocation and returns its output. A failed read
+    /// leaves the memory as it is, so the next full pass reads again. A
+    /// failed write may have written part of the list, so the memory then
+    /// holds every pane that may carry a mark (those read and those wanted):
+    /// the next full pass reads and settles them even once no window is in
+    /// column mode.
+    pub(super) async fn sync_attention<R, Fut>(&self, columns: bool, agents: &[Agent], run: R)
+    where
+        R: Fn(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        if self.answers_only() || (!columns && self.remembered().is_empty()) {
+            return;
+        }
+        let Ok(listing) = run(marks_argv()).await else {
+            return;
+        };
+        let PaneMarks { existing, marked } = pane_marks(&listing);
+        let wanted = wanted_marks(agents, &existing);
+        let argv = attention_argv(&attention_change(&marked, &wanted));
+        let written = argv.is_empty() || run(argv).await.is_ok();
+        self.remember_marks(if written { wanted } else { &marked | &wanted });
+    }
+
+    /// After a single-pane pass, settles the mark of `pane` alone, from the
+    /// remembered marks. It reads nothing and leaves every other pane to the
+    /// next full pass, which also corrects what the memory has wrong. It
+    /// sends nothing when the pane's agent is not in the pass, or when the
+    /// pane's mark already matches. A failed write changes nothing.
+    pub(super) async fn sync_pane_attention<R, Fut>(&self, pane: &str, agents: &[Agent], run: R)
+    where
+        R: FnOnce(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        if self.answers_only() {
+            return;
+        }
+        let change = pane_change(&self.remembered(), pane, agents);
+        let argv = attention_argv(&change);
+        if argv.is_empty() || run(argv).await.is_err() {
+            return;
+        }
+        if let Ok(mut marked) = self.attention.lock() {
+            marked.extend(change.set);
+            for pane in &change.unset {
+                marked.remove(pane);
+            }
+        }
+    }
+
+    /// When the watch stops, or turns to answers-only and stops writing
+    /// marks: clears the remembered marks, so none outlives what keeps it
+    /// right. Best effort; errors are ignored.
+    pub(super) async fn clear_attention<R, Fut>(&self, mut run: R)
+    where
+        R: FnMut(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        for argv in clear_argv(&self.remembered()) {
+            let _ = run(argv).await;
+        }
+        self.remember_marks(HashSet::new());
     }
 
     /// Drops the volatile memo for a bridge-notified PTY replacement or pane
@@ -1099,6 +1339,13 @@ pub(crate) async fn watch(
             while let Ok(outcome) = notifier.outcomes.try_recv() {
                 let _ = record_outcome(&manager, outcome).await;
             }
+            // Marks nothing keeps right any more come off with the badge,
+            // after the stored outcomes: the stop waits only so long.
+            if let Some(resident) = &manager.resident {
+                resident
+                    .clear_attention(|args| manager.command_owned(args))
+                    .await;
+            }
             return;
         }
         let test = control.test.lock().ok().and_then(|mut slot| slot.take());
@@ -1116,6 +1363,12 @@ pub(crate) async fn watch(
             // The set of panes to watch changed: look at all of them again.
             last_answers_only = answers_only;
             force_pass = true;
+            // Answers-only writes no marks, so the ones written stay wrong.
+            if answers_only && let Some(resident) = &manager.resident {
+                resident
+                    .clear_attention(|args| manager.command_owned(args))
+                    .await;
+            }
         }
         let poked = control.poked.swap(false, Ordering::SeqCst);
         let (inbox_changed, recounted) = take_inbox_changes(&control, manager.resident.as_ref());
@@ -2831,5 +3084,596 @@ mod tests {
         assert_eq!(core.unwrap(), "from-core");
         let failed = digest_or_list(None, async { Err::<String, _>("down".to_owned()) }).await;
         assert_eq!(failed.unwrap_err(), "down");
+    }
+
+    fn column_agent(pane: &str, state: &str, returned_idle: bool, columns: bool) -> Agent {
+        serde_json::from_value(json!({
+            "id": pane, "name": pane, "provider": "claude", "pane_id": pane,
+            "window_id": "@1", "workspace": "main", "cwd": "/tmp", "boot": "b",
+            "generation": "1", "run": "r", "process": "running", "state": state,
+            "evidence": {"state": state, "source": "screen"},
+            "seen": false, "revision": "1", "returned_idle": returned_idle,
+            "columns": columns,
+        }))
+        .unwrap()
+    }
+
+    fn panes(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|pane| (*pane).to_owned()).collect()
+    }
+
+    fn words(text: &str) -> Vec<String> {
+        text.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn read_command() -> Vec<String> {
+        ["list-panes", "-a", "-F", "#{pane_id} #{@masil-attention}"]
+            .map(String::from)
+            .to_vec()
+    }
+
+    #[test]
+    fn a_column_agent_that_needs_attention_is_wanted() {
+        let agents = [
+            column_agent("%1", "blocked", false, true),
+            column_agent("%2", "idle", true, true),
+            column_agent("%3", "working", false, true),
+            column_agent("%4", "idle", false, true),
+        ];
+        let wanted = wanted_marks(&agents, &panes(&["%1", "%2", "%3", "%4"]));
+        assert_eq!(wanted, panes(&["%1", "%2"]));
+        let change = attention_change(&HashSet::new(), &wanted);
+        assert_eq!(change.set, words("%1 %2"));
+        assert!(change.unset.is_empty());
+    }
+
+    #[test]
+    fn the_mark_rule_is_the_projection_attention_rule() {
+        for state in ["blocked", "idle", "working", "unknown", "exited"] {
+            for returned_idle in [false, true] {
+                let agent = column_agent("%1", state, returned_idle, true);
+                let projection = agent.projection();
+                let attention = &projection["attention"];
+                assert_eq!(
+                    wanted_marks(std::slice::from_ref(&agent), &panes(&["%1"])).contains("%1"),
+                    attention["pending"] == true && attention["available"] == true,
+                    "{state} {returned_idle}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_mark_that_is_still_wanted_is_not_written_again() {
+        let agents = [column_agent("%1", "blocked", false, true)];
+        let wanted = wanted_marks(&agents, &panes(&["%1"]));
+        assert_eq!(wanted, panes(&["%1"]));
+        assert_eq!(
+            attention_change(&panes(&["%1"]), &wanted),
+            AttentionChange::default()
+        );
+    }
+
+    #[test]
+    fn a_mark_is_cleared_when_the_agent_no_longer_needs_attention() {
+        let agents = [
+            column_agent("%1", "working", false, true),
+            column_agent("%2", "idle", false, true),
+        ];
+        let wanted = wanted_marks(&agents, &panes(&["%1", "%2"]));
+        assert!(wanted.is_empty());
+        let change = attention_change(&panes(&["%1", "%2"]), &wanted);
+        assert!(change.set.is_empty());
+        assert_eq!(change.unset, words("%1 %2"));
+    }
+
+    #[test]
+    fn an_agent_whose_pane_is_not_listed_is_not_wanted() {
+        let agents = [
+            column_agent("%1", "blocked", false, true),
+            column_agent("%2", "blocked", false, true),
+        ];
+        assert_eq!(wanted_marks(&agents, &panes(&["%1"])), panes(&["%1"]));
+        assert!(wanted_marks(&agents, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn an_agent_outside_a_column_window_is_never_wanted() {
+        let agents = [
+            column_agent("%1", "blocked", false, false),
+            column_agent("%2", "idle", true, false),
+        ];
+        let existing = panes(&["%1", "%2"]);
+        let wanted = wanted_marks(&agents, &existing);
+        assert!(wanted.is_empty());
+        assert_eq!(
+            attention_change(&HashSet::new(), &wanted),
+            AttentionChange::default()
+        );
+        // The window left column mode: its marks come off.
+        let change = attention_change(&panes(&["%1"]), &wanted);
+        assert_eq!(change.unset, words("%1"));
+        assert!(change.set.is_empty());
+    }
+
+    #[test]
+    fn nothing_to_do_is_empty_lists() {
+        let change = attention_change(&HashSet::new(), &HashSet::new());
+        assert_eq!(change, AttentionChange::default());
+        assert!(attention_argv(&change).is_empty());
+        let idle = [column_agent("%1", "idle", false, true)];
+        assert!(wanted_marks(&idle, &panes(&["%1"])).is_empty());
+    }
+
+    #[test]
+    fn the_attention_writes_are_one_semicolon_separated_command() {
+        let change = AttentionChange {
+            set: words("%1 %4"),
+            unset: words("%2"),
+        };
+        assert_eq!(
+            attention_argv(&change),
+            words(
+                "set-option -p -t %1 @masil-attention 1 ; set-option -p -t %4 @masil-attention 1 ; set-option -pu -t %2 @masil-attention"
+            )
+        );
+        let only_unset = AttentionChange {
+            unset: words("%2"),
+            ..AttentionChange::default()
+        };
+        assert_eq!(
+            attention_argv(&only_unset),
+            words("set-option -pu -t %2 @masil-attention")
+        );
+    }
+
+    #[test]
+    fn the_marks_listing_names_the_panes_that_exist_and_those_marked_one() {
+        let listing = "%1 1\n%2 \n%3 0\n%4 1\nbad 1\n%5\n%6 1 \n";
+        let marks = pane_marks(listing);
+        assert_eq!(marks.marked, panes(&["%1", "%4"]));
+        assert_eq!(marks.existing, panes(&["%1", "%2", "%3", "%4", "%5", "%6"]));
+        assert_eq!(pane_marks(""), PaneMarks::default());
+        assert_eq!(MARKS_FORMAT, format!("#{{pane_id}} #{{{ATTENTION}}}"));
+        assert_eq!(marks_argv(), read_command());
+    }
+
+    #[test]
+    fn a_single_pane_pass_changes_only_its_own_mark() {
+        let blocked = [
+            column_agent("%2", "blocked", false, true),
+            column_agent("%3", "blocked", false, true),
+        ];
+        // Wanted and not marked: only %2 is set, though %3 is in the pass too
+        // and %9 is remembered.
+        assert_eq!(
+            pane_change(&panes(&["%9"]), "%2", &blocked),
+            AttentionChange {
+                set: words("%2"),
+                unset: Vec::new()
+            }
+        );
+        // Wanted and already marked.
+        assert_eq!(
+            pane_change(&panes(&["%2"]), "%2", &blocked),
+            AttentionChange::default()
+        );
+        // Marked and no longer needing attention.
+        let idle = [column_agent("%2", "idle", false, true)];
+        assert_eq!(
+            pane_change(&panes(&["%2", "%9"]), "%2", &idle),
+            AttentionChange {
+                set: Vec::new(),
+                unset: words("%2")
+            }
+        );
+        // Marked and no longer in a column window.
+        let plain = [column_agent("%2", "blocked", false, false)];
+        assert_eq!(
+            pane_change(&panes(&["%2"]), "%2", &plain).unset,
+            words("%2")
+        );
+    }
+
+    #[test]
+    fn a_single_pane_pass_with_nothing_to_change_writes_nothing() {
+        let plain = [column_agent("%2", "blocked", false, false)];
+        let idle = [column_agent("%2", "idle", false, true)];
+        let other = [column_agent("%3", "blocked", false, true)];
+        let nothing = AttentionChange::default();
+        // Not in a column window and not remembered.
+        assert_eq!(pane_change(&panes(&["%9"]), "%2", &plain), nothing);
+        // In a column window, not needing attention, not remembered.
+        assert_eq!(pane_change(&HashSet::new(), "%2", &idle), nothing);
+        // The target's agent is not in the pass: another pane's agent is no
+        // reason to write, and a remembered mark waits for a full pass.
+        assert_eq!(pane_change(&HashSet::new(), "%2", &other), nothing);
+        assert_eq!(pane_change(&panes(&["%2"]), "%2", &[]), nothing);
+    }
+
+    #[test]
+    fn the_stop_clean_up_unsets_exactly_the_remembered_marks() {
+        assert!(clear_argv(&HashSet::new()).is_empty());
+        assert_eq!(
+            clear_argv(&panes(&["%3", "%1"])),
+            vec![
+                words("set-option -pu -t %1 @masil-attention"),
+                words("set-option -pu -t %3 @masil-attention"),
+            ]
+        );
+    }
+
+    fn fresh_resident() -> Resident {
+        Resident::new(
+            Duration::from_secs(2),
+            Arc::new(super::super::core_action::PaneActionLocks::default()),
+        )
+    }
+
+    /// The tmux server as the attention code sees it: it records every
+    /// invocation and answers the marks listing.
+    struct Tmux {
+        sent: Mutex<Vec<Vec<String>>>,
+        listing: Mutex<String>,
+        reads_fail: AtomicBool,
+        writes_fail: AtomicBool,
+    }
+
+    impl Tmux {
+        fn new(listing: &str) -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+                listing: Mutex::new(listing.to_owned()),
+                reads_fail: AtomicBool::new(false),
+                writes_fail: AtomicBool::new(false),
+            }
+        }
+
+        fn show(&self, listing: &str) {
+            *self.listing.lock().unwrap() = listing.to_owned();
+        }
+
+        async fn run(&self, args: Vec<String>) -> Result<String, String> {
+            let read = args[0] == "list-panes";
+            self.sent.lock().unwrap().push(args);
+            let failing = if read {
+                &self.reads_fail
+            } else {
+                &self.writes_fail
+            };
+            if failing.load(Ordering::SeqCst) {
+                return Err("server_unreachable".into());
+            }
+            Ok(if read {
+                self.listing.lock().unwrap().clone()
+            } else {
+                String::new()
+            })
+        }
+
+        fn take(&self) -> Vec<Vec<String>> {
+            std::mem::take(&mut *self.sent.lock().unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn with_column_mode_unused_a_full_pass_sends_no_command() {
+        let resident = fresh_resident();
+        let tmux = Tmux::new("%1 \n%2 \n");
+        let agents = [
+            column_agent("%1", "blocked", false, false),
+            column_agent("%2", "idle", true, false),
+        ];
+        for _ in 0..2 {
+            resident
+                .sync_attention(false, &agents, |args| tmux.run(args))
+                .await;
+        }
+        assert!(tmux.take().is_empty());
+        assert!(resident.remembered().is_empty());
+        // A coordinator that serves only `--answers` runs leaves panes alone,
+        // even with a window in column mode.
+        let columns = [column_agent("%1", "blocked", false, true)];
+        resident.set_answers_only(true);
+        resident
+            .sync_attention(true, &columns, |args| tmux.run(args))
+            .await;
+        assert!(tmux.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_mark_on_a_pane_whose_agent_is_gone_is_read_and_cleared() {
+        // A replaced resident left %5 marked; its agent quit and %5 is a
+        // shell. This resident remembers nothing, but %2 is in a column
+        // window.
+        let resident = fresh_resident();
+        let tmux = Tmux::new("%2 \n%5 1\n");
+        resident
+            .sync_attention(true, &[], |args| tmux.run(args))
+            .await;
+        assert_eq!(
+            tmux.take(),
+            vec![
+                read_command(),
+                words("set-option -pu -t %5 @masil-attention")
+            ]
+        );
+        assert!(resident.remembered().is_empty());
+        // Cleared: the next pass reads and finds nothing to write.
+        tmux.show("%2 \n%5 \n");
+        resident
+            .sync_attention(true, &[], |args| tmux.run(args))
+            .await;
+        assert_eq!(tmux.take(), vec![read_command()]);
+    }
+
+    #[tokio::test]
+    async fn a_full_pass_reads_the_marks_and_writes_the_differences_in_one_command() {
+        let resident = fresh_resident();
+        let tmux = Tmux::new("%1 1\n%2 1\n%3 \n%4 \n%5 1\n");
+        let agents = [
+            column_agent("%1", "blocked", false, true),
+            column_agent("%2", "idle", false, true),
+            column_agent("%3", "blocked", false, false),
+            column_agent("%4", "idle", true, true),
+        ];
+        resident
+            .sync_attention(true, &agents, |args| tmux.run(args))
+            .await;
+        // %4 is new, %2 is cleared, and %5 (marked, no longer an agent) is
+        // cleared; %1 stays.
+        assert_eq!(
+            tmux.take(),
+            vec![
+                read_command(),
+                words(
+                    "set-option -p -t %4 @masil-attention 1 ; set-option -pu -t %2 @masil-attention ; set-option -pu -t %5 @masil-attention"
+                ),
+            ]
+        );
+        assert_eq!(resident.remembered(), panes(&["%1", "%4"]));
+        // The server now agrees: the pass still reads, and writes nothing.
+        tmux.show("%1 1\n%2 \n%3 \n%4 1\n%5 \n");
+        resident
+            .sync_attention(true, &agents, |args| tmux.run(args))
+            .await;
+        assert_eq!(tmux.take(), vec![read_command()]);
+    }
+
+    #[tokio::test]
+    async fn a_mark_that_columns_off_and_on_removed_is_written_again() {
+        // `layout columns off` unset %1's mark and `on` came back before the
+        // next listing: memory says marked, the server says not.
+        let resident = fresh_resident();
+        resident.remember_marks(panes(&["%1"]));
+        let tmux = Tmux::new("%1 \n");
+        let agents = [column_agent("%1", "blocked", false, true)];
+        resident
+            .sync_attention(true, &agents, |args| tmux.run(args))
+            .await;
+        assert_eq!(
+            tmux.take(),
+            vec![
+                read_command(),
+                words("set-option -p -t %1 @masil-attention 1")
+            ]
+        );
+        assert_eq!(resident.remembered(), panes(&["%1"]));
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_changes_nothing() {
+        let resident = fresh_resident();
+        resident.remember_marks(panes(&["%1"]));
+        let tmux = Tmux::new("%1 1\n%2 \n");
+        tmux.reads_fail.store(true, Ordering::SeqCst);
+        let agents = [column_agent("%2", "blocked", false, true)];
+        resident
+            .sync_attention(true, &agents, |args| tmux.run(args))
+            .await;
+        // No write follows a read that failed, and the memory stays.
+        assert_eq!(tmux.take(), vec![read_command()]);
+        assert_eq!(resident.remembered(), panes(&["%1"]));
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_is_tried_again_at_the_next_full_pass() {
+        let resident = fresh_resident();
+        let tmux = Tmux::new("%1 \n%2 1\n");
+        tmux.writes_fail.store(true, Ordering::SeqCst);
+        let agents = [column_agent("%1", "blocked", false, true)];
+        resident
+            .sync_attention(true, &agents, |args| tmux.run(args))
+            .await;
+        let write =
+            words("set-option -p -t %1 @masil-attention 1 ; set-option -pu -t %2 @masil-attention");
+        assert_eq!(tmux.take(), vec![read_command(), write.clone()]);
+        // Part of the list may have been written: every pane that may carry
+        // a mark is remembered, so a pass without a column window reads too.
+        assert_eq!(resident.remembered(), panes(&["%1", "%2"]));
+        tmux.writes_fail.store(false, Ordering::SeqCst);
+        resident
+            .sync_attention(false, &agents, |args| tmux.run(args))
+            .await;
+        assert_eq!(tmux.take(), vec![read_command(), write]);
+        assert_eq!(resident.remembered(), panes(&["%1"]));
+    }
+
+    #[tokio::test]
+    async fn marks_come_off_when_column_mode_ends_and_then_cost_nothing() {
+        let resident = fresh_resident();
+        let tmux = Tmux::new("%1 \n");
+        let columns = [column_agent("%1", "blocked", false, true)];
+        resident
+            .sync_attention(true, &columns, |args| tmux.run(args))
+            .await;
+        tmux.take();
+        // No pane is in a column window now, but %1 is still marked.
+        tmux.show("%1 1\n");
+        let plain = [column_agent("%1", "blocked", false, false)];
+        resident
+            .sync_attention(false, &plain, |args| tmux.run(args))
+            .await;
+        assert_eq!(
+            tmux.take(),
+            vec![
+                read_command(),
+                words("set-option -pu -t %1 @masil-attention")
+            ]
+        );
+        assert!(resident.remembered().is_empty());
+        tmux.show("%1 \n");
+        resident
+            .sync_attention(false, &plain, |args| tmux.run(args))
+            .await;
+        assert!(tmux.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pane_that_closed_or_a_new_server_needs_no_write() {
+        let resident = fresh_resident();
+        let tmux = Tmux::new("%1 \n");
+        let agents = [column_agent("%1", "blocked", false, true)];
+        resident
+            .sync_attention(true, &agents, |args| tmux.run(args))
+            .await;
+        tmux.take();
+        assert_eq!(resident.remembered(), panes(&["%1"]));
+        // %1 closed after the inventory: it is not listed, so it is neither
+        // marked nor unmarked.
+        tmux.show("%2 \n");
+        resident
+            .sync_attention(true, &agents, |args| tmux.run(args))
+            .await;
+        assert_eq!(tmux.take(), vec![read_command()]);
+        assert!(resident.remembered().is_empty());
+        // A restarted server has no marks to find.
+        resident.remember_marks(panes(&["%1"]));
+        tmux.show("");
+        resident
+            .sync_attention(false, &[], |args| tmux.run(args))
+            .await;
+        assert_eq!(tmux.take(), vec![read_command()]);
+        assert!(resident.remembered().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_single_pane_pass_marks_and_unmarks_its_pane_from_memory() {
+        let resident = fresh_resident();
+        resident.remember_marks(panes(&["%9"]));
+        let tmux = Tmux::new("");
+        let blocked = [
+            column_agent("%2", "blocked", false, true),
+            column_agent("%3", "blocked", false, true),
+        ];
+        resident
+            .sync_pane_attention("%2", &blocked, |args| tmux.run(args))
+            .await;
+        // One write for %2 and no read: %3 and %9 are not touched.
+        assert_eq!(
+            tmux.take(),
+            vec![words("set-option -p -t %2 @masil-attention 1")]
+        );
+        assert_eq!(resident.remembered(), panes(&["%2", "%9"]));
+        // The same pass again writes nothing.
+        resident
+            .sync_pane_attention("%2", &blocked, |args| tmux.run(args))
+            .await;
+        assert!(tmux.take().is_empty());
+        let idle = [column_agent("%2", "idle", false, true)];
+        resident
+            .sync_pane_attention("%2", &idle, |args| tmux.run(args))
+            .await;
+        assert_eq!(
+            tmux.take(),
+            vec![words("set-option -pu -t %2 @masil-attention")]
+        );
+        assert_eq!(resident.remembered(), panes(&["%9"]));
+    }
+
+    #[tokio::test]
+    async fn a_single_pane_pass_without_a_change_sends_no_command() {
+        let resident = fresh_resident();
+        resident.remember_marks(panes(&["%9"]));
+        let tmux = Tmux::new("");
+        let plain = [column_agent("%2", "blocked", false, false)];
+        resident
+            .sync_pane_attention("%2", &plain, |args| tmux.run(args))
+            .await;
+        let idle = [column_agent("%2", "idle", false, true)];
+        resident
+            .sync_pane_attention("%2", &idle, |args| tmux.run(args))
+            .await;
+        assert!(tmux.take().is_empty());
+        assert_eq!(resident.remembered(), panes(&["%9"]));
+        // A coordinator that serves only `--answers` runs leaves panes alone.
+        let blocked = [column_agent("%2", "blocked", false, true)];
+        resident.set_answers_only(true);
+        resident
+            .sync_pane_attention("%2", &blocked, |args| tmux.run(args))
+            .await;
+        assert!(tmux.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_single_pane_write_leaves_the_memory() {
+        let resident = fresh_resident();
+        resident.remember_marks(panes(&["%2", "%9"]));
+        let tmux = Tmux::new("");
+        tmux.writes_fail.store(true, Ordering::SeqCst);
+        let idle = [column_agent("%2", "idle", false, true)];
+        resident
+            .sync_pane_attention("%2", &idle, |args| tmux.run(args))
+            .await;
+        assert_eq!(tmux.take().len(), 1);
+        assert_eq!(resident.remembered(), panes(&["%2", "%9"]));
+        let blocked = [column_agent("%3", "blocked", false, true)];
+        resident
+            .sync_pane_attention("%3", &blocked, |args| tmux.run(args))
+            .await;
+        assert_eq!(tmux.take().len(), 1);
+        assert_eq!(resident.remembered(), panes(&["%2", "%9"]));
+    }
+
+    #[tokio::test]
+    async fn stopping_clears_each_remembered_mark() {
+        let resident = fresh_resident();
+        let tmux = Tmux::new("");
+        resident.clear_attention(|args| tmux.run(args)).await;
+        assert!(tmux.take().is_empty());
+        resident.remember_marks(panes(&["%3", "%1"]));
+        resident.clear_attention(|args| tmux.run(args)).await;
+        assert_eq!(
+            tmux.take(),
+            vec![
+                words("set-option -pu -t %1 @masil-attention"),
+                words("set-option -pu -t %3 @masil-attention"),
+            ]
+        );
+        assert!(resident.remembered().is_empty());
+        // A failed pane does not stop the others, and errors are ignored.
+        tmux.writes_fail.store(true, Ordering::SeqCst);
+        resident.remember_marks(panes(&["%1", "%2"]));
+        resident.clear_attention(|args| tmux.run(args)).await;
+        assert_eq!(tmux.take().len(), 2);
+        assert!(resident.remembered().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_aborted_watch_clears_every_mark_the_server_has() {
+        let tmux = Tmux::new("%1 1\n%2 \n%3 1\n%4 0\n");
+        clear_all_marks(|args| tmux.run(args)).await;
+        assert_eq!(
+            tmux.take(),
+            vec![
+                marks_argv(),
+                words("set-option -pu -t %1 @masil-attention"),
+                words("set-option -pu -t %3 @masil-attention"),
+            ]
+        );
+        // No read, no writes.
+        tmux.reads_fail.store(true, Ordering::SeqCst);
+        clear_all_marks(|args| tmux.run(args)).await;
+        assert_eq!(tmux.take().len(), 1);
     }
 }

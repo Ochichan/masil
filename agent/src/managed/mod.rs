@@ -48,7 +48,7 @@ const META: &str = "@masil-managed-agent";
 const TRACKED: &str = "@masil-managed-observation";
 const EVIDENCE: &str = "@masil-agent-run-evidence";
 const STORE_OPTION: &str = "@masil-operation-store";
-const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}\t#{q:@masil-agent-run-evidence}\t#{q:@masil-agent-epoch}\t#{q:pane_last_output_time}";
+const FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:pane_output_generation}\t#{q:masil_osc_progress}\t#{q:@masil-agent-run-evidence}\t#{q:@masil-agent-epoch}\t#{q:pane_last_output_time}\t#{q:@masil-columns}";
 const CAPTURE_BATCH_SIZE: usize = 12;
 const MAX_PS_TTY_ARGUMENT: usize = 4096;
 const TRACKED_REJECTED: &str = "masil-agent-stale";
@@ -815,6 +815,9 @@ pub(crate) struct Agent {
     /// process under a reused group ID has another epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_epoch: Option<String>,
+    /// The pane's window is in column mode (`@masil-columns` is `1`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub columns: bool,
     #[serde(skip)]
     metadata: Option<Metadata>,
     #[serde(skip)]
@@ -926,6 +929,12 @@ impl Manager {
             .await
             .map_err(server_unreachable)?;
         String::from_utf8(result.stdout).map_err(|_| "native response is not UTF-8".into())
+    }
+
+    /// `command` for an argument list built at run time.
+    pub(super) async fn command_owned(&self, args: Vec<String>) -> Result<String, String> {
+        let words: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.command(&words).await
     }
 
     pub async fn boot(&self) -> Result<String, String> {
@@ -1382,6 +1391,10 @@ impl Manager {
         let mut prepared = self
             .capture_cache_misses(&inventory, &identified, target)
             .await?;
+        // Whether some pane is in a column window, which a full pass needs
+        // to settle `@masil-attention`. Read here because the loop below
+        // consumes the inventory.
+        let columns = inventory.iter().any(|fields| fields[19] == "1");
         let mut agents = Vec::new();
         let mut tracked_groups = Vec::new();
         let mut tracked_updates = Vec::new();
@@ -1636,6 +1649,7 @@ impl Manager {
                 tracked,
                 tracked_encoded: fields[12].clone(),
                 process_epoch,
+                columns: fields[19] == "1",
                 foreground_group,
                 output_generation,
                 permission_count: counts.0,
@@ -1723,6 +1737,18 @@ impl Manager {
         };
         if !read_only && let Some(resident) = &self.resident {
             resident.remember(&agents, target.is_none());
+            match target {
+                None => {
+                    resident
+                        .sync_attention(columns, &agents, |args| self.command_owned(args))
+                        .await;
+                }
+                Some(pane) => {
+                    resident
+                        .sync_pane_attention(pane, &agents, |args| self.command_owned(args))
+                        .await;
+                }
+            }
         }
         bridge_scope.extend(
             agents
@@ -3506,6 +3532,12 @@ impl Agent {
         }
     }
 
+    /// Whether the attention filter lists this agent: the projection's
+    /// `attention.pending && attention.available`.
+    pub(super) fn needs_attention(&self) -> bool {
+        self.state == "blocked" || self.returned_idle
+    }
+
     pub fn projection(&self) -> Value {
         let blocked = self.state == "blocked";
         // Counts come from the provider's own server or the requests its hooks
@@ -3538,6 +3570,9 @@ impl Agent {
             projection["native"]["freshness"] = json!("stale");
             projection["core"]["freshness"] = json!("stale");
             projection["core"]["process"] = json!("unknown");
+        }
+        if self.columns {
+            projection["columns"] = json!(true);
         }
         projection
     }
@@ -4134,7 +4169,7 @@ fn records(text: &str) -> Result<Vec<Vec<String>>, String> {
 
 fn validate_inventory(inventory: &[Vec<String>]) -> Result<(), String> {
     for fields in inventory {
-        if fields.len() != 19 || crate::pane_id(&fields[0]).is_err() {
+        if fields.len() != 20 || crate::pane_id(&fields[0]).is_err() {
             return Err("invalid native pane inventory".into());
         }
         if [&fields[11], &fields[12], &fields[16]]
@@ -4359,6 +4394,7 @@ fn identity_agent(
         tracked,
         tracked_encoded: fields[12].clone(),
         process_epoch,
+        columns: fields[19] == "1",
         foreground_group,
         output_generation,
         permission_count: 0,
@@ -4783,7 +4819,7 @@ mod tests {
         let codex = providers::find("codex");
         let boot = "00000000-0000-0000-0000-000000000000";
         let row = |pane: &str, metadata: Option<&Metadata>, group: &str| {
-            let mut row = vec![String::new(); 19];
+            let mut row = vec![String::new(); 20];
             row[0] = pane.into();
             row[5] = boot.into();
             row[6] = "1".into();
@@ -5890,6 +5926,7 @@ mod tests {
             tracked_encoded: String::new(),
             foreground_group: 0,
             process_epoch: None,
+            columns: false,
             output_generation: 0,
             permission_count: 0,
             question_count: 0,
@@ -6005,7 +6042,7 @@ mod tests {
 
     #[test]
     fn the_store_line_is_split_off_the_listing() {
-        let row = "%3\t@1\tmain\t10\t0\tboot\t2\tcodex\t/tmp\t\t\t\t\t0\t5\t\t\t\t0\n";
+        let row = "%3\t@1\tmain\t10\t0\tboot\t2\tcodex\t/tmp\t\t\t\t\t0\t5\t\t\t\t0\t\n";
         // With a recorded instance.
         let output = format!("{row}{row}77\n");
         let (listing, recorded) = split_store_line(&output).unwrap();
@@ -6021,7 +6058,7 @@ mod tests {
 
     #[test]
     fn a_listing_without_its_store_line_is_refused() {
-        let row = "%3\t@1\tmain\t10\t0\tboot\t2\tcodex\t/tmp\t\t\t\t\t0\t5\t\t\t\t0\n";
+        let row = "%3\t@1\tmain\t10\t0\tboot\t2\tcodex\t/tmp\t\t\t\t\t0\t5\t\t\t\t0\t\n";
         // Nothing printed, or an unterminated last line.
         assert!(split_store_line("").is_err());
         assert!(split_store_line("77").is_err());
@@ -6032,7 +6069,7 @@ mod tests {
     }
 
     fn inventory_row(pane: &str, dead: bool) -> Vec<String> {
-        let mut fields = vec![String::new(); 19];
+        let mut fields = vec![String::new(); 20];
         fields[0] = pane.into();
         fields[1] = "@1".into();
         fields[2] = "main".into();
@@ -6076,5 +6113,59 @@ mod tests {
         let mut bad = fields.clone();
         bad[14] = "x".into();
         assert!(identity_agent(&bad, codex, None, Some(codex)).is_err());
+    }
+
+    #[test]
+    fn the_inventory_has_twenty_fields_and_ends_with_the_column_flag() {
+        assert_eq!(FORMAT.split('\t').count(), 20);
+        assert_eq!(FORMAT.split('\t').next_back(), Some("#{q:@masil-columns}"));
+        let row = inventory_row("%3", false);
+        assert!(validate_inventory(std::slice::from_ref(&row)).is_ok());
+        let mut short = row.clone();
+        short.pop();
+        assert!(validate_inventory(&[short]).is_err());
+        let mut long = row;
+        long.push(String::new());
+        assert!(validate_inventory(&[long]).is_err());
+    }
+
+    #[test]
+    fn columns_come_from_field_nineteen_and_show_only_when_set() {
+        let codex = providers::find("codex").unwrap();
+        for (flag, expected) in [("1", true), ("", false), ("0", false), ("2", false)] {
+            let mut fields = inventory_row("%3", false);
+            fields[19] = flag.into();
+            let agent = identity_agent(&fields, codex, None, Some(codex)).unwrap();
+            assert_eq!(agent.columns, expected, "{flag:?}");
+            let shown = expected.then_some(json!(true));
+            let serialized = serde_json::to_value(&agent).unwrap();
+            assert_eq!(serialized.get("columns"), shown.as_ref());
+            assert_eq!(agent.projection().get("columns"), shown.as_ref());
+            // The wire form without the key reads as not in a column window.
+            let mut wire = serialized;
+            wire.as_object_mut().unwrap().remove("columns");
+            let decoded: Agent = serde_json::from_value(wire).unwrap();
+            assert!(!decoded.columns);
+        }
+    }
+
+    #[test]
+    fn needing_attention_is_the_projection_attention_rule() {
+        let codex = providers::find("codex").unwrap();
+        for state in ["blocked", "idle", "working", "unknown", "exited"] {
+            for returned_idle in [false, true] {
+                let mut agent =
+                    identity_agent(&inventory_row("%3", false), codex, None, Some(codex)).unwrap();
+                agent.state = state.into();
+                agent.returned_idle = returned_idle;
+                let projection = agent.projection();
+                let attention = &projection["attention"];
+                assert_eq!(
+                    agent.needs_attention(),
+                    attention["pending"] == true && attention["available"] == true,
+                    "{state} {returned_idle}"
+                );
+            }
+        }
     }
 }

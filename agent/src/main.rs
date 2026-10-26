@@ -6,6 +6,7 @@ mod attention;
 mod bridge;
 mod changes;
 mod checkpoint;
+mod columns;
 mod coordinator;
 mod daemon;
 mod detection;

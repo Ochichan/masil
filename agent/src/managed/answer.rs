@@ -1548,7 +1548,7 @@ mod tests {
         use super::super::{Metadata, RunEvidence, encode};
         let boot = "00000000-0000-0000-0000-000000000000";
         let row = |provider: &str, run: &str, channel: Option<&str>, evidence_run: &str| {
-            let mut row = vec![String::new(); 19];
+            let mut row = vec![String::new(); 20];
             row[0] = "%3".into();
             row[5] = boot.into();
             row[6] = "1".into();

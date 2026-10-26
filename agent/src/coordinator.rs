@@ -2115,6 +2115,17 @@ async fn supervise(
             handle.abort();
             // A badge write in flight lands before the clear below.
             let _ = handle.await;
+            // The aborted watch could not clear its attention marks.
+            if let Ok(manager) = crate::managed::Manager::new(socket.clone(), None) {
+                crate::managed::resident::clear_all_marks(|args: Vec<String>| {
+                    let manager = &manager;
+                    async move {
+                        let words: Vec<&str> = args.iter().map(String::as_str).collect();
+                        manager.command(&words).await
+                    }
+                })
+                .await;
+            }
             // The inbox went off: no badge for it. A core that takes
             // summaries holds it as one, and the option stays unwritten. This
             // clear is not retried, so it waits for a running action to

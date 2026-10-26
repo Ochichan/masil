@@ -447,6 +447,7 @@ impl App {
                         Style::default().fg(palette.text),
                     ),
                     self.inbox_span(palette),
+                    self.columns_span(palette),
                 ],
                 title_width as usize,
             );
@@ -511,20 +512,23 @@ impl App {
         let view = Span::styled(format!("  {view}"), Style::default().fg(palette.text));
         let status = |text: String| Span::styled(text, Style::default().fg(connection_color));
         let inbox = self.inbox_span(palette);
+        let columns = self.columns_span(palette);
         let titles = [
             vec![
                 product.clone(),
                 view.clone(),
                 inbox.clone(),
+                columns.clone(),
                 status(format!("  {connection}")),
             ],
             vec![
                 product.clone(),
                 view,
                 inbox.clone(),
+                columns.clone(),
                 status(format!("  {short}")),
             ],
-            vec![product, inbox, status(format!("  {short}"))],
+            vec![product, inbox, columns, status(format!("  {short}"))],
             vec![status(short.to_owned())],
         ];
         // Title and control labels shorten in turns until both fit.
@@ -1637,6 +1641,27 @@ impl App {
     /// The hint for the hovered target or focus: full, short, then minimal.
     /// "  Inbox N" in the header while the inbox is on, warning-coloured
     /// when something is unseen.
+    /// How many agents in column windows need attention; they may be off
+    /// screen. Empty when none do.
+    fn columns_span(&self, palette: Palette) -> Span<'static> {
+        let count = self
+            .rows
+            .iter()
+            .filter(|row| row.columns && row.pending && row.attention_available)
+            .count();
+        if count == 0 {
+            return Span::raw("");
+        }
+        let label = match self.language {
+            Language::English => "Column windows: attention",
+            Language::Korean => "열 window 주의",
+        };
+        Span::styled(
+            format!("  {label} {count}"),
+            Style::default().fg(palette.warning),
+        )
+    }
+
     fn inbox_span(&self, palette: Palette) -> Span<'static> {
         match self.inbox_label() {
             Some(label) => {
@@ -2654,6 +2679,36 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_header_counts_agents_needing_attention_in_column_windows() {
+        let header = |language: Language, columns: bool| {
+            let backend = TestBackend::new(120, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut app = App::new(false, language, Theme::Dark);
+            let mut snapshot = snapshot();
+            if columns {
+                snapshot["observations"][0]["columns"] = json!(true);
+            }
+            app.apply_snapshot(snapshot);
+            app.set_connection(true, None);
+            app.set_native_available(true);
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..3)
+                .flat_map(|y| (0..120).map(move |x| (x, y)))
+                .map(|cell| buffer.cell(cell).map(|cell| cell.symbol()).unwrap_or(" "))
+                .collect::<String>()
+        };
+        assert!(header(Language::English, true).contains("Column windows: attention 1"));
+        // A wide character leaves a blank cell after it.
+        assert!(
+            header(Language::Korean, true)
+                .replace(' ', "")
+                .contains("열window주의1")
+        );
+        assert!(!header(Language::English, false).contains("Column windows"));
     }
 
     #[test]

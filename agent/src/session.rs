@@ -68,6 +68,9 @@ struct SavedWindow {
     name: String,
     zoomed: bool,
     layout: String,
+    /// The window was in column mode (`@masil-columns`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    columns: bool,
     panes: Vec<SavedPane>,
 }
 
@@ -236,6 +239,7 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
             let plan = plan_restore(server, &snapshot)?;
             let report = execute_restore(
                 server,
+                Path::new(&options.socket),
                 &plan,
                 options.client.as_deref(),
                 &text(
@@ -287,20 +291,24 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
                         ),
                     ));
                 }
+                if !report.columns_skipped.is_empty() {
+                    message.push_str(&text(
+                        &format!(
+                            "; column mode not restored: {}",
+                            report.columns_skipped.join("; ")
+                        ),
+                        &format!(
+                            ". 열 모드를 되돌리지 못함: {}",
+                            report.columns_skipped.join("; ")
+                        ),
+                    ));
+                }
                 message
             };
             tell(server, options.client.as_deref(), &message);
             Ok((
                 0,
-                Some(
-                    serde_json::json!({"stage": "restored", "snapshot": name,
-                        "restored": report.restored, "skipped": report.skipped,
-                        "errors": report.errors,
-                        "shell_unconfirmed": report.shell_unconfirmed,
-                        "panes": report.panes, "commands": report.commands,
-                        "layout_fallbacks": report.layout_fallbacks, "message": message})
-                    .to_string(),
-                ),
+                Some(restore_output(&name, &report, &message).to_string()),
             ))
         }
         ["menu"] | ["menu", _] => {
@@ -323,6 +331,21 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
         }
         _ => Err(usage()),
     }
+}
+
+/// The JSON a restore prints. `columns_skipped` is present only when a column
+/// window came back as an ordinary one, so other output stays as it was.
+fn restore_output(name: &str, report: &Report, message: &str) -> serde_json::Value {
+    let mut output = serde_json::json!({"stage": "restored", "snapshot": name,
+        "restored": report.restored, "skipped": report.skipped,
+        "errors": report.errors,
+        "shell_unconfirmed": report.shell_unconfirmed,
+        "panes": report.panes, "commands": report.commands,
+        "layout_fallbacks": report.layout_fallbacks, "message": message});
+    if !report.columns_skipped.is_empty() {
+        output["columns_skipped"] = serde_json::json!(report.columns_skipped);
+    }
+    output
 }
 
 fn selected_snapshot<F>(
@@ -462,6 +485,7 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
                 "#{window_name}",
                 "#{window_zoomed_flag}",
                 "#{window_layout}",
+                "#{@masil-columns}",
             ]),
         ],
     )?;
@@ -502,7 +526,7 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
         });
     }
     for line in windows.lines() {
-        let Some(f) = fields(line, 5) else { continue };
+        let Some(f) = fields(line, 6) else { continue };
         let Some(session) = saved.iter_mut().find(|s| s.name == f[0]) else {
             continue;
         };
@@ -515,6 +539,7 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
             } else {
                 String::new()
             },
+            columns: f[5] == "1",
             panes: Vec::new(),
         });
     }
@@ -949,6 +974,9 @@ struct RestoreWindowPlan {
     index: i64,
     name: String,
     layout_fallback: bool,
+    /// The window was in column mode when saved.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    columns: bool,
     panes: Vec<RestorePanePlan>,
     #[serde(skip)]
     layout: String,
@@ -990,6 +1018,9 @@ struct Report {
     /// Panes whose shell was not ready in time (`session:window.pane`);
     /// nothing was typed there.
     shell_unconfirmed: Vec<String>,
+    /// Column windows restored as ordinary windows (`session:window`, then
+    /// `: error` when column mode failed rather than the layout falling back).
+    columns_skipped: Vec<String>,
 }
 
 /// One wait for every restored shell to be ready to read a command.
@@ -1163,6 +1194,7 @@ fn plan_restore(server: &Server, snapshot: &Snapshot) -> Result<RestorePlan, Str
                 index: window.index,
                 name: window.name.clone(),
                 layout_fallback,
+                columns: window.columns,
                 panes,
                 layout: window.layout.clone(),
                 zoomed: window.zoomed,
@@ -1187,6 +1219,7 @@ fn plan_restore(server: &Server, snapshot: &Snapshot) -> Result<RestorePlan, Str
 
 fn execute_restore(
     server: &Server,
+    socket: &Path,
     plan: &RestorePlan,
     client: Option<&str>,
     waiting: &str,
@@ -1211,7 +1244,7 @@ fn execute_restore(
             report.skipped.push(session.name.clone());
             continue;
         }
-        if let Err(error) = restore_session(server, session, &mut started, &mut report) {
+        if let Err(error) = restore_session(server, socket, session, &mut started, &mut report) {
             report.errors.push(format!("{}: {error}", session.name));
             continue;
         }
@@ -1258,7 +1291,7 @@ fn execute_restore(
             .unwrap_or_default();
             if attached.trim() == "0" && pristine(server, &session.name) {
                 let _ = masil(server, &["kill-session", "-t", &old]);
-                let _ = masil(
+                let renamed = masil(
                     server,
                     &[
                         "rename-session",
@@ -1267,7 +1300,17 @@ fn execute_restore(
                         "--",
                         &literal(&session.name),
                     ],
-                );
+                )
+                .is_ok();
+                if renamed {
+                    // Named as the person now sees the session.
+                    let old = format!("{}:", session.target_name);
+                    for skipped in &mut report.columns_skipped {
+                        if let Some(rest) = skipped.strip_prefix(&old) {
+                            *skipped = format!("{}:{rest}", session.name);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1390,6 +1433,7 @@ fn layout_size(layout: &str) -> Option<(u64, u64)> {
 
 fn restore_session(
     server: &Server,
+    socket: &Path,
     session: &RestoreSessionPlan,
     started: &mut HashSet<String>,
     report: &mut Report,
@@ -1471,13 +1515,36 @@ fn restore_session(
                 ],
             )?;
         }
-        if window.layout.is_empty()
-            || masil(
+        // A column layout is wider than the screen. select-layout resizes the
+        // window to it, and without a manual size the server shrinks the
+        // window back to the client, losing the columns off screen.
+        // A layout without a readable size gives no width to keep.
+        let mut columns_error = None;
+        if window.columns {
+            if window.layout_fallback {
+                columns_error = Some("the saved layout has no readable size".to_owned());
+            } else if let Err(error) = masil(
+                server,
+                &[
+                    "resize-window",
+                    "-t",
+                    &target(window),
+                    "-x",
+                    &window.width.max(10).to_string(),
+                    "-y",
+                    &window.height.max(5).to_string(),
+                ],
+            ) {
+                columns_error = Some(error);
+            }
+        }
+        let layout_applied = !window.layout.is_empty()
+            && masil(
                 server,
                 &["select-layout", "-t", &target(window), &window.layout],
             )
-            .is_err()
-        {
+            .is_ok();
+        if !layout_applied {
             // Without the saved layout the extra panes are tiled.
             report.layout_fallbacks += 1;
             let floating = masil(
@@ -1497,6 +1564,26 @@ fn restore_session(
                 }
             }
             let _ = masil(server, &["select-layout", "-t", &target(window), "tiled"]);
+        }
+        let mut column_window = false;
+        if window.columns {
+            let result = match columns_error {
+                Some(error) => Err(Some(error)),
+                None if !layout_applied => Err(None),
+                None => crate::columns::restored_blocking(socket, &target(window)).map_err(Some),
+            };
+            match result {
+                Ok(()) => column_window = true,
+                Err(error) => {
+                    // Not half on: no mark, and a window that follows the
+                    // client again instead of the manual size set above.
+                    let _ = crate::columns::abandon_blocking(socket, &target(window));
+                    report.columns_skipped.push(match error {
+                        Some(error) => format!("{name}:{}: {error}", window.index),
+                        None => format!("{name}:{}", window.index),
+                    });
+                }
+            }
         }
         let ids: Vec<String> = masil(
             server,
@@ -1532,7 +1619,8 @@ fn restore_session(
         }
         if let Some(id) = active {
             let _ = masil(server, &["select-pane", "-t", &id]);
-            if window.zoomed {
+            // The zoom hook would turn a column window's zoom into `fit`.
+            if window.zoomed && !column_window {
                 let _ = masil(server, &["resize-pane", "-Z", "-t", &id]);
             }
         }
@@ -2386,6 +2474,7 @@ mod tests {
                     name: "w".into(),
                     zoomed: false,
                     layout: "{}".into(),
+                    columns: false,
                     panes: vec![pane],
                 }],
             }],
@@ -2402,5 +2491,97 @@ mod tests {
         assert!(validate(&snapshot).is_err());
         assert!(!safe_argv(&["tail".into(), "a\u{3}".into()]));
         assert_eq!(clean("a\tb"), "a_b");
+    }
+
+    fn saved_window(columns: bool) -> SavedWindow {
+        SavedWindow {
+            index: 1,
+            name: "w".into(),
+            zoomed: false,
+            layout: r#"{"L":{"w":200,"h":24}}"#.into(),
+            columns,
+            panes: vec![SavedPane {
+                index: 0,
+                active: true,
+                cwd: "/tmp".into(),
+                title: String::new(),
+                command: None,
+                resume: None,
+                origin: "%0".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_column_window_round_trips_in_a_snapshot() {
+        let window = saved_window(true);
+        let text = serde_json::to_string(&window).unwrap();
+        assert!(text.contains(r#""columns":true"#), "{text}");
+        let back: SavedWindow = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, window);
+        assert!(back.columns);
+    }
+
+    #[test]
+    fn a_window_without_columns_serializes_without_the_key() {
+        let text = serde_json::to_string(&saved_window(false)).unwrap();
+        assert!(!text.contains("columns"), "{text}");
+    }
+
+    #[test]
+    fn an_old_snapshot_window_loads_as_not_columns() {
+        let old = r#"{"index":0,"name":"w","zoomed":false,"layout":"x","panes":[]}"#;
+        let window: SavedWindow = serde_json::from_str(old).unwrap();
+        assert!(!window.columns);
+        let explicit =
+            r#"{"index":0,"name":"w","zoomed":false,"layout":"x","columns":true,"panes":[]}"#;
+        assert!(
+            serde_json::from_str::<SavedWindow>(explicit)
+                .unwrap()
+                .columns
+        );
+    }
+
+    fn window_plan(columns: bool) -> RestoreWindowPlan {
+        RestoreWindowPlan {
+            index: 1,
+            name: "w".into(),
+            layout_fallback: false,
+            columns,
+            panes: Vec::new(),
+            layout: String::new(),
+            zoomed: false,
+            width: 200,
+            height: 24,
+        }
+    }
+
+    #[test]
+    fn the_restore_plan_shows_columns_only_when_set() {
+        let on = serde_json::to_value(window_plan(true)).unwrap();
+        assert_eq!(on["columns"], serde_json::json!(true));
+        let off = serde_json::to_value(window_plan(false)).unwrap();
+        assert!(off.get("columns").is_none(), "{off}");
+    }
+
+    #[test]
+    fn the_restore_output_lists_skipped_columns_only_when_there_are_some() {
+        let mut report = Report::default();
+        let plain = restore_output("snap", &report, "done");
+        assert!(plain.get("columns_skipped").is_none(), "{plain}");
+        assert_eq!(plain["stage"], "restored");
+        assert_eq!(plain["snapshot"], "snap");
+        assert_eq!(plain["message"], "done");
+
+        report.columns_skipped = vec!["work:1".into(), "work:2: boom".into()];
+        let listed = restore_output("snap", &report, "done");
+        assert_eq!(
+            listed["columns_skipped"],
+            serde_json::json!(["work:1", "work:2: boom"])
+        );
+        // Everything else is the same as without it.
+        let mut without = listed.clone();
+        without.as_object_mut().unwrap().remove("columns_skipped");
+        assert_eq!(without, plain);
     }
 }

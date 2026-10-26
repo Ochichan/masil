@@ -268,6 +268,8 @@ pub(crate) struct Observation {
     pub core_freshness: String,
     pub binding: String,
     pub frontend_verified: bool,
+    /// The agent's pane is in a column window (`layout columns`).
+    pub columns: bool,
 }
 
 impl Observation {
@@ -334,6 +336,10 @@ impl Observation {
             binding: string(value, "binding"),
             frontend_verified: value
                 .get("frontend_verified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            columns: value
+                .get("columns")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         })

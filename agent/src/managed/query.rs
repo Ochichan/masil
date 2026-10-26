@@ -51,12 +51,12 @@ const VIEW_LISTS: usize = 8;
 /// The inventory format without the output generation and the last output
 /// time. Everything in it changes only when a pane's identity, its options or
 /// its title changes, so a snapshot is checked against it on every query.
-const CONTROL_FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:masil_osc_progress}\t#{q:@masil-agent-run-evidence}\t#{q:@masil-agent-epoch}";
+const CONTROL_FORMAT: &str = "#{q:pane_id}\t#{q:window_id}\t#{q:session_name}\t#{q:pane_pid}\t#{q:pane_dead}\t#{q:masil_core_boot_id}\t#{q:masil_pty_generation}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{q:pane_tty}\t#{q:@masil-managed-agent}\t#{q:@masil-managed-observation}\t#{q:masil_foreground_pgid}\t#{q:masil_osc_progress}\t#{q:@masil-agent-run-evidence}\t#{q:@masil-agent-epoch}\t#{q:@masil-columns}";
 /// The global the `list` view is read from.
 const VIEW_FORMAT: &str = "#{@masil-agent-view}";
 /// The inventory fields `CONTROL_FORMAT` leaves out (see `FORMAT`).
 const ACTIVITY_FIELDS: [usize; 2] = [14, 18];
-const FIELDS: usize = 19;
+const FIELDS: usize = 20;
 
 /// What a query asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -740,6 +740,7 @@ mod tests {
             tracked_encoded: String::new(),
             foreground_group: 0,
             process_epoch: None,
+            columns: false,
             output_generation: 0,
             permission_count: 0,
             question_count: 0,
@@ -877,6 +878,12 @@ mod tests {
             .collect();
         assert_eq!(CONTROL_FORMAT, kept.join("\t"));
         assert_eq!(FORMAT.split('\t').count(), FIELDS);
+        assert_eq!(FIELDS, 20);
+        assert_eq!(CONTROL_FORMAT.split('\t').count(), FIELDS - 2);
+        // The column flag is the last field of both, so a window entering
+        // or leaving column mode moves the control digest.
+        assert!(FORMAT.ends_with("\t#{q:@masil-columns}"));
+        assert!(CONTROL_FORMAT.ends_with("\t#{q:@masil-columns}"));
         assert_eq!(VIEW_FORMAT, format!("#{{{}}}", view::OPTION));
         assert!(
             FORMAT
@@ -924,6 +931,26 @@ mod tests {
         assert_eq!(control_text(&one[..one.len() - 1]), None);
         assert_eq!(control_text("%1\\"), None);
         assert_eq!(control_text("").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_column_flag_is_the_last_control_field() {
+        let mut fields = vec![String::new(); FIELDS];
+        fields[0] = "%1".into();
+        let plain = fields.join("\t") + "\n";
+        fields[19] = "1".into();
+        let columns = fields.join("\t") + "\n";
+        let (plain, columns) = (
+            control_text(&plain).unwrap(),
+            control_text(&columns).unwrap(),
+        );
+        assert_ne!(plain, columns);
+        assert!(plain.ends_with("\t\n"));
+        assert!(columns.ends_with("\t1\n"));
+        assert_eq!(columns.trim_end().split('\t').count(), FIELDS - 2);
+        // The previous 19-field inventory is no inventory.
+        let old = vec![String::new(); FIELDS - 1].join("\t") + "\n";
+        assert_eq!(control_text(&old), None);
     }
 
     #[test]

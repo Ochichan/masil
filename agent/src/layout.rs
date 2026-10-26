@@ -1,5 +1,6 @@
 //! Declarative, explicitly confirmed native session layouts.
 
+use crate::columns::{Columns, MAX_WINDOW, MIN_WIDTH};
 use crate::managed::Manager;
 use crate::providers;
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,18 @@ struct TemplateFile {
 struct WindowFile {
     name: Option<String>,
     layout: Option<String>,
+    /// Column mode: every pane in its own full-height column. Excludes
+    /// `layout`.
+    columns: Option<ColumnsFile>,
     panes: Vec<PaneFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColumnsFile {
+    /// Cells per column; the window's, the global or half the screen when
+    /// not set.
+    width: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,7 +89,15 @@ struct Template {
 struct Window {
     name: Option<String>,
     layout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    columns: Option<ColumnsSetting>,
     panes: Vec<Pane>,
+}
+
+/// A window's column mode as the plan and `show` print it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct ColumnsSetting {
+    width: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -121,6 +141,8 @@ struct Plan {
 struct PlanWindow {
     name: Option<String>,
     layout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    columns: Option<ColumnsSetting>,
     panes: Vec<PlanPane>,
 }
 
@@ -198,7 +220,8 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
             "masil-agent layout [--socket MASIL_SOCKET] list\n\
              masil-agent layout [--socket MASIL_SOCKET] show NAME\n\
              masil-agent layout [--socket MASIL_SOCKET] plan NAME [--session NAME]\n\
-             masil-agent layout [--socket MASIL_SOCKET] apply NAME [--session NAME] [--yes]"
+             masil-agent layout [--socket MASIL_SOCKET] apply NAME [--session NAME] [--yes]\n\
+             masil-agent layout [--socket MASIL_SOCKET] columns on|off|add|close|width|fit|float|sync|show ... (layout columns --help)"
         );
         return Ok(0);
     }
@@ -215,6 +238,9 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     }
     let command = args.get(index).ok_or("missing layout command")?;
     let rest = &args[index + 1..];
+    if command == "columns" {
+        return crate::columns::run(resolve_socket(socket.as_deref()), rest);
+    }
 
     match command.as_str() {
         "list" if rest.is_empty() => {
@@ -569,6 +595,26 @@ fn normalize_from(
         if let Some(name) = &window.name {
             valid_session_name(name, 32, "window name")?;
         }
+        if window.columns.is_some() && window.layout.is_some() {
+            return Err(format!(
+                "window {window_index} cannot set both layout and columns"
+            ));
+        }
+        let columns = match window.columns {
+            Some(columns) => {
+                if let Some(width) = columns.width
+                    && !(MIN_WIDTH..=MAX_WINDOW).contains(&width)
+                {
+                    return Err(format!(
+                        "invalid columns width for window {window_index}: {width}"
+                    ));
+                }
+                Some(ColumnsSetting {
+                    width: columns.width,
+                })
+            }
+            None => None,
+        };
         if let Some(layout) = &window.layout
             && !matches!(
                 layout.as_str(),
@@ -581,6 +627,15 @@ fn normalize_from(
         }
         if window.panes.is_empty() || window.panes.len() > MAX_PANES_PER_WINDOW {
             return Err(format!("window {window_index} must contain 1–16 panes"));
+        }
+        // Every pane of a column window is a column of the width.
+        if let Some(width) = columns.as_ref().and_then(|columns| columns.width) {
+            let panes = window.panes.len() as u32;
+            if width * panes + panes - 1 > MAX_WINDOW {
+                return Err(format!(
+                    "invalid columns width for window {window_index}: {panes} panes of {width} need more than {MAX_WINDOW} cells"
+                ));
+            }
         }
         pane_count += window.panes.len();
         if pane_count > MAX_PANES {
@@ -671,6 +726,7 @@ fn normalize_from(
         windows.push(Window {
             name: window.name,
             layout: window.layout,
+            columns,
             panes,
         });
     }
@@ -783,7 +839,7 @@ fn valid_session_name(name: &str, max: usize, field: &str) -> Result<(), String>
     Ok(())
 }
 
-fn validate_argv(argv: &[String]) -> Result<(), String> {
+pub(crate) fn validate_argv(argv: &[String]) -> Result<(), String> {
     if argv.is_empty()
         || argv.len() > MAX_ARGS
         || argv.iter().map(String::len).sum::<usize>() > MAX_ARG_BYTES
@@ -1036,6 +1092,7 @@ async fn prepare_plan(
         windows.push(PlanWindow {
             name: window.name.clone(),
             layout: window.layout.clone(),
+            columns: window.columns,
             panes,
         });
         actions.push(window_actions);
@@ -1126,6 +1183,8 @@ async fn apply_prepared(
     let mut results = Vec::new();
     let mut previous = Vec::<Option<String>>::with_capacity(prepared.template.windows.len());
     let mut window_ids = Vec::<Option<String>>::with_capacity(prepared.template.windows.len());
+    // The column width of each column window that got one.
+    let mut column_widths = Vec::<Option<u32>>::with_capacity(prepared.template.windows.len());
     let mut focused = None;
     let mut session_created = false;
 
@@ -1139,9 +1198,23 @@ async fn apply_prepared(
         } else {
             create_window(&manager, &session, window, first).await
         };
+        let mut column_width = None;
         match created {
             Ok((pane_id, window_id)) => {
                 session_created = true;
+                if let Some(columns) = &window.columns {
+                    // A window whose width cannot be told is built as an
+                    // ordinary window.
+                    match Columns::new(manager.native.socket.clone())
+                        .width_for(&window_id, columns.width)
+                        .await
+                    {
+                        Ok(width) => column_width = Some(width),
+                        Err(error) => {
+                            results.push(failed_result(label.clone(), 0, "columns", error));
+                        }
+                    }
+                }
                 window_ids.push(Some(window_id));
                 if first.focus {
                     focused = Some((label.clone(), 0, pane_id.clone()));
@@ -1162,6 +1235,7 @@ async fn apply_prepared(
                 window_ids.push(None);
             }
         }
+        column_widths.push(column_width);
 
         for (pane_index, pane) in window.panes.iter().enumerate().skip(1) {
             if let Some(agent) = &pane.agent {
@@ -1199,6 +1273,13 @@ async fn apply_prepared(
                     }
                 };
                 let target = target.as_str();
+                if let Some(width) = column_width
+                    && let Err(error) =
+                        widen_for_column(&manager, &window_ids[window_index], width).await
+                {
+                    results.push(failed_result(label.clone(), pane_index, "agent", error));
+                    continue;
+                }
                 match manager
                     .start(
                         &agent.name,
@@ -1273,7 +1354,16 @@ async fn apply_prepared(
                     }
                 };
                 let target = target.as_str();
-                match create_split(&manager, target, pane).await {
+                let created = match column_width {
+                    Some(width) => {
+                        match widen_for_column(&manager, &window_ids[window_index], width).await {
+                            Ok(()) => create_column_split(&manager, target, pane, width).await,
+                            Err(error) => Err(error),
+                        }
+                    }
+                    None => create_split(&manager, target, pane).await,
+                };
+                match created {
                     Ok(pane_id) => {
                         if pane.focus {
                             focused = Some((label.clone(), pane_index, pane_id.clone()));
@@ -1318,6 +1408,44 @@ async fn apply_prepared(
             .await
         {
             results.push(failed_result(label, 0, "layout", error));
+        }
+    }
+
+    for (window_index, window) in prepared.template.windows.iter().enumerate() {
+        let (Some(width), Some(window_id)) = (
+            column_widths[window_index],
+            window_ids[window_index].as_deref(),
+        ) else {
+            continue;
+        };
+        let label = window_label(window, window_index);
+        // Building left uneven widths, and column mode saves the layout for
+        // `off` to restore, so the panes are spread evenly first. The resizes
+        // above made the size manual; column mode saves the window's own
+        // value for `off` too, and a new window had none.
+        if let Err(error) = manager
+            .command(&[
+                "select-layout",
+                "-t",
+                window_id,
+                "even-horizontal",
+                ";",
+                "set",
+                "-wu",
+                "-t",
+                window_id,
+                "window-size",
+            ])
+            .await
+        {
+            results.push(failed_result(label, 0, "columns", error));
+            continue;
+        }
+        if let Err(error) = Columns::new(manager.native.socket.clone())
+            .turn_on(window_id, Some(width))
+            .await
+        {
+            results.push(failed_result(label, 0, "columns", error));
         }
     }
 
@@ -1452,6 +1580,71 @@ async fn create_split(manager: &Manager, target: &str, pane: &Pane) -> Result<St
     ];
     append_command(&mut args, pane.command.as_deref());
     created_pane(manager, args).await
+}
+
+/// A full-height column of WIDTH cells at the window's right edge.
+fn column_split_args(target: &str, pane: &Pane, width: u32) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("split-window"),
+        OsString::from("-h"),
+        OsString::from("-f"),
+        OsString::from("-d"),
+        OsString::from("-l"),
+        OsString::from(width.to_string()),
+        OsString::from("-P"),
+        OsString::from("-F"),
+        OsString::from("#{pane_id}"),
+        OsString::from("-t"),
+        OsString::from(target),
+        OsString::from("-c"),
+        OsString::from(&pane.cwd),
+    ];
+    append_command(&mut args, pane.command.as_deref());
+    args
+}
+
+async fn create_column_split(
+    manager: &Manager,
+    target: &str,
+    pane: &Pane,
+    width: u32,
+) -> Result<String, String> {
+    created_pane(manager, column_split_args(target, pane, width)).await
+}
+
+/// The window width that leaves room for one more column of WIDTH cells and
+/// its border.
+fn widened_width(current: u32, width: u32) -> Result<u32, String> {
+    current
+        .checked_add(width)
+        .and_then(|cells| cells.checked_add(1))
+        .filter(|cells| *cells <= MAX_WINDOW)
+        .ok_or_else(|| {
+            format!("columns need more than {MAX_WINDOW} cells; a window holds at most that many")
+        })
+}
+
+/// Makes room in a column window for the next column. The window's size is
+/// manual by then, and a split of a fixed-size window fails once its panes
+/// have no room left.
+async fn widen_for_column(
+    manager: &Manager,
+    window: &Option<String>,
+    width: u32,
+) -> Result<(), String> {
+    let window = window.as_deref().ok_or("window was not created")?;
+    let current = manager
+        .command(&["display-message", "-p", "-t", window, "#{window_width}"])
+        .await?;
+    let current = current
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("invalid window width: {}", current.trim()))?;
+    let wider = widened_width(current, width)?.to_string();
+    manager
+        .command(&["resize-window", "-t", window, "-x", &wider])
+        .await
+        .map(drop)
 }
 
 fn append_command(args: &mut Vec<OsString>, command: Option<&[String]>) {
@@ -1677,5 +1870,161 @@ focus = true
 focus = true
 "#;
         assert!(parse(multiple_focus).is_err());
+    }
+
+    fn columns_template(window: &str) -> String {
+        format!(
+            "version = 1\nsession = \"api\"\n[[windows]]\n{window}\n[[windows.panes]]\n[[windows.panes]]\n"
+        )
+    }
+
+    #[test]
+    fn columns_and_layout_conflict() {
+        let error = parse(&columns_template("layout = \"tiled\"\ncolumns = {}")).unwrap_err();
+        assert_eq!(error, "window 0 cannot set both layout and columns");
+    }
+
+    #[test]
+    fn columns_width_is_bounded() {
+        for width in [9, 10_001, 0] {
+            let error = parse(&columns_template(&format!(
+                "columns = {{ width = {width} }}"
+            )))
+            .unwrap_err();
+            assert_eq!(
+                error,
+                format!("invalid columns width for window 0: {width}")
+            );
+        }
+        for width in [10, 60, 4_999] {
+            let template = parse(&columns_template(&format!(
+                "columns = {{ width = {width} }}"
+            )))
+            .unwrap();
+            assert_eq!(
+                template.windows[0].columns,
+                Some(ColumnsSetting { width: Some(width) })
+            );
+        }
+        assert!(parse(&columns_template("columns = { width = -1 }")).is_err());
+    }
+
+    #[test]
+    fn columns_width_must_leave_room_for_every_pane() {
+        // Two columns of 5000 and a border need 10001 cells.
+        for width in [5_000, 10_000] {
+            let error = parse(&columns_template(&format!(
+                "columns = {{ width = {width} }}"
+            )))
+            .unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "invalid columns width for window 0: 2 panes of {width} need more than 10000 cells"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn columns_may_be_empty_or_a_table() {
+        let template = parse(&columns_template("columns = {}")).unwrap();
+        assert_eq!(
+            template.windows[0].columns,
+            Some(ColumnsSetting { width: None })
+        );
+        let table = "version = 1\nsession = \"api\"\n[[windows]]\n[windows.columns]\nwidth = 60\n[[windows.panes]]\n";
+        let template = parse(table).unwrap();
+        assert_eq!(
+            template.windows[0].columns,
+            Some(ColumnsSetting { width: Some(60) })
+        );
+        assert_eq!(
+            parse(&columns_template("")).unwrap().windows[0].columns,
+            None
+        );
+    }
+
+    #[test]
+    fn columns_rejects_unknown_keys() {
+        assert!(parse(&columns_template("columns = { height = 3 }")).is_err());
+        assert!(parse(&columns_template("columns = { width = 60, gap = 1 }")).is_err());
+    }
+
+    #[test]
+    fn show_and_plan_print_columns_only_for_a_column_window() {
+        let ordinary = parse(&columns_template("layout = \"tiled\"")).unwrap();
+        let shown = serde_json::to_value(&ordinary).unwrap();
+        assert!(shown["windows"][0].get("columns").is_none(), "{shown}");
+        let columned = parse(&columns_template("columns = { width = 60 }")).unwrap();
+        let shown = serde_json::to_value(&columned).unwrap();
+        assert_eq!(shown["windows"][0]["columns"], json!({"width": 60}));
+
+        let plan = |template: Template| {
+            let prepared = runtime()
+                .unwrap()
+                .block_on(prepare_plan(template, "t", None, None, Duration::ZERO))
+                .unwrap();
+            serde_json::to_value(&prepared.output).unwrap()
+        };
+        let planned = plan(ordinary);
+        assert!(planned["windows"][0].get("columns").is_none(), "{planned}");
+        assert_eq!(planned["windows"][0]["layout"], "tiled");
+        let planned = plan(columned);
+        assert_eq!(planned["windows"][0]["columns"], json!({"width": 60}));
+        let default_width = plan(parse(&columns_template("columns = {}")).unwrap());
+        assert_eq!(
+            default_width["windows"][0]["columns"],
+            json!({"width": null})
+        );
+    }
+
+    #[test]
+    fn a_column_split_is_a_full_height_column_of_the_width() {
+        let pane = Pane {
+            cwd: "/work".into(),
+            command: Some(vec!["sleep".into(), "600".into()]),
+            focus: false,
+            agent: None,
+            worktree: None,
+            queue: Vec::new(),
+        };
+        let args: Vec<String> = column_split_args("%3", &pane, 60)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let text = args.join(" ");
+        assert!(text.starts_with("split-window -h -f -d -l 60 "), "{text}");
+        assert_eq!(
+            args[6..],
+            [
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "%3",
+                "-c",
+                "/work",
+                "--",
+                "sleep",
+                "600"
+            ]
+        );
+
+        let shell = Pane {
+            command: None,
+            ..pane
+        };
+        let args = column_split_args("%3", &shell, 10);
+        assert_eq!(args.last().unwrap(), "/work");
+        assert!(!args.iter().any(|arg| arg == "--"));
+    }
+
+    #[test]
+    fn widening_leaves_room_for_a_column_and_its_border() {
+        assert_eq!(widened_width(80, 60), Ok(141));
+        assert_eq!(widened_width(MAX_WINDOW - 11, 10), Ok(MAX_WINDOW));
+        assert!(widened_width(MAX_WINDOW - 10, 10).is_err());
+        assert!(widened_width(u32::MAX, 1).is_err());
     }
 }
