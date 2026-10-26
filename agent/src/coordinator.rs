@@ -1063,10 +1063,12 @@ fn sync_boot_setting(
             Ok(current) => {
                 let current = current.trim_end_matches(['\r', '\n']);
                 let current = (!current.is_empty()).then_some(current);
+                // The live value is not pruned: it goes with this server.
                 match crate::ui::settings::store::changed_socket_marker(
                     current,
                     socket_text,
                     enabled,
+                    |_| true,
                 ) {
                     Ok(value) => {
                         let changed = value.as_deref() != current;

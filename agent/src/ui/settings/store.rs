@@ -288,10 +288,42 @@ fn canonical_socket_text(socket: &str) -> String {
         .unwrap_or_else(|| socket.to_owned())
 }
 
+/// The per-user directory of default and `-L` sockets, as the core names it
+/// (`masil-<uid>` in TMUX_TMPDIR or /tmp, core/tmux.c).
+fn per_user_socket_dir() -> String {
+    // SAFETY: getuid has no preconditions.
+    format!("masil-{}", unsafe { libc::getuid() })
+}
+
+/// False only when the directory that held the socket is gone, which marks a
+/// removed server. A stopped server keeps its directory, and a directory that
+/// cannot be read is kept too. The per-user socket directory is always kept:
+/// the core makes it again at its next start, and a temp cleaner removes it
+/// while no server runs, so a missing one does not mean a removed server.
+fn socket_dir_exists(entry: &str) -> bool {
+    let Some(parent) = Path::new(entry).parent() else {
+        return true;
+    };
+    let per_user = per_user_socket_dir();
+    if parent
+        .file_name()
+        .is_some_and(|name| name == per_user.as_str())
+    {
+        return true;
+    }
+    !matches!(
+        fs::metadata(parent),
+        Err(error) if error.kind() == ErrorKind::NotFound
+    )
+}
+
+/// The list after adding or removing `socket`. Entries for which `keep` is
+/// false are dropped; the socket being added is always kept.
 pub(crate) fn changed_socket_marker(
     current: Option<&str>,
     socket: &str,
     enabled: bool,
+    keep: impl Fn(&str) -> bool,
 ) -> Result<Option<String>, String> {
     if !Path::new(socket).is_absolute() {
         return Err("coordinator boot marker requires an absolute socket path".into());
@@ -309,9 +341,10 @@ pub(crate) fn changed_socket_marker(
     };
     let mut unique = Vec::with_capacity(entries.len() + usize::from(enabled));
     for entry in entries.drain(..) {
-        if enabled || !same_socket_path(Path::new(&entry), Path::new(socket)) {
+        let own = same_socket_path(Path::new(&entry), Path::new(socket));
+        if enabled || !own {
             let entry = canonical_socket_text(&entry);
-            if !unique.contains(&entry) {
+            if (own || keep(&entry)) && !unique.contains(&entry) {
                 unique.push(entry);
             }
         }
@@ -409,7 +442,9 @@ pub(crate) fn update_marker(path: &Path, key: &str, enabled: bool) -> Result<(),
 
 /// Adds or removes one absolute socket from an internal marker list. An
 /// unchanged list returns before taking the settings lock. A change is
-/// checked again under the lock before the atomic replacement.
+/// checked again under the lock before the atomic replacement. A rewrite also
+/// drops entries whose socket directory no longer exists. Dropping alone is
+/// not a change: stale entries go with the next add or remove.
 pub(crate) fn update_socket_marker(
     path: &Path,
     key: &str,
@@ -417,17 +452,18 @@ pub(crate) fn update_socket_marker(
     enabled: bool,
 ) -> Result<(Option<String>, bool), String> {
     let current = load(path)?.get_value(key);
-    let changed = changed_socket_marker(current.as_deref(), socket, enabled)?;
+    let changed = changed_socket_marker(current.as_deref(), socket, enabled, |_| true)?;
     if changed == current {
         return Ok((changed, false));
     }
     let _lock = Lock::take(path)?;
     let mut saved = load(path)?;
     let current = saved.get_value(key);
-    let changed = changed_socket_marker(current.as_deref(), socket, enabled)?;
+    let changed = changed_socket_marker(current.as_deref(), socket, enabled, |_| true)?;
     if changed == current {
         return Ok((changed, false));
     }
+    let changed = changed_socket_marker(current.as_deref(), socket, enabled, socket_dir_exists)?;
     match &changed {
         Some(value) => saved.set_quoted(key, value),
         None => saved.remove(key),
@@ -538,8 +574,13 @@ mod tests {
         )
         .unwrap();
 
-        let first = "/tmp/masil socket/one";
-        let second = "/tmp/masil/socket'two";
+        let first_dir = directory.join("masil socket");
+        let second_dir = directory.join("masil");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        let first = first_dir.join("one").to_str().unwrap().to_owned();
+        let second = second_dir.join("socket'two").to_str().unwrap().to_owned();
+        let (first, second) = (first.as_str(), second.as_str());
         assert_eq!(
             update_socket_marker(&path, "@masil-coordinator-boot", first, true).unwrap(),
             (Some(format!("|{first}|")), true)
@@ -581,6 +622,160 @@ mod tests {
     }
 
     #[test]
+    fn changed_socket_marker_drops_what_keep_rejects() {
+        let keep = |entry: &str| entry.starts_with("/kept/");
+        // The paths do not exist, so they are compared as written.
+        assert_eq!(
+            changed_socket_marker(Some("|/gone/a|/kept/b|"), "/kept/c", true, keep).unwrap(),
+            Some("|/kept/b|/kept/c|".to_owned())
+        );
+        // The socket being added stays, in its place, even when keep rejects it.
+        assert_eq!(
+            changed_socket_marker(Some("|/gone/a|/gone/s|/kept/b|"), "/gone/s", true, keep)
+                .unwrap(),
+            Some("|/gone/s|/kept/b|".to_owned())
+        );
+        assert_eq!(
+            changed_socket_marker(None, "/gone/s", true, keep).unwrap(),
+            Some("|/gone/s|".to_owned())
+        );
+        // Removing a socket prunes the others too, and an empty list is None.
+        assert_eq!(
+            changed_socket_marker(Some("|/gone/a|/kept/b|"), "/kept/b", false, keep).unwrap(),
+            None
+        );
+        assert_eq!(
+            changed_socket_marker(Some("|/gone/a|/kept/b|"), "/kept/z", false, keep).unwrap(),
+            Some("|/kept/b|".to_owned())
+        );
+    }
+
+    #[test]
+    fn socket_dir_exists_is_false_only_for_a_missing_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "masil-marker-dir-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let present = directory.join("present");
+        fs::create_dir_all(&present).unwrap();
+        // A stopped server: its directory exists, its socket file does not.
+        assert!(socket_dir_exists(present.join("socket").to_str().unwrap()));
+        assert!(!socket_dir_exists(
+            directory.join("missing/socket").to_str().unwrap()
+        ));
+        fs::remove_dir_all(&directory).unwrap();
+        assert!(!socket_dir_exists(present.join("socket").to_str().unwrap()));
+    }
+
+    #[test]
+    fn the_per_user_socket_directory_is_kept_even_when_it_is_missing() {
+        let directory = std::env::temp_dir().join(format!(
+            "masil-marker-user-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let mine = per_user_socket_dir();
+        assert!(mine.starts_with("masil-"));
+        let socket = |name: &str| directory.join(name).join("default");
+        // Neither directory exists. A default server stopped long enough to
+        // lose its directory keeps its entry; another name does not.
+        assert!(socket_dir_exists(socket(mine.as_str()).to_str().unwrap()));
+        assert!(!socket_dir_exists(
+            socket(format!("{mine}0").as_str()).to_str().unwrap()
+        ));
+        assert!(!socket_dir_exists(socket("masil-other").to_str().unwrap()));
+        assert!(!socket_dir_exists(socket("other").to_str().unwrap()));
+        // Only the directory's own name counts, not an ancestor's.
+        assert!(!socket_dir_exists(
+            directory
+                .join(&mine)
+                .join("deeper/default")
+                .to_str()
+                .unwrap()
+        ));
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn rewriting_the_boot_list_drops_removed_socket_directories() {
+        let directory = std::env::temp_dir().join(format!(
+            "masil-marker-prune-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("settings.conf");
+        let key = "@masil-coordinator-boot";
+        let socket = |name: &str| {
+            let folder = directory.join(name);
+            fs::create_dir_all(&folder).unwrap();
+            folder.join("socket").to_str().unwrap().to_owned()
+        };
+        let throwaway = socket("throwaway");
+        let stopped = socket("stopped");
+        let live = socket("live");
+        let other = socket("other");
+        for entry in [&throwaway, &stopped, &live] {
+            update_socket_marker(&path, key, entry, true).unwrap();
+        }
+        assert_eq!(
+            load(&path).unwrap().get_value(key),
+            Some(format!("|{throwaway}|{stopped}|{live}|"))
+        );
+
+        // The throwaway server's directory is removed. Its entry stays while
+        // nothing changes: the call returns before taking the lock.
+        fs::remove_dir_all(directory.join("throwaway")).unwrap();
+        fs::remove_file(directory.join(".settings.lock")).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            update_socket_marker(&path, key, &live, true).unwrap(),
+            (Some(format!("|{throwaway}|{stopped}|{live}|")), false)
+        );
+        assert!(!directory.join(".settings.lock").exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        // The next real change drops it. The stopped server's entry stays
+        // because its directory still exists.
+        assert_eq!(
+            update_socket_marker(&path, key, &other, true).unwrap(),
+            (Some(format!("|{stopped}|{live}|{other}|")), true)
+        );
+        assert_eq!(
+            load(&path).unwrap().get_value(key),
+            Some(format!("|{stopped}|{live}|{other}|"))
+        );
+
+        // Removing a socket prunes as well, and the line goes when none is left.
+        fs::remove_dir_all(directory.join("stopped")).unwrap();
+        fs::remove_dir_all(directory.join("live")).unwrap();
+        assert_eq!(
+            update_socket_marker(&path, key, &other, false).unwrap(),
+            (None, true)
+        );
+        assert_eq!(load(&path).unwrap().get_value(key), None);
+
+        // A socket being added is recorded even when its directory is missing,
+        // and pruning never turns autosave on.
+        let missing = directory
+            .join("missing/socket")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            update_socket_marker(&path, key, &missing, true).unwrap(),
+            (Some(format!("|{missing}|")), true)
+        );
+        assert_eq!(load(&path).unwrap().get_value("@masil-autosave-used"), None);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn socket_markers_compare_canonical_paths() {
         let directory = std::env::temp_dir().join(format!(
             "masil-marker-paths-{}-{}",
@@ -599,7 +794,8 @@ mod tests {
         let marker = format!("|{}|", aliased.display());
         assert!(socket_marker_contains(&marker, canonical.to_str().unwrap()));
         assert_eq!(
-            changed_socket_marker(Some(&marker), canonical.to_str().unwrap(), true).unwrap(),
+            changed_socket_marker(Some(&marker), canonical.to_str().unwrap(), true, |_| true)
+                .unwrap(),
             Some(format!("|{}|", canonical.display()))
         );
 
@@ -613,7 +809,8 @@ mod tests {
         let marker = format!("|{}|", relative.display());
         assert!(socket_marker_contains(&marker, canonical.to_str().unwrap()));
         assert_eq!(
-            changed_socket_marker(Some(&marker), canonical.to_str().unwrap(), true).unwrap(),
+            changed_socket_marker(Some(&marker), canonical.to_str().unwrap(), true, |_| true)
+                .unwrap(),
             Some(format!("|{}|", canonical.display()))
         );
 
