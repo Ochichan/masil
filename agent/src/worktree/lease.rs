@@ -253,6 +253,19 @@ pub(crate) fn launched(lease: &Lease, pane: &str) {
     }
 }
 
+/// Records the session `run` bound, when this registry made the marker in
+/// `found` (the worktree of the run's directory). Best effort: a registry
+/// that is absent, busy or does not know the run changes nothing, and a
+/// report never creates a registry.
+pub(crate) fn record_session(found: &Found, socket: &str, boot: &str, run: &str, session: &str) {
+    let Ok(Some(mut registry)) = Registry::open_existing() else {
+        return;
+    };
+    if registry.registry_id().is_ok_and(|id| id == found.registry) {
+        let _ = registry.set_run_session(socket, boot, run, session);
+    }
+}
+
 /// The run never started: its lease goes, and git's lock with the last one.
 pub(crate) fn abandon(lease: &Lease) {
     let Ok(mut registry) = Registry::open() else {
@@ -275,7 +288,8 @@ pub(crate) fn abandon(lease: &Lease) {
 }
 
 enum Liveness {
-    Alive(String),
+    /// The pane, and the session its metadata names when it has one.
+    Alive(String, Option<String>),
     Gone,
     Unknown,
 }
@@ -291,7 +305,9 @@ fn liveness(lease: &LeaseRow, server: Option<&Server>) -> Liveness {
             .find(|pane| {
                 !pane.dead && pane.boot == lease.boot && pane.run.as_deref() == Some(&lease.run)
             })
-            .map_or(Liveness::Gone, |pane| Liveness::Alive(pane.pane.clone())),
+            .map_or(Liveness::Gone, |pane| {
+                Liveness::Alive(pane.pane.clone(), pane.session.clone())
+            }),
     }
 }
 
@@ -305,9 +321,10 @@ pub(super) fn prune(registry: &mut Registry, only: Option<i64>) -> Result<(), St
     if leases.is_empty() {
         return Ok(());
     }
-    let seen: HashMap<i64, String> = leases
+    // Each lease's state and session as they were before the servers were asked.
+    let seen: HashMap<i64, (String, Option<String>)> = leases
         .iter()
-        .map(|lease| (lease.id, lease.state.clone()))
+        .map(|lease| (lease.id, (lease.state.clone(), lease.session.clone())))
         .collect();
     let sockets: BTreeSet<String> = leases.iter().map(|lease| lease.socket.clone()).collect();
     let answers: HashMap<String, Server> = sockets
@@ -321,13 +338,31 @@ pub(super) fn prune(registry: &mut Registry, only: Option<i64>) -> Result<(), St
     let now = now_ms();
     let mut emptied = BTreeSet::new();
     for lease in registry.leases(only)? {
-        if seen.get(&lease.id) != Some(&lease.state) {
+        let Some((state, session_before)) = seen.get(&lease.id) else {
+            continue;
+        };
+        if *state != lease.state {
             continue;
         }
         match liveness(&lease, answers.get(&lease.socket)) {
-            Liveness::Alive(pane) => {
+            Liveness::Alive(pane, session) => {
                 if lease.state == "launching" {
                     registry.set_lease_live(lease.id, &pane)?;
+                }
+                // A report may have been missed, or the session switched. The
+                // pane was read before the lock, so a session recorded since
+                // is newer and stays: the write applies only to the value read
+                // before the servers were asked. Best effort, like a report's.
+                if let Some(session) = session
+                    && lease.session.as_deref() != Some(session.as_str())
+                {
+                    let _ = registry.replace_run_session(
+                        &lease.socket,
+                        &lease.boot,
+                        &lease.run,
+                        session_before.as_deref(),
+                        &session,
+                    );
                 }
             }
             // A start may still be making its pane.

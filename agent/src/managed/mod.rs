@@ -2667,18 +2667,17 @@ impl Manager {
             });
         let now = now_ms();
         let mut binding = None;
+        let mut registry_note = false;
         if let Some(session) = session {
             if session.is_empty() || session.len() > 512 || session.chars().any(char::is_control) {
                 return Err("invalid session reference".into());
             }
-            binding = Some(apply_binding(
-                &mut metadata,
-                &mut evidence,
-                session,
-                sequence,
-                now,
-                origin,
-            ));
+            // Read before apply_binding replaces the request with a binding.
+            let was_requested = session_is_requested(&metadata, &evidence);
+            let outcome =
+                apply_binding(&mut metadata, &mut evidence, session, sequence, now, origin);
+            registry_note = notes_session(outcome, was_requested);
+            binding = Some(outcome);
         }
         metadata.last_sequence = sequence;
         // A cleared or resumed session starts no turn of the held one.
@@ -2763,10 +2762,35 @@ impl Manager {
         if self.resident.is_none() {
             crate::coordinator::poke(&self.native.socket);
         }
+        if registry_note && let Some(session) = session {
+            self.record_worktree_session(agent, session).await;
+        }
         Ok(ReportResult {
             binding,
             state_applied: state.is_some(),
         })
+    }
+
+    /// Notes a run's new session in the worktree registry when the run is in
+    /// a masil worktree. Best effort. Any other run costs the lstat walk of
+    /// `worktree::detect` and opens no registry.
+    async fn record_worktree_session(&self, agent: &Agent, session: &str) {
+        let cwd = Path::new(&agent.cwd);
+        if !cwd.is_absolute() {
+            return;
+        }
+        let Ok(Some(found)) = crate::worktree::detect(cwd) else {
+            return;
+        };
+        // The lease was written with this text (`worktree::begin`).
+        let Some(socket) = self.native.socket.to_str().map(str::to_owned) else {
+            return;
+        };
+        let (boot, run, session) = (agent.boot.clone(), agent.run.clone(), session.to_owned());
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::worktree::record_session(&found, &socket, &boot, &run, &session);
+        })
+        .await;
     }
 
     /// A provider hook's turn report (`TurnReport`). `Begin` writes a held
@@ -3426,6 +3450,28 @@ fn apply_binding(
     outcome
 }
 
+/// Whether the run still holds the session it was started with, unreported.
+fn session_is_requested(metadata: &Metadata, evidence: &RunEvidence) -> bool {
+    evidence.binding.as_ref().is_some_and(|binding| {
+        binding.source == BindingSource::Requested
+            && metadata.session.as_deref() == Some(binding.session.as_str())
+    })
+}
+
+/// Whether a binding outcome is a session the worktree registry should
+/// hear of. A confirmation counts only when it confirms the session the run
+/// was started with: the registry has not seen it yet, and every later
+/// confirmation repeats it.
+fn notes_session(outcome: BindingOutcome, was_requested: bool) -> bool {
+    match outcome {
+        BindingOutcome::Established
+        | BindingOutcome::Switched
+        | BindingOutcome::ReplacedRequest => true,
+        BindingOutcome::Confirmed => was_requested,
+        BindingOutcome::Contradicted => false,
+    }
+}
+
 /// How long a resumed run has to report the session it was asked for.
 const RESUME_DEADLINE_MS: u64 = 120_000;
 
@@ -3754,6 +3800,8 @@ pub(crate) struct PaneRun {
     pub(crate) dead: bool,
     /// The managed run in this pane, if masil started an agent there.
     pub(crate) run: Option<String>,
+    /// The native session that run has bound, if any.
+    pub(crate) session: Option<String>,
     pub(crate) path: String,
 }
 
@@ -3761,13 +3809,17 @@ pub(crate) fn pane_runs(output: &str) -> Result<Vec<PaneRun>, String> {
     records(output)?
         .into_iter()
         .map(|fields| match fields.as_slice() {
-            [pane, boot, dead, meta, path] => Ok(PaneRun {
-                pane: pane.clone(),
-                boot: boot.clone(),
-                dead: dead == "1",
-                run: decode::<Metadata>(meta).map(|meta| meta.run),
-                path: path.clone(),
-            }),
+            [pane, boot, dead, meta, path] => {
+                let meta = decode::<Metadata>(meta);
+                Ok(PaneRun {
+                    pane: pane.clone(),
+                    boot: boot.clone(),
+                    dead: dead == "1",
+                    session: meta.as_ref().and_then(|meta| meta.session.clone()),
+                    run: meta.map(|meta| meta.run),
+                    path: path.clone(),
+                })
+            }
             _ => Err("invalid pane record".to_owned()),
         })
         .collect()
@@ -4390,6 +4442,37 @@ mod tests {
         assert!(records("unfinished\\").is_err());
         assert!(records("unfinished").is_err());
     }
+
+    #[test]
+    fn pane_runs_carry_the_session_their_metadata_names() {
+        let meta = |session: Option<&str>| {
+            encode(&Metadata {
+                run: "run-1".into(),
+                session: session.map(str::to_owned),
+                ..Metadata::default()
+            })
+            .unwrap()
+        };
+        let output = format!(
+            "%1\tboot-a\t0\t{}\t/w/one\n%2\tboot-a\t1\t{}\t/w/two\n%3\tboot-a\t0\t\t/w/three\n",
+            meta(Some("ses-1")),
+            meta(None),
+        );
+        let panes = pane_runs(&output).unwrap();
+        assert_eq!(panes.len(), 3);
+        assert_eq!(panes[0].run.as_deref(), Some("run-1"));
+        assert_eq!(panes[0].session.as_deref(), Some("ses-1"));
+        assert!(!panes[0].dead);
+        // A run that has not bound a session has none.
+        assert_eq!(panes[1].run.as_deref(), Some("run-1"));
+        assert_eq!(panes[1].session, None);
+        assert!(panes[1].dead);
+        // A pane with no registration has neither.
+        assert_eq!(panes[2].run, None);
+        assert_eq!(panes[2].session, None);
+        assert_eq!(panes[2].path, "/w/three");
+    }
+
     #[test]
     fn metadata_roundtrip_and_invalid_limits() {
         let m = Metadata {
@@ -4523,6 +4606,92 @@ mod tests {
         );
         let shown = view(&metadata, &evidence);
         assert_eq!((shown.state.as_str(), shown.origin), ("reported", None));
+    }
+
+    #[test]
+    fn only_the_first_confirmation_of_a_requested_session_is_noted_for_the_registry() {
+        let (mut metadata, mut evidence) = requested("ses-a");
+        assert!(session_is_requested(&metadata, &evidence));
+        // The first report names the session the run was started with.
+        let was_requested = session_is_requested(&metadata, &evidence);
+        let outcome = apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-a",
+            1,
+            10,
+            callback("SessionStart"),
+        );
+        assert_eq!(outcome, BindingOutcome::Confirmed);
+        assert!(notes_session(outcome, was_requested));
+        // Later reports of it repeat what the registry has.
+        assert!(!session_is_requested(&metadata, &evidence));
+        let outcome = apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-a",
+            2,
+            11,
+            callback("session.idle"),
+        );
+        assert_eq!(outcome, BindingOutcome::Confirmed);
+        assert!(!notes_session(
+            outcome,
+            session_is_requested(&metadata, &evidence)
+        ));
+
+        // Another session than the request replaces it, and is noted.
+        let (mut metadata, mut evidence) = requested("ses-a");
+        let was_requested = session_is_requested(&metadata, &evidence);
+        let outcome = apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-b",
+            1,
+            10,
+            callback("SessionStart"),
+        );
+        assert_eq!(outcome, BindingOutcome::ReplacedRequest);
+        assert!(notes_session(outcome, was_requested));
+
+        // A run started without a request is noted when its session is first
+        // bound or switched, and never for a contradiction.
+        let mut metadata = Metadata::default();
+        let mut evidence = RunEvidence::default();
+        assert!(!session_is_requested(&metadata, &evidence));
+        let outcome = apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-a",
+            1,
+            10,
+            ReportOrigin::Run,
+        );
+        assert!(notes_session(outcome, false));
+        let outcome = apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-x",
+            2,
+            11,
+            ReportOrigin::Run,
+        );
+        assert_eq!(outcome, BindingOutcome::Contradicted);
+        assert!(!notes_session(outcome, false));
+        let outcome = apply_binding(
+            &mut metadata,
+            &mut evidence,
+            "ses-c",
+            3,
+            12,
+            switch("SessionStart"),
+        );
+        assert_eq!(outcome, BindingOutcome::Switched);
+        assert!(notes_session(outcome, false));
+        // A request for another session is not this run's request.
+        let (metadata, mut evidence) = requested("ses-a");
+        evidence.binding.as_mut().unwrap().session = "other".into();
+        assert!(!session_is_requested(&metadata, &evidence));
     }
 
     #[test]

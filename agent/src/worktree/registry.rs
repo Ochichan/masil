@@ -219,6 +219,8 @@ pub(super) struct LeaseRow {
     pub(super) pane: Option<String>,
     pub(super) state: String,
     pub(super) until_ms: u64,
+    /// The run's native session from its history row, once known.
+    pub(super) session: Option<String>,
 }
 
 /// A new worktree row, before its directory exists.
@@ -354,6 +356,20 @@ impl Registry {
 
     pub(super) fn open() -> Result<Self, String> {
         Self::open_in(Self::directory()?)
+    }
+
+    /// The registry if its database file already exists; `None` otherwise.
+    /// Creates no directory and no file.
+    pub(super) fn open_existing() -> Result<Option<Self>, String> {
+        Self::open_existing_in(&crate::managed::state_base()?.join("masil/worktrees"))
+    }
+
+    fn open_existing_in(dir: &Path) -> Result<Option<Self>, String> {
+        match fs::symlink_metadata(dir.join("registry.sqlite3")) {
+            Ok(_) => Self::open_in(crate::managed::private_directory(dir)?).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("worktree registry: {error}")),
+        }
     }
 
     /// The registry in `dir`, a private directory.
@@ -1037,8 +1053,11 @@ impl Registry {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT id, worktree_id, socket, boot, run, pane, state, until_ms FROM leases
-                 WHERE ?1 IS NULL OR worktree_id = ?1 ORDER BY id",
+                "SELECT l.id, l.worktree_id, l.socket, l.boot, l.run, l.pane, l.state, l.until_ms,
+                        r.session
+                 FROM leases l LEFT JOIN runs r
+                   ON r.socket = l.socket AND r.boot = l.boot AND r.run = l.run
+                 WHERE ?1 IS NULL OR l.worktree_id = ?1 ORDER BY l.id",
             )
             .map_err(sql)?;
         statement
@@ -1052,6 +1071,7 @@ impl Registry {
                     pane: row.get(5)?,
                     state: row.get(6)?,
                     until_ms: row.get::<_, i64>(7)? as u64,
+                    session: row.get(8)?,
                 })
             })
             .map_err(sql)?
@@ -1067,6 +1087,46 @@ impl Registry {
                 params![id, pane],
             )
             .map(drop)
+            .map_err(sql)
+    }
+
+    /// Records the native session of a run in its history row. A session can
+    /// switch, so the latest one is kept. False if the run is not recorded
+    /// or already has this session.
+    pub(super) fn set_run_session(
+        &mut self,
+        socket: &str,
+        boot: &str,
+        run: &str,
+        session: &str,
+    ) -> Result<bool, String> {
+        self.conn
+            .execute(
+                "UPDATE runs SET session = ?4 WHERE socket = ?1 AND boot = ?2 AND run = ?3
+                   AND session IS NOT ?4",
+                params![socket, boot, run, session],
+            )
+            .map(|changed| changed == 1)
+            .map_err(sql)
+    }
+
+    /// As `set_run_session`, but only if the run's session is still
+    /// `expected`, so a session recorded since it was read is kept.
+    pub(super) fn replace_run_session(
+        &mut self,
+        socket: &str,
+        boot: &str,
+        run: &str,
+        expected: Option<&str>,
+        session: &str,
+    ) -> Result<bool, String> {
+        self.conn
+            .execute(
+                "UPDATE runs SET session = ?5 WHERE socket = ?1 AND boot = ?2 AND run = ?3
+                   AND session IS ?4 AND session IS NOT ?5",
+                params![socket, boot, run, expected, session],
+            )
+            .map(|changed| changed == 1)
             .map_err(sql)
     }
 
@@ -1352,6 +1412,24 @@ mod tests {
         Registry::open_in(crate::managed::private_directory(&dir).unwrap()).unwrap()
     }
 
+    #[test]
+    fn open_existing_creates_nothing_and_finds_a_registry_that_is_there() {
+        let dir =
+            std::env::temp_dir().join(format!("masil-wt-{}", crate::managed::nonce().unwrap()));
+        assert!(Registry::open_existing_in(&dir).unwrap().is_none());
+        assert!(!dir.exists());
+        // A directory without the database file stays without it.
+        fs::create_dir_all(&dir).unwrap();
+        assert!(Registry::open_existing_in(&dir).unwrap().is_none());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        let made = Registry::open_in(crate::managed::private_directory(&dir).unwrap()).unwrap();
+        let id = made.registry_id().unwrap();
+        drop(made);
+        let found = Registry::open_existing_in(&dir).unwrap().unwrap();
+        assert_eq!(found.registry_id().unwrap(), id);
+    }
+
     fn queued(registry: &mut Registry, resource: &str) -> i64 {
         let (job, new) = registry
             .insert_job("create", resource, None, &json!({"r": resource}), 1)
@@ -1541,6 +1619,111 @@ mod tests {
         );
         assert!(!registry.taken("k", "feat", "/w/k/feat").unwrap());
         registry.reserve(job, &reservation, 3).unwrap();
+    }
+
+    #[test]
+    fn a_runs_session_is_recorded_switched_and_listed_with_its_lease() {
+        let mut registry = registry();
+        let job = queued(&mut registry, "repo:a");
+        let reservation = Reservation {
+            repo_common_dir: "/r/.git",
+            repo_key: "k",
+            repo_root: "/r",
+            name: "feat",
+            branch: "feat",
+            from_oid: "0",
+            path: "/w/k/feat",
+        };
+        let worktree = registry.reserve(job, &reservation, 1).unwrap();
+        registry
+            .insert_lease(worktree, "/s/one", "boot-1", "run-1", 100, 1)
+            .unwrap();
+        registry
+            .insert_lease(worktree, "/s/one", "boot-1", "run-2", 100, 1)
+            .unwrap();
+        let session = |registry: &Registry, run: &str| {
+            registry
+                .leases(Some(worktree))
+                .unwrap()
+                .into_iter()
+                .find(|lease| lease.run == run)
+                .unwrap()
+                .session
+        };
+        // A new run has no session.
+        assert_eq!(session(&registry, "run-1"), None);
+
+        assert!(
+            registry
+                .set_run_session("/s/one", "boot-1", "run-1", "ses-a")
+                .unwrap()
+        );
+        assert_eq!(session(&registry, "run-1").as_deref(), Some("ses-a"));
+        // The same session again writes nothing.
+        assert!(
+            !registry
+                .set_run_session("/s/one", "boot-1", "run-1", "ses-a")
+                .unwrap()
+        );
+        // A switch keeps the latest session.
+        assert!(
+            registry
+                .set_run_session("/s/one", "boot-1", "run-1", "ses-b")
+                .unwrap()
+        );
+        assert_eq!(session(&registry, "run-1").as_deref(), Some("ses-b"));
+        // Another boot, socket or run is another row; a run that was never
+        // recorded stays unrecorded.
+        assert_eq!(session(&registry, "run-2"), None);
+        assert!(
+            !registry
+                .set_run_session("/s/one", "boot-2", "run-1", "ses-c")
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .set_run_session("/s/two", "boot-1", "run-1", "ses-c")
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .set_run_session("/s/one", "boot-1", "never", "ses-c")
+                .unwrap()
+        );
+        assert_eq!(session(&registry, "run-1").as_deref(), Some("ses-b"));
+        assert_eq!(session(&registry, "run-2"), None);
+
+        // A replacement applies only to the session that was read: one
+        // recorded since stays.
+        assert!(
+            !registry
+                .replace_run_session("/s/one", "boot-1", "run-1", Some("ses-a"), "ses-c")
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .replace_run_session("/s/one", "boot-1", "run-1", None, "ses-c")
+                .unwrap()
+        );
+        assert_eq!(session(&registry, "run-1").as_deref(), Some("ses-b"));
+        assert!(
+            registry
+                .replace_run_session("/s/one", "boot-1", "run-1", Some("ses-b"), "ses-c")
+                .unwrap()
+        );
+        assert_eq!(session(&registry, "run-1").as_deref(), Some("ses-c"));
+        // A run with no session yet is replaced when none was read.
+        assert!(
+            !registry
+                .replace_run_session("/s/one", "boot-1", "run-2", Some("ses-a"), "ses-d")
+                .unwrap()
+        );
+        assert!(
+            registry
+                .replace_run_session("/s/one", "boot-1", "run-2", None, "ses-d")
+                .unwrap()
+        );
+        assert_eq!(session(&registry, "run-2").as_deref(), Some("ses-d"));
     }
 
     #[test]

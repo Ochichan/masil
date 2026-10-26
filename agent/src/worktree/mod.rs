@@ -11,7 +11,7 @@ mod remove;
 mod servers;
 mod setup;
 
-pub(crate) use lease::{Found, abandon, begin, detect, launched, start_dir};
+pub(crate) use lease::{Found, abandon, begin, detect, launched, record_session, start_dir};
 
 use registry::{Job, Registry, now_ms};
 use serde_json::{Value, json};
@@ -403,7 +403,7 @@ pub(crate) fn listing(args: &[String]) -> Result<Value, String> {
             .leases(Some(worktree.id))?
             .iter()
             .map(|lease| {
-                json!({"socket": lease.socket, "run": lease.run, "pane": lease.pane, "state": lease.state})
+                json!({"socket": lease.socket, "run": lease.run, "pane": lease.pane, "state": lease.state, "session": lease.session})
             })
             .collect();
         value["runs"] = json!(runs);
