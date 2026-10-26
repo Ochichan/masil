@@ -994,6 +994,10 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
             }
             Ok(json!({"boot":before, "agents":agents}))
         }
+        // A remote caller is not one of this server's terminal clients.
+        Request::View { args } if args.iter().any(|arg| arg == super::CLIENT_FLAG) => {
+            Err("usage: --client-view names a client of this server, not of an endpoint".into())
+        }
         Request::View { args } => manager.view(&args).await,
         Request::Save { path } => manager.save(Path::new(&path)).await,
         // Over an endpoint the call returns without watching readiness: a

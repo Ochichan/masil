@@ -712,6 +712,20 @@ const QUERY_TIMEOUT: Duration = Duration::from_millis(300);
 pub(crate) fn query(socket: &Path, kind: &str, target: Option<&str>) -> Option<String> {
     let started = Instant::now();
     let params = crate::managed::query::request_params(kind, target)?;
+    query_with(socket, params, started)
+}
+
+/// As `query`, for `agent list --client-view`: the list under a client's
+/// saved view (as stored) rather than the server's. An older coordinator
+/// does not know the kind and refuses it.
+pub(crate) fn query_view(socket: &Path, view: &str) -> Option<String> {
+    let started = Instant::now();
+    let mut params = crate::managed::query::request_params("list_view", None)?;
+    params["view"] = json!(view);
+    query_with(socket, params, started)
+}
+
+fn query_with(socket: &Path, params: Value, started: Instant) -> Option<String> {
     let state = crate::managed::state_base().ok()?;
     let listen = paths(socket, &state).ok()?.listen;
     let value = query_request_within(&listen, params, started + QUERY_TIMEOUT)?;
@@ -726,10 +740,15 @@ fn query_request_within(listen: &Path, params: Value, deadline: Instant) -> Opti
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
     };
-    let mut stream = StdUnixStream::connect(listen).ok()?;
     let body =
         serde_json::to_vec(&json!({"v": 1, "id": "cli", "method": "query", "params": params}))
             .ok()?;
+    // The coordinator refuses a larger request (a client view with many
+    // workspaces): the local path answers without the round trip.
+    if body.len() > REQUEST_FRAME {
+        return None;
+    }
+    let mut stream = StdUnixStream::connect(listen).ok()?;
     // Both set while the peer is surely connected: on macOS a socket whose
     // peer has gone refuses a timeout.
     stream.set_write_timeout(Some(left()?)).ok()?;

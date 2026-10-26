@@ -42,6 +42,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 pub(crate) use store::validate_private_metadata;
+pub(crate) use view::{CLIENT_FLAG, save_client_ui};
 
 const META: &str = "@masil-managed-agent";
 const TRACKED: &str = "@masil-managed-observation";

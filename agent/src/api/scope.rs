@@ -100,6 +100,8 @@ pub(crate) fn needed(verb: &str, args: &[String]) -> Option<Scope> {
         },
         "get" | "explain" | "read" | "find" | "capabilities" | "providers" | "prompt-receipt"
         | "wait" | "requests" => Read,
+        // An API caller is not one of the server's terminal clients.
+        "view" if args.iter().any(|arg| arg == crate::managed::CLIENT_FLAG) => return None,
         "view" => match word(0) {
             Some("get") | None => Read,
             Some("set" | "clear") => Admin,

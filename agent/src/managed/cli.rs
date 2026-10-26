@@ -97,6 +97,13 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
         if socket.is_some() || client.is_some() {
             return Err("usage: --endpoint cannot be combined with --socket or --client".into());
         }
+        if matches!(command.as_str(), "list" | "view")
+            && rest.iter().any(|arg| arg == super::view::CLIENT_FLAG)
+        {
+            return Err(
+                "usage: --client-view names a client of this server, not of an endpoint".into(),
+            );
+        }
         if !commands::supports_remote(command) {
             return Err(format!(
                 "usage: {command} is not available with --endpoint; see masil-agent agent --help"
@@ -165,6 +172,9 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
     {
         return super::remote_cli::refuse(&error);
     }
+    if command == "list" && rest.iter().any(|arg| arg == super::view::CLIENT_FLAG) {
+        return list_client_view(&socket, client, rest);
+    }
     // Before a Manager: the coordinator answers `list` and `get` from its
     // snapshot, and any refusal or failure leaves the local path below.
     if client.is_none()
@@ -182,6 +192,45 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
         .block_on(super::remote_cli::cancellable(execute(
             manager, command, rest,
         )))
+}
+
+/// `list --client-view`: the list under one terminal client's saved view, or
+/// under the server's when the client has none. The client and its row are
+/// read first (one native command and a read-only store read); then the
+/// coordinator answers when it can, as for `list`, and the local path
+/// otherwise.
+fn list_client_view(socket: &str, client: Option<String>, args: &[String]) -> Result<i32, String> {
+    let (_, rest) = super::view::take_client_flag(args)?;
+    if !(rest.is_empty() || rest == ["--json"]) {
+        return Err("usage: list --client-view takes only --json".into());
+    }
+    let canonical = PathBuf::from(socket)
+        .canonicalize()
+        .map_err(|e| format!("server_unreachable: native socket: {e}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let native = crate::native_ui::Context {
+        socket: canonical.clone(),
+        client: client.clone(),
+    };
+    let resolved = runtime.block_on(super::view::resolve_client(&native))?;
+    let socket = std::path::Path::new(socket);
+    let answered = match resolved.view_text() {
+        Some(view) => crate::coordinator::query_view(socket, view),
+        None => crate::coordinator::query(socket, "list", None),
+    };
+    if let Some(text) = answered {
+        print_text(&text);
+        return Ok(0);
+    }
+    let manager = Manager::new(canonical, client)?;
+    runtime.block_on(super::remote_cli::cancellable(async move {
+        let agents = manager.list_view_for(resolved.view_text()).await?;
+        print_text(&super::query::render_list(&agents)?);
+        Ok(0)
+    }))
 }
 
 /// Keep native startup callbacks behind registration, then replace this wrapper

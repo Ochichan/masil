@@ -47,21 +47,21 @@ pub(crate) const VERBS: &[Verb] = &[
     },
     Verb {
         name: "list",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] list|get TARGET|explain TARGET",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] [--client NAME] list [--client-view]|get TARGET|explain TARGET",
         mutating: false,
         target_stage: None,
         remote: true,
     },
     Verb {
         name: "get",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] list|get TARGET|explain TARGET",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] [--client NAME] list [--client-view]|get TARGET|explain TARGET",
         mutating: false,
         target_stage: None,
         remote: true,
     },
     Verb {
         name: "explain",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] list|get TARGET|explain TARGET",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] [--client NAME] list [--client-view]|get TARGET|explain TARGET",
         mutating: false,
         target_stage: None,
         remote: true,
@@ -299,7 +299,7 @@ pub(crate) const VERBS: &[Verb] = &[
     },
     Verb {
         name: "view",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] view get|clear|set [--provider ID] [--state STATE] [--workspace NAME] [--sort priority|name|provider|workspace]",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] [--client NAME] view get|clear|set [--provider ID] [--state STATE] [--workspace NAME] [--sort priority|name|provider|workspace] [--client-view]",
         mutating: true,
         target_stage: None,
         remote: true,

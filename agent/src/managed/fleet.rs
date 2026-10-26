@@ -42,6 +42,9 @@ struct State {
 }
 pub(crate) struct Fleet {
     pub local: Arc<Manager>,
+    /// The terminal client's saved view (as stored) the local list follows
+    /// instead of the server's (D1).
+    local_view: Option<Arc<str>>,
     state: Mutex<State>,
 }
 pub(super) fn key(endpoint: &Endpoint) -> String {
@@ -55,8 +58,14 @@ impl Fleet {
         endpoints::load()?;
         Ok(Self {
             local: Arc::new(local),
+            local_view: None,
             state: Mutex::new(State::default()),
         })
+    }
+    /// The local list follows this client view rather than the server's.
+    pub fn with_local_view(mut self, view: Option<String>) -> Self {
+        self.local_view = view.map(Arc::from);
+        self
     }
     pub fn endpoint_ids(&self) -> Result<Vec<String>, String> {
         let mut ids = vec!["local".into()];
@@ -153,10 +162,11 @@ impl Fleet {
             }
             if !state.pending.contains_key("local") {
                 let local = self.local.clone();
+                let view = self.local_view.clone();
                 let handle = state.work.spawn(async move {
                     let result = async {
                         let before = local.boot().await?;
-                        let agents = local.list_view().await?;
+                        let agents = local.list_view_for(view.as_deref()).await?;
                         if before != local.boot().await? {
                             return Err("native server restarted during inventory".to_owned());
                         }

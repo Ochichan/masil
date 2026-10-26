@@ -7,6 +7,9 @@
 //! snapshot answers while the core's view of the panes is unchanged and the
 //! snapshot is younger than `AGE_BOUND`; otherwise it is collected again.
 //!
+//! `agent list --client-view` asks with kind `list_view` and the client's
+//! saved view: the snapshot keeps the last few lists it rendered that way.
+//!
 //! The reply is the text the local command would print, so the CLI writes it
 //! unchanged. Anything the snapshot cannot answer is a refusal, and the CLI
 //! then runs the local path, which also produces the authoritative errors.
@@ -39,6 +42,11 @@ pub(crate) const FRAME: usize = MAX_ANSWER + 8 * 1024;
 /// A new `get` or `list` of the same override files is not asked for a
 /// reload again until this long after a request.
 const RELOAD_RETRY: Duration = Duration::from_secs(2);
+/// The longest client view a `list_view` query carries (the option limit
+/// of an encoded view).
+const MAX_VIEW: usize = 16384;
+/// Client-view lists one snapshot keeps.
+const VIEW_LISTS: usize = 8;
 
 /// The inventory format without the output generation and the last output
 /// time. Everything in it changes only when a pane's identity, its options or
@@ -55,11 +63,15 @@ const FIELDS: usize = 19;
 enum Kind {
     List,
     Get,
+    /// `list` under a client's saved view.
+    ListView,
 }
 
 struct Request {
     kind: Kind,
     target: Option<String>,
+    /// The client's saved view, encoded, for `ListView`.
+    view: Option<String>,
     state_dir: PathBuf,
     config_dir: Option<PathBuf>,
     fingerprint: String,
@@ -94,17 +106,32 @@ fn parse(params: &Value) -> Result<Request, Refusal> {
     let kind = match text("kind")? {
         "list" => Kind::List,
         "get" => Kind::Get,
+        "list_view" => Kind::ListView,
         other => return Err(Refusal::new(format!("unknown query kind {other}"))),
     };
     let target = params["target"].as_str().map(str::to_owned);
     match (kind, &target) {
         (Kind::Get, None) => return Err(Refusal::new("get needs a target")),
-        (Kind::List, Some(_)) => return Err(Refusal::new("list takes no target")),
+        (Kind::List | Kind::ListView, Some(_)) => {
+            return Err(Refusal::new("list takes no target"));
+        }
+        _ => {}
+    }
+    let view = params["view"].as_str().map(str::to_owned);
+    match (kind, &view) {
+        (Kind::ListView, None) => return Err(Refusal::new("list_view needs a view")),
+        (Kind::ListView, Some(view)) if view.len() > MAX_VIEW => {
+            return Err(Refusal::new("the view is too long"));
+        }
+        (Kind::List | Kind::Get, Some(_)) => {
+            return Err(Refusal::new("only list_view takes a view"));
+        }
         _ => {}
     }
     Ok(Request {
         kind,
         target,
+        view,
         state_dir: PathBuf::from(text("state_dir")?),
         config_dir: params["config_dir"].as_str().map(PathBuf::from),
         fingerprint: text("config_fingerprint")?.to_owned(),
@@ -112,7 +139,8 @@ fn parse(params: &Value) -> Result<Request, Refusal> {
     })
 }
 
-/// The control-socket parameters of a query, for the CLI.
+/// The control-socket parameters of a query, for the CLI. A `list_view`
+/// query also carries `view`.
 pub(crate) fn request_params(kind: &str, target: Option<&str>) -> Option<Value> {
     let state = super::state_base().ok()?;
     let state = state.canonicalize().unwrap_or(state);
@@ -196,6 +224,9 @@ fn control_text(inventory: &str) -> Option<String> {
     (!escaped && start == inventory.len() && row.is_empty()).then_some(out)
 }
 
+/// Client-view lists by view text, newest last.
+type ViewLists = std::sync::Mutex<Vec<(String, Result<Arc<str>, String>)>>;
+
 /// A read-only look at every agent, and what it was checked against.
 struct Snapshot {
     /// SHA-256 of the inventory's control fields, as the core computes it.
@@ -207,6 +238,8 @@ struct Snapshot {
     agents: Vec<Agent>,
     /// The `list` text, or why the saved view cannot be applied.
     list: Result<Arc<str>, String>,
+    /// `list_view` answers made from these agents, newest last.
+    views: ViewLists,
 }
 
 impl Snapshot {
@@ -218,6 +251,26 @@ impl Snapshot {
             && self.digest == digest
             && self.view_text == view_text
             && now < self.valid_until
+    }
+
+    /// The `list` text under a client's saved view, rendered once per view
+    /// for the last `VIEW_LISTS` views asked.
+    fn list_for(&self, view: &str) -> Result<Arc<str>, String> {
+        if let Ok(views) = self.views.lock()
+            && let Some((_, list)) = views.iter().find(|(text, _)| text == view)
+        {
+            return list.clone();
+        }
+        let list = view::view_from_text(view)
+            .and_then(|saved| render_list(&view::apply_view(&saved, self.agents.clone())))
+            .map(Arc::from);
+        if let Ok(mut views) = self.views.lock() {
+            if views.len() >= VIEW_LISTS {
+                drop(views.remove(0));
+            }
+            views.push((view.to_owned(), list.clone()));
+        }
+        list
     }
 }
 
@@ -531,6 +584,7 @@ impl Service {
             valid_until: valid_until(taken, wall_ms, &agents),
             agents,
             list,
+            views: std::sync::Mutex::new(Vec::new()),
         });
         // Stored only when the core's digest from before the read is the
         // one of the text the read used (nothing moved in between) and no
@@ -597,6 +651,10 @@ impl Service {
                 .as_ref()
                 .map(|text| text.to_string())
                 .map_err(|error| Refusal::new(error.clone()))?,
+            Kind::ListView => snapshot
+                .list_for(request.view.as_deref().unwrap_or_default())
+                .map(|text| text.to_string())
+                .map_err(Refusal::new)?,
             Kind::Get => {
                 let target = request.target.as_deref().unwrap_or_default();
                 if target.starts_with('%') {
@@ -619,7 +677,7 @@ impl Service {
             let message = format!(
                 "the {} answer is {} bytes; over the {MAX_ANSWER} byte frame",
                 match request.kind {
-                    Kind::List => "list",
+                    Kind::List | Kind::ListView => "list",
                     Kind::Get => "get",
                 },
                 text.len()
@@ -711,6 +769,7 @@ mod tests {
             valid_until: Instant::now() + valid_for,
             agents: Vec::new(),
             list: Ok(Arc::from("{}\n")),
+            views: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -974,6 +1033,47 @@ mod tests {
             assert!(parse(&params).is_err(), "{params}");
         }
         assert!(parse(&params("get", Some("%1"), &guard)).is_ok());
+        let mut list_view = params("list_view", None, &guard);
+        assert!(parse(&list_view).is_err(), "list_view needs a view");
+        list_view["view"] = json!("ab");
+        assert_eq!(parse(&list_view).unwrap().view.as_deref(), Some("ab"));
+        list_view["view"] = json!("a".repeat(MAX_VIEW + 1));
+        assert!(parse(&list_view).is_err(), "an over-long view");
+        let mut list = params("list", None, &guard);
+        list["view"] = json!("ab");
+        assert!(parse(&list).is_err(), "only list_view takes a view");
+    }
+
+    #[test]
+    fn a_snapshot_renders_each_client_view_once_and_keeps_the_last_eight() {
+        let mut snap = snapshot(AGE_BOUND);
+        snap.agents = vec![agent("b", "%2", "idle"), agent("a", "%1", "blocked")];
+        let encode = |sort: &str| {
+            let text = format!(
+                r#"{{"version":1,"providers":[],"states":[],"workspaces":[],"sort":"{sort}"}}"#
+            );
+            text.bytes()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let by_name = encode("name");
+        let first = snap.list_for(&by_name).unwrap();
+        let expected = view::apply_view(
+            &view::view_from_text(&by_name).unwrap(),
+            snap.agents.clone(),
+        );
+        assert_eq!(&*first, render_list(&expected).unwrap());
+        // The same view again is the same rendered text, not a new one.
+        assert!(Arc::ptr_eq(&first, &snap.list_for(&by_name).unwrap()));
+        assert!(snap.list_for("zz").is_err(), "a damaged view is refused");
+        for index in 0..VIEW_LISTS {
+            let mut other = by_name.clone();
+            other.push_str(&format!("{index:02x}"));
+            let _ = snap.list_for(&other);
+        }
+        let views = snap.views.lock().unwrap();
+        assert_eq!(views.len(), VIEW_LISTS);
+        assert!(views.iter().all(|(text, _)| text != &by_name));
     }
 
     type Collected = std::future::Ready<Result<(Vec<Agent>, String), String>>;

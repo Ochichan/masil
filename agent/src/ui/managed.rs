@@ -792,7 +792,17 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     if let Some(warning) = &preferences.warning {
         app.notify(warning.clone());
     }
-    let fleet = Arc::new(Fleet::new(Manager::new(socket.clone(), options.client)?)?);
+    let manager = Manager::new(socket.clone(), options.client)?;
+    // This client's own list view and desk state (D1).
+    let (mut client_view, local_view, notice) =
+        super::client_view::ClientView::open(&manager, app.language, options.compact).await;
+    if let Some(notice) = notice
+        && app.toast.is_none()
+    {
+        app.notify(notice);
+    }
+    client_view.restore_filter(&mut app);
+    let fleet = Arc::new(Fleet::new(manager)?.with_local_view(local_view));
     // An inbox in another state directory is not the one the server writes.
     {
         let socket = socket.clone();
@@ -857,6 +867,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 }
                 event = events.next() => match event {
                     Some(Ok(event)) => {
+                        client_view.input(&app, &event);
                         if let Some(active) = &mut palette {
                             if matches!(event, Event::Resize(_, _)) {
                                 app.handle(event.clone(), Instant::now());
@@ -955,6 +966,11 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             match result {
                                 Ok(FleetSnapshot { epoch, agents: list, endpoints }) => {
                                     let previous_selected_identity = selected_identity(&app, &agents);
+                                    let local_ready = endpoints.iter().any(|status| status.id == "local" && status.connected);
+                                    let connecting = endpoints.iter().any(|status| status.error.as_deref() == Some("connecting"));
+                                    // Before the guards below: they and the epoch must see
+                                    // the restored agent.
+                                    client_view.restore_selection(&mut app, |id| list.iter().any(|agent| agent.id == id), local_ready, connecting);
                                     let projection = list.iter().map(Agent::projection).collect::<Vec<_>>();
                                     let mut stable_projection = projection.clone();
                                     for (row, agent) in stable_projection.iter_mut().zip(&list) {
@@ -1016,6 +1032,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         app.apply_snapshot(json!({"epoch":app_epoch,"revision":revision.to_string(),"observations":projection}));
                                         last_projection = Some(stable_projection);
                                     }
+                                    client_view.rows_shown(&mut app, local_ready);
                                     current_epoch = epoch;
                                     if !app.connected || app.connection_message.is_some() { app.set_connection(true, None); }
                                 }
@@ -1204,12 +1221,16 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 dispatch_effect(effect, &mut dialog, &mut app, &agents, fleet.clone(), &mut tasks, owned_pane.as_deref(), &current_epoch, last_poll_ms);
                 app.dirty = true;
             }
+            client_view.tick(&mut app, Instant::now());
         }
         Ok(0)
     }.await;
     tasks.abort_all();
     drop(events);
     drop(terminal);
+    // After the terminal is given back: a busy store must not hold the
+    // desk on screen.
+    client_view.finish(&app).await;
     result
 }
 

@@ -800,6 +800,71 @@ impl Context {
         })
     }
 
+    /// The terminal profile (`masil_client_profile`) of the client a
+    /// per-client agent view belongs to: the `--client` one, or else the one
+    /// attached client that is neither read-only nor in control mode. Any
+    /// other count of such clients is `client_ambiguous`.
+    pub(crate) async fn client_profile(&self) -> Result<String, String> {
+        const FORMAT: &str =
+            "#{client_name}\t#{client_readonly}\t#{client_control_mode}\t#{masil_client_profile}";
+        let fields = |line: &str| -> Result<[String; 4], String> {
+            let fields: Vec<_> = line.split('\t').map(str::to_owned).collect();
+            fields
+                .try_into()
+                .map_err(|_| "native client list contains an unsafe client name".to_owned())
+        };
+        if let Some(name) = self.client.as_deref() {
+            require_client_name(name)?;
+            let output = self
+                .tmux(
+                    [
+                        OsString::from("display-message"),
+                        OsString::from("-p"),
+                        OsString::from("-c"),
+                        OsString::from(name),
+                        OsString::from("-F"),
+                        OsString::from(FORMAT),
+                    ],
+                    None,
+                )
+                .await
+                .map_err(|error| format!("invalid_target: client {name}: {error}"))?;
+            let [found, readonly, control, profile] = fields(output_line(&output)?)?;
+            if found != name {
+                return Err(format!("invalid_target: no attached client {name}"));
+            }
+            if readonly != "0" || control != "0" {
+                return Err(format!(
+                    "invalid_target: client {name} is read-only or in control mode"
+                ));
+            }
+            return Ok(profile);
+        }
+        let output = self
+            .tmux(
+                [
+                    OsString::from("list-clients"),
+                    OsString::from("-F"),
+                    OsString::from(FORMAT),
+                ],
+                None,
+            )
+            .await?;
+        let mut eligible = Vec::new();
+        for line in utf8_stdout(&output)?.lines() {
+            let [name, readonly, control, profile] = fields(line)?;
+            if readonly == "0" && control == "0" {
+                require_client_name(&name)?;
+                eligible.push(profile);
+            }
+        }
+        match eligible.len() {
+            1 => Ok(eligible.pop().unwrap()),
+            0 => Err("client_ambiguous: no attached client; pass --client NAME".into()),
+            _ => Err("client_ambiguous: several clients are attached; pass --client NAME".into()),
+        }
+    }
+
     async fn target_info(&self, target: &str) -> Result<TargetInfo, String> {
         if target.is_empty() || target.contains(['\0', '\r', '\n']) {
             return Err("invalid native pane target".into());

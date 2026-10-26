@@ -47,6 +47,8 @@ const CODES: &[(&str, Class)] = &[
     ("schedule_invalid", Class::Invalid),
     ("transfer_invalid", Class::Invalid),
     ("transfer_too_large", Class::Invalid),
+    ("client_ambiguous", Class::Invalid),
+    ("client_profile_unstable", Class::Invalid),
     ("identity_mismatch", Class::Refused),
     ("boot_mismatch", Class::Refused),
     ("core_boot_changed", Class::Refused),

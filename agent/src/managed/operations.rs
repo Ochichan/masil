@@ -112,6 +112,7 @@ const FEATURES: &[(&str, &str)] = &[
     ("extensions", EXTENSIONS_SCHEMA),
     ("operations_compaction", COMPACTION_SCHEMA),
     ("restore_plans", RESTORE_SCHEMA),
+    ("view_preferences", VIEW_PREFERENCES_SCHEMA),
 ];
 
 const PROMPT_CORE_LEDGER_FEATURE: &[(&str, &str)] =
@@ -155,6 +156,39 @@ CREATE TABLE restore_targets (
   PRIMARY KEY (plan_id, target)
 );
 ";
+
+/// D1 (RL-12): what one terminal client keeps of the agent views, keyed by
+/// the core's `masil_client_profile`. `view` is a saved list view (NULL
+/// follows the server's `@masil-agent-view`); `ui` is the agent UI's filter
+/// tab, selection and scroll as JSON.
+const VIEW_PREFERENCES_SCHEMA: &str = "
+CREATE TABLE view_preferences (
+  profile TEXT PRIMARY KEY,
+  view TEXT,
+  ui TEXT NOT NULL,
+  updated_ms INTEGER NOT NULL
+);
+";
+
+/// At most this many client rows; a write drops the least recently used.
+const VIEW_PREFERENCES_MAX: i64 = 64;
+/// A client row unused this long is dropped.
+const VIEW_PREFERENCES_KEEP_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+/// One client's stored view preferences.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewPreference {
+    pub view: Option<String>,
+    pub ui: String,
+}
+
+/// What a write to a client row changes; the other column keeps its value
+/// (a new row starts with no view and an empty UI state).
+#[derive(Clone, Debug)]
+pub enum ViewChange {
+    View(Option<String>),
+    Ui(String),
+}
 
 /// A restore plan unused this long is dropped.
 const RESTORE_KEEP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -2395,6 +2429,86 @@ impl Store {
         let store = Self::readonly(socket).ok().flatten()?;
         let instance = store.instance().ok()?.to_string();
         Some((store.inbox_enabled().unwrap_or(false), instance))
+    }
+
+    /// One client's view preferences, read without creating or changing
+    /// anything: None without a store, without the table, or without a row.
+    pub fn view_preference_readonly(
+        socket: &Path,
+        profile: &str,
+    ) -> Result<Option<ViewPreference>, String> {
+        let Some(store) = Self::readonly(socket)? else {
+            return Ok(None);
+        };
+        let table: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'view_preferences')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if !table {
+            return Ok(None);
+        }
+        store.view_preference(profile)
+    }
+
+    pub fn view_preference(&self, profile: &str) -> Result<Option<ViewPreference>, String> {
+        self.conn
+            .query_row(
+                "SELECT view, ui FROM view_preferences WHERE profile = ?1",
+                [profile],
+                |row| {
+                    Ok(ViewPreference {
+                        view: row.get(0)?,
+                        ui: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    /// Writes one column of a client's row and, in the same transaction,
+    /// drops rows unused for `VIEW_PREFERENCES_KEEP_MS` and all but the
+    /// `VIEW_PREFERENCES_MAX` most recently used.
+    pub fn set_view_preference(
+        &mut self,
+        profile: &str,
+        change: &ViewChange,
+        now: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        match change {
+            ViewChange::View(view) => tx.execute(
+                "INSERT INTO view_preferences (profile, view, ui, updated_ms) VALUES (?1, ?2, '{}', ?3)
+                 ON CONFLICT (profile) DO UPDATE SET view = excluded.view, updated_ms = excluded.updated_ms",
+                params![profile, view, now as i64],
+            ),
+            ViewChange::Ui(ui) => tx.execute(
+                "INSERT INTO view_preferences (profile, view, ui, updated_ms) VALUES (?1, NULL, ?2, ?3)
+                 ON CONFLICT (profile) DO UPDATE SET ui = excluded.ui, updated_ms = excluded.updated_ms",
+                params![profile, ui, now as i64],
+            ),
+        }
+        .map_err(sql)?;
+        tx.execute(
+            "DELETE FROM view_preferences WHERE updated_ms < ?1",
+            [now.saturating_sub(VIEW_PREFERENCES_KEEP_MS) as i64],
+        )
+        .map_err(sql)?;
+        tx.execute(
+            "DELETE FROM view_preferences WHERE profile NOT IN (
+               SELECT profile FROM view_preferences ORDER BY updated_ms DESC, profile LIMIT ?1)",
+            [VIEW_PREFERENCES_MAX],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
     }
 
     // Resident extensions (P9).
@@ -5636,7 +5750,8 @@ mod tests {
                 "provider_secrets",
                 "remote_links",
                 "restore_plans",
-                "schedules"
+                "schedules",
+                "view_preferences"
             ])
         );
         fs::remove_dir_all(dir).unwrap();
@@ -5762,8 +5877,89 @@ mod tests {
                 "provider_secrets",
                 "remote_links",
                 "restore_plans",
-                "schedules"
+                "schedules",
+                "view_preferences"
             ])
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn view_preferences_write_one_column_and_keep_the_newest_rows() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        let mut store = Store::open_path(&path).unwrap();
+        let profile = "0123456789abcdef";
+        assert_eq!(store.view_preference(profile).unwrap(), None);
+        store
+            .set_view_preference(
+                profile,
+                &ViewChange::Ui(r#"{"filter":"attention"}"#.into()),
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            store.view_preference(profile).unwrap(),
+            Some(ViewPreference {
+                view: None,
+                ui: r#"{"filter":"attention"}"#.into()
+            })
+        );
+        // A view write keeps the UI state; a UI write keeps the view.
+        store
+            .set_view_preference(profile, &ViewChange::View(Some("v".into())), 11)
+            .unwrap();
+        store
+            .set_view_preference(profile, &ViewChange::Ui("{}".into()), 12)
+            .unwrap();
+        assert_eq!(
+            store.view_preference(profile).unwrap(),
+            Some(ViewPreference {
+                view: Some("v".into()),
+                ui: "{}".into()
+            })
+        );
+        store
+            .set_view_preference(profile, &ViewChange::View(None), 13)
+            .unwrap();
+        assert_eq!(store.view_preference(profile).unwrap().unwrap().view, None);
+
+        // 64 rows at most: the 65th write drops the least recently used.
+        for index in 0..VIEW_PREFERENCES_MAX {
+            let other = format!("{index:016x}");
+            store
+                .set_view_preference(&other, &ViewChange::Ui("{}".into()), 100 + index as u64)
+                .unwrap();
+        }
+        let count = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM view_preferences", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(&store), VIEW_PREFERENCES_MAX);
+        assert_eq!(store.view_preference(profile).unwrap(), None);
+        assert!(
+            store
+                .view_preference(&format!("{:016x}", 0))
+                .unwrap()
+                .is_some()
+        );
+
+        // A row unused for 90 days goes with the next write.
+        let later = 200 + VIEW_PREFERENCES_KEEP_MS;
+        store
+            .set_view_preference(profile, &ViewChange::Ui("{}".into()), later)
+            .unwrap();
+        assert_eq!(count(&store), 1);
+        drop(store);
+
+        // The read-only path needs no socket store; a missing file is None.
+        assert_eq!(
+            Store::view_preference_readonly(&dir.join("no-such.sock"), profile).unwrap(),
+            None
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -5799,7 +5995,8 @@ mod tests {
                 "provider_secrets",
                 "remote_links",
                 "restore_plans",
-                "schedules"
+                "schedules",
+                "view_preferences"
             ])
         );
         fs::remove_dir_all(dir).unwrap();

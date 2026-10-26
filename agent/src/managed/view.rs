@@ -1,16 +1,116 @@
 //! Saved filters and deterministic ordering for agent list presentation.
 
+use super::operations::{Store, ViewChange, ViewPreference};
 use super::{Agent, Manager};
 use crate::providers;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::path::Path;
 
 pub(super) const OPTION: &str = "@masil-agent-view";
+const USAGE: &str = "view requires get, clear, or set [--provider ID] [--state STATE] [--workspace NAME] [--sort ORDER], and --client-view for one terminal client's view";
 const VERSION: u32 = 1;
 const MAX_WORKSPACES: usize = 64;
 const STATES: [&str; 5] = ["idle", "working", "blocked", "unknown", "exited"];
+/// Selects the per-client view in `view` and `list` (D1, RL-12).
+pub(crate) const CLIENT_FLAG: &str = "--client-view";
+/// The longest agent UI state a client row keeps.
+const MAX_UI: usize = 4096;
+const UNSTABLE: &str = "client_profile_unstable: this terminal gives masil no stable identity; set MASIL_CLIENT_KEY in it before attaching";
+
+/// The client a `--client-view` command or the agent UI acts for, and what
+/// the operation store keeps for it.
+#[derive(Clone, Debug)]
+pub(crate) struct ClientView {
+    /// The client's terminal profile; None when its terminal gives no
+    /// stable identity (`unstable`), and nothing is kept for it.
+    pub(crate) profile: Option<String>,
+    stored: Option<ViewPreference>,
+}
+
+impl ClientView {
+    /// The client's own saved view as stored, when it has one.
+    pub(crate) fn view_text(&self) -> Option<&str> {
+        self.stored.as_ref()?.view.as_deref()
+    }
+
+    /// The agent UI state the client last left, when there is one.
+    pub(crate) fn ui(&self) -> Option<&str> {
+        self.stored.as_ref().map(|row| row.ui.as_str())
+    }
+
+    /// Fails for a damaged saved view; a client without one passes.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        self.view_text()
+            .map_or(Ok(()), |text| client_view_from_text(text).map(drop))
+    }
+}
+
+/// `profile` when it is a stable `masil_client_profile`; None for
+/// `unstable`.
+fn stable_profile(profile: &str) -> Result<Option<String>, String> {
+    if profile == "unstable" {
+        return Ok(None);
+    }
+    if (16..=128).contains(&profile.len())
+        && profile
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(Some(profile.to_owned()))
+    } else {
+        Err("invalid_target: the client's profile is malformed".into())
+    }
+}
+
+/// The client view of a server, read without creating the store.
+pub(super) async fn resolve_client(
+    native: &crate::native_ui::Context,
+) -> Result<ClientView, String> {
+    let profile = stable_profile(&native.client_profile().await?)?;
+    let stored = match &profile {
+        Some(profile) => Store::view_preference_readonly(&native.socket, profile)?,
+        None => None,
+    };
+    Ok(ClientView { profile, stored })
+}
+
+/// A client's saved view; a damaged one names its own way out.
+fn client_view_from_text(encoded: &str) -> Result<SavedView, String> {
+    view_from_text(encoded).map_err(|_| {
+        "invalid client agent view; clear it with agent view clear --client-view".into()
+    })
+}
+
+/// Keeps the agent UI state of a client, for the next UI it opens.
+pub(crate) fn save_client_ui(socket: &Path, profile: &str, ui: &str) -> Result<(), String> {
+    if ui.len() > MAX_UI {
+        return Err(format!("agent UI state exceeds {MAX_UI} bytes"));
+    }
+    stable_profile(profile)?.ok_or(UNSTABLE)?;
+    Store::open(socket)?.set_view_preference(
+        profile,
+        &ViewChange::Ui(ui.to_owned()),
+        crate::observation::now_ms(),
+    )
+}
+
+/// `args` without `CLIENT_FLAG`, and whether it was there once. Twice is a
+/// usage error.
+pub(super) fn take_client_flag(args: &[String]) -> Result<(bool, Vec<String>), String> {
+    let rest: Vec<String> = args
+        .iter()
+        .filter(|arg| *arg != CLIENT_FLAG)
+        .cloned()
+        .collect();
+    match args.len() - rest.len() {
+        0 => Ok((false, rest)),
+        1 => Ok((true, rest)),
+        _ => Err(format!("usage: repeated {CLIENT_FLAG}")),
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +134,10 @@ enum SortOrder {
 
 impl Manager {
     pub async fn view(&self, args: &[String]) -> Result<Value, String> {
+        let (client, args) = take_client_flag(args)?;
+        if client {
+            return self.client_view_command(&args).await;
+        }
         match args.first().map(String::as_str) {
             Some("get") if args.len() == 1 => {
                 let view = self.load_view().await?;
@@ -46,10 +150,92 @@ impl Manager {
             Some("set") => {
                 let view = parse_set(&args[1..])?;
                 let encoded = super::encode(&view)?;
-                self.command(&["set-option", "-g", OPTION, &encoded]).await?;
+                self.command(&["set-option", "-g", OPTION, &encoded])
+                    .await?;
                 Ok(json!({"stage":"view_saved", "view":view}))
             }
-            _ => Err("view requires get, clear, or set [--provider ID] [--state STATE] [--workspace NAME] [--sort ORDER]".into()),
+            _ => Err(USAGE.into()),
+        }
+    }
+
+    /// `view get|clear|set --client-view`: the view of one terminal client.
+    async fn client_view_command(&self, args: &[String]) -> Result<Value, String> {
+        // A usage error is reported before any client is looked up.
+        let set = match args.first().map(String::as_str) {
+            Some("get" | "clear") if args.len() == 1 => None,
+            Some("set") => Some(parse_set(&args[1..])?),
+            _ => return Err(USAGE.into()),
+        };
+        let client = resolve_client(&self.native).await?;
+        let stable = if client.profile.is_some() {
+            "stable"
+        } else {
+            "unstable"
+        };
+        if let Some(view) = set {
+            let profile = client.profile.as_deref().ok_or(UNSTABLE)?;
+            let encoded = super::encode(&view)?;
+            Store::open(&self.native.socket)?.set_view_preference(
+                profile,
+                &ViewChange::View(Some(encoded)),
+                crate::observation::now_ms(),
+            )?;
+            return Ok(
+                json!({"stage":"view_saved","view":view,"source":"client","profile":stable}),
+            );
+        }
+        match args.first().map(String::as_str) {
+            Some("get") => {
+                let (view, source) = match client.view_text() {
+                    Some(text) => (client_view_from_text(text)?, "client"),
+                    None => self.server_view().await?,
+                };
+                Ok(json!({"stage":"view_loaded","view":view,"source":source,"profile":stable}))
+            }
+            _ => {
+                let profile = client.profile.as_deref().ok_or(UNSTABLE)?;
+                // A client without a view of its own has nothing to clear,
+                // and no store is created for it.
+                if client.view_text().is_some() {
+                    Store::open(&self.native.socket)?.set_view_preference(
+                        profile,
+                        &ViewChange::View(None),
+                        crate::observation::now_ms(),
+                    )?;
+                }
+                let (view, source) = self.server_view().await?;
+                Ok(json!({"stage":"view_cleared","view":view,"source":source,"profile":stable}))
+            }
+        }
+    }
+
+    /// The server's view and where it comes from (`server`, or `default`
+    /// when none is saved).
+    async fn server_view(&self) -> Result<(SavedView, &'static str), String> {
+        let encoded = self.command(&["show-options", "-gqv", OPTION]).await?;
+        let source = if encoded.trim().is_empty() {
+            "default"
+        } else {
+            "server"
+        };
+        Ok((view_from_text(&encoded)?, source))
+    }
+
+    /// The client view of the `--client` client, or of the one attached
+    /// client when no client is named.
+    pub(crate) async fn client_view(&self) -> Result<ClientView, String> {
+        resolve_client(&self.native).await
+    }
+
+    /// The agents under a client's saved view (as stored), or under the
+    /// server's view when the client has none.
+    pub(crate) async fn list_view_for(&self, view: Option<&str>) -> Result<Vec<Agent>, String> {
+        match view {
+            Some(text) => Ok(apply_view(
+                &client_view_from_text(text)?,
+                self.list().await?,
+            )),
+            None => self.list_view().await,
         }
     }
 
@@ -293,6 +479,65 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn client_profiles_are_hex_or_unstable() {
+        assert_eq!(stable_profile("unstable").unwrap(), None);
+        assert_eq!(
+            stable_profile("0123456789abcdef").unwrap().as_deref(),
+            Some("0123456789abcdef")
+        );
+        assert!(stable_profile("0123456789abcde").is_err());
+        assert!(stable_profile("0123456789ABCDEF").is_err());
+        assert!(stable_profile(&"a".repeat(129)).is_err());
+        assert!(stable_profile("").is_err());
+    }
+
+    #[test]
+    fn the_client_flag_is_taken_once() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            take_client_flag(&args(&["set", "--client-view", "--sort", "name"])).unwrap(),
+            (true, args(&["set", "--sort", "name"]))
+        );
+        assert_eq!(
+            take_client_flag(&args(&["get"])).unwrap(),
+            (false, args(&["get"]))
+        );
+        assert!(take_client_flag(&args(&["get", "--client-view", "--client-view"])).is_err());
+    }
+
+    #[test]
+    fn a_client_view_reads_its_own_view_or_reports_damage() {
+        let own = ClientView {
+            profile: Some("0123456789abcdef".into()),
+            stored: Some(ViewPreference {
+                view: Some(super::super::encode(&default_view()).unwrap()),
+                ui: "{}".into(),
+            }),
+        };
+        assert!(own.check().is_ok());
+        assert_eq!(own.ui(), Some("{}"));
+        let damaged = ClientView {
+            profile: Some("0123456789abcdef".into()),
+            stored: Some(ViewPreference {
+                view: Some("zz".into()),
+                ui: "{}".into(),
+            }),
+        };
+        assert!(
+            damaged
+                .check()
+                .unwrap_err()
+                .contains("view clear --client-view")
+        );
+        let none = ClientView {
+            profile: None,
+            stored: None,
+        };
+        assert_eq!(none.view_text(), None);
+        assert!(none.check().is_ok());
     }
 
     #[test]

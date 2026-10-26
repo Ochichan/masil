@@ -9,6 +9,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 */
 mod answer;
 mod changes;
+mod client_view;
 mod i18n;
 mod inbox;
 mod input;
