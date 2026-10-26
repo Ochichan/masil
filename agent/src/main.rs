@@ -760,6 +760,8 @@ fn execute() -> Result<i32, String> {
     }
     let command = args[2].as_str();
     if command == "ui" || command == "sidebar" {
+        // The managed screen never waits on a busy coordinator.
+        coordinator::enter(coordinator::Entry::Ui);
         return ui::run(&args[1], &args[3..], command == "sidebar");
     }
     if command == "serve" {

@@ -236,8 +236,36 @@ impl Endpoint {
     }
 
     async fn call_owned(self, request: Request) -> Result<Value, String> {
-        validate_endpoint(&self)?;
-        let input = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+        self.call_within(request, crate::coordinator::busy_budget())
+            .await
+    }
+
+    /// One call, made again as a new RPC while the endpoint answers that its
+    /// coordinator was busy and `budget` still holds the whole limit of
+    /// another call. The limit of a call is never cut: a call killed here
+    /// while the endpoint's coordinator goes on to send its action would be
+    /// reported as unreachable, and a caller that sends the same keys or
+    /// prompt again would deliver it twice. The busy answer means nothing was
+    /// sent there, and each RPC plans its action anew on the endpoint. A
+    /// budget of zero makes a single call.
+    async fn call_within(self, request: Request, budget: Duration) -> Result<Value, String> {
+        let limit = deadline(&request);
+        let mut busy = crate::coordinator::BusyRetry::with_room(budget, limit);
+        loop {
+            let error = match self.call_once(&request, limit).await {
+                Ok(value) => return Ok(value),
+                Err(error) => error,
+            };
+            match busy.wait_after(&error) {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => return Err(busy.last(error)),
+            }
+        }
+    }
+
+    async fn call_once(&self, request: &Request, limit: Duration) -> Result<Value, String> {
+        validate_endpoint(self)?;
+        let input = serde_json::to_vec(request).map_err(|error| error.to_string())?;
         if input.len() > MAX_INPUT_BYTES {
             return Err("invalid_argument: endpoint request exceeds 262144 bytes".into());
         }
@@ -291,16 +319,14 @@ impl Endpoint {
             tokio::join!(write, read_stdout, read_stderr, wait)
         };
 
-        let deadline = deadline(&request);
-        let (write, stdout, stderr, status) = match tokio::time::timeout(deadline, operation).await
-        {
+        let (write, stdout, stderr, status) = match tokio::time::timeout(limit, operation).await {
             Ok(result) => result,
             Err(_) => {
                 process_group.kill();
                 let _ = child.wait().await;
                 return Err(endpoint_unreachable(
                     &id,
-                    format!("timed out after {} seconds", deadline.as_secs()),
+                    format!("timed out after {} seconds", limit.as_secs()),
                 ));
             }
         };
@@ -1395,5 +1421,113 @@ mod tests {
     fn typed_requests_reject_unknown_fields() {
         let error = decode_request(br#"{"operation":"list","unexpected":true}"#).unwrap_err();
         assert!(error.contains("unknown field"));
+    }
+
+    /// A local endpoint whose masil-agent counts its calls in `calls`. The
+    /// first `busy_calls` answer the busy envelope after `busy_secs` seconds,
+    /// as an endpoint does after its coordinator's wait; the rest deliver a
+    /// keys action.
+    fn counting_endpoint(label: &str, busy_calls: usize, busy_secs: u32) -> (Endpoint, PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("masil-endpoint-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let calls = directory.join("calls");
+        let busy = json!({
+            "version": VERSION,
+            "ok": false,
+            "error": crate::managed::core_action::COORDINATOR_BUSY,
+        });
+        let delivered = json!({
+            "version": VERSION,
+            "ok": true,
+            "value": {"stage": "keys_delivered"},
+        });
+        let script = directory.join("counting-agent");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nn=$(cat {calls} 2>/dev/null || echo 0)\nn=$((n + 1))\necho \"$n\" > {calls}\nif [ \"$n\" -le {busy_calls} ]; then\n  sleep {busy_secs}\n  printf '%s' {busy}\nelse\n  printf '%s' {delivered}\nfi\n",
+                calls = shell_quote(calls.to_str().unwrap()),
+                busy = shell_quote(&busy.to_string()),
+                delivered = shell_quote(&delivered.to_string()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = Endpoint {
+            binary: script.to_string_lossy().into_owned(),
+            socket: "/tmp/unused-masil.sock".into(),
+            ..endpoint(None)
+        };
+        (endpoint, directory)
+    }
+
+    fn call_count(directory: &Path) -> String {
+        fs::read_to_string(directory.join("calls"))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    fn keys_request() -> Request {
+        Request::Action {
+            expected: Expected {
+                pane_id: "%1".into(),
+                boot: "boot".into(),
+                generation: "1".into(),
+                run: "run".into(),
+                revision: "1".into(),
+                session_id: None,
+            },
+            action: Action::Keys {
+                keys: vec!["Enter".into()],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_endpoint_is_called_again_and_delivers_once() {
+        let (endpoint, directory) = counting_endpoint("busy-again", 1, 0);
+        let started = std::time::Instant::now();
+        let value = endpoint
+            .call_within(keys_request(), Duration::from_secs(12))
+            .await
+            .unwrap();
+        assert_eq!(value["stage"], "keys_delivered");
+        // One busy answer, a pause of 100 ms, then the delivery.
+        assert_eq!(call_count(&directory), "2");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resend_needs_the_whole_call_limit_left_in_the_budget() {
+        // Each busy answer takes 1 s. A call's limit is 8 s, never cut, so
+        // 9.7 s holds a second call (8 s + about 1.1 s used) and not a third
+        // (8 s + about 2.3 s used).
+        let (endpoint, directory) = counting_endpoint("busy-room", 5, 1);
+        let error = endpoint
+            .call_within(keys_request(), Duration::from_millis(9_700))
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("coordinator_busy:") && error.contains("not delivered"),
+            "{error}"
+        );
+        assert_eq!(call_count(&directory), "2");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_call_without_a_busy_budget_is_made_once() {
+        let (endpoint, directory) = counting_endpoint("busy-once", 5, 0);
+        let error = endpoint
+            .call_within(keys_request(), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(error, crate::managed::core_action::COORDINATOR_BUSY);
+        assert_eq!(call_count(&directory), "1");
+        fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -18,8 +18,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Inbox writes reported to this process since it started.
@@ -765,13 +765,34 @@ fn check_action_frame(params: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// The read limit of an action that is not a launch or a focus.
+pub(crate) const ACTION_READ_LIMIT: Duration =
+    COMMAND_TIMEOUT.saturating_add(Duration::from_secs(2));
+
 /// Sends one guarded-action request through the coordinator. Once a core
 /// path was selected, a missing bridge is reported here rather than falling
-/// back to native.
+/// back to native. A coordinator that answers busy is asked again within the
+/// process's busy budget (`busy_budget`).
 pub(crate) fn action(socket: &Path, params: Value) -> Result<Value, String> {
+    action_within(socket, params, busy_budget(), Duration::MAX)
+}
+
+/// As `action`, but a busy answer is final and the read is cut to `cap`. For
+/// a caller that plans its request again before it sends another, as an
+/// interrupt does, and keeps the time itself.
+pub(crate) fn action_once(socket: &Path, params: Value, cap: Duration) -> Result<Value, String> {
+    action_within(socket, params, Duration::ZERO, cap)
+}
+
+fn action_within(
+    socket: &Path,
+    params: Value,
+    budget: Duration,
+    cap: Duration,
+) -> Result<Value, String> {
     check_action_frame(&params)?;
     let (_, server) = ensure_checked(socket, true)?;
-    action_on_running_coordinator(socket, &server, params)
+    action_on_running_coordinator(socket, &server, params, budget, cap)
 }
 
 /// Sends an action after a caller has already ensured the coordinator.
@@ -780,13 +801,15 @@ pub(crate) fn action(socket: &Path, params: Value) -> Result<Value, String> {
 pub(crate) fn action_after_ensure(socket: &Path, params: Value) -> Result<Value, String> {
     check_action_frame(&params)?;
     let server = check_state(socket)?;
-    action_on_running_coordinator(socket, &server, params)
+    action_on_running_coordinator(socket, &server, params, busy_budget(), Duration::MAX)
 }
 
 fn action_on_running_coordinator(
     socket: &Path,
     server: &ServerInfo,
     params: Value,
+    budget: Duration,
+    cap: Duration,
 ) -> Result<Value, String> {
     let paths = paths(socket, &server.state)?;
     let timeout = match params["operation"].as_str() {
@@ -797,9 +820,203 @@ fn action_on_running_coordinator(
                 + Duration::from_secs(2)
                 + crate::managed::core_action::FOCUS_EVENT_TIMEOUT
         }
-        _ => COMMAND_TIMEOUT + Duration::from_secs(2),
-    };
-    action_control_request(&paths.listen, params, timeout).map_err(action_request_failure)
+        _ => ACTION_READ_LIMIT,
+    }
+    .min(cap);
+    send_retrying_busy(budget, timeout, |limit| {
+        action_control_request(&paths.listen, params.clone(), limit).map_err(action_request_failure)
+    })
+}
+
+// ------------------------------------------------------------- busy retries
+
+/// What `execute` answers when it could not start before its pre-dispatch
+/// wait ran out. Nothing was sent, so the same request may be sent again.
+const COORDINATOR_BUSY: &str = crate::managed::core_action::COORDINATOR_BUSY;
+const BUSY_FIRST_DELAY: Duration = Duration::from_millis(100);
+const BUSY_LAST_DELAY: Duration = Duration::from_millis(500);
+/// A request is sent again only if the coordinator can still refuse it again
+/// before the budget ends: its wait, plus time for the answer to travel.
+const BUSY_ANSWER_WINDOW: Duration =
+    crate::managed::core_action::PRE_DISPATCH_WAIT.saturating_add(Duration::from_millis(500));
+
+/// Where this process was entered. It decides whether a busy coordinator is
+/// asked again. Only the entry points that must not wait name themselves
+/// (`Rpc`, `Api`, `Ui`); a process that never calls `enter` has the budget of
+/// `LocalCli`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Entry {
+    /// A person's `masil-agent agent ...` command. Also any process that
+    /// never named its entry point: scheduled actions inside the coordinator,
+    /// `layout`, `worktree`.
+    LocalCli,
+    /// `agent rpc`. It answers busy in its envelope; the endpoint's caller
+    /// sends a new call.
+    Rpc,
+    /// A verb run for the extension API or MCP (`MASIL_API_CALL`).
+    Api,
+    /// The managed screen and its sidebar, from `agent ui|sidebar` or the
+    /// top-level `--socket S ui|sidebar`.
+    Ui,
+}
+
+impl Entry {
+    /// The entry point of the `agent` command `command`.
+    pub(crate) fn of(command: &str, api_call: bool) -> Self {
+        match command {
+            "rpc" => Self::Rpc,
+            "ui" | "sidebar" => Self::Ui,
+            _ if api_call => Self::Api,
+            _ => Self::LocalCli,
+        }
+    }
+
+    /// How long, from its first attempt, this entry point keeps sending a
+    /// request the coordinator refuses as busy. The local CLI gets the launch
+    /// limit, the longest it waits for any one answer already.
+    pub(crate) const fn busy_budget(self) -> Duration {
+        match self {
+            Self::LocalCli => LAUNCH_ACTION_TIMEOUT,
+            Self::Rpc | Self::Api | Self::Ui => Duration::ZERO,
+        }
+    }
+}
+
+static ENTRY: OnceLock<Entry> = OnceLock::new();
+
+/// Records how this process was entered. Only the first call counts.
+pub(crate) fn enter(entry: Entry) {
+    let _ = ENTRY.set(entry);
+}
+
+/// The busy budget of this process: that of the local CLI, unless `enter`
+/// named an entry point that does not retry.
+pub(crate) fn busy_budget() -> Duration {
+    budget_of(ENTRY.get().copied())
+}
+
+fn budget_of(entry: Option<Entry>) -> Duration {
+    entry.unwrap_or(Entry::LocalCli).busy_budget()
+}
+
+/// The pause before sending again after the `refusals`th busy answer: 100 ms,
+/// doubled each time up to 500 ms.
+fn busy_delay(refusals: u32) -> Duration {
+    BUSY_FIRST_DELAY
+        .saturating_mul(1 << refusals.saturating_sub(1).min(3))
+        .min(BUSY_LAST_DELAY)
+}
+
+/// The busy answers one request has had, and the time left to try again in.
+pub(crate) struct BusyRetry {
+    started: Instant,
+    budget: Duration,
+    /// What must be left of the budget to send again.
+    room: Duration,
+    refusals: u32,
+}
+
+impl BusyRetry {
+    /// Counts from now. A zero budget never sends again. A request is sent
+    /// again while the budget leaves room for the coordinator's next busy
+    /// answer.
+    pub(crate) fn new(budget: Duration) -> Self {
+        Self::with_room(budget, BUSY_ANSWER_WINDOW)
+    }
+
+    /// As `new`, with the budget `room` that must be left to send again. A
+    /// caller that never cuts its read limit gives the whole limit, so a
+    /// request it sent is never given up on before the coordinator is done
+    /// with it.
+    pub(crate) fn with_room(budget: Duration, room: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            budget,
+            room,
+            refusals: 0,
+        }
+    }
+
+    /// The read limit for the next attempt. The first attempt and any attempt
+    /// without a budget keep their usual limit. One sent again after a busy
+    /// answer is cut to the budget that is left.
+    pub(crate) fn limit(&self, usual: Duration) -> Duration {
+        self.limit_at(usual, self.started.elapsed())
+    }
+
+    fn limit_at(&self, usual: Duration, elapsed: Duration) -> Duration {
+        if self.budget.is_zero() || self.refusals == 0 {
+            usual
+        } else {
+            usual.min(self.budget.saturating_sub(elapsed))
+        }
+    }
+
+    /// As `limit`, for a caller that spends time between `wait_after` and the
+    /// send (an interrupt plans again). None when what is left no longer
+    /// holds another busy answer, and the request should not be sent.
+    pub(crate) fn limit_with_room(&self, usual: Duration) -> Option<Duration> {
+        self.limit_with_room_at(usual, self.started.elapsed())
+    }
+
+    fn limit_with_room_at(&self, usual: Duration, elapsed: Duration) -> Option<Duration> {
+        let limit = self.limit_at(usual, elapsed);
+        (self.budget.is_zero() || self.refusals == 0 || limit >= self.room).then_some(limit)
+    }
+
+    /// The pause before sending again after `error`. None when `error` is
+    /// final: it is not the busy answer, there is no budget, or the budget
+    /// no longer leaves room for another answer.
+    pub(crate) fn wait_after(&mut self, error: &str) -> Option<Duration> {
+        self.wait_at(error, self.started.elapsed())
+    }
+
+    fn wait_at(&mut self, error: &str, elapsed: Duration) -> Option<Duration> {
+        if self.budget.is_zero() || error != COORDINATOR_BUSY {
+            return None;
+        }
+        self.refusals = self.refusals.saturating_add(1);
+        let wait = busy_delay(self.refusals);
+        let left = self.budget.checked_sub(elapsed.checked_add(wait)?)?;
+        (left >= self.room).then_some(wait)
+    }
+
+    /// The error to report once no further attempt is made. With a budget, a
+    /// busy answer says the request was not delivered and had no effect.
+    pub(crate) fn last(&self, error: String) -> String {
+        self.last_at(error, self.started.elapsed())
+    }
+
+    fn last_at(&self, error: String, elapsed: Duration) -> String {
+        if self.budget.is_zero() || error != COORDINATOR_BUSY {
+            return error;
+        }
+        format!(
+            "coordinator_busy: another action held the coordinator for {} s; the request was not delivered and had no effect",
+            elapsed.as_secs()
+        )
+    }
+}
+
+/// Sends with `send`, which is given the read limit for the attempt, and
+/// sends again after a pause while the coordinator answers busy and `budget`
+/// leaves room. Every attempt starts from the same request.
+fn send_retrying_busy(
+    budget: Duration,
+    usual: Duration,
+    mut send: impl FnMut(Duration) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let mut busy = BusyRetry::new(budget);
+    loop {
+        let error = match send(busy.limit(usual)) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        match busy.wait_after(&error) {
+            Some(wait) => std::thread::sleep(wait),
+            None => return Err(busy.last(error)),
+        }
+    }
 }
 
 /// The running coordinator's resident extensions; None if none runs.
@@ -2926,5 +3143,271 @@ mod tests {
         if let Some(watch) = shared.watch.lock().unwrap().take() {
             watch.abort();
         }
+    }
+
+    #[test]
+    fn only_rpc_api_and_the_screen_skip_the_busy_retry() {
+        assert_eq!(Entry::of("send-keys", false), Entry::LocalCli);
+        assert_eq!(Entry::of("send-keys", true), Entry::Api);
+        assert_eq!(Entry::of("rpc", false), Entry::Rpc);
+        assert_eq!(Entry::of("rpc", true), Entry::Rpc);
+        assert_eq!(Entry::of("ui", false), Entry::Ui);
+        assert_eq!(Entry::of("sidebar", false), Entry::Ui);
+        assert_eq!(Entry::LocalCli.busy_budget(), Duration::from_secs(12));
+        assert_eq!(Entry::LocalCli.busy_budget(), LAUNCH_ACTION_TIMEOUT);
+        for entry in [Entry::Rpc, Entry::Api, Entry::Ui] {
+            assert_eq!(entry.busy_budget(), Duration::ZERO, "{entry:?}");
+        }
+        // A process that never named its entry point (a scheduled action in
+        // the coordinator, `layout`, `worktree`) keeps the local CLI budget.
+        assert_eq!(budget_of(None), Duration::from_secs(12));
+        assert_eq!(budget_of(Some(Entry::LocalCli)), Duration::from_secs(12));
+        assert_eq!(budget_of(Some(Entry::Rpc)), Duration::ZERO);
+        assert_eq!(budget_of(Some(Entry::Api)), Duration::ZERO);
+        assert_eq!(budget_of(Some(Entry::Ui)), Duration::ZERO);
+    }
+
+    #[test]
+    fn busy_pauses_grow_from_100_to_500_ms() {
+        let pauses: Vec<u128> = (1..=7).map(|n| busy_delay(n).as_millis()).collect();
+        assert_eq!(pauses, [100, 200, 400, 500, 500, 500, 500]);
+        assert_eq!(busy_delay(u32::MAX).as_millis(), 500);
+    }
+
+    #[test]
+    fn a_busy_request_is_sent_again_only_while_the_next_answer_fits_in_the_budget() {
+        let budget = Entry::LocalCli.busy_budget();
+        let mut retry = BusyRetry::new(budget);
+        // Each send is refused after the coordinator's pre-dispatch wait.
+        let mut elapsed = Duration::ZERO;
+        let mut sends = 1;
+        loop {
+            elapsed += crate::managed::core_action::PRE_DISPATCH_WAIT;
+            let Some(pause) = retry.wait_at(COORDINATOR_BUSY, elapsed) else {
+                break;
+            };
+            elapsed += pause;
+            sends += 1;
+            // The send that follows can still be refused before the end.
+            assert!(
+                elapsed + crate::managed::core_action::PRE_DISPATCH_WAIT <= budget,
+                "send {sends} at {elapsed:?}"
+            );
+        }
+        // Sent at 0, 2.6, 5.3 and 8.2 s; the fourth is refused at 10.7 s and
+        // 0.5 s later too little is left.
+        assert_eq!(sends, 4);
+        assert!(elapsed <= budget);
+    }
+
+    #[test]
+    fn a_retry_reads_for_its_usual_limit_cut_to_the_budget_left() {
+        let mut retry = BusyRetry::new(Duration::from_secs(12));
+        let usual = Duration::from_secs(5);
+        // The first attempt keeps its limit, even a long one.
+        assert_eq!(retry.limit_at(usual, Duration::ZERO), usual);
+        assert_eq!(
+            retry.limit_at(Duration::from_secs(20), Duration::ZERO),
+            Duration::from_secs(20)
+        );
+        // After a busy answer the limit is cut to what is left.
+        assert!(
+            retry
+                .wait_at(COORDINATOR_BUSY, Duration::from_millis(2_500))
+                .is_some()
+        );
+        assert_eq!(retry.limit_at(usual, Duration::from_millis(2_600)), usual);
+        assert_eq!(retry.limit_at(usual, Duration::from_millis(5_300)), usual);
+        assert_eq!(
+            retry.limit_at(usual, Duration::from_millis(8_200)),
+            Duration::from_millis(3_800)
+        );
+        // A launch's usual limit is the whole budget.
+        assert_eq!(
+            retry.limit_at(LAUNCH_ACTION_TIMEOUT, Duration::from_millis(2_600)),
+            Duration::from_millis(9_400)
+        );
+        // Without a budget the limit is untouched.
+        let none = BusyRetry::new(Duration::ZERO);
+        assert_eq!(none.limit_at(usual, Duration::from_secs(60)), usual);
+    }
+
+    #[test]
+    fn a_call_that_is_never_cut_is_sent_again_only_while_its_whole_limit_fits() {
+        // An endpoint call: the whole 8 s limit must fit in what is left.
+        let mut retry = BusyRetry::with_room(Duration::from_secs(12), Duration::from_secs(8));
+        let mut elapsed = Duration::ZERO;
+        let mut sends = 1;
+        loop {
+            elapsed += crate::managed::core_action::PRE_DISPATCH_WAIT;
+            let Some(pause) = retry.wait_at(COORDINATOR_BUSY, elapsed) else {
+                break;
+            };
+            elapsed += pause;
+            sends += 1;
+            assert!(elapsed + Duration::from_secs(8) <= Duration::from_secs(12));
+        }
+        // Sent at 0 and 2.6 s. After the second refusal, at 5.1 s, 6.9 s is left.
+        assert_eq!(sends, 2);
+    }
+
+    #[test]
+    fn a_resend_after_a_plan_needs_the_room_for_another_busy_answer() {
+        let mut retry = BusyRetry::new(Duration::from_secs(12));
+        let usual = ACTION_READ_LIMIT;
+        // Nothing refused yet: the usual limit, whatever the time.
+        assert_eq!(retry.limit_with_room_at(usual, Duration::ZERO), Some(usual));
+        assert!(
+            retry
+                .wait_at(COORDINATOR_BUSY, Duration::from_millis(2_500))
+                .is_some()
+        );
+        assert_eq!(
+            retry.limit_with_room_at(usual, Duration::from_millis(8_200)),
+            Some(Duration::from_millis(3_800))
+        );
+        // The plan used up the room: do not send.
+        assert_eq!(
+            retry.limit_with_room_at(usual, Duration::from_millis(9_500)),
+            None
+        );
+        assert_eq!(
+            retry.limit_with_room_at(usual, Duration::from_secs(13)),
+            None
+        );
+        // Without a budget nothing is cut or withheld.
+        let none = BusyRetry::new(Duration::ZERO);
+        assert_eq!(
+            none.limit_with_room_at(usual, Duration::from_secs(60)),
+            Some(usual)
+        );
+    }
+
+    #[test]
+    fn no_budget_and_other_errors_are_final_and_unchanged() {
+        let mut none = BusyRetry::new(Duration::ZERO);
+        assert_eq!(none.wait_at(COORDINATOR_BUSY, Duration::ZERO), None);
+        assert_eq!(
+            none.last_at(COORDINATOR_BUSY.to_owned(), Duration::from_secs(3)),
+            COORDINATOR_BUSY
+        );
+        let mut retry = BusyRetry::new(Duration::from_secs(12));
+        for other in [
+            "coordinator_busy: too many connections",
+            "outcome_unknown: coordinator action reply lost: timed out",
+            "bridge_unavailable: coordinator action request was not sent: x",
+            "identity_mismatch: agent changed",
+        ] {
+            assert_eq!(retry.wait_at(other, Duration::ZERO), None, "{other}");
+            assert_eq!(
+                retry.last_at(other.to_owned(), Duration::from_secs(3)),
+                other
+            );
+        }
+    }
+
+    #[test]
+    fn a_spent_budget_says_not_delivered_and_stays_transient() {
+        let retry = BusyRetry::new(Duration::from_secs(12));
+        let text = retry.last_at(COORDINATOR_BUSY.to_owned(), Duration::from_millis(10_700));
+        assert!(text.starts_with("coordinator_busy:"), "{text}");
+        assert!(text.contains("for 10 s"), "{text}");
+        assert!(text.contains("not delivered"), "{text}");
+        assert!(text.contains("no effect"), "{text}");
+        let (class, code) = crate::managed::failure::classify(&text);
+        assert_eq!(code, "coordinator_busy");
+        assert_eq!(class, crate::managed::failure::Class::Transient);
+        assert_eq!(class.exit_code(), 4);
+    }
+
+    /// A coordinator that takes one action request per connection and
+    /// answers each with the next of `replies`. It gives up waiting for a
+    /// connection after two seconds and returns the requests it read.
+    fn scripted_coordinator(
+        name: &str,
+        replies: Vec<Value>,
+    ) -> (PathBuf, std::thread::JoinHandle<Vec<Value>>) {
+        let path = std::env::temp_dir().join(format!("mb-{}-{name}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for reply in replies {
+                let waiting = Instant::now();
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(_) if waiting.elapsed() < Duration::from_secs(2) => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return requests,
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).unwrap();
+                let mut request = vec![0; u32::from_be_bytes(header) as usize];
+                stream.read_exact(&mut request).unwrap();
+                requests.push(serde_json::from_slice(&request).unwrap());
+                let reply = serde_json::to_vec(&reply).unwrap();
+                stream
+                    .write_all(&(reply.len() as u32).to_be_bytes())
+                    .unwrap();
+                stream.write_all(&reply).unwrap();
+            }
+            requests
+        });
+        (path, handle)
+    }
+
+    fn busy_reply() -> Value {
+        // As `action_reply` builds it from the error text.
+        json!({"v": 1, "id": "cli", "ok": false,
+            "error": {"code": "coordinator_busy", "message": COORDINATOR_BUSY}})
+    }
+
+    fn send_to(path: &Path, budget: Duration, params: &Value) -> Result<Value, String> {
+        send_retrying_busy(budget, Duration::from_secs(5), |limit| {
+            action_control_request(path, params.clone(), limit).map_err(action_request_failure)
+        })
+    }
+
+    #[test]
+    fn a_busy_action_is_sent_again_and_delivered_once() {
+        let done = json!({"v": 1, "id": "cli", "ok": true, "value": {"stage": "keys_delivered"}});
+        let (path, server) = scripted_coordinator("again", vec![busy_reply(), busy_reply(), done]);
+        let params = json!({"operation": "keys", "pane_id": "%3"});
+        let started = Instant::now();
+        let answer = send_to(&path, Entry::LocalCli.busy_budget(), &params).unwrap();
+        assert_eq!(answer["stage"], "keys_delivered");
+        // Pauses of 100 and 200 ms between three sends of one request.
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request["params"] == params));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rpc_and_api_get_the_busy_answer_after_one_send() {
+        let (path, server) = scripted_coordinator("once", vec![busy_reply()]);
+        let params = json!({"operation": "keys", "pane_id": "%3"});
+        let error = send_to(&path, Duration::ZERO, &params).unwrap_err();
+        assert_eq!(error, COORDINATOR_BUSY);
+        assert_eq!(server.join().unwrap().len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_refusal_that_is_not_busy_is_not_sent_again() {
+        let refusal = json!({"v": 1, "id": "cli", "ok": false,
+            "error": {"code": "identity_mismatch", "message": "identity_mismatch: agent changed"}});
+        let (path, server) = scripted_coordinator("refused", vec![refusal]);
+        let params = json!({"operation": "keys", "pane_id": "%3"});
+        let error = send_to(&path, Entry::LocalCli.busy_budget(), &params).unwrap_err();
+        assert_eq!(error, "identity_mismatch: agent changed");
+        assert_eq!(server.join().unwrap().len(), 1);
+        let _ = fs::remove_file(path);
     }
 }

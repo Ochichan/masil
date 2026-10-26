@@ -65,6 +65,11 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
     commands::verb(command).ok_or_else(|| {
         format!("usage: unknown agent command '{command}'; see masil-agent agent --help")
     })?;
+    // Name the entry points that must not ask a busy coordinator again.
+    crate::coordinator::enter(crate::coordinator::Entry::of(
+        command,
+        std::env::var_os("MASIL_API_CALL").is_some(),
+    ));
     if command == "providers" && rest.is_empty() {
         print(
             &json!({"providers":providers::all().iter().map(|p|json!({"id":p.id,"command":p.command,"aliases":p.aliases,"resume":providers::resume(p.id,"example").is_ok(),"integration":super::integration::target_capability(p.id)})).collect::<Vec<_>>()}),

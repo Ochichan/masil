@@ -44,6 +44,18 @@ pub(crate) const RECONNECT_VIEW_CHANGED: &str =
 /// How long a focus answer waits for the output phases of its action. The
 /// core itself ends tracking with `tty_output_pending` after 2 s.
 pub(crate) const FOCUS_EVENT_TIMEOUT: Duration = Duration::from_millis(2_500);
+/// How long `execute` waits before it sends anything: for the serial lock,
+/// the connection lock and a connect, all under one deadline. When it runs
+/// out the action is refused with nothing sent, so a caller that gave up on
+/// its own read limit is never answered by an action that runs late. It is
+/// shorter than the CLI's 5 s limit, so the refusal arrives while the caller
+/// still waits.
+pub(crate) const PRE_DISPATCH_WAIT: Duration = Duration::from_millis(2_500);
+/// The refusal for a pre-dispatch wait that ran out. Nothing was ticketed,
+/// written or sent, so the caller may send the same request again.
+pub(crate) const COORDINATOR_BUSY: &str =
+    "coordinator_busy: another action holds the coordinator; nothing was sent";
+const STOPPING: &str = "coordinator_unavailable: the coordinator is stopping";
 
 /// A boot-local ticket assigned by the coordinator connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -2129,7 +2141,8 @@ struct ActionStatus {
 /// The coordinator-side owner of the core action connection. Its serial lock
 /// is deliberately broader than a pane lock: core tickets are one ordered
 /// sequence for the connection, while pane locks only protect resident
-/// TRACKED writes during an individual action.
+/// TRACKED writes during an individual action. An action waits for it at
+/// most `PRE_DISPATCH_WAIT`, together with the other waits before its request.
 pub(crate) struct CoordinatorActions {
     socket: PathBuf,
     locks: Arc<PaneActionLocks>,
@@ -2436,9 +2449,19 @@ impl CoordinatorActions {
     }
 
     pub(crate) async fn execute(&self, params: &Value) -> Result<Value, String> {
-        let serial = self.serial.lock().await;
+        self.execute_within(params, PRE_DISPATCH_WAIT).await
+    }
+
+    /// `execute` with the pre-dispatch wait given. One deadline, counted from
+    /// the call, covers waiting for `serial`, waiting for `client` and any
+    /// connect. Past it the answer is `COORDINATOR_BUSY`, before a ticket, a
+    /// SQLite write or a core request. Once the action is sent it runs to its
+    /// reply; `stop` still waits for it without a deadline.
+    async fn execute_within(&self, params: &Value, wait: Duration) -> Result<Value, String> {
+        let until = tokio::time::Instant::now() + wait;
+        let serial = self.before(until, self.serial.lock()).await?;
         if self.stopping.load(Ordering::SeqCst) {
-            return Err("coordinator_unavailable: the coordinator is stopping".into());
+            return Err(STOPPING.into());
         }
         let active = ActiveAction::new(self);
         let action = ControlAction::parse(params)?;
@@ -2449,11 +2472,11 @@ impl CoordinatorActions {
         };
         let manager = Manager::new(self.socket.clone(), None)?;
         let connect_needed = {
-            let client = self.client.lock().await;
+            let client = self.before(until, self.client.lock()).await?;
             connection_needed(client.as_ref())
         };
         let connected = if connect_needed {
-            self.connect(&manager).await
+            self.before(until, self.connect(&manager)).await?
         } else {
             Ok(())
         };
@@ -2472,12 +2495,15 @@ impl CoordinatorActions {
         // A query's failed digest may have dropped the connection since the
         // check above, so connect once more if it did.
         let (mut client, reconnected) = self
-            .lock_connected(|| async {
-                let error = self.connect(&manager).await.err()?;
-                self.unavailable(&error);
-                Some(format!("bridge_unavailable: {error}"))
-            })
-            .await?;
+            .before(
+                until,
+                self.lock_connected(|| async {
+                    let error = self.connect(&manager).await.err()?;
+                    self.unavailable(&error);
+                    Some(format!("bridge_unavailable: {error}"))
+                }),
+            )
+            .await??;
         if reconnected && matches!(action, ControlAction::Focus(_)) {
             return Err(RECONNECT_VIEW_CHANGED.into());
         }
@@ -2587,6 +2613,22 @@ impl CoordinatorActions {
             applied["phase"] = json!(phase);
         }
         outcome
+    }
+
+    /// Waits for one pre-dispatch step until `until`. A step still waiting
+    /// then is refused as busy with nothing sent. While `stop` runs, the
+    /// refusal is the stopping error instead, as the step would get once
+    /// `stop` released the lock.
+    async fn before<T>(
+        &self,
+        until: tokio::time::Instant,
+        step: impl Future<Output = T>,
+    ) -> Result<T, String> {
+        match tokio::time::timeout_at(until, step).await {
+            Ok(done) => Ok(done),
+            Err(_) if self.stopping.load(Ordering::SeqCst) => Err(STOPPING.into()),
+            Err(_) => Err(COORDINATOR_BUSY.into()),
+        }
     }
 
     async fn connect(&self, manager: &Manager) -> Result<(), String> {
@@ -7583,5 +7625,141 @@ mod tests {
         drop(other);
         drop(first);
         assert!(!locks.is_locked("%1"));
+    }
+
+    /// A file the actions can canonicalize as their native socket path.
+    fn socket_file(label: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("masil-busy-{label}-{}.sock", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        path
+    }
+
+    fn keys_params() -> Value {
+        json!({
+            "operation": "keys",
+            "pane_id": "%3",
+            "expected": {
+                "pane_id": "%3",
+                "boot": "boot",
+                "generation": "1",
+                "run": "run",
+                "meta_digest": "a".repeat(64),
+                "foreground_pgid": "42",
+                "process_epoch": "42:1",
+            },
+            "keys": ["Enter"],
+            "retry": "same_run",
+        })
+    }
+
+    #[test]
+    fn the_pre_dispatch_wait_is_shorter_than_the_cli_read_limit() {
+        assert_eq!(PRE_DISPATCH_WAIT, Duration::from_millis(2_500));
+        assert!(PRE_DISPATCH_WAIT < Duration::from_secs(5));
+        assert!(COORDINATOR_BUSY.starts_with("coordinator_busy:"));
+    }
+
+    #[tokio::test]
+    async fn a_held_serial_lock_is_refused_as_busy_and_nothing_is_sent() {
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        let (client, _frames, mut received) = wired_test_client();
+        *actions.client.lock().await = Some(client);
+        // Another action, such as a slow launch, owns the lock.
+        let held = actions.serial.lock().await;
+        let started = std::time::Instant::now();
+        let refused = actions
+            .execute_within(&keys_params(), Duration::from_millis(150))
+            .await;
+        assert_eq!(refused.unwrap_err(), COORDINATOR_BUSY);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Freeing the lock afterwards does not run the refused request.
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(actions.active.load(Ordering::SeqCst), 0);
+        let client = actions.client.lock().await;
+        let client = client.as_ref().unwrap();
+        assert_eq!(client.request_number, 0);
+        assert_eq!(client.next_ticket(), DispatchTicket { epoch: 2, seq: 5 });
+    }
+
+    #[tokio::test]
+    async fn a_held_connection_lock_is_refused_as_busy_before_any_ticket() {
+        let socket = socket_file("client");
+        let actions = CoordinatorActions::new(socket.clone(), Arc::new(PaneActionLocks::default()));
+        let (client, _frames, mut received) = wired_test_client();
+        // A digest or summary request holds the connection while it waits
+        // for the core's answer.
+        let mut held = actions.client.lock().await;
+        *held = Some(client);
+        let started = std::time::Instant::now();
+        let refused = actions
+            .execute_within(&keys_params(), Duration::from_millis(150))
+            .await;
+        assert_eq!(refused.unwrap_err(), COORDINATOR_BUSY);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let client = held.as_ref().unwrap();
+        assert_eq!(client.request_number, 0);
+        assert_eq!(client.next_ticket(), DispatchTicket { epoch: 2, seq: 5 });
+        // Nothing the refused action took is still held.
+        assert_eq!(actions.active.load(Ordering::SeqCst), 0);
+        assert!(!actions.locks.is_locked("%3"));
+        assert!(actions.serial.try_lock().is_ok());
+        drop(held);
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lock_freed_within_the_wait_lets_the_action_go_on() {
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        // Stopping gives the answer an action reaches only after it holds
+        // `serial`, without a server to talk to.
+        actions.stopping.store(true, Ordering::SeqCst);
+        let held = actions.serial.lock().await;
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(held);
+        };
+        let params = keys_params();
+        let started = std::time::Instant::now();
+        let (reached, ()) = tokio::join!(
+            actions.execute_within(&params, Duration::from_secs(5)),
+            release
+        );
+        assert_eq!(reached.unwrap_err(), STOPPING);
+        // Both outcomes answer STOPPING; only the time tells that the lock
+        // was taken when it freed, not when the wait ran out.
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_ends_while_stopping_answers_stopping() {
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        actions.stopping.store(true, Ordering::SeqCst);
+        // `stop` holds the lock while it waits for the running action.
+        let _held = actions.serial.lock().await;
+        let refused = actions
+            .execute_within(&keys_params(), Duration::from_millis(100))
+            .await;
+        assert_eq!(refused.unwrap_err(), STOPPING);
     }
 }

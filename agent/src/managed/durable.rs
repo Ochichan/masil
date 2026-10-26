@@ -279,51 +279,65 @@ impl Manager {
                 // checks identity and dispatches these already-selected keys.
                 Via::Keys(keys) => {
                     let mut tracked_retry = super::core_action::TrackedChangeRetry::default();
-                    let result = self
-                        .core_durable_action(
-                            &current,
-                            "interrupt",
-                            key.map(|key| key.id),
-                            Some(&keys),
-                        )
-                        .await;
-                    if !result
-                        .as_ref()
-                        .err()
-                        .is_some_and(|error| tracked_retry.take(error))
-                    {
-                        return result;
-                    }
-
-                    // The caller owns the screen judgment. Re-plan once
-                    // when its TRACKED value changed, but never carry an
-                    // interrupt into another foreground run.
-                    let again = self.get(&current.pane_id).await?;
-                    if !super::core_action::same_core_run(&current, &again) {
-                        return Err(
-                            "identity_mismatch: interrupt target changed before retrying after tracked state changed"
-                                .into(),
-                        );
-                    }
-                    let (again, via) = self.interrupt_plan(&mut store, &again, request).await?;
-                    return match via {
-                        Via::Keys(keys) => {
-                            self.core_durable_action(
-                                &again,
+                    // A busy coordinator is asked again here, not inside the
+                    // action call: each try follows a fresh plan.
+                    let mut busy =
+                        crate::coordinator::BusyRetry::new(crate::coordinator::busy_budget());
+                    let (mut current, mut keys) = (current, keys);
+                    loop {
+                        // The read is cut to the budget left, so the last
+                        // try ends within it. The plan may have used up the
+                        // room another busy answer needs.
+                        let Some(cap) = busy.limit_with_room(crate::coordinator::ACTION_READ_LIMIT)
+                        else {
+                            return Err(busy.last(super::core_action::COORDINATOR_BUSY.to_owned()));
+                        };
+                        let result = self
+                            .core_durable_action(
+                                &current,
                                 "interrupt",
                                 key.map(|key| key.id),
                                 Some(&keys),
+                                Some(cap),
                             )
-                            .await
+                            .await;
+                        let Err(error) = &result else {
+                            return result;
+                        };
+                        let why = if tracked_retry.take(error) {
+                            "tracked state changed"
+                        } else if let Some(wait) = busy.wait_after(error) {
+                            tokio::time::sleep(wait).await;
+                            "the coordinator was busy"
+                        } else {
+                            return result.map_err(|error| busy.last(error));
+                        };
+
+                        // The caller owns the screen judgment. Re-plan when
+                        // its TRACKED value changed, or after the wait for a
+                        // busy coordinator (the turn may have ended
+                        // meanwhile), but never carry an interrupt into
+                        // another foreground run.
+                        let again = self.get(&current.pane_id).await?;
+                        if !super::core_action::same_core_run(&current, &again) {
+                            return Err(format!(
+                                "identity_mismatch: interrupt target changed before retrying after {why}"
+                            ));
                         }
-                        // The API abort is deliberately local. It depends on
-                        // the caller's answer channel and never crosses the
-                        // coordinator action bridge.
-                        Via::Abort => {
-                            self.effect(&again, Effect::Interrupt, key, Some(request))
-                                .await
+                        let (planned, via) =
+                            self.interrupt_plan(&mut store, &again, request).await?;
+                        match via {
+                            Via::Keys(next) => (current, keys) = (planned, next),
+                            // The API abort is deliberately local. It depends on
+                            // the caller's answer channel and never crosses the
+                            // coordinator action bridge.
+                            Via::Abort => {
+                                return self
+                                    .effect(&planned, Effect::Interrupt, key, Some(request))
+                                    .await;
+                            }
                         }
-                    };
+                    }
                 }
                 Via::Abort => {
                     // Keep OpenCode's abort on the caller side.
@@ -568,7 +582,7 @@ impl Manager {
                 );
             }
             let outcome = self
-                .core_durable_action(agent, "close", key.map(|key| key.id), None)
+                .core_durable_action(agent, "close", key.map(|key| key.id), None, None)
                 .await?;
             let stage = outcome["stage"].as_str().unwrap_or_default();
             if !matches!(
@@ -590,12 +604,17 @@ impl Manager {
         Ok(outcome)
     }
 
+    /// `read_cap` is given by a caller that sends again itself, after a new
+    /// plan (an interrupt): a busy answer is then final here and the read is
+    /// cut to the cap. Without it the action call sends again within the
+    /// process's busy budget.
     async fn core_durable_action(
         &self,
         agent: &Agent,
         action: &str,
         operation: Option<&str>,
         keys: Option<&[String]>,
+        read_cap: Option<std::time::Duration>,
     ) -> Result<Value, String> {
         let socket = self.native.socket.clone();
         let mut params = json!({
@@ -609,9 +628,12 @@ impl Manager {
         {
             params["keys"] = json!(keys);
         }
-        tokio::task::spawn_blocking(move || crate::coordinator::action(&socket, params))
-            .await
-            .map_err(|error| format!("coordinator_unavailable: {error}"))?
+        tokio::task::spawn_blocking(move || match read_cap {
+            None => crate::coordinator::action(&socket, params),
+            Some(cap) => crate::coordinator::action_once(&socket, params, cap),
+        })
+        .await
+        .map_err(|error| format!("coordinator_unavailable: {error}"))?
     }
 
     async fn effect(
