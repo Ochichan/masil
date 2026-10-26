@@ -3721,7 +3721,9 @@ fn decode<T: for<'a> Deserialize<'a>>(value: &str) -> Option<T> {
     }
     let bytes: Option<Vec<u8>> = value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| {
             std::str::from_utf8(p)
                 .ok()

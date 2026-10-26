@@ -472,7 +472,7 @@ fn operation(agent: &Agent, args: &[String]) -> Result<Option<u64>, String> {
     if !args.len().is_multiple_of(2) {
         return Err("usage: missing prompt option value".into());
     }
-    for pair in args.chunks_exact(2) {
+    for pair in args.as_chunks::<2>().0 {
         match pair[0].as_str() {
             "--run" if run.is_none() => run = Some(pair[1].as_str()),
             "--operation" if operation.is_none() => {
