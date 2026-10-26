@@ -64,6 +64,8 @@ const TRACKED_LOST: &str = "identity_mismatch: agent run changed before the acti
 /// A report that lost its guard to a concurrent write; the caller may read
 /// the agent again and retry.
 pub(super) const REPORT_REJECTED: &str = "identity_mismatch: agent state changed before the report";
+/// A report from a callback older than one already recorded.
+pub(super) const REPORT_STALE: &str = "report sequence did not advance";
 
 /// The action path is fixed for one native core boot. A core that advertises
 /// actions must never fall back to the native guarded path after the bridge
@@ -350,6 +352,21 @@ struct RunEvidence {
     /// `verified` (the same session) or `mismatch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume: Option<String>,
+    /// Requests the provider's hooks raised that still wait for the person,
+    /// oldest first. Kept by `integration::tally_changes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requests: Vec<OpenRequest>,
+}
+
+/// One request a provider hook raised that no hook has answered yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct OpenRequest {
+    /// The inbox key: `request:<id>` when the provider named the request,
+    /// else a per-callback key (`integration::names_request`).
+    key: String,
+    /// `approval_requested` or `question_asked`.
+    kind: String,
+    at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -687,7 +704,7 @@ pub(crate) struct Agent {
     #[serde(default)]
     pub capabilities: CapabilityView,
     /// Pending permissions and questions while blocked, when the provider's
-    /// own server told; 0 otherwise.
+    /// own server or the run's hooks told; 0 otherwise.
     #[serde(default)]
     pub permission_count: u32,
     #[serde(default)]
@@ -1336,6 +1353,14 @@ impl Manager {
                 .unwrap_or(synthetic);
             if evidence.skip_state_update() && previous.run == run {
                 state = previous.state.clone();
+            }
+            // Without a server that counts them, the requests the hooks left
+            // open say what a blocked agent waits for.
+            if state == "blocked"
+                && counts == (0, 0)
+                && let Some(run_evidence) = &run_evidence
+            {
+                counts = integration::request_counts(&run_evidence.requests);
             }
             let sequence = metadata
                 .as_ref()
@@ -2655,7 +2680,7 @@ impl Manager {
                     .as_ref()
                     .is_some_and(|r| sequence <= r.sequence))
         {
-            return Err("report sequence did not advance".into());
+            return Err(REPORT_STALE.into());
         }
         let mut evidence = agent
             .run_evidence
@@ -2796,6 +2821,7 @@ impl Manager {
     /// A provider hook's turn report (`TurnReport`). `Begin` writes a held
     /// `working` report; `End` drops a held report so the screen decides
     /// again (an idle report would outrank a turn the screen shows running).
+    /// Either also drops the open requests, in the same write.
     pub(crate) async fn report_turn(
         &self,
         agent: &Agent,
@@ -2812,7 +2838,7 @@ impl Manager {
                 .as_ref()
                 .is_some_and(|r| sequence <= r.sequence)
         {
-            return Err("report sequence did not advance".into());
+            return Err(REPORT_STALE.into());
         }
         let mut evidence = agent
             .run_evidence
@@ -2856,9 +2882,13 @@ impl Manager {
                         marker: marker.clone(),
                     }),
                 });
+                integration::clear_open_requests(&mut evidence.requests);
             }
             TurnReport::End => {
-                if !end_turn_hold(&mut metadata, &mut evidence) {
+                let held = end_turn_hold(&mut metadata, &mut evidence);
+                // Nothing open outlives the turn, held report or not.
+                let cleared = integration::clear_open_requests(&mut evidence.requests);
+                if !held && !cleared {
                     return Ok(());
                 }
             }
@@ -2881,6 +2911,56 @@ impl Manager {
             crate::coordinator::poke(&self.native.socket);
         }
         Ok(())
+    }
+
+    /// Sets the run's open-request list (`RunEvidence::requests`) to what
+    /// `next` makes of the list the pane holds now. The write holds only
+    /// while the evidence is still the text read here, so two hooks never
+    /// overwrite each other. `REPORT_REJECTED` means another writer got in
+    /// first: read the agent again and retry. Ok(false): nothing changed.
+    async fn record_requests(
+        &self,
+        agent: &Agent,
+        next: impl FnOnce(&[OpenRequest]) -> Vec<OpenRequest>,
+    ) -> Result<bool, String> {
+        if agent.metadata.is_none() || agent.process != "running" {
+            return Err("identity_mismatch: stale agent report".into());
+        }
+        let raw = self
+            .pane_values(&agent.pane_id, &[EVIDENCE])
+            .await?
+            .pop()
+            .unwrap_or_default();
+        // The text goes into a guard format as it is.
+        if !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid_argument: run evidence is not encoded".into());
+        }
+        let mut evidence = decode::<RunEvidence>(&raw)
+            .filter(|evidence| evidence.run == agent.run)
+            .unwrap_or_else(|| RunEvidence {
+                run: agent.run.clone(),
+                ..RunEvidence::default()
+            });
+        let requests = next(&evidence.requests);
+        if requests == evidence.requests {
+            return Ok(false);
+        }
+        evidence.requests = requests;
+        let unchanged = format!("#{{==:#{{{EVIDENCE}}},{raw}}}");
+        let outcome = self
+            .guarded_input_outcome(
+                agent,
+                vec![Self::option(agent, EVIDENCE, encode(&evidence)?)],
+                Some(&unchanged),
+            )
+            .await?;
+        if matches!(outcome, Guarded::Rejected) {
+            return Err(REPORT_REJECTED.into());
+        }
+        if self.resident.is_none() {
+            crate::coordinator::poke(&self.native.socket);
+        }
+        Ok(true)
     }
 
     /// The coordinator's report from the provider's own server
@@ -3231,8 +3311,9 @@ impl Agent {
 
     pub fn projection(&self) -> Value {
         let blocked = self.state == "blocked";
-        // Counts come from the provider's own server; without them a blocked
-        // agent is one pending item of an unknown kind.
+        // Counts come from the provider's own server or the requests its hooks
+        // left open; without them a blocked agent is one pending item of an
+        // unknown kind.
         let (permissions, questions) = if blocked {
             (self.permission_count, self.question_count)
         } else {
@@ -5049,10 +5130,75 @@ mod tests {
                 marker: Some("0123456789abcdef".into()),
             }),
         });
+        // The most requests, with the longest keys `integration` keeps.
+        evidence.requests = (0..16)
+            .map(|n| OpenRequest {
+                key: format!("{n:02}{}", "k".repeat(78)),
+                kind: "approval_requested".into(),
+                at: u64::MAX,
+            })
+            .collect();
         assert_eq!(
             decode::<RunEvidence>(&encode(&evidence).unwrap()),
             Some(evidence)
         );
+    }
+
+    #[test]
+    fn open_requests_are_left_out_when_empty_and_default_when_absent() {
+        let mut evidence = RunEvidence {
+            run: "r".into(),
+            ..RunEvidence::default()
+        };
+        // Evidence that has none reads and writes as it did before them.
+        assert_eq!(
+            serde_json::to_value(&evidence).unwrap(),
+            json!({"run": "r"})
+        );
+        assert!(
+            serde_json::from_value::<RunEvidence>(json!({"run": "r"}))
+                .unwrap()
+                .requests
+                .is_empty()
+        );
+        evidence.requests = vec![OpenRequest {
+            key: "request:a".into(),
+            kind: "question_asked".into(),
+            at: 3,
+        }];
+        assert_eq!(
+            serde_json::to_value(&evidence).unwrap(),
+            json!({"run": "r", "requests": [{"key": "request:a", "kind": "question_asked", "at": 3}]})
+        );
+    }
+
+    #[test]
+    fn counts_from_open_requests_set_the_attention_kind() {
+        let blocked = |permissions: u32, questions: u32| -> Agent {
+            serde_json::from_value(json!({
+                "id": "c", "name": "c", "provider": "claude", "pane_id": "%1",
+                "window_id": "@1", "workspace": "main", "cwd": "/tmp", "boot": "b",
+                "generation": "1", "run": "r", "process": "running", "state": "blocked",
+                "evidence": {"state": "blocked", "source": "screen"},
+                "seen": false, "revision": "1", "returned_idle": false,
+                "permission_count": permissions, "question_count": questions,
+            }))
+            .unwrap()
+        };
+        let attention = |agent: Agent| agent.projection()["native"]["attention"].clone();
+        let open = |kind: &str| OpenRequest {
+            key: format!("{kind}:r:1"),
+            kind: kind.into(),
+            at: 1,
+        };
+        let counts = super::integration::request_counts;
+        let (permissions, questions) = counts(&[open("approval_requested")]);
+        assert_eq!(attention(blocked(permissions, questions)), "approval");
+        let (permissions, questions) = counts(&[open("question_asked")]);
+        assert_eq!(attention(blocked(permissions, questions)), "question");
+        // No open request: one pending item of an unknown kind, as before.
+        let (permissions, questions) = counts(&[]);
+        assert_eq!(attention(blocked(permissions, questions)), "needs_input");
     }
 
     #[test]

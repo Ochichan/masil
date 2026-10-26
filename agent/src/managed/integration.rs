@@ -7,7 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use super::{Manager, ReportOrigin};
+use super::inbox::Effect;
+use super::{Manager, OpenRequest, ReportOrigin};
 
 const MAX_CALLBACK_BYTES: usize = 256 * 1024;
 
@@ -893,11 +894,9 @@ async fn hook(
         {
             return Ok(None);
         }
-        manager
-            .inbox_apply(callback_effects(
-                target.id, &pane, &run, sequence, &mapped, payload,
-            ))
-            .await;
+        let effects = callback_effects(target.id, &pane, &run, sequence, &mapped, payload);
+        manager.inbox_apply(effects.clone()).await;
+        note_requests(manager, &agent, true, &effects, false).await;
         if target.id == "claude" {
             let event = normalize_event(&mapped.event);
             // Acceptance does not wait on the turn report, nor fail with it.
@@ -938,13 +937,12 @@ async fn hook(
             .as_deref()
             .is_some_and(|bound| bound != session)
     }) && !(mapped.session_switch || mapped.allow_root_switch);
-    if !contradicted {
-        manager
-            .inbox_apply(callback_effects(
-                target.id, &pane, &run, sequence, &mapped, payload,
-            ))
-            .await;
-    }
+    let effects = if contradicted {
+        Vec::new()
+    } else {
+        callback_effects(target.id, &pane, &run, sequence, &mapped, payload)
+    };
+    manager.inbox_apply(effects.clone()).await;
     let origin = ReportOrigin::Callback {
         event: &mapped.event,
         frontend: mapped.root_binding,
@@ -979,9 +977,23 @@ async fn hook(
                     );
                 }
             }
-            attempt => break attempt?,
+            attempt => break attempt,
         }
     };
+    // After the report, whose write rebuilds the evidence from its own read.
+    let event = normalize_event(&callback_event(payload).unwrap_or_else(|| mapped.event.clone()));
+    let turn = !contradicted && turn_boundary(target.id, &event, mapped.state);
+    match &result {
+        Ok(_) => note_requests(manager, &agent, false, &effects, turn).await,
+        // A callback older than the recorded state is refused, but what it
+        // answered is answered: removing a request is always safe, and
+        // adding one from a callback this old is not.
+        Err(error) if error == super::REPORT_STALE => {
+            note_requests(manager, &agent, false, &answers_only(&effects), false).await
+        }
+        Err(_) => {}
+    }
+    let result = result?;
     Ok(Some(json!({
         "stage": "native_callback_recorded",
         "provider": target.id,
@@ -1520,8 +1532,11 @@ pub(super) fn api_request_effects(
     .collect()
 }
 
+/// The inbox key of a request the provider named.
+const REQUEST_PREFIX: &str = "request:";
+
 fn request_ref(id: &str) -> String {
-    format!("request:{id}")
+    format!("{REQUEST_PREFIX}{id}")
 }
 
 fn resolve_effect(source: &str, id: &str, resolution: &'static str) -> super::inbox::Effect {
@@ -1530,6 +1545,209 @@ fn resolve_effect(source: &str, id: &str, resolution: &'static str) -> super::in
         source_ref: request_ref(id),
         resolution,
     }
+}
+
+/// Most requests `RunEvidence::requests` keeps; the oldest go first.
+const MAX_OPEN_REQUESTS: usize = 16;
+/// Longer inbox keys are shortened, so a provider's long ID cannot push the
+/// run evidence past its size limit.
+const MAX_REQUEST_KEY: usize = 80;
+
+/// Whether the key names a request by the provider's own ID. A hook that
+/// carries no ID has a per-callback key (`callback_ref`), and no later hook
+/// can answer it.
+fn names_request(key: &str) -> bool {
+    key.starts_with(REQUEST_PREFIX)
+}
+
+fn is_request_kind(kind: &str) -> bool {
+    matches!(kind, "approval_requested" | "question_asked")
+}
+
+/// The key `RunEvidence::requests` keeps for an inbox key. A shortened key
+/// keeps its first part, so `names_request` still tells the two kinds apart.
+fn request_key(source_ref: &str) -> String {
+    use sha2::{Digest, Sha256};
+    if source_ref.len() <= MAX_REQUEST_KEY {
+        return source_ref.to_owned();
+    }
+    let head: String = source_ref
+        .chars()
+        .take_while(|character| *character != ':')
+        .take(24)
+        .collect();
+    let digest: String = Sha256::digest(source_ref.as_bytes())[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{head}:#{digest}")
+}
+
+/// Drops the open requests without an ID, which no hook can answer.
+fn drop_unnamed_requests(requests: &mut Vec<OpenRequest>) {
+    requests.retain(|request| names_request(&request.key));
+}
+
+/// Drops every open request, as a turn's start or end does: nothing from
+/// before it still waits. True when there was any.
+pub(super) fn clear_open_requests(requests: &mut Vec<OpenRequest>) -> bool {
+    let any = !requests.is_empty();
+    requests.clear();
+    any
+}
+
+/// The open requests after one callback.
+/// - A request with the provider's own ID is added, and the `Resolve` with
+///   that ID removes it.
+/// - A request without one, which is all of Claude's, replaces the open
+///   requests without one, since nothing can tell which of them an approval
+///   answered.
+/// - `turn`, the callback begins or ends a turn, drops every open request
+///   first. This also drops one whose answer arrived before it did (a
+///   plugin's events can come out of order), which no `Resolve` would remove.
+///
+/// `open` is the list before the callback and `at` the time to record.
+fn tally_changes(
+    open: &[OpenRequest],
+    effects: &[Effect],
+    turn: bool,
+    at: u64,
+) -> Vec<OpenRequest> {
+    let mut requests = open.to_vec();
+    if turn {
+        clear_open_requests(&mut requests);
+    }
+    for effect in effects {
+        match effect {
+            Effect::Event {
+                kind, source_ref, ..
+            } if is_request_kind(kind) => {
+                let key = request_key(source_ref);
+                if names_request(&key) {
+                    // The same request seen twice (a plugin and the API).
+                    if requests.iter().any(|request| request.key == key) {
+                        continue;
+                    }
+                } else {
+                    drop_unnamed_requests(&mut requests);
+                }
+                requests.push(OpenRequest {
+                    key,
+                    kind: (*kind).to_owned(),
+                    at,
+                });
+            }
+            Effect::Resolve { source_ref, .. } => {
+                let key = request_key(source_ref);
+                requests.retain(|request| request.key != key);
+            }
+            _ => {}
+        }
+    }
+    if requests.len() > MAX_OPEN_REQUESTS {
+        requests.drain(..requests.len() - MAX_OPEN_REQUESTS);
+    }
+    requests
+}
+
+/// The effects of a callback that answer requests, without the ones that
+/// raise them.
+fn answers_only(effects: &[Effect]) -> Vec<Effect> {
+    effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Resolve { .. }))
+        .cloned()
+        .collect()
+}
+
+/// Pending approvals and questions among the open requests.
+pub(super) fn request_counts(requests: &[OpenRequest]) -> (u32, u32) {
+    let count = |kind: &str| {
+        requests
+            .iter()
+            .filter(|request| request.kind == kind)
+            .count() as u32
+    };
+    (count("approval_requested"), count("question_asked"))
+}
+
+/// Whether a callback (`event` is normalized, `state` is what it reports)
+/// begins or ends a top-level turn of the provider. Claude's turn events are
+/// `claude_turn`'s, which clear in the write that holds or drops the turn's
+/// report. OpenCode and Kilo end a turn when a callback reports idle; their
+/// child-session callbacks never get this far. A turn drops named requests
+/// too, so only events that cannot fire mid-turn are listed: a prompt, a
+/// `Stop` and an `Interrupt`, where sub-agents have their own events
+/// (`subagentstart`, `subagentend`). Left out: MastraCode's `AgentStart` and
+/// `AgentEnd`, and omp's `agent_start` (it can follow a `willContinue`
+/// `agent_end` within one turn) and `agent_end`, since nothing here shows
+/// they exclude sub-agents or continuations.
+fn turn_boundary(provider: &str, event: &str, state: Option<&str>) -> bool {
+    match provider {
+        "opencode" | "kilo" => state == Some("idle"),
+        "kimi" => matches!(event, "userpromptsubmit" | "stop" | "interrupt"),
+        "mastracode" => matches!(event, "userpromptsubmit" | "stop" | "interrupt"),
+        _ => false,
+    }
+}
+
+/// Keeps the run's open requests (`RunEvidence::requests`) in step with one
+/// callback. `hint` is the agent the hook read first; `current` says nothing
+/// has written the pane since, so the first try can use it. Best effort like
+/// the inbox write: a failure is logged and never fails the hook.
+async fn note_requests(
+    manager: &Manager,
+    hint: &super::Agent,
+    current: bool,
+    effects: &[Effect],
+    turn: bool,
+) {
+    let touched = effects.iter().any(|effect| match effect {
+        Effect::Event { kind, .. } => is_request_kind(kind),
+        Effect::Resolve { .. } => true,
+        _ => false,
+    });
+    // A turn event always looks: the list `hint` was read with may be older
+    // than a request recorded since. `record_requests` writes only a change.
+    if !touched && !turn {
+        return;
+    }
+    let at = crate::observation::now_ms();
+    let log = |error: &str| {
+        super::inbox::log(
+            "inbox.log",
+            &json!({"error": format!("open_requests: {error}")}),
+        );
+    };
+    let mut agent = current.then(|| hint.clone());
+    // A write another hook beat is tried again on a fresh read, as
+    // `claude_turn` does, twice.
+    for _ in 0..3 {
+        let fresh = match agent.take() {
+            Some(agent) => agent,
+            None => match manager.get(&hint.pane_id).await {
+                Ok(fresh) if fresh.run == hint.run && fresh.process == "running" => fresh,
+                // The run ended or was replaced; its requests do not matter.
+                Ok(_) => return,
+                Err(error) => {
+                    log(&error);
+                    return;
+                }
+            },
+        };
+        match manager
+            .record_requests(&fresh, |open| tally_changes(open, effects, turn, at))
+            .await
+        {
+            Ok(_) => return,
+            Err(error) if error == super::REPORT_REJECTED => {}
+            Err(error) => {
+                log(&error);
+                return;
+            }
+        }
+    }
+    log("the run evidence kept changing under the write");
 }
 
 /// A field of an OpenCode or Kilo event's `properties`. The event's own
@@ -2865,5 +3083,407 @@ mod tests {
                 .unwrap()
                 .contains("event = \"PreToolUse\"\nmatcher = \"^AskUserQuestion$\"")
         );
+    }
+
+    fn raised(kind: &'static str, source_ref: &str) -> Effect {
+        Effect::Event {
+            source: "hook:test".into(),
+            source_ref: source_ref.into(),
+            provider: "test".into(),
+            pane: "%1".into(),
+            run: "run-1".into(),
+            revision: None,
+            kind,
+            native_ref: None,
+            summary: None,
+        }
+    }
+
+    fn answered(source_ref: &str) -> Effect {
+        Effect::Resolve {
+            source: "hook:test".into(),
+            source_ref: source_ref.into(),
+            resolution: "decided",
+        }
+    }
+
+    fn keys(requests: &[OpenRequest]) -> Vec<(&str, &str)> {
+        requests
+            .iter()
+            .map(|request| (request.key.as_str(), request.kind.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn requests_with_an_id_are_added_once_and_removed_by_that_id() {
+        let both = tally_changes(
+            &[],
+            &[
+                raised("approval_requested", "request:a"),
+                raised("question_asked", "request:b"),
+            ],
+            false,
+            10,
+        );
+        assert_eq!(
+            keys(&both),
+            [
+                ("request:a", "approval_requested"),
+                ("request:b", "question_asked")
+            ]
+        );
+        assert_eq!(request_counts(&both), (1, 1));
+        // The plugin and the API both report one request: the first stays.
+        let again = tally_changes(
+            &both,
+            &[raised("approval_requested", "request:a")],
+            false,
+            20,
+        );
+        assert_eq!(again, both);
+        let rest = tally_changes(&both, &[answered("request:a")], false, 30);
+        assert_eq!(keys(&rest), [("request:b", "question_asked")]);
+        assert_eq!(
+            tally_changes(&rest, &[answered("request:none")], false, 40),
+            rest
+        );
+        // Effects apply in order.
+        let flip = tally_changes(
+            &[],
+            &[raised("question_asked", "request:c"), answered("request:c")],
+            false,
+            50,
+        );
+        assert!(flip.is_empty());
+    }
+
+    #[test]
+    fn a_request_without_an_id_replaces_the_ones_without_one() {
+        let permission = tally_changes(
+            &[],
+            &[raised("approval_requested", "approval_requested:run-1:2")],
+            false,
+            1,
+        );
+        assert_eq!(request_counts(&permission), (1, 0));
+        // Approved, then the same turn asks a question: only the question.
+        let question = tally_changes(
+            &permission,
+            &[raised("question_asked", "question_asked:run-1:5")],
+            false,
+            2,
+        );
+        assert_eq!(
+            keys(&question),
+            [("question_asked:run-1:5", "question_asked")]
+        );
+        assert_eq!(request_counts(&question), (0, 1));
+        // The ones with an id stay.
+        let mixed = tally_changes(
+            &question,
+            &[raised("approval_requested", "request:a")],
+            false,
+            3,
+        );
+        let replaced = tally_changes(
+            &mixed,
+            &[raised("approval_requested", "approval_requested:run-1:9")],
+            false,
+            4,
+        );
+        assert_eq!(
+            keys(&replaced),
+            [
+                ("request:a", "approval_requested"),
+                ("approval_requested:run-1:9", "approval_requested")
+            ]
+        );
+        assert_eq!(request_counts(&replaced), (2, 0));
+    }
+
+    #[test]
+    fn a_turn_event_drops_every_open_request_and_other_callbacks_keep_the_named_ones() {
+        let mixed = tally_changes(
+            &[],
+            &[
+                raised("approval_requested", "request:a"),
+                raised("question_asked", "question_asked:run-1:5"),
+            ],
+            false,
+            1,
+        );
+        // A callback that is not a turn event leaves the named request be,
+        // whether or not it raises or answers others.
+        assert_eq!(tally_changes(&mixed, &[], false, 2), mixed);
+        let kept = tally_changes(
+            &mixed,
+            &[
+                raised("question_asked", "question_asked:run-1:6"),
+                answered("request:none"),
+            ],
+            false,
+            3,
+        );
+        assert_eq!(
+            keys(&kept),
+            [
+                ("request:a", "approval_requested"),
+                ("question_asked:run-1:6", "question_asked")
+            ]
+        );
+        // A turn event drops the named one too.
+        assert!(tally_changes(&mixed, &[], true, 4).is_empty());
+        // `report_turn` clears the same way, in its own write.
+        let mut list = mixed.clone();
+        assert!(clear_open_requests(&mut list));
+        assert!(list.is_empty());
+        assert!(!clear_open_requests(&mut list));
+        // A request the turn's own callback raises stays.
+        let begun = tally_changes(
+            &mixed,
+            &[raised("question_asked", "question_asked:run-1:7")],
+            true,
+            5,
+        );
+        assert_eq!(keys(&begun), [("question_asked:run-1:7", "question_asked")]);
+        // Turn ends and blocked events with no known kind are not requests.
+        let ignored = tally_changes(
+            &[],
+            &[
+                raised("turn_completed", "turn_completed:run-1:3"),
+                raised("error", "error:run-1:3"),
+                raised("blocked", "blocked:run-1:3"),
+            ],
+            false,
+            4,
+        );
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn the_list_is_capped_and_long_ids_are_shortened_consistently() {
+        let many: Vec<Effect> = (0..20)
+            .map(|n| raised("approval_requested", &format!("request:{n}")))
+            .collect();
+        let capped = tally_changes(&[], &many, false, 1);
+        assert_eq!(capped.len(), MAX_OPEN_REQUESTS);
+        assert_eq!(capped[0].key, "request:4");
+        assert_eq!(capped[15].key, "request:19");
+
+        let long = format!("request:{}", "x".repeat(500));
+        let kept = tally_changes(&[], &[raised("question_asked", &long)], false, 1);
+        assert!(kept[0].key.len() <= MAX_REQUEST_KEY, "{}", kept[0].key);
+        assert!(names_request(&kept[0].key));
+        assert!(tally_changes(&kept, &[answered(&long)], false, 2).is_empty());
+        let other = format!("request:{}y", "x".repeat(499));
+        let two = tally_changes(&kept, &[raised("question_asked", &other)], false, 3);
+        assert_eq!(two.len(), 2);
+        assert_ne!(two[0].key, two[1].key);
+    }
+
+    #[test]
+    fn hook_payloads_make_the_expected_changes() {
+        // Claude has no request ID: a question replaces the permission.
+        let permission = tally_changes(
+            &[],
+            &effects(
+                "claude",
+                r#"{"hook_event_name":"PermissionRequest","session_id":"s1","tool_name":"Bash"}"#,
+            ),
+            false,
+            1,
+        );
+        assert_eq!(request_counts(&permission), (1, 0));
+        let question = tally_changes(
+            &permission,
+            &effects(
+                "claude",
+                r#"{"hook_event_name":"Notification","notification_type":"elicitation_dialog"}"#,
+            ),
+            false,
+            2,
+        );
+        assert_eq!(request_counts(&question), (0, 1));
+        // Stop only reports the turn's end; `report_turn` does the clearing.
+        let stop = effects(
+            "claude",
+            r#"{"hook_event_name":"Stop","session_id":"s1","prompt_id":"p1"}"#,
+        );
+        assert_eq!(tally_changes(&question, &stop, false, 3), question);
+
+        // Kimi names its requests with the tool call.
+        let kimi = tally_changes(
+            &[],
+            &effects(
+                "kimi",
+                r#"{"hook_event_name":"PermissionRequest","toolCallId":"tc-1","tool_name":"Bash"}"#,
+            ),
+            false,
+            1,
+        );
+        let kimi = tally_changes(
+            &kimi,
+            &effects(
+                "kimi",
+                r#"{"hook_event_name":"PreToolUse","toolCallId":"tc-2","tool_name":"AskUserQuestion"}"#,
+            ),
+            false,
+            2,
+        );
+        assert_eq!(request_counts(&kimi), (1, 1));
+        let kimi = tally_changes(
+            &kimi,
+            &effects(
+                "kimi",
+                r#"{"hook_event_name":"PermissionResult","toolCallId":"tc-1","decision":"allow"}"#,
+            ),
+            false,
+            3,
+        );
+        assert_eq!(keys(&kimi), [("request:tc-2", "question_asked")]);
+
+        // So does omp.
+        let omp = tally_changes(
+            &[],
+            &effects(
+                "omp",
+                r#"{"event":"tool_approval_requested","toolCallId":"call-1","tool_name":"bash"}"#,
+            ),
+            false,
+            1,
+        );
+        assert_eq!(keys(&omp), [("request:call-1", "approval_requested")]);
+        let omp = tally_changes(
+            &omp,
+            &effects(
+                "omp",
+                r#"{"event":"tool_approval_resolved","toolCallId":"call-1"}"#,
+            ),
+            false,
+            2,
+        );
+        assert!(omp.is_empty());
+    }
+
+    #[test]
+    fn a_stale_callback_only_removes_what_it_answered() {
+        let open = tally_changes(
+            &[],
+            &[
+                raised("approval_requested", "request:a"),
+                raised("question_asked", "request:c"),
+            ],
+            false,
+            1,
+        );
+        let callback = [
+            raised("approval_requested", "request:b"),
+            answered("request:a"),
+            raised("question_asked", "question_asked:run-1:9"),
+        ];
+        let answers = answers_only(&callback);
+        assert_eq!(answers, [answered("request:a")]);
+        let after = tally_changes(&open, &answers, false, 2);
+        assert_eq!(keys(&after), [("request:c", "question_asked")]);
+        // From a real payload: Kimi's decision for a call that is open.
+        let decided = effects(
+            "kimi",
+            r#"{"hook_event_name":"PermissionResult","toolCallId":"tc-1","decision":"allow"}"#,
+        );
+        assert_eq!(answers_only(&decided), decided);
+        // A callback that raises a request answers nothing.
+        let asked = effects(
+            "kimi",
+            r#"{"hook_event_name":"PermissionRequest","toolCallId":"tc-2","tool_name":"Bash"}"#,
+        );
+        assert!(answers_only(&asked).is_empty());
+    }
+
+    fn is_turn_boundary(provider: &str, source: &str) -> bool {
+        let payload = object(source);
+        let mapped = map_callback(target(provider).unwrap(), None, &payload).unwrap();
+        let event =
+            normalize_event(&callback_event(&payload).unwrap_or_else(|| mapped.event.clone()));
+        turn_boundary(provider, &event, mapped.state)
+    }
+
+    #[test]
+    fn each_providers_turn_events_are_its_boundaries() {
+        for event in ["userpromptsubmit", "stop", "interrupt"] {
+            assert!(turn_boundary("kimi", event, None), "{event}");
+            assert!(turn_boundary("mastracode", event, None), "{event}");
+        }
+        for event in [
+            "permissionresult",
+            "pretooluse",
+            "posttooluse",
+            "subagentstart",
+        ] {
+            assert!(!turn_boundary("kimi", event, Some("working")), "{event}");
+            assert!(
+                !turn_boundary("mastracode", event, Some("working")),
+                "{event}"
+            );
+        }
+        // Not shown to exclude sub-agents or a turn's continuation.
+        for event in ["agentstart", "agentend", "subagentend"] {
+            assert!(!turn_boundary("mastracode", event, Some("idle")), "{event}");
+        }
+        for event in ["agentstart", "agentend", "toolapprovalresolved"] {
+            assert!(!turn_boundary("omp", event, Some("idle")), "{event}");
+        }
+        // Claude's are `claude_turn`'s.
+        for provider in ["claude", "codex", "pi"] {
+            assert!(!turn_boundary(provider, "stop", Some("idle")), "{provider}");
+        }
+    }
+
+    #[test]
+    fn opencode_and_kilo_end_a_turn_when_a_callback_reports_idle() {
+        for provider in ["opencode", "kilo"] {
+            for idle in [
+                r#"{"event":{"type":"session.idle","properties":{"sessionID":"s1"}}}"#,
+                r#"{"event":{"type":"session.status","properties":{"sessionID":"s1","status":{"type":"idle"}}}}"#,
+                r#"{"event":{"type":"session.error","properties":{"sessionID":"s1","error":{"name":"MessageAbortedError"}}}}"#,
+            ] {
+                assert!(is_turn_boundary(provider, idle), "{provider} {idle}");
+            }
+            for other in [
+                r#"{"event":{"type":"session.status","properties":{"sessionID":"s1","status":{"type":"busy"}}}}"#,
+                r#"{"event":{"type":"permission.replied","properties":{"sessionID":"s1","requestID":"r1"}}}"#,
+                r#"{"event":{"type":"permission.asked","properties":{"sessionID":"s1","id":"r1"}}}"#,
+                r#"{"event":{"type":"session.error","properties":{"sessionID":"s1","error":{"name":"ProviderAuthError"}}}}"#,
+            ] {
+                assert!(!is_turn_boundary(provider, other), "{provider} {other}");
+            }
+
+            // The reply came before the ask: nothing removes the late request
+            // but the end of the turn.
+            let replied = effects(
+                provider,
+                r#"{"event":{"type":"permission.replied","properties":{"sessionID":"s1","requestID":"late-1","reply":"allow"}}}"#,
+            );
+            let asked = effects(
+                provider,
+                r#"{"event":{"type":"permission.asked","properties":{"id":"late-1","sessionID":"s1","permission":"bash"}}}"#,
+            );
+            let late = tally_changes(&tally_changes(&[], &replied, false, 1), &asked, false, 2);
+            assert_eq!(
+                keys(&late),
+                [("request:late-1", "approval_requested")],
+                "{provider}"
+            );
+            let busy = r#"{"event":{"type":"session.status","properties":{"sessionID":"s1","status":{"type":"busy"}}}}"#;
+            let idle = r#"{"event":{"type":"session.idle","properties":{"sessionID":"s1"}}}"#;
+            assert_eq!(
+                tally_changes(&late, &[], is_turn_boundary(provider, busy), 3),
+                late,
+                "{provider}"
+            );
+            assert!(
+                tally_changes(&late, &[], is_turn_boundary(provider, idle), 4).is_empty(),
+                "{provider}"
+            );
+        }
     }
 }
