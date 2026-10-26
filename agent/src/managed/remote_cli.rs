@@ -585,6 +585,13 @@ pub(super) async fn serve(manager: &Manager) -> Result<i32, String> {
     print(&envelope)?;
     Ok(0)
 }
+/// Answers the request on standard input with `error`, as `serve` would.
+pub(super) fn refuse(error: &str) -> Result<i32, String> {
+    let mut bytes = Vec::new();
+    let _ = std::io::stdin().take(262145).read_to_end(&mut bytes);
+    print(&endpoints::refusal(error))?;
+    Ok(0)
+}
 pub(super) fn endpoint_connect(args: &[String]) -> Result<i32, String> {
     if args.len() != 7 {
         return Err("invalid_argument: invalid endpoint connection identity".into());

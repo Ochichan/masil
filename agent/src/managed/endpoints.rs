@@ -899,8 +899,13 @@ pub(crate) async fn serve(manager: &Manager, bytes: &[u8]) -> Value {
     };
     match result {
         Ok(value) => json!({"version":VERSION, "ok":true, "value":value}),
-        Err(error) => json!({"version":VERSION, "ok":false, "error":error}),
+        Err(error) => refusal(&error),
     }
+}
+
+/// The envelope of a request that failed.
+pub(crate) fn refusal(error: &str) -> Value {
+    json!({"version":VERSION, "ok":false, "error":error})
 }
 
 pub(crate) fn decode_request(bytes: &[u8]) -> Result<Request, String> {

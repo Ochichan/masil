@@ -105,20 +105,46 @@ struct Subscription {
 }
 
 /// Serves the stream on standard input and output until EOF, a framing
-/// error, or a replaced executable. Every path ends with status 0.
+/// error, or a replaced executable. Every path after the server's state
+/// directory is taken ends with status 0.
 pub(crate) fn serve(socket: &str) -> Result<i32, String> {
     let socket = PathBuf::from(socket);
+    // Before the runtime and its threads: the server's state directory.
+    let using = match crate::coordinator::adopt_server_state(&socket)? {
+        Some(state) => Some(state),
+        None => crate::managed::state_base()
+            .ok()
+            .and_then(|own| crate::coordinator::canonical(&own)),
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    runtime.block_on(run(socket));
+    runtime.block_on(run(socket, using));
     // Standard input is read by a blocking thread a runtime cannot cancel:
     // end here rather than wait for the next byte.
     std::process::exit(0)
 }
 
-async fn run(socket: PathBuf) {
+/// Why the stream must end so a new process can start over: the server
+/// now has another state directory than this process uses, or one it
+/// cannot take. None while no server answers.
+async fn state_moved(socket: &Path, using: Option<&PathBuf>) -> Option<String> {
+    let socket = socket.to_owned();
+    let found = tokio::task::spawn_blocking(move || crate::coordinator::entry_state(&socket))
+        .await
+        .ok()?;
+    match found {
+        Ok(None) => None,
+        Ok(Some(state)) if Some(&state) == using => None,
+        Ok(Some(state)) => Some(format!("the server now uses {}", state.display())),
+        // A server slow to answer is looked at again at the next tick.
+        Err(error) if error.starts_with("server_unreachable") => None,
+        Err(error) => Some(error),
+    }
+}
+
+async fn run(socket: PathBuf, using: Option<PathBuf>) {
     let exe = crate::coordinator::exe_identity();
     let mut incoming = frames(tokio::io::stdin(), MAX_FRAME_IN);
     let mut stdout = tokio::io::stdout();
@@ -171,6 +197,14 @@ async fn run(socket: PathBuf) {
                 } else if let Some(request) = message.get("request") {
                     if manager.is_none() {
                         manager = Manager::new(socket.clone(), None).ok();
+                        // A server met here, before the retry tick, has its
+                        // directory checked as that tick would.
+                        if manager.is_some()
+                            && let Some(reason) = state_moved(&socket, using.as_ref()).await
+                        {
+                            let _ = send(&mut stdout, &json!({"event": "restart", "reason": reason})).await;
+                            return;
+                        }
                     }
                     answer(id, request, manager.as_ref()).await
                 } else {
@@ -197,6 +231,10 @@ async fn run(socket: PathBuf) {
                         manager = None;
                         continue;
                     }
+                    if let Some(reason) = state_moved(&socket, using.as_ref()).await {
+                        let _ = send(&mut stdout, &json!({"event": "restart", "reason": reason})).await;
+                        return;
+                    }
                     let event = json!({"event": "status", "now_ms": now_ms(), "status": last_status});
                     if send(&mut stdout, &event).await.is_err() {
                         return;
@@ -214,6 +252,9 @@ async fn run(socket: PathBuf) {
                 if now["server"] != "running" {
                     // A server that went away is looked for again.
                     manager = None;
+                } else if let Some(reason) = state_moved(&socket, using.as_ref()).await {
+                    let _ = send(&mut stdout, &json!({"event": "restart", "reason": reason})).await;
+                    return;
                 }
                 if now != last_status {
                     last_status = now.clone();

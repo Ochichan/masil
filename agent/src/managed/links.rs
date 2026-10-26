@@ -538,6 +538,11 @@ impl Task {
                     let Ok(frame) = serde_json::from_slice::<Value>(&bytes) else {
                         break "the stream sent something that is not JSON".into();
                     };
+                    if frame["event"] == "restart" {
+                        // The far side ends so a new process starts over.
+                        let reason = frame["reason"].as_str().unwrap_or_default();
+                        break format!("the endpoint restarts: {reason}");
+                    }
                     if let Some(id) = frame.get("id").and_then(Value::as_u64) {
                         if ping.is_some_and(|(sent, _)| sent == id) {
                             ping = None;

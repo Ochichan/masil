@@ -139,7 +139,10 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
     if command == "exec-managed" {
         return launch_registered(&socket, rest);
     }
+    // These act for the server, often over SSH with sshd's environment:
+    // they take its state directory before any thread starts.
     if command == "open-native" {
+        crate::coordinator::adopt_server_state(std::path::Path::new(&socket))?;
         return super::remote_cli::open_native(&socket, rest);
     }
     // Before a Manager: the stream says when no server runs, and waits.
@@ -148,7 +151,14 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
     }
     // A file from another server needs no server here.
     if command == "receive" && rest.is_empty() {
+        crate::coordinator::adopt_server_state(std::path::Path::new(&socket))?;
         return super::transfer::receive();
+    }
+    if command == "rpc"
+        && rest.is_empty()
+        && let Err(error) = crate::coordinator::adopt_server_state(std::path::Path::new(&socket))
+    {
+        return super::remote_cli::refuse(&error);
     }
     // Before a Manager: the coordinator answers `list` and `get` from its
     // snapshot, and any refusal or failure leaves the local path below.

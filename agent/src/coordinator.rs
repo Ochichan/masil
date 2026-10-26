@@ -229,27 +229,174 @@ pub(crate) fn server_info(socket: &Path) -> Result<ServerInfo, String> {
     if boot.is_empty() {
         return Err("server_unreachable: the server has no boot id".into());
     }
-    let mut xdg = None;
-    let mut home = None;
-    for line in lines {
-        if let Some(value) = line.strip_prefix("XDG_STATE_HOME=") {
-            xdg = Some(PathBuf::from(value));
-        } else if let Some(value) = line.strip_prefix("HOME=") {
-            home = Some(PathBuf::from(value));
-        }
-    }
-    let state = xdg
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            home.filter(|path| path.is_absolute())
-                .map(|home| home.join(".local/state"))
-        })
+    let state = state_of(lines)
         .ok_or("server_unreachable: the server has no absolute XDG_STATE_HOME or HOME")?;
     Ok(ServerInfo {
         pid,
         boot: boot.to_owned(),
         state,
     })
+}
+
+/// The state directory an environment of `NAME=value` entries gives:
+/// absolute XDG_STATE_HOME, else HOME/.local/state. The first entry of a
+/// name counts, as getenv reads it.
+fn state_of<'a>(entries: impl IntoIterator<Item = &'a str>) -> Option<PathBuf> {
+    let mut xdg = None;
+    let mut home = None;
+    for entry in entries {
+        if let Some(value) = entry.strip_prefix("XDG_STATE_HOME=") {
+            xdg.get_or_insert_with(|| PathBuf::from(value));
+        } else if let Some(value) = entry.strip_prefix("HOME=") {
+            home.get_or_insert_with(|| PathBuf::from(value));
+        }
+    }
+    xdg.filter(|path| path.is_absolute()).or_else(|| {
+        home.filter(|path| path.is_absolute())
+            .map(|home| home.join(".local/state"))
+    })
+}
+
+/// `path` with its symlinks resolved. A tail that does not exist yet is
+/// kept as written below its deepest existing directory. None for a
+/// relative path or one with `..`.
+pub(crate) fn canonical(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return None;
+    }
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(found) = existing.canonicalize() {
+            return Some(
+                missing
+                    .iter()
+                    .rev()
+                    .fold(found, |path, part| path.join(part)),
+            );
+        }
+        missing.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
+}
+
+/// The state directory an entry point that acts for the server (`rpc`,
+/// `open-native`, `receive`) must use, canonical; None when no server
+/// answers. Any pane can change the server's global environment, so the
+/// server's directory counts only when the server process's own start
+/// environment gives the same one and it passes `adoptable`.
+pub(crate) fn entry_state(socket: &Path) -> Result<Option<PathBuf>, String> {
+    let server = match server_info(socket) {
+        Ok(server) => server,
+        Err(error) if no_server(socket, &error) => return Ok(None),
+        // A server that answers badly is not taken as absent: that would
+        // fall back to this process's own directory.
+        Err(error) => return Err(error),
+    };
+    let theirs = canonical(&server.state);
+    let own = crate::managed::state_base()
+        .ok()
+        .and_then(|own| canonical(&own));
+    if own.is_some() && own == theirs {
+        return Ok(own);
+    }
+    let refuse = |reason: String| {
+        format!(
+            "coordinator_state_mismatch: the server uses {} and this endpoint cannot take it ({reason}); set the endpoint binary to a wrapper that exports XDG_STATE_HOME={}",
+            server.state.display(),
+            server.state.display()
+        )
+    };
+    let started = crate::process::environment(server.pid)
+        .and_then(|entries| state_of(entries.iter().map(String::as_str)))
+        .and_then(|path| canonical(&path));
+    let Some(theirs) = theirs.filter(|theirs| started.as_ref() == Some(theirs)) else {
+        return Err(refuse(match &started {
+            Some(started) => format!(
+                "the server process started with {}; its global environment was changed since",
+                started.display()
+            ),
+            None => "the server process's start environment cannot be read".into(),
+        }));
+    };
+    adoptable(socket, server.pid, &theirs).map_err(refuse)?;
+    Ok(Some(theirs))
+}
+
+/// Whether a native command failed because no server listens on `socket`.
+fn no_server(socket: &Path, error: &str) -> bool {
+    !socket.exists()
+        || ["no server running on", "error connecting to"]
+            .iter()
+            .any(|text| error.contains(text))
+}
+
+/// Checks a server's state directory before this process takes it: the
+/// server runs as this user with a private socket directory, the directory
+/// (or its deepest existing parent) is this user's, and masil's directory
+/// in it is not writable by others.
+fn adoptable(socket: &Path, pid: libc::pid_t, state: &Path) -> Result<(), String> {
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if crate::process::owner(pid) != Some(euid) {
+        return Err("the server runs as another user".into());
+    }
+    let socket = socket
+        .canonicalize()
+        .map_err(|_| "the server socket is unavailable".to_string())?;
+    ipc::private_parent(&socket, "server")
+        .map_err(|_| "the server socket is not in a private directory of yours".to_string())?;
+    state_checks(state, euid)
+}
+
+fn state_checks(state: &Path, euid: u32) -> Result<(), String> {
+    if !state.is_absolute() {
+        return Err("the state directory is not absolute".into());
+    }
+    let owned = state
+        .ancestors()
+        .find_map(|directory| fs::metadata(directory).ok())
+        .is_some_and(|metadata| metadata.is_dir() && metadata.uid() == euid);
+    if !owned {
+        return Err(format!("{} is not a directory of yours", state.display()));
+    }
+    let masil = state.join("masil");
+    match fs::symlink_metadata(&masil) {
+        Ok(metadata)
+            if metadata.is_dir() && metadata.uid() == euid && metadata.mode() & 0o022 == 0 => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            return Err(format!(
+                "{} is not a directory of yours that only you can write",
+                masil.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// For an entry point that acts for the server: takes the server's state
+/// directory (`entry_state`) as XDG_STATE_HOME, for this process and its
+/// children. Callers run it before any other thread or a runtime starts.
+/// Returns the directory in use, None when no server answers.
+pub(crate) fn adopt_server_state(socket: &Path) -> Result<Option<PathBuf>, String> {
+    let state = entry_state(socket)?;
+    let own = crate::managed::state_base()
+        .ok()
+        .and_then(|own| canonical(&own));
+    if let Some(state) = &state
+        && own.as_ref() != Some(state)
+    {
+        // SAFETY: no other thread exists; the native command's readers
+        // were joined.
+        unsafe { std::env::set_var("XDG_STATE_HOME", state) };
+    }
+    Ok(state)
 }
 
 fn private_directory(path: &Path) -> Result<(), String> {
@@ -715,6 +862,12 @@ fn signal_holder(lock: &Path, signal: libc::c_int) -> bool {
 fn current(value: &Value, server: &ServerInfo) -> bool {
     value["boot"] == server.boot.as_str()
         && value["server_pid"].as_i64() == Some(i64::from(server.pid))
+        // One started under another state directory of the server is
+        // replaced. Canonical, so one directory written two ways matches.
+        && value["state_dir"]
+            .as_str()
+            .and_then(|state| canonical(Path::new(state)))
+            == canonical(&server.state)
         && value["generation"]
             .as_u64()
             .is_some_and(|g| g >= GENERATION)
@@ -790,8 +943,12 @@ pub(crate) fn status(socket: &Path) -> Result<Value, String> {
 pub(crate) fn check_state(socket: &Path) -> Result<ServerInfo, String> {
     let server = server_info(socket)?;
     let own = crate::managed::state_base()?;
-    let same_state = match (own.canonicalize(), server.state.canonicalize()) {
-        (Ok(own), Ok(theirs)) => own == theirs,
+    // Canonical even before the directory exists: an endpoint that took the
+    // server's directory holds it as /private/tmp/... where the server's
+    // environment says /tmp/....
+    let resolve = |path: &Path| path.canonicalize().ok().or_else(|| canonical(path));
+    let same_state = match (resolve(&own), resolve(&server.state)) {
+        (Some(own), Some(theirs)) => own == theirs,
         _ => own == server.state,
     };
     if !same_state {
@@ -2443,6 +2600,7 @@ mod tests {
         let compatible = json!({
             "boot": "boot-a",
             "server_pid": 42,
+            "state_dir": "/tmp/state",
             "generation": GENERATION,
             "action_protocol": crate::managed::core_action::ACTION_PROTOCOL,
             "exe": exe_identity(),
@@ -2451,11 +2609,44 @@ mod tests {
         let replaced = json!({
             "boot": "boot-a",
             "server_pid": 42,
+            "state_dir": "/tmp/state",
             "generation": GENERATION,
             "action_protocol": crate::managed::core_action::ACTION_PROTOCOL,
             "exe": {"path": "/another/masil-agent"},
         });
         assert!(!current(&replaced, &server));
+    }
+
+    #[test]
+    fn a_coordinator_under_another_state_directory_is_not_current() {
+        let directory =
+            std::env::temp_dir().join(format!("masil-state-current-{}", std::process::id()));
+        private_directory(&directory).unwrap();
+        let real = directory.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let server = ServerInfo {
+            pid: 42,
+            boot: "boot-a".into(),
+            state: link.clone(),
+        };
+        let hello = |state: Value| {
+            json!({
+                "boot": "boot-a",
+                "server_pid": 42,
+                "state_dir": state,
+                "generation": GENERATION,
+                "action_protocol": crate::managed::core_action::ACTION_PROTOCOL,
+                "exe": exe_identity(),
+            })
+        };
+        // The same directory written through a symlink is the same one.
+        assert!(current(&hello(json!(real)), &server));
+        assert!(!current(&hello(json!(directory.join("other"))), &server));
+        // An older coordinator that does not say is replaced.
+        assert!(!current(&hello(Value::Null), &server));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2495,6 +2686,73 @@ mod tests {
         assert_eq!(options.watch, DEFAULT_WATCH);
         assert!(parse(&["--socket".into(), "relative".into()]).is_err());
         assert_eq!(digest16(Path::new("/tmp/a")).len(), 16);
+    }
+
+    #[test]
+    fn the_state_directory_follows_the_store_rule() {
+        let state = |entries: &[&str]| state_of(entries.iter().copied());
+        assert_eq!(
+            state(&["HOME=/h", "XDG_STATE_HOME=/s"]),
+            Some(PathBuf::from("/s"))
+        );
+        assert_eq!(
+            state(&["XDG_STATE_HOME=relative", "HOME=/h"]),
+            Some(PathBuf::from("/h/.local/state"))
+        );
+        // The first value of a name, as getenv reads it.
+        assert_eq!(
+            state(&["XDG_STATE_HOME=/a", "XDG_STATE_HOME=/b"]),
+            Some(PathBuf::from("/a"))
+        );
+        assert_eq!(state(&["-XDG_STATE_HOME", "HOME=relative"]), None);
+    }
+
+    #[test]
+    fn a_canonical_path_resolves_links_and_keeps_a_missing_tail() {
+        let dir = std::env::temp_dir().join(format!("masil-canonical-{}", std::process::id()));
+        private_directory(&dir.join("real")).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(dir.join("real"), &link).unwrap();
+        let real = dir.join("real").canonicalize().unwrap();
+        assert_eq!(canonical(&link), Some(real.clone()));
+        assert_eq!(canonical(&link.join("not/yet")), Some(real.join("not/yet")));
+        assert_eq!(canonical(Path::new("relative/path")), None);
+        assert_eq!(canonical(&link.join("../real")), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_state_directory_to_take_is_yours_and_private() {
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let base = std::env::temp_dir().join(format!("masil-state-checks-{}", std::process::id()));
+        private_directory(&base).unwrap();
+        // Checked in canonical form, as entry_state passes it.
+        let dir = base.canonicalize().unwrap();
+        // Not there yet: its deepest existing parent is yours.
+        assert_eq!(state_checks(&dir.join("state"), euid), Ok(()));
+        let masil = dir.join("state/masil");
+        fs::create_dir_all(&masil).unwrap();
+        fs::set_permissions(&masil, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(state_checks(&dir.join("state"), euid), Ok(()));
+        for mode in [0o770, 0o707] {
+            fs::set_permissions(&masil, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(state_checks(&dir.join("state"), euid).is_err(), "{mode:o}");
+        }
+        // The base itself may be group-writable, as umask 002 makes it.
+        fs::set_permissions(&masil, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(dir.join("state"), fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(state_checks(&dir.join("state"), euid), Ok(()));
+        // masil's directory is never a link.
+        fs::remove_dir(&masil).unwrap();
+        std::os::unix::fs::symlink(&dir, &masil).unwrap();
+        assert!(state_checks(&dir.join("state"), euid).is_err());
+        assert!(state_checks(Path::new("relative"), euid).is_err());
+        // Another user's directory.
+        if euid != 0 {
+            assert!(state_checks(Path::new("/masil-absent-state/state"), euid).is_err());
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

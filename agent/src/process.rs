@@ -257,6 +257,33 @@ pub(crate) fn other_users_parent(_pid: i32) -> Option<i32> {
     None
 }
 
+/// The user ID a process runs as.
+#[cfg(target_os = "macos")]
+pub(crate) fn owner(pid: i32) -> Option<u32> {
+    // SAFETY: as in other_users_parent.
+    let mut short: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&mut short as *mut libc::proc_bsdshortinfo).cast(),
+            size,
+        )
+    };
+    (written == size).then_some(short.pbsi_uid)
+}
+
+/// The user ID a process runs as: the owner of its /proc directory.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn owner(pid: i32) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(format!("/proc/{pid}"))
+        .ok()
+        .map(|metadata| metadata.uid())
+}
+
 /// The direct children of `pid`.
 #[cfg(target_os = "macos")]
 pub(crate) fn children(pid: i32) -> Vec<i32> {
@@ -361,6 +388,14 @@ mod tests {
             assert_eq!(other_users_parent(1), Some(0));
         }
         assert_eq!(other_users_parent(std::process::id() as i32), None);
+    }
+
+    #[test]
+    fn a_process_owner_is_its_user() {
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(owner(std::process::id() as i32), Some(me));
+        assert_eq!(owner(-1), None);
     }
 
     #[test]
