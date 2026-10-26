@@ -30,7 +30,9 @@ static POKES: AtomicUsize = AtomicUsize::new(0);
 /// core guarded-action control RPC.
 /// 4: the coordinator writes the prompt ledger markers; a client no longer
 /// does, so it must not prompt through an older coordinator.
-pub(crate) const GENERATION: u64 = 4;
+/// 5: a prompt may carry `submit: "two_step"` (cursor). An older coordinator
+/// refuses it, so a client replaces that coordinator first.
+pub(crate) const GENERATION: u64 = 5;
 const REQUEST_FRAME: usize = 8 * 1024;
 const ACTION_REQUEST_FRAME: usize = 64 * 1024;
 const RESPONSE_FRAME: usize = 64 * 1024;
@@ -831,6 +833,42 @@ pub(crate) fn action_after_ensure(socket: &Path, params: Value) -> Result<Value,
     action_on_running_coordinator(socket, &server, params, busy_budget(), Duration::MAX)
 }
 
+/// A prompt the coordinator submits in two steps (paste, then Enter).
+fn two_step_prompt(params: &Value) -> bool {
+    params["operation"] == "prompt" && params["submit"] == "two_step"
+}
+
+/// How long the CLI reads for the answer to an action.
+fn action_read_limit(params: &Value) -> Duration {
+    match params["operation"].as_str() {
+        Some("launch") => LAUNCH_ACTION_TIMEOUT,
+        // The answer, then up to the event wait for the output phases.
+        Some("focus") => {
+            COMMAND_TIMEOUT
+                + Duration::from_secs(2)
+                + crate::managed::core_action::FOCUS_EVENT_TIMEOUT
+        }
+        // A two-step prompt also waits for the provider to draw the paste
+        // and settle, then sends the Enter.
+        _ if two_step_prompt(params) => {
+            ACTION_READ_LIMIT.saturating_add(crate::managed::core_action::TWO_STEP_READ_EXTRA)
+        }
+        _ => ACTION_READ_LIMIT,
+    }
+}
+
+/// What must be left of the busy budget to send an action again. A resend is
+/// cut to the budget left, and a two-step prompt cut below its whole read
+/// limit reports a lost reply while the coordinator still delivers. So it is
+/// sent again only if the whole limit fits; otherwise the busy answer is final.
+fn busy_room(params: &Value, limit: Duration) -> Duration {
+    if two_step_prompt(params) {
+        limit
+    } else {
+        BUSY_ANSWER_WINDOW
+    }
+}
+
 fn action_on_running_coordinator(
     socket: &Path,
     server: &ServerInfo,
@@ -839,19 +877,20 @@ fn action_on_running_coordinator(
     cap: Duration,
 ) -> Result<Value, String> {
     let paths = paths(socket, &server.state)?;
-    let timeout = match params["operation"].as_str() {
-        Some("launch") => LAUNCH_ACTION_TIMEOUT,
-        // The answer, then up to the event wait for the output phases.
-        Some("focus") => {
-            COMMAND_TIMEOUT
-                + Duration::from_secs(2)
-                + crate::managed::core_action::FOCUS_EVENT_TIMEOUT
-        }
-        _ => ACTION_READ_LIMIT,
-    }
-    .min(cap);
-    send_retrying_busy(budget, timeout, |limit| {
-        action_control_request(&paths.listen, params.clone(), limit).map_err(action_request_failure)
+    send_action(&paths.listen, params, budget, cap)
+}
+
+/// Sends an action to the coordinator listening at `listen`, and sends it
+/// again while the coordinator answers busy and the room rule allows it.
+fn send_action(
+    listen: &Path,
+    params: Value,
+    budget: Duration,
+    cap: Duration,
+) -> Result<Value, String> {
+    let timeout = action_read_limit(&params).min(cap);
+    send_retrying_busy(budget, busy_room(&params, timeout), timeout, |limit| {
+        action_control_request(listen, params.clone(), limit).map_err(action_request_failure)
     })
 }
 
@@ -1027,13 +1066,14 @@ impl BusyRetry {
 
 /// Sends with `send`, which is given the read limit for the attempt, and
 /// sends again after a pause while the coordinator answers busy and `budget`
-/// leaves room. Every attempt starts from the same request.
+/// leaves `room` after the pause. Every attempt starts from the same request.
 fn send_retrying_busy(
     budget: Duration,
+    room: Duration,
     usual: Duration,
     mut send: impl FnMut(Duration) -> Result<Value, String>,
 ) -> Result<Value, String> {
-    let mut busy = BusyRetry::new(budget);
+    let mut busy = BusyRetry::with_room(budget, room);
     loop {
         let error = match send(busy.limit(usual)) {
             Ok(value) => return Ok(value),
@@ -3283,6 +3323,105 @@ mod tests {
     }
 
     #[test]
+    fn a_two_step_prompt_reads_longer_than_other_actions() {
+        let prompt = |submit: &str| json!({"operation": "prompt", "submit": submit});
+        // 5 s, plus 1.5 s to settle, 0.5 s of slack and 0.75 s for the whole busy
+        // backoff of the bridge client on the Enter.
+        assert_eq!(ACTION_READ_LIMIT, Duration::from_secs(5));
+        assert_eq!(
+            action_read_limit(&prompt("two_step")),
+            Duration::from_millis(7_750)
+        );
+        // Every other action keeps its limit.
+        assert_eq!(action_read_limit(&prompt("enter")), ACTION_READ_LIMIT);
+        assert_eq!(
+            action_read_limit(&json!({"operation": "prompt"})),
+            ACTION_READ_LIMIT
+        );
+        assert_eq!(
+            action_read_limit(&json!({"operation": "keys", "submit": "two_step"})),
+            ACTION_READ_LIMIT
+        );
+        assert_eq!(
+            action_read_limit(&json!({"operation": "launch"})),
+            LAUNCH_ACTION_TIMEOUT
+        );
+        // A two-step prompt is sent again only if its whole read limit fits
+        // in the budget left. Any other action needs the room for another
+        // busy answer.
+        let long = action_read_limit(&prompt("two_step"));
+        assert_eq!(busy_room(&prompt("two_step"), long), long);
+        assert_eq!(
+            busy_room(&prompt("enter"), ACTION_READ_LIMIT),
+            BUSY_ANSWER_WINDOW
+        );
+        assert_eq!(
+            busy_room(
+                &json!({"operation": "keys", "submit": "two_step"}),
+                ACTION_READ_LIMIT
+            ),
+            BUSY_ANSWER_WINDOW
+        );
+        let mut retry = BusyRetry::with_room(Duration::from_secs(12), long);
+        assert_eq!(retry.limit_with_room_at(long, Duration::ZERO), Some(long));
+        // Refused at 2.5 s: 9.4 s are left after the pause, 7.75 s are needed.
+        assert!(
+            retry
+                .wait_at(COORDINATOR_BUSY, Duration::from_millis(2_500))
+                .is_some()
+        );
+        assert_eq!(
+            retry.limit_with_room_at(long, Duration::from_millis(2_600)),
+            Some(long)
+        );
+        // Refused again at 5.1 s: with the pause 6.7 s are left, too little
+        // for a read of 7.75 s (a plain action would send again here, with a
+        // read cut to 6.7 s).
+        assert_eq!(
+            retry.wait_at(COORDINATOR_BUSY, Duration::from_millis(5_100)),
+            None
+        );
+        let mut plain = BusyRetry::new(Duration::from_secs(12));
+        assert!(
+            plain
+                .wait_at(COORDINATOR_BUSY, Duration::from_millis(2_500))
+                .is_some()
+        );
+        assert!(
+            plain
+                .wait_at(COORDINATOR_BUSY, Duration::from_millis(5_100))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_two_step_prompt_busy_answer_is_final_when_its_read_does_not_fit() {
+        let two_step = json!({"operation": "prompt", "submit": "two_step"});
+        let enter = json!({"operation": "prompt", "submit": "enter"});
+        // A budget under the 7.75 s read: one send and the busy refusal.
+        let (path, server) = scripted_coordinator("two-step-busy", vec![busy_reply()]);
+        let error = send_to(&path, Duration::from_secs(6), &two_step).unwrap_err();
+        assert!(error.starts_with("coordinator_busy:"), "{error}");
+        assert!(error.contains("had no effect"), "{error}");
+        assert_eq!(server.join().unwrap().len(), 1);
+        let _ = fs::remove_file(path);
+        // The same budget sends a plain prompt again.
+        let done = json!({"v": 1, "id": "cli", "ok": true, "value": {"stage": "delivered"}});
+        let (path, server) = scripted_coordinator("plain-busy", vec![busy_reply(), done]);
+        let answer = send_to(&path, Duration::from_secs(6), &enter).unwrap();
+        assert_eq!(answer["stage"], "delivered");
+        assert_eq!(server.join().unwrap().len(), 2);
+        let _ = fs::remove_file(path);
+        // A budget that holds the read sends the two-step prompt again.
+        let done = json!({"v": 1, "id": "cli", "ok": true, "value": {"stage": "delivered"}});
+        let (path, server) = scripted_coordinator("two-step-room", vec![busy_reply(), done]);
+        let answer = send_to(&path, Entry::LocalCli.busy_budget(), &two_step).unwrap();
+        assert_eq!(answer["stage"], "delivered");
+        assert_eq!(server.join().unwrap().len(), 2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn a_resend_after_a_plan_needs_the_room_for_another_busy_answer() {
         let mut retry = BusyRetry::new(Duration::from_secs(12));
         let usual = ACTION_READ_LIMIT;
@@ -3425,10 +3564,9 @@ mod tests {
             "error": {"code": "coordinator_busy", "message": COORDINATOR_BUSY}})
     }
 
+    /// The production send, with no cap on the read limit.
     fn send_to(path: &Path, budget: Duration, params: &Value) -> Result<Value, String> {
-        send_retrying_busy(budget, Duration::from_secs(5), |limit| {
-            action_control_request(path, params.clone(), limit).map_err(action_request_failure)
-        })
+        send_action(path, params.clone(), budget, Duration::MAX)
     }
 
     #[test]

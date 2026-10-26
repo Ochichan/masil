@@ -15,11 +15,90 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
+use std::time::Duration;
 
-/// Providers that drop an Enter sent in the same command group as a paste
-/// (cursor-agent 2026.09.18, measured 2026-10-04): the text would sit in the
-/// composer while the receipt said delivered, so `prompt` refuses them.
-pub(super) const ENTER_DROPPED: &[&str] = &["cursor"];
+/// How a prompt reaches a provider's composer. `Enter` pastes and presses
+/// Enter in one guarded input_commit. `TwoStep` pastes first, waits until the
+/// provider drew the text and stopped changing the screen, then presses Enter
+/// as a separate guarded key. cursor-agent drops an Enter that arrives in the
+/// same client command as a paste (2026.10.01 and 2026.10.22, measured
+/// 2026-10-26); a paste alone, then Enter alone about 300 ms later, starts the
+/// turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SubmitPlan {
+    Enter,
+    TwoStep,
+}
+
+impl SubmitPlan {
+    /// The value of the request's `submit` field.
+    pub(super) const fn wire(self) -> &'static str {
+        match self {
+            Self::Enter => "enter",
+            Self::TwoStep => "two_step",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enter" => Some(Self::Enter),
+            "two_step" => Some(Self::TwoStep),
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn submit_plan(provider: &str) -> SubmitPlan {
+    match provider {
+        "cursor" => SubmitPlan::TwoStep,
+        _ => SubmitPlan::Enter,
+    }
+}
+
+/// How long the output must stay unchanged after the paste was drawn.
+pub(super) const TWO_STEP_QUIET: Duration = Duration::from_millis(300);
+/// How long after the recorded paste result the screen may take to settle.
+pub(super) const TWO_STEP_SETTLE_MAX: Duration = Duration::from_millis(1500);
+/// Time after the settle limit for the judged read, the tail check and the
+/// Enter.
+pub(super) const TWO_STEP_ENTER_SLACK: Duration = Duration::from_millis(500);
+/// Pause between two reads of the pane's output generation.
+pub(super) const TWO_STEP_POLL: Duration = Duration::from_millis(50);
+/// Leading characters (after leading whitespace) that cursor treats as a
+/// command. Text that starts with one opens a menu, and Enter would run the
+/// highlighted entry instead of submitting the text.
+const TWO_STEP_REFUSED_LEADS: &[char] = &['/'];
+/// Longest piece of the prompt's last word that must end a screen line.
+const TAIL_TOKEN_CHARS: usize = 24;
+
+/// The refusal for text a two-step provider would read as a command, or None.
+pub(super) fn two_step_refusal(text: &str) -> Option<String> {
+    let lead = text.trim_start().chars().next()?;
+    TWO_STEP_REFUSED_LEADS.contains(&lead).then(|| {
+        format!(
+            "prompt_unsupported: cursor opens its command menu for text starting with \"{lead}\", and Enter would run the highlighted entry; nothing was sent"
+        )
+    })
+}
+
+/// The last whitespace-separated word of `text`, cut to its last 24
+/// characters. It must end a screen line once the provider drew the paste.
+/// None when the text has no word.
+pub(super) fn tail_token(text: &str) -> Option<String> {
+    let word = text.split_whitespace().next_back()?;
+    let count = word.chars().count();
+    let skip = count.saturating_sub(TAIL_TOKEN_CHARS);
+    Some(word.chars().skip(skip).collect())
+}
+
+/// The number of screen lines whose text, without trailing whitespace, ends
+/// with `token`.
+pub(super) fn count_line_tails(capture: &str, token: &str) -> usize {
+    capture
+        .lines()
+        .filter(|line| line.trim_end().ends_with(token))
+        .count()
+}
 
 const OPTION: &str = "@masil-agent-prompt-receipts";
 const TICKETS: &str = "@masil-agent-prompt-tickets";
@@ -529,17 +608,26 @@ impl Manager {
         {
             return Err("prompt must contain 1–32768 bytes without control keys".into());
         }
-        if ENTER_DROPPED.contains(&agent.provider.as_str()) {
-            return Err(format!(
-                "prompt_unsupported: {} drops the Enter sent right after a paste; nothing was sent",
-                agent.provider
-            ));
+        let plan = submit_plan(&agent.provider);
+        if plan == SubmitPlan::TwoStep
+            && let Some(refusal) = two_step_refusal(text)
+        {
+            return Err(refusal);
         }
         let context = self.action_context().await?;
         if context.path == ActionPath::CoreLedger {
             return self
-                .deliver_core(agent, text, operation, queued, checkpoint, &context)
+                .deliver_core(agent, text, operation, queued, checkpoint, &context, plan)
                 .await;
+        }
+        if plan == SubmitPlan::TwoStep {
+            // The native path sends the paste and the Enter in one guarded
+            // group, which this provider drops. Only the core can send the
+            // Enter as a second guarded step.
+            return Err(format!(
+                "prompt_unsupported: {} drops an Enter sent with a paste, and this server's core cannot send the Enter as a second guarded step; nothing was sent",
+                agent.provider
+            ));
         }
         let _lock = self.lock()?;
         let explicit = operation.is_some();
@@ -828,6 +916,7 @@ impl Manager {
     /// Core-path delivery sends the verified screen snapshot, durable intent,
     /// staged input, and guarded commit through the coordinator. The option
     /// ledger is never read on this path.
+    #[allow(clippy::too_many_arguments)]
     async fn deliver_core(
         &self,
         agent: &Agent,
@@ -836,6 +925,7 @@ impl Manager {
         queued: Option<(i64, i64)>,
         checkpoint: bool,
         context: &ActionContext,
+        plan: SubmitPlan,
     ) -> Result<Value, String> {
         let digest = sha256(text);
         // A killed coordinator leaves a dispatching SQLite record until its
@@ -953,7 +1043,7 @@ impl Manager {
             "operation_id": operation,
             "queued": queued.map(|(item, revision)| json!({"item": item, "revision": revision})),
             "needs_bracket": needs_bracket,
-            "submit": "enter",
+            "submit": plan.wire(),
             "checkpoint": checkpoint,
         });
         tokio::task::spawn_blocking(move || {
@@ -1173,6 +1263,91 @@ fn format_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_cursor_gets_the_two_step_plan() {
+        assert_eq!(submit_plan("cursor"), SubmitPlan::TwoStep);
+        for provider in ["codex", "claude", "opencode", "kilo", "gemini", "omp", ""] {
+            assert_eq!(submit_plan(provider), SubmitPlan::Enter, "{provider}");
+        }
+        assert_eq!(SubmitPlan::Enter.wire(), "enter");
+        assert_eq!(SubmitPlan::TwoStep.wire(), "two_step");
+        assert_eq!(SubmitPlan::parse("enter"), Some(SubmitPlan::Enter));
+        assert_eq!(SubmitPlan::parse("two_step"), Some(SubmitPlan::TwoStep));
+        for other in ["", "none", "Enter", "two-step", "twostep"] {
+            assert_eq!(SubmitPlan::parse(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn the_two_step_time_limits_fit_each_other() {
+        assert_eq!(TWO_STEP_QUIET, Duration::from_millis(300));
+        assert_eq!(TWO_STEP_SETTLE_MAX, Duration::from_millis(1500));
+        assert_eq!(TWO_STEP_ENTER_SLACK, Duration::from_millis(500));
+        assert_eq!(TWO_STEP_POLL, Duration::from_millis(50));
+        // A screen drawn at once settles in `quiet` plus one tick, well
+        // inside the limit.
+        assert!(TWO_STEP_QUIET + TWO_STEP_POLL * 2 < TWO_STEP_SETTLE_MAX);
+    }
+
+    #[test]
+    fn a_command_lead_is_refused_before_anything_is_sent() {
+        for text in ["/help", "  /help me", "\n\t/model", "/"] {
+            let refusal = two_step_refusal(text).unwrap_or_else(|| panic!("{text:?}"));
+            assert!(
+                refusal.starts_with("prompt_unsupported: cursor opens its command menu"),
+                "{refusal}"
+            );
+            assert!(refusal.contains("starting with \"/\""), "{refusal}");
+            assert!(refusal.ends_with("nothing was sent"), "{refusal}");
+        }
+        for text in [
+            "@notes please",
+            "x/y",
+            "see /help",
+            "!echo hi",
+            "word",
+            " 한글 /x",
+        ] {
+            assert_eq!(two_step_refusal(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_tail_token_is_the_last_word_cut_to_24_characters() {
+        assert_eq!(tail_token("hello world").as_deref(), Some("world"));
+        assert_eq!(tail_token("hello world  \n\t ").as_deref(), Some("world"));
+        assert_eq!(tail_token("one\ntwo\nthree\n").as_deref(), Some("three"));
+        assert_eq!(tail_token("single").as_deref(), Some("single"));
+        let long = format!("start {}", "abcdefghij".repeat(3));
+        assert_eq!(
+            tail_token(&long).as_deref(),
+            Some("ghijabcdefghijabcdefghij")
+        );
+        assert_eq!(tail_token(&long).unwrap().chars().count(), 24);
+        // Exactly 24 characters stay whole.
+        let exact = "x".repeat(24);
+        assert_eq!(tail_token(&exact).as_deref(), Some(exact.as_str()));
+        // Characters, not bytes: 30 CJK characters keep their last 24.
+        let cjk: String = (0..30)
+            .map(|i| char::from_u32(0xAC00 + i).unwrap())
+            .collect();
+        let token = tail_token(&format!("앞 {cjk}")).unwrap();
+        assert_eq!(token.chars().count(), 24);
+        assert!(cjk.ends_with(&token));
+        assert_eq!(tail_token(""), None);
+        assert_eq!(tail_token("   \n\t"), None);
+    }
+
+    #[test]
+    fn line_tails_count_the_lines_that_end_with_the_token() {
+        let screen = "  Plan, search, build anything\n  \u{2192} say hello world   \nworld\nworld.\n    continued world\n";
+        assert_eq!(count_line_tails(screen, "world"), 3);
+        assert_eq!(count_line_tails(screen, "hello world"), 1);
+        assert_eq!(count_line_tails(screen, "worl"), 0);
+        assert_eq!(count_line_tails("", "world"), 0);
+        assert_eq!(count_line_tails("world \n\t\nworld", "world"), 2);
+    }
 
     #[test]
     fn claude_and_opencode_reports_compare_equal_to_what_was_sent() {

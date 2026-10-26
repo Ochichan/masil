@@ -3825,13 +3825,16 @@ fn binding_view(metadata: Option<&Metadata>, evidence: Option<&RunEvidence>) -> 
 }
 
 /// How `agent prompt` can reach this provider: `guarded_paste`;
+/// `two_step_paste` when the provider drops an Enter sent with a paste, so
+/// the core path pastes, waits for the screen to settle and presses Enter as
+/// a second guarded step (`prompt::SubmitPlan::TwoStep`; a server without the
+/// core ledger refuses it with `prompt_unsupported`);
 /// `needs_integration` when only an installed lifecycle integration can show
 /// it waiting; `needs_idle_evidence` when nothing can (prompt refuses until
-/// something reports idle); `unsupported` when the provider drops the Enter
-/// (`prompt::ENTER_DROPPED`).
+/// something reports idle).
 fn prompt_submit_mode(engine: &Engine, provider: &str) -> &'static str {
-    if prompt::ENTER_DROPPED.contains(&provider) {
-        "unsupported"
+    if prompt::submit_plan(provider) == prompt::SubmitPlan::TwoStep {
+        "two_step_paste"
     } else if engine.has_idle_rule(provider) || matches!(provider, "opencode" | "kilo") {
         "guarded_paste"
     } else if integration::target_capability(provider) == Some("full_lifecycle") {
@@ -5309,6 +5312,39 @@ mod tests {
         assert_eq!(view(&metadata, &evidence).state, "unverified");
         assert_eq!(bounded_event(&"x".repeat(65)), None);
         assert_eq!(bounded_event("bad\nevent"), None);
+    }
+
+    #[test]
+    fn cursor_reports_the_two_step_paste_and_others_keep_their_mode() {
+        let engine = Engine::load().unwrap();
+        assert_eq!(prompt_submit_mode(&engine, "cursor"), "two_step_paste");
+        assert_eq!(prompt_submit_mode(&engine, "opencode"), "guarded_paste");
+        assert_eq!(prompt_submit_mode(&engine, "kilo"), "guarded_paste");
+        let contract = provider_contract(&engine, "cursor").unwrap();
+        assert_eq!(contract["prompt_submit"], "two_step_paste");
+        let none = binding_view(None, None);
+        let running = capability_view(
+            "cursor",
+            prompt_submit_mode(&engine, "cursor"),
+            true,
+            true,
+            None,
+            "running",
+            None,
+            &none,
+        );
+        assert_eq!(running.prompt_submit, "two_step_paste");
+        let exited = capability_view(
+            "cursor",
+            prompt_submit_mode(&engine, "cursor"),
+            true,
+            true,
+            None,
+            "exited",
+            None,
+            &none,
+        );
+        assert_eq!(exited.prompt_submit, "unavailable");
     }
 
     #[test]

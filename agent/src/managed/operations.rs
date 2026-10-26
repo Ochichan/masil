@@ -1128,6 +1128,12 @@ impl Store {
             .map_err(sql)
     }
 
+    /// A store at `path`, for tests of code outside this module.
+    #[cfg(test)]
+    pub(super) fn open_at(path: &Path) -> Result<Self, String> {
+        Self::open_path(path)
+    }
+
     fn open_path(path: &Path) -> Result<Self, String> {
         match fs::symlink_metadata(path) {
             Ok(metadata) => super::store::validate_private_metadata(&metadata, "operation store")?,

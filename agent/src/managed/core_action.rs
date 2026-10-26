@@ -4,7 +4,10 @@
 //! single coordinator-role connection, keeps a reader running while no call
 //! is pending, and serializes ledger requests so ticket order is explicit.
 
-use super::operations::{Admission, NewOperation, Record, Store, Ticket, UNKNOWN};
+use super::operations::{
+    Admission, DISPATCHING, NewOperation, ReceiptRow, Record, Store, Ticket, UNKNOWN,
+};
+use super::prompt::SubmitPlan;
 use super::{Agent, Manager, nonce};
 use crate::bridge::{self, Endpoint, LaunchEvent};
 use crate::observation::now_ms;
@@ -51,6 +54,14 @@ pub(crate) const FOCUS_EVENT_TIMEOUT: Duration = Duration::from_millis(2_500);
 /// shorter than the CLI's 5 s limit, so the refusal arrives while the caller
 /// still waits.
 pub(crate) const PRE_DISPATCH_WAIT: Duration = Duration::from_millis(2_500);
+/// What a two-step prompt adds to the CLI's read limit: the longest settle,
+/// the slack for the judged read and the Enter, and the whole busy backoff of
+/// the bridge client on the Enter (`busy_backoff_total`, 750 ms). The backoff
+/// of the retire after the Enter falls in the base 5 s, like the backoffs of
+/// every other action; counting it too would pass the 8 s endpoint limit.
+pub(crate) const TWO_STEP_READ_EXTRA: Duration = super::prompt::TWO_STEP_SETTLE_MAX
+    .saturating_add(super::prompt::TWO_STEP_ENTER_SLACK)
+    .saturating_add(busy_backoff_total());
 /// The refusal for a pre-dispatch wait that ran out. Nothing was ticketed,
 /// written or sent, so the caller may send the same request again.
 pub(crate) const COORDINATOR_BUSY: &str =
@@ -1412,9 +1423,25 @@ fn decimal_or_number(value: Option<&Value>, field: &str) -> Result<u64, Error> {
     }
 }
 
-fn busy_backoff(attempt: usize) -> Duration {
-    let multiplier = 1_u64 << attempt.saturating_sub(1).min(3);
-    Duration::from_millis(50 * multiplier)
+const fn busy_backoff(attempt: usize) -> Duration {
+    let doublings = if attempt > 4 {
+        3
+    } else {
+        attempt.saturating_sub(1)
+    };
+    Duration::from_millis(50 * (1_u64 << doublings))
+}
+
+/// The pauses of one request that the bridge answers busy every time: 50,
+/// 100, 200 and 400 ms between its `BUSY_ATTEMPTS` sends, 750 ms in all.
+const fn busy_backoff_total() -> Duration {
+    let mut total = Duration::ZERO;
+    let mut attempt = 1;
+    while attempt < BUSY_ATTEMPTS {
+        total = total.saturating_add(busy_backoff(attempt));
+        attempt += 1;
+    }
+    total
 }
 
 /// The same request is retried only when the bridge explicitly says it did
@@ -2554,6 +2581,7 @@ impl CoordinatorActions {
                 operation,
                 queued,
                 needs_bracket,
+                submit,
                 checkpoint,
             } => {
                 self.prompt(
@@ -2565,6 +2593,7 @@ impl CoordinatorActions {
                     operation,
                     queued,
                     needs_bracket,
+                    submit,
                     checkpoint,
                 )
                 .await
@@ -2952,6 +2981,7 @@ impl CoordinatorActions {
         operation: Option<u64>,
         queued: Option<(i64, i64)>,
         needs_bracket: bool,
+        submit: SubmitPlan,
         checkpoint: bool,
     ) -> Result<Value, String> {
         if !core.supports_input() {
@@ -2967,6 +2997,15 @@ impl CoordinatorActions {
         // coordinator confirms identity before durable admission, then gives
         // those exact guards to core for the commit boundary.
         expected.matches(&current, false)?;
+        // The request names how the CLI means to submit. A coordinator that
+        // reads another plan for this provider sends nothing, so a paste is
+        // never combined with an Enter the provider drops.
+        plan_mismatch(submit, &current.provider)?;
+        let tail = if submit == SubmitPlan::TwoStep {
+            Some(Self::two_step_tail(manager, pane, text).await?)
+        } else {
+            None
+        };
 
         let mut store = manager.operation_store_recorded(&recorded).await?;
         let next = store.prompt_next(&current.run)?;
@@ -3006,12 +3045,16 @@ impl CoordinatorActions {
         input_preconditions.expected_output_generation = expected.output_generation;
         input_preconditions.expected_title = expected.title.clone();
         input_preconditions.expected_progress = expected.progress.clone();
+        let (bracketed, commit_submit) = input_commit_shape(submit, needs_bracket);
         let action = GuardedAction {
             operation_key: key.clone(),
             ticket: core_ticket,
-            payload_digest: digest(&format!(
-                "input:{slot}:{staging_id}:{needs_bracket}:enter:{}",
-                text_digest
+            payload_digest: digest(&input_payload_text(
+                slot,
+                &staging_id,
+                bracketed,
+                commit_submit,
+                &text_digest,
             )),
             retain: true,
             preconditions: input_preconditions,
@@ -3020,12 +3063,12 @@ impl CoordinatorActions {
             action: json!({
                 "kind": "input_commit",
                 "staging_id": staging_id.clone(),
-                "bracketed": needs_bracket,
-                "submit": "enter",
+                "bracketed": bracketed,
+                "submit": commit_submit,
             }),
         };
         validate_guarded_action(&action)?;
-        let intent = json!({
+        let mut intent = json!({
             "slot": slot,
             "path": "core_ledger",
             "core": {
@@ -3036,6 +3079,11 @@ impl CoordinatorActions {
             "paste_ms": now_ms(),
             "queue_item": queued.map(|(item, _)| item),
         });
+        if submit == SubmitPlan::TwoStep {
+            // Reconcile reads this to keep a paste-only record out of every
+            // generic path (`is_two_step`).
+            intent["submit"] = json!(submit.wire());
+        }
         let marked = queued.map(|(item, revision)| super::operations::QueuedPrompt {
             item,
             revision,
@@ -3114,6 +3162,70 @@ impl CoordinatorActions {
                 result_digest,
                 queued_bytes: Some(queued_bytes),
                 ..
+            }) if submit == SubmitPlan::TwoStep => {
+                // Nothing may leave through `?` from here: the text is in the
+                // composer, and every path ends in a recorded outcome.
+                let mut evidence = input_result_evidence(
+                    &key,
+                    core_ticket,
+                    &result_digest,
+                    "applied",
+                    Some(queued_bytes),
+                );
+                evidence["step"] = json!("paste");
+                let record = match store.note_dispatch(
+                    &ticket,
+                    "core_action_result",
+                    "core_ledger",
+                    Some(&evidence),
+                    now_ms(),
+                ) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        core.broken = true;
+                        return Err(Self::finish_paste_only(
+                            &mut store,
+                            core,
+                            &ticket,
+                            slot,
+                            "paste_result_not_recorded",
+                            json!({"error": error}),
+                        ));
+                    }
+                };
+                if core
+                    .retire_receipt(&key, core_ticket, &result_digest, record.updated_ms)
+                    .await
+                    .is_err()
+                {
+                    // Do not send the Enter on a connection that failed.
+                    core.broken = true;
+                    return Err(Self::finish_paste_only(
+                        &mut store,
+                        core,
+                        &ticket,
+                        slot,
+                        "paste_receipt_not_retired",
+                        json!({}),
+                    ));
+                }
+                let run = TwoStepRun {
+                    manager,
+                    current: &current,
+                    ticket: &ticket,
+                    key: &key,
+                    slot,
+                    paste_generation: expected.output_generation,
+                    tail: tail.as_ref(),
+                    started: tokio::time::Instant::now(),
+                };
+                self.two_step_enter(core, &mut store, run).await
+            }
+            Ok(LedgerResult::Applied {
+                ticket: core_ticket,
+                result_digest,
+                queued_bytes: Some(queued_bytes),
+                ..
             }) => {
                 let evidence = input_result_evidence(
                     &key,
@@ -3185,6 +3297,495 @@ impl CoordinatorActions {
                 )?;
                 Err(message)
             }
+        }
+    }
+
+    /// The screen before a two-step paste: the text's last word must end one
+    /// more screen line after cursor drew the paste. An error here is before
+    /// admission, so it records nothing.
+    async fn two_step_tail(manager: &Manager, pane: &str, text: &str) -> Result<TailCheck, String> {
+        if let Some(refusal) = super::prompt::two_step_refusal(text) {
+            return Err(refusal);
+        }
+        let token = super::prompt::tail_token(text)
+            .ok_or("invalid_action: prompt text has no word to find on the screen")?;
+        let capture = manager.command(&["capture-pane", "-p", "-t", pane]).await?;
+        let before = super::prompt::count_line_tails(&capture, &token);
+        let added = super::prompt::count_line_tails(text, &token).max(1);
+        Ok(TailCheck {
+            token,
+            before,
+            added,
+        })
+    }
+
+    /// Second step of a two-step prompt: wait for the pasted text to be drawn
+    /// and the output to settle, judge the screen, check the text's tail, then
+    /// send Enter as its own guarded key. The paste is already recorded.
+    /// Nothing here may leave through `?`: every path ends in `delivered`,
+    /// or in `outcome_unknown` with the reason, so the operation is never
+    /// left dispatching with text in the composer.
+    async fn two_step_enter(
+        &self,
+        core: &mut Client,
+        store: &mut Store,
+        run: TwoStepRun<'_>,
+    ) -> Result<Value, String> {
+        let TwoStepRun {
+            manager,
+            current,
+            ticket,
+            key,
+            slot,
+            paste_generation,
+            tail,
+            started,
+        } = run;
+        let judged =
+            match Self::settle_two_step(manager, current, paste_generation, started, tail).await {
+                Ok(judged) => judged,
+                Err(hold) => {
+                    return Err(Self::finish_paste_only(
+                        store,
+                        core,
+                        ticket,
+                        slot,
+                        hold.reason,
+                        hold.extra,
+                    ));
+                }
+            };
+        if started.elapsed()
+            >= super::prompt::TWO_STEP_SETTLE_MAX + super::prompt::TWO_STEP_ENTER_SLACK
+        {
+            return Err(Self::finish_paste_only(
+                store,
+                core,
+                ticket,
+                slot,
+                "enter_too_late",
+                json!({}),
+            ));
+        }
+        self.send_two_step_enter(core, store, ticket, key, slot, &judged)
+            .await
+    }
+
+    /// Records the Enter's ticket, sends the Enter with the screen guards of
+    /// the judged read, and ends the operation by the core's answer.
+    async fn send_two_step_enter(
+        &self,
+        core: &mut Client,
+        store: &mut Store,
+        ticket: &Ticket,
+        key: &OperationKey,
+        slot: u64,
+        judged: &Agent,
+    ) -> Result<Value, String> {
+        // The second ticket is durable before it is sent, as a multi-key
+        // interrupt does, so a replacement coordinator can query it.
+        let next = core.next_ticket();
+        let mut intent = core_intent(key, next);
+        intent["step"] = json!("enter");
+        if let Err(error) = store.note_dispatch(
+            ticket,
+            "core_dispatch_ticket",
+            "core_ledger",
+            Some(&intent),
+            now_ms(),
+        ) {
+            core.broken = true;
+            return Err(Self::finish_paste_only(
+                store,
+                core,
+                ticket,
+                slot,
+                "enter_ticket_not_recorded",
+                json!({"error": error}),
+            ));
+        }
+        // `send_keys` takes `core.next_ticket()` itself: nothing may use
+        // `core` between the note above and this send.
+        let sent = self
+            .send_keys(
+                core,
+                judged,
+                &["Enter".to_owned()],
+                KeyDispatch {
+                    retain: true,
+                    operation_key: Some(key.clone()),
+                    tracked_digest: Some(digest(&judged.tracked_encoded)),
+                    screen: Some(ScreenGuard::of(judged)),
+                },
+            )
+            .await;
+        // One match on every variant, so a new one fails to compile. Neither
+        // `prompt_transport_failure` nor `finish_prompt_result` may map this
+        // step: they free the prompt slot, and the text is in the composer.
+        match sent {
+            Ok(LedgerResult::Applied {
+                ticket: core_ticket,
+                result_digest,
+                queued_bytes: _,
+                launch: _,
+            }) => {
+                let mut evidence =
+                    core_result_evidence(key, core_ticket, &result_digest, "applied");
+                evidence["step"] = json!("enter");
+                // `finish_admitted` records `outcome_unknown` when it cannot
+                // record `delivered`, so this error leaves nothing dispatching.
+                let record = Self::finish_prompt_admitted(
+                    store,
+                    core,
+                    ticket,
+                    "delivered",
+                    &evidence,
+                    "the prompt Enter applied, but its durable receipt could not be committed",
+                )?;
+                if core
+                    .retire_receipt(key, core_ticket, &result_digest, record.updated_ms)
+                    .await
+                    .is_err()
+                {
+                    core.broken = true;
+                }
+                if super::observe::observable(judged) {
+                    crate::coordinator::poke(&self.socket);
+                }
+                Ok(super::prompt::core_public_record(
+                    &judged.run,
+                    slot,
+                    &record,
+                ))
+            }
+            Ok(LedgerResult::RejectedBeforeEffect {
+                ticket: core_ticket,
+                reason,
+                result_digest,
+            }) => {
+                let mut extra = core_result_evidence(
+                    key,
+                    core_ticket,
+                    &result_digest,
+                    "rejected_before_effect",
+                );
+                extra["step"] = json!("enter");
+                let (message, record) =
+                    Self::finish_paste_only_record(store, core, ticket, slot, &reason, extra);
+                Self::retire_enter_slot(core, key, core_ticket, &result_digest, record).await;
+                Err(message)
+            }
+            Ok(LedgerResult::NotApplied {
+                ticket: core_ticket,
+                result_digest,
+            }) => {
+                let mut extra =
+                    core_result_evidence(key, core_ticket, &result_digest, "not_applied");
+                extra["step"] = json!("enter");
+                let (message, record) = Self::finish_paste_only_record(
+                    store,
+                    core,
+                    ticket,
+                    slot,
+                    "enter_not_applied",
+                    extra,
+                );
+                Self::retire_enter_slot(core, key, core_ticket, &result_digest, record).await;
+                Err(message)
+            }
+            Ok(LedgerResult::LedgerFull) => {
+                let mut extra = enter_error_evidence(key, next, "not_applied");
+                extra["ledger"] = json!("ledger_full");
+                Err(Self::finish_paste_only(
+                    store,
+                    core,
+                    ticket,
+                    slot,
+                    "ledger_full",
+                    extra,
+                ))
+            }
+            Ok(
+                result @ (LedgerResult::IdempotencyConflict
+                | LedgerResult::ReceiptNotRetained
+                | LedgerResult::TicketGap
+                | LedgerResult::EpochClosed
+                | LedgerResult::EpochUnknown),
+            ) => {
+                // The Enter may have applied, and the connection no longer
+                // agrees with the core about tickets.
+                core.broken = true;
+                let evidence = enter_unknown_evidence(key, next, result.result_text(), None);
+                Err(Self::finish_enter_unknown(
+                    store,
+                    core,
+                    ticket,
+                    slot,
+                    &evidence,
+                    result.result_text(),
+                ))
+            }
+            Err(error @ (Error::InvalidArgument(_) | Error::Busy(_))) => {
+                // The core did not take the ticket, so the Enter was not
+                // sent. The stored `core_ticket` evidence settles the record
+                // as paste_only, and no later coordinator queries the ticket.
+                // A query would be wrong. Busy does not use up the sequence
+                // number, so the next action on this connection sends under
+                // the same ticket number with another key, and the ledger
+                // would answer with that other operation's result.
+                let extra = enter_error_evidence(key, next, "not_applied");
+                let reason = if matches!(error, Error::Busy(_)) {
+                    "bridge_busy"
+                } else {
+                    "enter_invalid"
+                };
+                let mut extra = extra;
+                extra["error"] = json!(error.to_string());
+                Err(Self::finish_paste_only(
+                    store, core, ticket, slot, reason, extra,
+                ))
+            }
+            Err(Error::Rejected { code, message }) => {
+                let mut extra = enter_error_evidence(key, next, "rejected_before_effect");
+                extra["error"] = json!(format!("{code}: {message}"));
+                Err(Self::finish_paste_only(
+                    store, core, ticket, slot, &code, extra,
+                ))
+            }
+            Err(error @ (Error::Unavailable(_) | Error::Lost(_) | Error::Protocol(_))) => {
+                core.broken = true;
+                let evidence = enter_unknown_evidence(key, next, "unknown", Some(&error));
+                Err(Self::finish_enter_unknown(
+                    store,
+                    core,
+                    ticket,
+                    slot,
+                    &evidence,
+                    &error.to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Retires the core's ledger slot of an Enter the core answered, once the
+    /// answer is durable, as `finish_prompt_result` does. The Enter was sent
+    /// with `retain`, and the core keeps the slot of a guard-refused action,
+    /// so an unretired one holds a ledger slot until the next reconnect. A
+    /// failed retire breaks the connection, so the next coordinator
+    /// reconciles it.
+    async fn retire_enter_slot(
+        core: &mut Client,
+        key: &OperationKey,
+        core_ticket: DispatchTicket,
+        result_digest: &str,
+        record: Option<Record>,
+    ) {
+        if let Some(record) = record
+            && core
+                .retire_receipt(key, core_ticket, result_digest, record.updated_ms)
+                .await
+                .is_err()
+        {
+            core.broken = true;
+        }
+    }
+
+    /// Waits until cursor drew the paste and its output stopped changing,
+    /// judges the screen and checks that the text's tail ends a new line.
+    /// Returns the judged agent, or the reason to leave the text unsubmitted.
+    /// One `display-message` per tick: no identity read in the loop.
+    async fn settle_two_step(
+        manager: &Manager,
+        current: &Agent,
+        paste_generation: Option<u64>,
+        started: tokio::time::Instant,
+        tail: Option<&TailCheck>,
+    ) -> Result<Agent, PasteHold> {
+        let (Some(paste_generation), Some(tail)) = (paste_generation, tail) else {
+            return Err(PasteHold::new("composer_unchecked", json!({})));
+        };
+        let deadline = started + super::prompt::TWO_STEP_SETTLE_MAX;
+        let pane = current.pane_id.as_str();
+        let unreadable =
+            |error: String| PasteHold::new("target_unreadable", json!({"error": error}));
+        // The quiet timer starts when the generation first leaves the one the
+        // paste was guarded on: before that, cursor has drawn nothing yet.
+        let mut drawn = false;
+        let mut last: Option<String> = None;
+        let mut since = started;
+        let mut generation = paste_generation;
+        loop {
+            let reading = manager
+                .command(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane,
+                    "#{pane_output_generation}\t#{pane_title}\t#{masil_osc_progress}",
+                ])
+                .await
+                .map_err(unreadable)?;
+            let now = tokio::time::Instant::now();
+            let reading = reading.trim_end_matches('\n');
+            let Some(seen) = reading
+                .split('\t')
+                .next()
+                .and_then(|field| field.trim().parse::<u64>().ok())
+            else {
+                return Err(unreadable(
+                    "the pane's output generation is unreadable".into(),
+                ));
+            };
+            if !drawn && seen != paste_generation {
+                drawn = true;
+                last = None;
+            }
+            if drawn && last.as_deref() != Some(reading) {
+                last = Some(reading.to_owned());
+                since = now;
+                generation = seen;
+            }
+            if drawn && now.duration_since(since) >= super::prompt::TWO_STEP_QUIET {
+                // The judged read needs room before the limit; past it the
+                // screen did not settle in time.
+                if now >= deadline {
+                    return Err(PasteHold::new("output_not_settled", json!({})));
+                }
+                let judged = manager.get(pane).await.map_err(unreadable)?;
+                if !same_core_run(current, &judged) {
+                    return Err(PasteHold::new("target_changed", json!({})));
+                }
+                if judged.state != "idle" {
+                    let rule = serde_json::to_value(&*judged.evidence)
+                        .ok()
+                        .and_then(|evidence| {
+                            evidence["matched_rule"]["id"].as_str().map(str::to_owned)
+                        });
+                    return Err(PasteHold::new(
+                        "not_idle_after_paste",
+                        json!({"state": judged.state, "rule": rule}),
+                    ));
+                }
+                if judged.output_generation != generation {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(PasteHold::new("output_not_settled", json!({})));
+                    }
+                    // The screen moved while it was judged. Settle again.
+                    last = None;
+                } else {
+                    let after = manager
+                        .command(&["capture-pane", "-p", "-t", pane])
+                        .await
+                        .map_err(unreadable)?;
+                    if let Err(seen) = tail.shows_paste(&after) {
+                        return Err(PasteHold::new(
+                            "composer_mismatch",
+                            json!({
+                                "tail_before": tail.before,
+                                "tail_added": tail.added,
+                                "tail_after": seen,
+                                "token_chars": tail.token.chars().count(),
+                            }),
+                        ));
+                    }
+                    return Ok(judged);
+                }
+            }
+            if now >= deadline {
+                let reason = if drawn {
+                    "output_not_settled"
+                } else {
+                    "paste_not_drawn"
+                };
+                return Err(PasteHold::new(reason, json!({})));
+            }
+            tokio::time::sleep(super::prompt::TWO_STEP_POLL).await;
+        }
+    }
+
+    /// Ends a two-step prompt whose text is in the composer and whose Enter
+    /// will not be sent: `outcome_unknown`, kept unresolved so no later prompt
+    /// pastes on top of it. Returns the error text for the caller.
+    fn finish_paste_only(
+        store: &mut Store,
+        core: &mut Client,
+        ticket: &Ticket,
+        slot: u64,
+        reason: &str,
+        extra: Value,
+    ) -> String {
+        Self::finish_paste_only_record(store, core, ticket, slot, reason, extra).0
+    }
+
+    /// As `finish_paste_only`, and the record it committed (None when the
+    /// final write failed), for a caller that retires the core's slot after.
+    fn finish_paste_only_record(
+        store: &mut Store,
+        core: &mut Client,
+        ticket: &Ticket,
+        slot: u64,
+        reason: &str,
+        extra: Value,
+    ) -> (String, Option<Record>) {
+        let mut evidence = json!({
+            "path": "core_ledger",
+            "two_step": "paste_only",
+            "reason": reason,
+        });
+        if let (Some(base), Some(extra)) = (evidence.as_object_mut(), extra.as_object()) {
+            for (field, value) in extra {
+                base.entry(field.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        let message = format!(
+            "outcome_unknown: prompt operation {slot} pasted its text into the agent's composer but masil did not send Enter ({reason}); press Enter in the pane to submit it, or clear the composer, then run `masil-agent agent operation resolve {} --as delivered|not-delivered`",
+            ticket.key
+        );
+        Self::finish_two_step_unknown(store, core, ticket, &evidence, message)
+    }
+
+    /// As `finish_paste_only`, for an Enter whose result is not known.
+    fn finish_enter_unknown(
+        store: &mut Store,
+        core: &mut Client,
+        ticket: &Ticket,
+        slot: u64,
+        evidence: &Value,
+        detail: &str,
+    ) -> String {
+        let message = format!(
+            "outcome_unknown: prompt operation {slot} pasted its text and masil sent Enter, but its result is unknown ({detail}); look at the pane, then run `masil-agent agent operation resolve {} --as delivered|not-delivered`",
+            ticket.key
+        );
+        Self::finish_two_step_unknown(store, core, ticket, evidence, message).0
+    }
+
+    /// Returns the error text and, when the final write succeeded, the record.
+    /// A failed write keeps the hint in `message`: the text is in the
+    /// composer whatever could be recorded.
+    fn finish_two_step_unknown(
+        store: &mut Store,
+        core: &mut Client,
+        ticket: &Ticket,
+        evidence: &Value,
+        message: String,
+    ) -> (String, Option<Record>) {
+        match Self::finish_prompt_admitted(
+            store,
+            core,
+            ticket,
+            UNKNOWN,
+            evidence,
+            "the two-step prompt outcome could not be committed",
+        ) {
+            Ok(record) => (message, Some(record)),
+            // `finish_admitted` already tried to record `outcome_unknown`,
+            // and its error says what could be recorded. It keeps the leading
+            // code that `classify` reads, so `message` drops its own.
+            Err(error) => (
+                format!("{error}; {}", super::failure::human(&message)),
+                None,
+            ),
         }
     }
 
@@ -3853,12 +4454,18 @@ impl CoordinatorActions {
             )
         });
         let ticket = core.next_ticket();
+        let mut guards = preconditions(agent, dispatch.tracked_digest);
+        if let Some(screen) = dispatch.screen {
+            guards.expected_output_generation = Some(screen.output_generation);
+            guards.expected_title = Some(screen.title);
+            guards.expected_progress = Some(screen.progress);
+        }
         let request = GuardedAction {
             operation_key,
             ticket,
             payload_digest: digest(&json!({"keys": keys}).to_string()),
             retain: dispatch.retain,
-            preconditions: preconditions(agent, dispatch.tracked_digest),
+            preconditions: guards,
             launch_target: None,
             focus: false,
             action: json!({"kind": "keys", "keys": keys}),
@@ -4162,6 +4769,7 @@ impl CoordinatorActions {
                         retain: true,
                         operation_key: Some(key.clone()),
                         tracked_digest: (index == 0).then(|| tracked_digest.to_owned()),
+                        screen: None,
                     },
                 )
                 .await;
@@ -4657,7 +5265,11 @@ impl CoordinatorActions {
             let decision = reconcile_decision(has_receipt, &entry.result);
             let mut evidence = ledger_result_evidence(entry);
             launch_reconcile_receipt(&mut evidence, &current, &entry.result);
-            let current = if current.state == UNKNOWN {
+            let current = if is_two_step(&current) {
+                // A two-step prompt is never decided from one entry: the
+                // paste and the Enter are judged together below.
+                record_two_step_entry(&mut store, current, entry)?
+            } else if current.state == UNKNOWN {
                 // Retaining the ledger result is part of reconciliation, not
                 // just cleanup. Once the slot is retired this receipt is the
                 // operator's only evidence of what the core proved.
@@ -4766,6 +5378,10 @@ impl CoordinatorActions {
                 current.state.as_str(),
                 super::operations::DISPATCHING | UNKNOWN
             ) {
+                continue;
+            }
+            if is_two_step(&current) {
+                reconcile_two_step(&mut store, core, &retained, current).await?;
                 continue;
             }
             let intents = core_intents(&current);
@@ -5000,10 +5616,82 @@ enum Retry {
     SameRun,
 }
 
+/// The prompt's last word, how many screen lines ended with it before the
+/// paste, and how many lines of the pasted text end with it (at least the
+/// last one; a text whose lines repeat their last word shows each of them).
+/// After the paste the screen must show `before + added` such lines
+/// (`prompt::tail_token`, `prompt::count_line_tails`).
+struct TailCheck {
+    token: String,
+    before: usize,
+    added: usize,
+}
+
+impl TailCheck {
+    /// Whether `capture` shows the pasted text: exactly `added` more lines end
+    /// with the token than before. A composer cleared since the paste, keys
+    /// typed after the text, and an older copy of the same text higher up the
+    /// screen each give another count. Err carries the count found.
+    fn shows_paste(&self, capture: &str) -> Result<(), usize> {
+        let seen = super::prompt::count_line_tails(capture, &self.token);
+        if seen == self.before + self.added {
+            Ok(())
+        } else {
+            Err(seen)
+        }
+    }
+}
+
+/// What `two_step_enter` needs from `prompt()` once the paste is recorded.
+struct TwoStepRun<'a> {
+    manager: &'a Manager,
+    current: &'a Agent,
+    ticket: &'a Ticket,
+    key: &'a OperationKey,
+    slot: u64,
+    /// The output generation the paste was guarded on.
+    paste_generation: Option<u64>,
+    tail: Option<&'a TailCheck>,
+    /// When the paste result was recorded and retired.
+    started: tokio::time::Instant,
+}
+
+/// Why a two-step prompt's Enter is not sent. `reason` is a stable word;
+/// `extra` is small evidence for the receipt.
+struct PasteHold {
+    reason: &'static str,
+    extra: Value,
+}
+
+impl PasteHold {
+    fn new(reason: &'static str, extra: Value) -> Self {
+        Self { reason, extra }
+    }
+}
+
 struct KeyDispatch {
     retain: bool,
     operation_key: Option<OperationKey>,
     tracked_digest: Option<String>,
+    /// The screen the caller judged. The core rejects the key if the pane
+    /// output, title or progress moved since.
+    screen: Option<ScreenGuard>,
+}
+
+struct ScreenGuard {
+    output_generation: u64,
+    title: String,
+    progress: String,
+}
+
+impl ScreenGuard {
+    fn of(agent: &Agent) -> Self {
+        Self {
+            output_generation: agent.output_generation,
+            title: agent.title.clone(),
+            progress: agent.progress.clone(),
+        }
+    }
 }
 
 impl KeyDispatch {
@@ -5012,6 +5700,7 @@ impl KeyDispatch {
             retain: false,
             operation_key: None,
             tracked_digest: tracked.then(|| digest(&agent.tracked_encoded)),
+            screen: None,
         }
     }
 }
@@ -5195,6 +5884,7 @@ enum ControlAction {
         operation: Option<u64>,
         queued: Option<(i64, i64)>,
         needs_bracket: bool,
+        submit: SubmitPlan,
         checkpoint: bool,
     },
     Launch(LaunchAction),
@@ -5471,9 +6161,11 @@ impl ControlAction {
                 if needs_bracket != (text.contains('\n') || text.contains('\t')) {
                     return Err("invalid_action: prompt bracket rule is invalid".into());
                 }
-                if object.get("submit").and_then(Value::as_str) != Some("enter") {
-                    return Err("invalid_action: prompt submit is invalid".into());
-                }
+                let submit = object
+                    .get("submit")
+                    .and_then(Value::as_str)
+                    .and_then(SubmitPlan::parse)
+                    .ok_or("invalid_action: prompt submit is invalid")?;
                 let checkpoint = object
                     .get("checkpoint")
                     .and_then(Value::as_bool)
@@ -5485,6 +6177,7 @@ impl ControlAction {
                     operation: prompt_operation,
                     queued,
                     needs_bracket,
+                    submit,
                     checkpoint,
                 })
             }
@@ -5904,6 +6597,82 @@ fn core_result_evidence(
     })
 }
 
+/// The evidence of an Enter the core refused or never took, so the result is
+/// known and has no digest: the ticket and key tie it to the Enter's intent,
+/// `result` says what reconcile should read it as. An Enter whose result is
+/// unknown uses `enter_unknown_evidence` instead.
+fn enter_error_evidence(
+    operation_key: &OperationKey,
+    ticket: DispatchTicket,
+    result: &str,
+) -> Value {
+    json!({
+        "path": "core_ledger",
+        "core_ticket": ticket.value(),
+        "core_operation_key": operation_key.value(),
+        "result": result,
+        "step": "enter",
+    })
+}
+
+/// The evidence of an Enter whose result is not known: it may have applied.
+/// The ticket and key sit under their own field names, not `core_ticket` and
+/// `core_operation_key`, so no receipt answers for the ticket until reconcile
+/// records the core's own answer (which carries `core_ticket`). The Enter's
+/// intent, with its ticket, is already in the `core_dispatch_ticket` receipt.
+fn enter_unknown_evidence(
+    operation_key: &OperationKey,
+    ticket: DispatchTicket,
+    result: &str,
+    error: Option<&Error>,
+) -> Value {
+    let mut evidence = json!({
+        "path": "core_ledger",
+        "enter_ticket": ticket.value(),
+        "enter_operation_key": operation_key.value(),
+        "result": result,
+        "step": "enter",
+        "two_step": "enter_unknown",
+    });
+    if let Some(error) = error {
+        evidence["error"] = json!(error.to_string());
+    }
+    evidence
+}
+
+/// The refusal for a request whose submit plan is not the one this provider
+/// gets. Checked before admission, so nothing is recorded or sent.
+fn plan_mismatch(submit: SubmitPlan, provider: &str) -> Result<(), String> {
+    if submit == super::prompt::submit_plan(provider) {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid_action: prompt submit {} does not match {provider}; nothing was sent",
+        submit.wire()
+    ))
+}
+
+/// Whether the input_commit brackets its paste, and whether the core presses
+/// Enter after it. A two-step prompt always brackets (the core refuses before
+/// any effect when the pane's bracketed-paste mode is off) and leaves the
+/// Enter to a second guarded key.
+fn input_commit_shape(plan: SubmitPlan, needs_bracket: bool) -> (bool, &'static str) {
+    match plan {
+        SubmitPlan::Enter => (needs_bracket, "enter"),
+        SubmitPlan::TwoStep => (true, "none"),
+    }
+}
+
+fn input_payload_text(
+    slot: u64,
+    staging_id: &str,
+    bracketed: bool,
+    submit: &str,
+    text_digest: &str,
+) -> String {
+    format!("input:{slot}:{staging_id}:{bracketed}:{submit}:{text_digest}")
+}
+
 fn input_result_evidence(
     operation_key: &OperationKey,
     ticket: DispatchTicket,
@@ -6064,8 +6833,11 @@ struct StoredIntent {
 }
 
 fn core_intents(record: &Record) -> Vec<StoredIntent> {
-    record
-        .receipts
+    intents_in(&record.receipts)
+}
+
+fn intents_in(receipts: &[ReceiptRow]) -> Vec<StoredIntent> {
+    receipts
         .iter()
         .filter_map(|receipt| receipt.evidence.as_ref())
         .filter_map(|evidence| evidence.get("core"))
@@ -6134,6 +6906,262 @@ fn stored_intent_for_entry<'a>(
 /// not apply.
 fn has_core_effect(record: &Record) -> bool {
     applied_core_effects(record) > 0
+}
+
+/// A prompt admitted for the two-step plan: its intent says so. Its first
+/// core intent is the paste; a second one (the Enter) exists only once the
+/// coordinator was about to send the Enter.
+fn is_two_step(record: &Record) -> bool {
+    record.action == "prompt"
+        && record
+            .intent()
+            .is_some_and(|intent| intent["submit"] == SubmitPlan::TwoStep.wire())
+}
+
+/// The receipts of the record's current attempt, from its dispatch intent on.
+/// A key that was tried again keeps the receipts of the attempts before.
+fn attempt_receipts(record: &Record) -> &[ReceiptRow] {
+    let start = record
+        .receipts
+        .iter()
+        .rposition(|receipt| {
+            receipt.stage == "dispatch_intent"
+                && receipt
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence["ticket"] == record.ticket.as_str())
+        })
+        .unwrap_or(0);
+    &record.receipts[start..]
+}
+
+/// What the receipts say about one core ticket of a two-step prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepResult {
+    AppliedWithBytes,
+    AppliedNoBytes,
+    RejectedBeforeEffect,
+    NotApplied,
+    Unknown,
+    Missing,
+}
+
+/// The newest receipt that carries this ticket and key, directly or in the
+/// evidence a failed receipt commit wrapped (`finish_admitted`).
+fn step_result(receipts: &[ReceiptRow], intent: &StoredIntent) -> StepResult {
+    let found = receipts.iter().rev().find_map(|receipt| {
+        let evidence = receipt.evidence.as_ref()?;
+        [evidence, &evidence["evidence"]]
+            .into_iter()
+            .find(|evidence| core_receipt_matches(evidence, intent.ticket, &intent.operation_key))
+    });
+    let Some(evidence) = found else {
+        return StepResult::Missing;
+    };
+    match evidence["result"].as_str() {
+        Some("applied") if evidence["queued_bytes"].as_u64().is_some() => {
+            StepResult::AppliedWithBytes
+        }
+        Some("applied") => StepResult::AppliedNoBytes,
+        Some("rejected_before_effect") => StepResult::RejectedBeforeEffect,
+        Some("not_applied") => StepResult::NotApplied,
+        _ => StepResult::Unknown,
+    }
+}
+
+/// What reconcile does with a two-step record.
+#[derive(Debug, Eq, PartialEq)]
+enum TwoStepDecision {
+    /// The operation's state. Never `outcome_unknown`.
+    Final(&'static str),
+    /// Keep `outcome_unknown`, with this reason in the receipt.
+    StayUnknown(&'static str),
+}
+
+/// The only judge of a two-step record. It reads the receipts of the current
+/// attempt and nothing else. The generic paths (`prompt_core_state`,
+/// `recorded_prompt_core_state`, the partial-interrupt choice) must never see
+/// one: they read a paste without its Enter as a finished prompt, which frees
+/// the slot while the text sits in the composer.
+fn decide_two_step(record: &Record) -> TwoStepDecision {
+    let receipts = attempt_receipts(record);
+    let intents = intents_in(receipts);
+    let (paste, enter) = match intents.as_slice() {
+        [paste] => (paste, None),
+        [paste, enter] => (paste, Some(enter)),
+        _ => return TwoStepDecision::StayUnknown("unexpected_intents"),
+    };
+    if let Some(enter) = enter {
+        return match step_result(receipts, enter) {
+            StepResult::AppliedWithBytes | StepResult::AppliedNoBytes => {
+                TwoStepDecision::Final("delivered")
+            }
+            StepResult::RejectedBeforeEffect | StepResult::NotApplied => {
+                TwoStepDecision::StayUnknown("paste_only")
+            }
+            StepResult::Unknown | StepResult::Missing => {
+                TwoStepDecision::StayUnknown("enter_unknown")
+            }
+        };
+    }
+    match step_result(receipts, paste) {
+        StepResult::AppliedWithBytes => TwoStepDecision::StayUnknown("paste_only"),
+        StepResult::AppliedNoBytes => TwoStepDecision::StayUnknown("paste_unconfirmed"),
+        StepResult::RejectedBeforeEffect => TwoStepDecision::Final("rejected_before_effect"),
+        StepResult::NotApplied => TwoStepDecision::Final("not_applied"),
+        StepResult::Unknown | StepResult::Missing => TwoStepDecision::StayUnknown("paste_unknown"),
+    }
+}
+
+fn two_step_evidence(label: &str) -> Value {
+    json!({"path": "core_ledger", "reconciled": "two_step", "two_step": label})
+}
+
+/// Appends a retained ledger entry's result to a two-step record that has no
+/// receipt for the entry's ticket. Nothing is decided here.
+fn record_two_step_entry(
+    store: &mut Store,
+    current: Record,
+    entry: &LedgerEntry,
+) -> Result<Record, String> {
+    if has_ticket_receipt(&current, entry.ticket, &entry.operation_key) {
+        return Ok(current);
+    }
+    let evidence = ledger_result_evidence(entry);
+    match current.state.as_str() {
+        DISPATCHING => store.note_dispatch(
+            &ticket_for(&current),
+            "core_ledger_result",
+            "core_ledger_reconcile",
+            Some(&evidence),
+            now_ms(),
+        ),
+        UNKNOWN => store.note_unknown(
+            &current,
+            "core_ledger_result",
+            "core_ledger_reconcile",
+            Some(&evidence),
+            now_ms(),
+        ),
+        _ => Ok(current),
+    }
+}
+
+/// Settles a dispatching or unknown two-step record as `decide_two_step`
+/// says. A record that stays unknown gets a receipt only when its newest
+/// receipt does not already carry the reason: reconcile runs on every
+/// connection.
+fn apply_two_step(store: &mut Store, record: &Record) -> Result<Record, String> {
+    let now = now_ms();
+    let updated = match (decide_two_step(record), record.state.as_str()) {
+        (TwoStepDecision::Final(state), DISPATCHING) => store.finish(
+            &ticket_for(record),
+            state,
+            "core_ledger_reconcile",
+            Some(&two_step_evidence("settled")),
+            now,
+        )?,
+        (TwoStepDecision::Final(state), UNKNOWN) => store.settle_unknown(
+            record,
+            state,
+            "core_ledger_reconcile",
+            Some(&two_step_evidence("settled")),
+            now,
+        )?,
+        (TwoStepDecision::StayUnknown(reason), DISPATCHING) => store.finish(
+            &ticket_for(record),
+            UNKNOWN,
+            "core_ledger_reconcile",
+            Some(&two_step_evidence(reason)),
+            now,
+        )?,
+        (TwoStepDecision::StayUnknown(reason), UNKNOWN) => {
+            let said = record
+                .receipts
+                .last()
+                .and_then(|receipt| receipt.evidence.as_ref())
+                .is_some_and(|evidence| evidence["two_step"] == reason);
+            if said {
+                record.clone()
+            } else {
+                store.note_unknown(
+                    record,
+                    "core_ledger_result",
+                    "core_ledger_reconcile",
+                    Some(&two_step_evidence(reason)),
+                    now,
+                )?
+            }
+        }
+        _ => record.clone(),
+    };
+    store.note_prompt_result(&updated)?;
+    Ok(updated)
+}
+
+/// Reconciles a dispatching or unknown two-step record of the current boot:
+/// asks the core about each of its tickets that has no receipt and was not
+/// retained, records the answers, then settles it. A query error is fatal to
+/// the pass, as it is for every other record.
+async fn reconcile_two_step(
+    store: &mut Store,
+    core: &mut Client,
+    retained: &HashSet<(DispatchTicket, String)>,
+    current: Record,
+) -> Result<(), String> {
+    let missing: Vec<_> = intents_in(attempt_receipts(&current))
+        .into_iter()
+        .filter(|intent| {
+            !retained.contains(&(intent.ticket, intent.operation_key.ledger_digest()))
+                && !has_ticket_receipt(&current, intent.ticket, &intent.operation_key)
+        })
+        .collect();
+    let operation_key = current.operation_key.clone();
+    let mut current = current;
+    for intent in missing {
+        let answer = core.ledger_query(intent.ticket).await.map_err(|error| {
+            format!(
+                "core ledger query for {}:{} failed: {error}",
+                intent.ticket.epoch, intent.ticket.seq
+            )
+        })?;
+        let mut evidence = json!({
+            "path": "core_ledger",
+            "core_ticket": intent.ticket.value(),
+            "core_operation_key": intent.operation_key.value(),
+            "result": answer.result_text(),
+            "reconciled": "ledger_query",
+        });
+        if let LedgerResult::Applied {
+            queued_bytes: Some(queued_bytes),
+            ..
+        } = &answer
+        {
+            evidence["queued_bytes"] = json!(queued_bytes);
+        }
+        current = match current.state.as_str() {
+            DISPATCHING => store.note_dispatch(
+                &ticket_for(&current),
+                "core_ledger_result",
+                "core_ledger_reconcile",
+                Some(&evidence),
+                now_ms(),
+            )?,
+            UNKNOWN => store.note_unknown(
+                &current,
+                "core_ledger_result",
+                "core_ledger_reconcile",
+                Some(&evidence),
+                now_ms(),
+            )?,
+            _ => return Ok(()),
+        };
+    }
+    let current = store
+        .get(&operation_key)?
+        .ok_or("operation disappeared during core ledger reconciliation")?;
+    apply_two_step(store, &current)?;
+    Ok(())
 }
 
 fn recorded_prompt_core_state(record: &Record) -> Option<&'static str> {
@@ -7766,5 +8794,1444 @@ mod tests {
             .execute_within(&keys_params(), Duration::from_millis(100))
             .await;
         assert_eq!(refused.unwrap_err(), STOPPING);
+    }
+
+    // ---- two-step prompt (cursor) -------------------------------------------
+
+    fn two_step_params(submit: Value) -> Value {
+        let mut params = json!({
+            "operation": "prompt",
+            "pane_id": "%3",
+            "expected": {
+                "pane_id": "%3",
+                "boot": "boot",
+                "generation": "1",
+                "run": "run",
+                "meta_digest": "a".repeat(64),
+                "tracked_digest": "b".repeat(64),
+                "foreground_pgid": "42",
+                "process_epoch": "42:1",
+                "expected_output_generation": "9",
+                "expected_title": "title",
+                "expected_progress": "progress"
+            },
+            "text": "word",
+            "operation_id": null,
+            "queued": null,
+            "needs_bracket": false,
+            "checkpoint": false
+        });
+        if !submit.is_null() {
+            params["submit"] = submit;
+        }
+        params
+    }
+
+    #[test]
+    fn the_prompt_request_names_its_submit_plan() {
+        assert!(matches!(
+            ControlAction::parse(&two_step_params(json!("enter"))),
+            Ok(ControlAction::Prompt {
+                submit: SubmitPlan::Enter,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ControlAction::parse(&two_step_params(json!("two_step"))),
+            Ok(ControlAction::Prompt {
+                submit: SubmitPlan::TwoStep,
+                ..
+            })
+        ));
+        for bad in [
+            json!("none"),
+            json!("Enter"),
+            json!(""),
+            json!(true),
+            Value::Null,
+        ] {
+            let error = ControlAction::parse(&two_step_params(bad)).err().unwrap();
+            assert_eq!(error, "invalid_action: prompt submit is invalid");
+        }
+    }
+
+    #[test]
+    fn a_plan_the_provider_does_not_get_is_refused_before_anything_is_sent() {
+        assert!(plan_mismatch(SubmitPlan::TwoStep, "cursor").is_ok());
+        assert!(plan_mismatch(SubmitPlan::Enter, "codex").is_ok());
+        assert_eq!(
+            plan_mismatch(SubmitPlan::Enter, "cursor").unwrap_err(),
+            "invalid_action: prompt submit enter does not match cursor; nothing was sent"
+        );
+        assert_eq!(
+            plan_mismatch(SubmitPlan::TwoStep, "codex").unwrap_err(),
+            "invalid_action: prompt submit two_step does not match codex; nothing was sent"
+        );
+    }
+
+    #[test]
+    fn a_two_step_paste_is_always_bracketed_and_leaves_the_enter_out() {
+        assert_eq!(
+            input_commit_shape(SubmitPlan::TwoStep, false),
+            (true, "none")
+        );
+        assert_eq!(
+            input_commit_shape(SubmitPlan::TwoStep, true),
+            (true, "none")
+        );
+        assert_eq!(
+            input_commit_shape(SubmitPlan::Enter, false),
+            (false, "enter")
+        );
+        assert_eq!(input_commit_shape(SubmitPlan::Enter, true), (true, "enter"));
+        let (bracketed, submit) = input_commit_shape(SubmitPlan::TwoStep, false);
+        let text = input_payload_text(3, "prompt-1", bracketed, submit, "dg");
+        assert_eq!(text, "input:3:prompt-1:true:none:dg");
+        assert!(text.contains(":true:none:"));
+        // The plan that presses Enter in the same turn is unchanged.
+        assert_eq!(
+            input_payload_text(3, "prompt-1", false, "enter", "dg"),
+            "input:3:prompt-1:false:enter:dg"
+        );
+    }
+
+    const PASTE: DispatchTicket = DispatchTicket { epoch: 2, seq: 7 };
+    const ENTER: DispatchTicket = DispatchTicket { epoch: 2, seq: 8 };
+
+    fn two_step_key() -> OperationKey {
+        durable_key_for_boot(Path::new("/tmp/two-step.sock"), "boot", "nonce", "op")
+    }
+
+    fn row(ordinal: u32, stage: &str, evidence: Value) -> ReceiptRow {
+        ReceiptRow {
+            ordinal,
+            stage: stage.into(),
+            source: "core_ledger".into(),
+            evidence: Some(evidence),
+            at_ms: 0,
+        }
+    }
+
+    fn two_step_intent(sqlite_ticket: &str) -> Value {
+        let mut intent = core_intent(&two_step_key(), PASTE);
+        intent["slot"] = json!(1);
+        intent["ticket"] = json!(sqlite_ticket);
+        intent["submit"] = json!("two_step");
+        intent
+    }
+
+    /// A step's result receipt: `result` as the core says it, `bytes` for a
+    /// paste that reports its queued bytes.
+    fn step_evidence(ticket: DispatchTicket, result: &str, bytes: Option<u64>) -> Value {
+        let mut evidence =
+            core_result_evidence(&two_step_key(), ticket, "d".repeat(64).as_str(), result);
+        if let Some(bytes) = bytes {
+            evidence["queued_bytes"] = json!(bytes);
+        }
+        evidence
+    }
+
+    /// What a step left in the receipts: nothing, or this result.
+    type Seen = Option<(&'static str, Option<u64>)>;
+
+    /// A prompt record with the paste's result and, if `enter` is `Some`, the
+    /// Enter's intent and (inside) its result.
+    fn two_step_record(state: &str, paste: Seen, enter: Option<Seen>) -> Record {
+        let mut receipts = vec![row(1, "dispatch_intent", two_step_intent("t1"))];
+        if let Some((result, bytes)) = paste {
+            receipts.push(row(
+                2,
+                "core_action_result",
+                step_evidence(PASTE, result, bytes),
+            ));
+        }
+        if let Some(enter) = enter {
+            let mut intent = core_intent(&two_step_key(), ENTER);
+            intent["step"] = json!("enter");
+            receipts.push(row(3, "core_dispatch_ticket", intent));
+            if let Some((result, bytes)) = enter {
+                receipts.push(row(
+                    4,
+                    "core_action_result",
+                    step_evidence(ENTER, result, bytes),
+                ));
+            }
+        }
+        Record {
+            op: 1,
+            operation_key: "run:r1/prompt/1".into(),
+            action: "prompt".into(),
+            id: "1".into(),
+            explicit: true,
+            target: "%1".into(),
+            run: Some("r1".into()),
+            boot: "boot".into(),
+            digest: "digest".into(),
+            payload_bytes: 4,
+            state: state.into(),
+            ticket: "t1".into(),
+            attempts: 1,
+            lease_until_ms: 0,
+            created_ms: 0,
+            updated_ms: 0,
+            compacted_ms: None,
+            receipts,
+        }
+    }
+
+    #[test]
+    fn decide_two_step_follows_the_table() {
+        use TwoStepDecision::{Final, StayUnknown};
+        let applied: Seen = Some(("applied", None));
+        let pasted: Seen = Some(("applied", Some(5)));
+        let rows: Vec<(Seen, Option<Seen>, TwoStepDecision)> = vec![
+            // Enter intent present: its result decides, whatever the paste says.
+            (pasted, Some(applied), Final("delivered")),
+            (pasted, Some(Some(("applied", Some(1)))), Final("delivered")),
+            (None, Some(applied), Final("delivered")),
+            (
+                Some(("rejected_before_effect", None)),
+                Some(applied),
+                Final("delivered"),
+            ),
+            (
+                pasted,
+                Some(Some(("rejected_before_effect", None))),
+                StayUnknown("paste_only"),
+            ),
+            (
+                pasted,
+                Some(Some(("not_applied", None))),
+                StayUnknown("paste_only"),
+            ),
+            (
+                pasted,
+                Some(Some(("ticket_gap", None))),
+                StayUnknown("enter_unknown"),
+            ),
+            (pasted, Some(None), StayUnknown("enter_unknown")),
+            (None, Some(None), StayUnknown("enter_unknown")),
+            // No Enter intent: the paste decides.
+            (pasted, None, StayUnknown("paste_only")),
+            (applied, None, StayUnknown("paste_unconfirmed")),
+            (
+                Some(("rejected_before_effect", None)),
+                None,
+                Final("rejected_before_effect"),
+            ),
+            (Some(("not_applied", None)), None, Final("not_applied")),
+            (
+                Some(("epoch_closed", None)),
+                None,
+                StayUnknown("paste_unknown"),
+            ),
+            (None, None, StayUnknown("paste_unknown")),
+        ];
+        for (paste, enter, wanted) in rows {
+            for state in [super::super::operations::DISPATCHING, UNKNOWN] {
+                let record = two_step_record(state, paste, enter);
+                assert_eq!(
+                    decide_two_step(&record),
+                    wanted,
+                    "{state}: paste {paste:?}, enter {enter:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_third_core_intent_is_not_decided() {
+        let mut record = two_step_record(
+            UNKNOWN,
+            Some(("applied", Some(5))),
+            Some(Some(("applied", None))),
+        );
+        let mut intent = core_intent(&two_step_key(), DispatchTicket { epoch: 2, seq: 9 });
+        intent["step"] = json!("enter");
+        record.receipts.push(row(5, "core_dispatch_ticket", intent));
+        assert_eq!(
+            decide_two_step(&record),
+            TwoStepDecision::StayUnknown("unexpected_intents")
+        );
+    }
+
+    #[test]
+    fn a_result_inside_a_failed_receipt_commit_still_counts() {
+        // `finish_admitted` wraps the evidence it could not commit.
+        let mut record = two_step_record(UNKNOWN, Some(("applied", Some(5))), Some(None));
+        record.receipts.push(row(
+            5,
+            "outcome_unknown",
+            json!({
+                "path": "core_ledger",
+                "receipt_error": "disk",
+                "evidence": step_evidence(ENTER, "applied", None),
+            }),
+        ));
+        assert_eq!(
+            decide_two_step(&record),
+            TwoStepDecision::Final("delivered")
+        );
+    }
+
+    #[test]
+    fn only_the_current_attempt_is_judged() {
+        // A key tried again keeps the older attempt's receipts. The older
+        // attempt had an Enter; the current one only a paste.
+        let mut record = two_step_record(
+            UNKNOWN,
+            Some(("applied", Some(5))),
+            Some(Some(("applied", None))),
+        );
+        record.ticket = "t2".into();
+        let mut intent = core_intent(&two_step_key(), DispatchTicket { epoch: 3, seq: 1 });
+        intent["ticket"] = json!("t2");
+        intent["submit"] = json!("two_step");
+        record.receipts.push(row(5, "dispatch_intent", intent));
+        record.receipts.push(row(
+            6,
+            "core_action_result",
+            core_result_evidence(
+                &two_step_key(),
+                DispatchTicket { epoch: 3, seq: 1 },
+                &"d".repeat(64),
+                "applied",
+            ),
+        ));
+        assert!(is_two_step(&record));
+        assert_eq!(
+            decide_two_step(&record),
+            TwoStepDecision::StayUnknown("paste_unconfirmed")
+        );
+    }
+
+    #[test]
+    fn only_a_two_step_intent_marks_a_two_step_record() {
+        let record = two_step_record(UNKNOWN, None, None);
+        assert!(is_two_step(&record));
+        let mut plain = record.clone();
+        plain.receipts[0].evidence.as_mut().unwrap()["submit"] = json!("enter");
+        assert!(!is_two_step(&plain));
+        plain.receipts[0]
+            .evidence
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("submit");
+        assert!(!is_two_step(&plain));
+        let mut other = record;
+        other.action = "interrupt".into();
+        assert!(!is_two_step(&other));
+    }
+
+    // The crash windows, against a real operation store in both states a
+    // reconcile can find the record in.
+
+    fn temp_store() -> (Store, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(format!("masil-two-step-{}", nonce().unwrap()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        (
+            Store::open_at(&directory.join("ops.sqlite3")).unwrap(),
+            directory,
+        )
+    }
+
+    fn admit_two_step(store: &mut Store) -> Ticket {
+        let digest = "d".repeat(8);
+        let request = NewOperation {
+            namespace: "run:r1",
+            action: "prompt",
+            id: "1",
+            explicit: true,
+            target: "%1",
+            run: Some("r1"),
+            boot: "boot",
+            digest: &digest,
+            payload_bytes: 4,
+        };
+        let mut intent = core_intent(&two_step_key(), PASTE);
+        intent["slot"] = json!(1);
+        intent["submit"] = json!("two_step");
+        match store
+            .admit_prompt(&request, intent, 10, Some(1), None)
+            .unwrap()
+            .0
+        {
+            Admission::Dispatch(ticket) => ticket,
+            other => panic!("expected dispatch, got {other:?}"),
+        }
+    }
+
+    fn note(store: &mut Store, ticket: &Ticket, stage: &str, evidence: Value) {
+        store
+            .note_dispatch(ticket, stage, "core_ledger", Some(&evidence), 11)
+            .unwrap();
+    }
+
+    fn enter_intent_evidence() -> Value {
+        let mut intent = core_intent(&two_step_key(), ENTER);
+        intent["step"] = json!("enter");
+        intent
+    }
+
+    fn entry(ticket: DispatchTicket, result: LedgerResult) -> LedgerEntry {
+        LedgerEntry {
+            ticket,
+            operation_id: two_step_key().operation_id,
+            operation_key_digest: two_step_key().ledger_digest(),
+            operation_key: two_step_key(),
+            payload_digest: "a".repeat(64),
+            result,
+        }
+    }
+
+    fn applied(ticket: DispatchTicket, queued_bytes: Option<u64>) -> LedgerResult {
+        LedgerResult::Applied {
+            ticket,
+            result_digest: "d".repeat(64),
+            queued_bytes,
+            launch: None,
+        }
+    }
+
+    /// Runs the reconcile steps of one two-step record: records each retained
+    /// entry, asks the scripted core about each ticket that has no receipt
+    /// (`answers`, by ticket), then settles it. `unknown` first moves the
+    /// record to `outcome_unknown` after `setup`, as a crash window can leave
+    /// it. Returns the record afterwards.
+    async fn reconcile_case(
+        unknown: bool,
+        setup: impl FnOnce(&mut Store, &Ticket),
+        retained: Vec<LedgerEntry>,
+        answers: Vec<(DispatchTicket, &'static str)>,
+    ) -> Record {
+        let (mut store, directory) = temp_store();
+        let ticket = admit_two_step(&mut store);
+        setup(&mut store, &ticket);
+        if unknown {
+            store
+                .finish(
+                    &ticket,
+                    UNKNOWN,
+                    "core_ledger",
+                    Some(&json!({"path": "core_ledger", "error": "crash"})),
+                    12,
+                )
+                .unwrap();
+        }
+        reconcile_passes(store, directory, ticket, retained, answers).await
+    }
+
+    /// The reconcile steps of `reconcile_case`, for a record already in the
+    /// store: records each retained entry, then two passes of the settle.
+    async fn reconcile_passes(
+        mut store: Store,
+        directory: PathBuf,
+        ticket: Ticket,
+        retained: Vec<LedgerEntry>,
+        answers: Vec<(DispatchTicket, &'static str)>,
+    ) -> Record {
+        let mut current = store.get(&ticket.key).unwrap().unwrap();
+        let mut kept = HashSet::new();
+        for listed in &retained {
+            current = record_two_step_entry(&mut store, current, listed).unwrap();
+            kept.insert((listed.ticket, listed.operation_key.ledger_digest()));
+        }
+        let (mut core, _frames, mut received) = wired_test_client();
+        let script = tokio::spawn(async move {
+            while let Some(request) = received.recv().await {
+                let asked = DispatchTicket::parse(request.value.get("dispatch_ticket")).unwrap();
+                let result = answers
+                    .iter()
+                    .find(|(ticket, _)| *ticket == asked)
+                    .map_or("not_applied", |(_, result)| *result);
+                let reply = if result == "receipt_not_retained" {
+                    json!({"v": 1, "kind": "error", "request_id": request.request_id,
+                        "code": "receipt_not_retained", "message": "gone"})
+                } else {
+                    json!({"v": 1, "kind": "ledger_query", "request_id": request.request_id,
+                        "dispatch_ticket": asked.value(), "result": result,
+                        "result_digest": "e".repeat(64)})
+                };
+                let _ = request.reply.send(Ok(reply));
+            }
+        });
+        reconcile_two_step(&mut store, &mut core, &kept, current)
+            .await
+            .unwrap();
+        script.abort();
+        let record = store.get(&ticket.key).unwrap().unwrap();
+        // Reconcile runs on every connection: a second pass changes nothing.
+        let before = record.receipts.len();
+        let again = store.get(&ticket.key).unwrap().unwrap();
+        let (mut core, _frames, mut received) = wired_test_client();
+        let script = tokio::spawn(async move {
+            while let Some(request) = received.recv().await {
+                let asked = DispatchTicket::parse(request.value.get("dispatch_ticket")).unwrap();
+                let _ = request.reply.send(Ok(json!({"v": 1, "kind": "ledger_query",
+                    "request_id": request.request_id, "dispatch_ticket": asked.value(),
+                    "result": "not_applied", "result_digest": "e".repeat(64)})));
+            }
+        });
+        reconcile_two_step(&mut store, &mut core, &kept, again)
+            .await
+            .unwrap();
+        script.abort();
+        let record_again = store.get(&ticket.key).unwrap().unwrap();
+        assert_eq!(record_again.state, record.state);
+        assert_eq!(
+            record_again.receipts.len(),
+            before,
+            "a second pass added a receipt"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+        record
+    }
+
+    fn says(record: &Record, label: &str) -> bool {
+        record
+            .receipts
+            .iter()
+            .rev()
+            .filter_map(|receipt| receipt.evidence.as_ref())
+            .any(|evidence| evidence["two_step"] == label)
+    }
+
+    fn pasted_result(store: &mut Store, ticket: &Ticket) {
+        let mut evidence = step_evidence(PASTE, "applied", Some(5));
+        evidence["step"] = json!("paste");
+        note(store, ticket, "core_action_result", evidence);
+    }
+
+    #[tokio::test]
+    async fn w1_a_retained_paste_with_no_recorded_result_stays_unknown() {
+        for unknown in [false, true] {
+            let record = reconcile_case(
+                unknown,
+                |_, _| {},
+                vec![entry(PASTE, applied(PASTE, Some(5)))],
+                vec![],
+            )
+            .await;
+            assert_eq!(record.state, UNKNOWN, "unknown={unknown}");
+            assert!(says(&record, "paste_only"), "unknown={unknown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn w2_a_recorded_paste_with_no_enter_stays_unknown() {
+        for unknown in [false, true] {
+            let record = reconcile_case(unknown, pasted_result, vec![], vec![]).await;
+            assert_eq!(record.state, UNKNOWN, "unknown={unknown}");
+            assert!(says(&record, "paste_only"), "unknown={unknown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn w3_an_enter_that_never_reached_the_core_leaves_the_paste_only() {
+        for unknown in [false, true] {
+            let record = reconcile_case(
+                unknown,
+                |store, ticket| {
+                    pasted_result(store, ticket);
+                    note(
+                        store,
+                        ticket,
+                        "core_dispatch_ticket",
+                        enter_intent_evidence(),
+                    );
+                },
+                vec![],
+                vec![(ENTER, "not_applied")],
+            )
+            .await;
+            assert_eq!(record.state, UNKNOWN, "unknown={unknown}");
+            assert!(says(&record, "paste_only"), "unknown={unknown}");
+            // The query answer is kept as the Enter's receipt.
+            assert!(record.receipts.iter().any(|receipt| {
+                receipt.evidence.as_ref().is_some_and(|evidence| {
+                    evidence["reconciled"] == "ledger_query"
+                        && evidence["result"] == "not_applied"
+                        && evidence["core_ticket"] == ENTER.value()
+                })
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn w3_an_enter_the_core_cannot_vouch_for_is_unknown_not_paste_only() {
+        let record = reconcile_case(
+            true,
+            |store, ticket| {
+                pasted_result(store, ticket);
+                note(
+                    store,
+                    ticket,
+                    "core_dispatch_ticket",
+                    enter_intent_evidence(),
+                );
+            },
+            vec![],
+            vec![(ENTER, "receipt_not_retained")],
+        )
+        .await;
+        // The core's "receipt not retained" is an answer, and it proves
+        // nothing about the Enter.
+        assert_eq!(record.state, UNKNOWN);
+        assert!(says(&record, "enter_unknown"));
+        assert!(!says(&record, "paste_only"));
+    }
+
+    #[tokio::test]
+    async fn w4_a_retained_enter_with_no_recorded_result_is_delivered() {
+        for unknown in [false, true] {
+            // The paste's retained entry and the Enter's, in either order.
+            for paste_first in [true, false] {
+                let mut retained = vec![
+                    entry(PASTE, applied(PASTE, Some(5))),
+                    entry(ENTER, applied(ENTER, None)),
+                ];
+                if !paste_first {
+                    retained.reverse();
+                }
+                let record = reconcile_case(
+                    unknown,
+                    |store, ticket| {
+                        note(
+                            store,
+                            ticket,
+                            "core_dispatch_ticket",
+                            enter_intent_evidence(),
+                        );
+                    },
+                    retained,
+                    vec![],
+                )
+                .await;
+                assert_eq!(
+                    record.state, "delivered",
+                    "unknown={unknown} first={paste_first}"
+                );
+            }
+            // The paste's result is in SQLite and only the Enter is retained.
+            let record = reconcile_case(
+                unknown,
+                |store, ticket| {
+                    pasted_result(store, ticket);
+                    note(
+                        store,
+                        ticket,
+                        "core_dispatch_ticket",
+                        enter_intent_evidence(),
+                    );
+                },
+                vec![entry(ENTER, applied(ENTER, None))],
+                vec![],
+            )
+            .await;
+            assert_eq!(record.state, "delivered", "unknown={unknown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn w5_a_recorded_enter_result_is_delivered() {
+        for unknown in [false, true] {
+            let record = reconcile_case(
+                unknown,
+                |store, ticket| {
+                    pasted_result(store, ticket);
+                    note(
+                        store,
+                        ticket,
+                        "core_dispatch_ticket",
+                        enter_intent_evidence(),
+                    );
+                    note(
+                        store,
+                        ticket,
+                        "core_action_result",
+                        step_evidence(ENTER, "applied", None),
+                    );
+                },
+                vec![],
+                vec![],
+            )
+            .await;
+            assert_eq!(record.state, "delivered", "unknown={unknown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn w6_a_retained_rejected_enter_leaves_the_paste_only() {
+        for unknown in [false, true] {
+            let rejected = LedgerResult::RejectedBeforeEffect {
+                ticket: ENTER,
+                reason: "output_changed".into(),
+                result_digest: "d".repeat(64),
+            };
+            let record = reconcile_case(
+                unknown,
+                |store, ticket| {
+                    pasted_result(store, ticket);
+                    note(
+                        store,
+                        ticket,
+                        "core_dispatch_ticket",
+                        enter_intent_evidence(),
+                    );
+                },
+                vec![entry(ENTER, rejected)],
+                vec![],
+            )
+            .await;
+            assert_eq!(record.state, UNKNOWN, "unknown={unknown}");
+            assert!(says(&record, "paste_only"), "unknown={unknown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn w7_a_rejected_paste_with_no_enter_frees_the_prompt() {
+        for unknown in [false, true] {
+            let rejected = LedgerResult::RejectedBeforeEffect {
+                ticket: PASTE,
+                reason: "bracket_mode_off".into(),
+                result_digest: "d".repeat(64),
+            };
+            let record =
+                reconcile_case(unknown, |_, _| {}, vec![entry(PASTE, rejected)], vec![]).await;
+            assert_eq!(record.state, "rejected_before_effect", "unknown={unknown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paste_the_core_never_received_is_not_applied() {
+        for unknown in [false, true] {
+            let record =
+                reconcile_case(unknown, |_, _| {}, vec![], vec![(PASTE, "not_applied")]).await;
+            assert_eq!(record.state, "not_applied", "unknown={unknown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn w9_a_rejection_the_coordinator_recorded_is_not_recorded_again() {
+        let (mut store, directory) = temp_store();
+        let ticket = admit_two_step(&mut store);
+        pasted_result(&mut store, &ticket);
+        note(
+            &mut store,
+            &ticket,
+            "core_dispatch_ticket",
+            enter_intent_evidence(),
+        );
+        // What `two_step_enter` writes for a rejected Enter.
+        let (mut core, _frames) = test_client();
+        let mut extra = core_result_evidence(
+            &two_step_key(),
+            ENTER,
+            &"d".repeat(64),
+            "rejected_before_effect",
+        );
+        extra["step"] = json!("enter");
+        let message = CoordinatorActions::finish_paste_only(
+            &mut store,
+            &mut core,
+            &ticket,
+            1,
+            "output_changed",
+            extra,
+        );
+        assert!(message.starts_with("outcome_unknown: "), "{message}");
+        assert!(message.contains("operation resolve run:r1/prompt/1 --as delivered|not-delivered"));
+        assert!(!core.broken);
+        let before = store.get(&ticket.key).unwrap().unwrap();
+        assert_eq!(before.state, UNKNOWN);
+        assert_eq!(
+            decide_two_step(&before),
+            TwoStepDecision::StayUnknown("paste_only")
+        );
+        // A later reconcile finds the same answer and adds nothing.
+        let (mut core, _frames, _received) = wired_test_client();
+        reconcile_two_step(&mut store, &mut core, &HashSet::new(), before.clone())
+            .await
+            .unwrap();
+        let after = store.get(&ticket.key).unwrap().unwrap();
+        assert_eq!(after.state, UNKNOWN);
+        assert_eq!(after.receipts.len(), before.receipts.len());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_paste_only_record_keeps_the_prompt_slot_taken() {
+        let (mut store, directory) = temp_store();
+        let ticket = admit_two_step(&mut store);
+        pasted_result(&mut store, &ticket);
+        let (mut core, _frames) = test_client();
+        let message = CoordinatorActions::finish_paste_only(
+            &mut store,
+            &mut core,
+            &ticket,
+            1,
+            "paste_not_drawn",
+            json!({}),
+        );
+        assert!(message.contains("(paste_not_drawn)"), "{message}");
+        let record = store.get(&ticket.key).unwrap().unwrap();
+        assert_eq!(record.state, UNKNOWN);
+        let last = record.receipts.last().unwrap().evidence.clone().unwrap();
+        assert_eq!(last["two_step"], "paste_only");
+        assert_eq!(last["reason"], "paste_not_drawn");
+        assert!(store.prompt_unresolved("r1").unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_tail_check_wants_exactly_the_pasted_lines_on_the_screen() {
+        let check = |before_screen: &str, text: &str| {
+            let token = super::super::prompt::tail_token(text).unwrap();
+            TailCheck {
+                before: super::super::prompt::count_line_tails(before_screen, &token),
+                added: super::super::prompt::count_line_tails(text, &token).max(1),
+                token,
+            }
+        };
+        let idle = "  Cursor\n\n  \u{2192} Plan, search, build anything\n  Auto\n  ~/mock\n";
+        let text = "say hello world";
+        let tail = check(idle, text);
+        assert_eq!((tail.before, tail.added), (0, 1));
+        // Drawn as the composer shows it.
+        let drawn = "  Cursor\n\n  \u{2192} say hello world\n  Auto\n  ~/mock\n";
+        assert_eq!(tail.shows_paste(drawn), Ok(()));
+        // Cleared since the paste, or never drawn.
+        assert_eq!(tail.shows_paste(idle), Err(0));
+        // Keys typed after the text.
+        let typed = "  Cursor\n\n  \u{2192} say hello world EXTRA\n  Auto\n";
+        assert_eq!(tail.shows_paste(typed), Err(0));
+        // The text is higher up the screen as an old answer and in the composer.
+        let old = "  \u{2192} say hello world\n  answer\n";
+        let tail = check(old, text);
+        assert_eq!(tail.before, 1);
+        assert_eq!(
+            tail.shows_paste("  \u{2192} say hello world\n  answer\n  \u{2192} say hello world\n"),
+            Ok(())
+        );
+        // Only the old copy is left: the composer is missing.
+        assert_eq!(tail.shows_paste(old), Err(1));
+        // Lines that repeat the last word each show it.
+        let multi = "first line\nsecond line\nthird line";
+        let tail = check(idle, multi);
+        assert_eq!((tail.before, tail.added), (0, 3));
+        let drawn = "  \u{2192} first line\n    second line\n    third line\n  Auto\n";
+        assert_eq!(tail.shows_paste(drawn), Ok(()));
+        assert_eq!(tail.shows_paste("  \u{2192} first line\n"), Err(1));
+    }
+
+    /// What the scripted core saw and how it answers a guarded Enter.
+    type CoreLog = std::sync::Arc<Mutex<Vec<Value>>>;
+
+    /// A core that answers each request: `enter` for the guarded action, an
+    /// acknowledgement for a retire. Every request is kept in the log.
+    fn scripted_core(
+        received: mpsc::Receiver<WireRequest>,
+        enter: impl Fn(&Value) -> Result<Value, Error> + Send + 'static,
+    ) -> (CoreLog, tokio::task::JoinHandle<()>) {
+        scripted_core_with(received, enter, true)
+    }
+
+    /// As `scripted_core`; with `retire_ok` false a retire is lost.
+    fn scripted_core_with(
+        mut received: mpsc::Receiver<WireRequest>,
+        enter: impl Fn(&Value) -> Result<Value, Error> + Send + 'static,
+        retire_ok: bool,
+    ) -> (CoreLog, tokio::task::JoinHandle<()>) {
+        let seen: CoreLog = Arc::default();
+        let log = Arc::clone(&seen);
+        let task = tokio::spawn(async move {
+            while let Some(request) = received.recv().await {
+                log.lock().unwrap().push(request.value.clone());
+                let kind = request.value["kind"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let reply = if kind == "retire_receipt" && !retire_ok {
+                    Err(Error::Lost("retire reply lost".into()))
+                } else if kind == "retire_receipt" {
+                    Ok(
+                        json!({"v": 1, "kind": "retire_receipt", "request_id": request.request_id,
+                        "dispatch_ticket": request.value["dispatch_ticket"], "retired": true}),
+                    )
+                } else {
+                    enter(&request.value).map(|mut reply| {
+                        if reply.get("request_id").is_none() && reply.get("v").is_some() {
+                            reply["request_id"] = json!(request.request_id);
+                        }
+                        reply
+                    })
+                };
+                let _ = request.reply.send(reply);
+            }
+        });
+        (seen, task)
+    }
+
+    fn ledger_error(code: &str) -> Value {
+        json!({"v": 1, "kind": "error", "code": code, "message": "scripted"})
+    }
+
+    fn guarded_reply(ticket: &Value, result: &str) -> Value {
+        json!({"v": 1, "kind": "guarded_action", "dispatch_ticket": ticket,
+            "result": result, "result_digest": "a".repeat(64)})
+    }
+
+    /// The agent a judged read returns for a cursor pane that shows its draft.
+    fn judged_cursor() -> Agent {
+        let mut agent: Agent = serde_json::from_value(json!({
+            "id": "c", "name": "c", "provider": "cursor", "pane_id": "%1",
+            "window_id": "@1", "workspace": "main", "cwd": "/tmp", "boot": "boot",
+            "generation": "1", "run": "r1", "process": "running", "state": "idle",
+            "evidence": {"state": "idle", "source": "screen"},
+            "seen": false, "revision": "1", "returned_idle": false,
+            "process_epoch": "42:1",
+        }))
+        .unwrap();
+        agent.output_generation = 9;
+        agent.title = "title".into();
+        agent.progress = "progress".into();
+        agent.tracked_encoded = "tracked".into();
+        agent.encoded = "meta".into();
+        agent.foreground_group = 42;
+        agent.foreground_command = "python3".into();
+        agent
+    }
+
+    /// Sends the Enter of a two-step prompt whose paste is recorded, with the
+    /// core answering as `enter` says. Returns the outcome, the record, the
+    /// client's broken flag and what the core saw.
+    async fn enter_case(
+        enter: impl Fn(&Value) -> Result<Value, Error> + Send + 'static,
+    ) -> (Result<Value, String>, Record, bool, Vec<Value>) {
+        enter_case_with(enter, true).await
+    }
+
+    /// As `enter_case`; with `retire_ok` false the core loses a retire's reply.
+    async fn enter_case_with(
+        enter: impl Fn(&Value) -> Result<Value, Error> + Send + 'static,
+        retire_ok: bool,
+    ) -> (Result<Value, String>, Record, bool, Vec<Value>) {
+        let (mut store, directory) = temp_store();
+        let ticket = admit_two_step(&mut store);
+        pasted_result(&mut store, &ticket);
+        let (mut core, _frames, received) = wired_test_client();
+        let (seen, task) = scripted_core_with(received, enter, retire_ok);
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        let outcome = actions
+            .send_two_step_enter(
+                &mut core,
+                &mut store,
+                &ticket,
+                &two_step_key(),
+                1,
+                &judged_cursor(),
+            )
+            .await;
+        task.abort();
+        let record = store.get(&ticket.key).unwrap().unwrap();
+        let broken = core.broken;
+        let seen = seen.lock().unwrap().clone();
+        std::fs::remove_dir_all(directory).unwrap();
+        (outcome, record, broken, seen)
+    }
+
+    fn final_evidence(record: &Record) -> Value {
+        record.receipts.last().unwrap().evidence.clone().unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_applied_enter_is_guarded_by_the_judged_screen_and_delivers() {
+        let (outcome, record, broken, seen) =
+            enter_case(|request| Ok(guarded_reply(&request["dispatch_ticket"], "applied"))).await;
+        let value = outcome.unwrap();
+        assert_eq!(value["stage"], "delivered");
+        assert_eq!(record.state, "delivered");
+        assert!(!broken);
+        let enter = &seen[0];
+        assert_eq!(enter["kind"], "guarded_action");
+        assert_eq!(enter["action"], json!({"kind": "keys", "keys": ["Enter"]}));
+        assert_eq!(enter["operation_key"], two_step_key().value());
+        assert_eq!(enter["retain"], true);
+        assert_eq!(enter["dispatch_ticket"], json!({"epoch": "2", "seq": "5"}));
+        let guards = &enter["preconditions"];
+        assert_eq!(guards["expected_output_generation"], "9");
+        assert_eq!(guards["expected_title"], "title");
+        assert_eq!(guards["expected_progress"], "progress");
+        assert_eq!(guards["tracked_digest"], digest("tracked"));
+        assert_eq!(guards["meta_digest"], digest("meta"));
+        // The Enter's ticket was recorded before it was sent; its result and
+        // the paste's receipt are retired.
+        let steps: Vec<_> = record
+            .receipts
+            .iter()
+            .filter_map(|row| row.evidence.as_ref())
+            .filter_map(|evidence| evidence["step"].as_str())
+            .collect();
+        assert_eq!(steps, ["paste", "enter", "enter"]);
+        assert_eq!(seen[1]["kind"], "retire_receipt");
+        assert_eq!(final_evidence(&record)["result"], "applied");
+    }
+
+    #[tokio::test]
+    async fn an_enter_the_core_proves_unsent_leaves_the_paste_only() {
+        type Answer = Box<dyn Fn(&Value) -> Result<Value, Error> + Send>;
+        // The last column: the core answered with a ledger slot, so the
+        // coordinator retires it. A refusal that reserved no ticket has none.
+        let cases: Vec<(&str, Answer, &str, bool)> = vec![
+            (
+                "output_changed",
+                Box::new(|request| {
+                    let mut reply = guarded_reply(
+                        &request["dispatch_ticket"],
+                        "rejected_before_effect:output_changed",
+                    );
+                    reply["result"] = json!("rejected_before_effect:output_changed");
+                    Ok(reply)
+                }),
+                "output_changed",
+                true,
+            ),
+            (
+                "not_applied",
+                Box::new(|request| Ok(guarded_reply(&request["dispatch_ticket"], "not_applied"))),
+                "enter_not_applied",
+                true,
+            ),
+            (
+                "ledger_full",
+                Box::new(|_| Ok(ledger_error("ledger_full"))),
+                "ledger_full",
+                false,
+            ),
+            (
+                "rejected",
+                Box::new(|_| Ok(ledger_error("invalid_action"))),
+                "invalid_action",
+                false,
+            ),
+        ];
+        for (name, answer, reason, retires) in cases {
+            let (outcome, record, broken, seen) = enter_case(answer).await;
+            let retired: Vec<_> = seen
+                .iter()
+                .filter(|request| request["kind"] == "retire_receipt")
+                .collect();
+            assert_eq!(retired.len(), usize::from(retires), "{name}: {seen:?}");
+            if let Some(retire) = retired.first() {
+                // The Enter's slot, by the digest the core answered with.
+                assert_eq!(
+                    retire["dispatch_ticket"], seen[0]["dispatch_ticket"],
+                    "{name}"
+                );
+                assert_eq!(retire["result_digest"], "a".repeat(64), "{name}");
+                assert_eq!(retire["operation_key"], two_step_key().value(), "{name}");
+            }
+            let message = outcome.unwrap_err();
+            assert!(
+                message.starts_with("outcome_unknown: "),
+                "{name}: {message}"
+            );
+            assert!(
+                message.contains(&format!("did not send Enter ({reason})")),
+                "{name}: {message}"
+            );
+            assert!(
+                message.contains("operation resolve run:r1/prompt/1 --as"),
+                "{name}: {message}"
+            );
+            assert_eq!(record.state, UNKNOWN, "{name}");
+            let evidence = final_evidence(&record);
+            assert_eq!(evidence["two_step"], "paste_only", "{name}");
+            assert_eq!(evidence["reason"], reason, "{name}");
+            assert_eq!(evidence["step"], "enter", "{name}");
+            // The client drops its connection on a bridge error reply it
+            // cannot map to a ledger result (`guarded_action_reply`), so the
+            // next coordinator reconciles; the answers above leave it alone.
+            assert_eq!(broken, name == "rejected", "{name}");
+            // The Enter's answer is on record for the next reconcile.
+            assert_eq!(
+                decide_two_step(&record),
+                TwoStepDecision::StayUnknown("paste_only"),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_retire_of_a_refused_enter_breaks_the_connection() {
+        let (outcome, record, broken, seen) = enter_case_with(
+            |request| Ok(guarded_reply(&request["dispatch_ticket"], "not_applied")),
+            false,
+        )
+        .await;
+        assert!(outcome.unwrap_err().contains("did not send Enter"));
+        assert_eq!(record.state, UNKNOWN);
+        assert!(broken, "the next coordinator reconciles the slot");
+        assert!(
+            seen.iter()
+                .any(|request| request["kind"] == "retire_receipt")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_enter_is_not_retired_when_its_final_write_fails() {
+        let (mut store, directory) = temp_store();
+        let ticket = admit_two_step(&mut store);
+        pasted_result(&mut store, &ticket);
+        let (mut core, _frames, received) = wired_test_client();
+        // While the core answers, another process finishes the operation, as
+        // a reconcile does after the lease expires. The final write of the
+        // Enter then fails, so its result is not durable.
+        let other = ticket.clone();
+        let path = directory.join("ops.sqlite3");
+        let (seen, task) = scripted_core(received, move |request| {
+            Store::open_at(&path)
+                .unwrap()
+                .finish(&other, UNKNOWN, "core_ledger", None, now_ms())
+                .unwrap();
+            Ok(guarded_reply(&request["dispatch_ticket"], "not_applied"))
+        });
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        let message = actions
+            .send_two_step_enter(
+                &mut core,
+                &mut store,
+                &ticket,
+                &two_step_key(),
+                1,
+                &judged_cursor(),
+            )
+            .await
+            .unwrap_err();
+        task.abort();
+        let seen = seen.lock().unwrap().clone();
+        let broken = core.broken;
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(seen[0]["kind"], "guarded_action", "{seen:?}");
+        // The slot stays in the core for the next coordinator to reconcile.
+        assert!(
+            seen.iter()
+                .all(|request| request["kind"] != "retire_receipt"),
+            "{seen:?}"
+        );
+        assert!(broken);
+        // The error keeps one leading code, and the hint to the person.
+        assert_eq!(
+            crate::managed::failure::classify(&message).1,
+            "outcome_unknown"
+        );
+        assert_eq!(message.matches("outcome_unknown:").count(), 1, "{message}");
+        assert!(
+            message.contains("did not send Enter (enter_not_applied)"),
+            "{message}"
+        );
+    }
+
+    /// `finish_admitted` marks the connection broken after a failed final
+    /// write, and a broken connection sends nothing. So the test above cannot
+    /// see the guard of `retire_enter_slot` itself; this one calls it on a
+    /// connection that is still healthy.
+    #[tokio::test]
+    async fn the_enter_slot_is_retired_only_with_a_durable_record() {
+        let (mut store, directory) = temp_store();
+        let ticket = admit_two_step(&mut store);
+        let durable = store.get(&ticket.key).unwrap().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        for (name, record) in [("no record", None), ("a record", Some(durable))] {
+            let (mut core, _frames, received) = wired_test_client();
+            let (seen, task) = scripted_core(received, |_| {
+                unreachable!("a retire is not a guarded action")
+            });
+            CoordinatorActions::retire_enter_slot(
+                &mut core,
+                &two_step_key(),
+                DispatchTicket { epoch: 2, seq: 5 },
+                &"a".repeat(64),
+                record.clone(),
+            )
+            .await;
+            task.abort();
+            let sent = seen.lock().unwrap().len();
+            assert_eq!(sent, usize::from(record.is_some()), "{name}");
+            assert!(!core.broken, "{name}");
+        }
+    }
+
+    /// A real Enter send whose reply the core loses or garbles, then the
+    /// reconcile of a replacement coordinator: `retained` are the ledger
+    /// entries it lists for the Enter's ticket (given the ticket), `query` is
+    /// what the core answers when asked about it.
+    async fn lost_enter_then_reconcile(
+        enter: impl Fn(&Value) -> Result<Value, Error> + Send + 'static,
+        retained: impl FnOnce(DispatchTicket) -> Vec<LedgerEntry>,
+        query: &'static str,
+    ) -> Record {
+        let (mut store, directory) = temp_store();
+        let ticket = admit_two_step(&mut store);
+        pasted_result(&mut store, &ticket);
+        let (mut core, _frames, received) = wired_test_client();
+        let (_seen, task) = scripted_core(received, enter);
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        let message = actions
+            .send_two_step_enter(
+                &mut core,
+                &mut store,
+                &ticket,
+                &two_step_key(),
+                1,
+                &judged_cursor(),
+            )
+            .await
+            .unwrap_err();
+        task.abort();
+        assert!(message.contains("its result is unknown"), "{message}");
+        let before = store.get(&ticket.key).unwrap().unwrap();
+        assert_eq!(before.state, UNKNOWN);
+        let enter_ticket = intents_in(attempt_receipts(&before))[1].ticket;
+        reconcile_passes(
+            store,
+            directory,
+            ticket,
+            retained(enter_ticket),
+            vec![(enter_ticket, query)],
+        )
+        .await
+    }
+
+    type EnterAnswer = Box<dyn Fn(&Value) -> Result<Value, Error> + Send>;
+
+    /// The two ways an Enter ends with a result the coordinator cannot read.
+    fn unreadable_enters() -> Vec<(&'static str, EnterAnswer)> {
+        let lost: EnterAnswer = Box::new(|_| Err(Error::Lost("peer closed".into())));
+        let gap: EnterAnswer = Box::new(|_| Ok(ledger_error("ticket_gap")));
+        vec![("lost", lost), ("ticket_gap", gap)]
+    }
+
+    #[tokio::test]
+    async fn an_enter_that_applied_but_whose_reply_was_lost_ends_delivered() {
+        for (name, answer) in unreadable_enters() {
+            let record = lost_enter_then_reconcile(
+                answer,
+                |enter| vec![entry(enter, applied(enter, None))],
+                "applied",
+            )
+            .await;
+            assert_eq!(record.state, "delivered", "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enter_that_never_reached_the_core_is_proved_unsent_and_paste_only() {
+        for (name, answer) in unreadable_enters() {
+            let record = lost_enter_then_reconcile(answer, |_| vec![], "not_applied").await;
+            assert_eq!(record.state, UNKNOWN, "{name}");
+            assert!(says(&record, "paste_only"), "{name}");
+            // The newest receipt is the verdict, not the earlier enter_unknown.
+            assert_eq!(final_evidence(&record)["two_step"], "paste_only", "{name}");
+            // The core's answer is the Enter's receipt, with its ticket.
+            assert!(
+                record.receipts.iter().any(|receipt| {
+                    receipt.evidence.as_ref().is_some_and(|evidence| {
+                        evidence["reconciled"] == "ledger_query"
+                            && evidence["result"] == "not_applied"
+                            && evidence["core_ticket"].is_object()
+                    })
+                }),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_final_write_keeps_the_composer_hint() {
+        let (mut store, directory) = temp_store();
+        let ticket = admit_two_step(&mut store);
+        pasted_result(&mut store, &ticket);
+        // The record is no longer dispatching, so the final write fails.
+        store
+            .finish(
+                &ticket,
+                UNKNOWN,
+                "core_ledger",
+                Some(&json!({"path": "core_ledger"})),
+                12,
+            )
+            .unwrap();
+        let (mut core, _frames) = test_client();
+        let pasted = CoordinatorActions::finish_paste_only(
+            &mut store,
+            &mut core,
+            &ticket,
+            1,
+            "paste_not_drawn",
+            json!({}),
+        );
+        let entered = CoordinatorActions::finish_enter_unknown(
+            &mut store,
+            &mut core,
+            &ticket,
+            1,
+            &enter_unknown_evidence(&two_step_key(), ENTER, "unknown", None),
+            "lost",
+        );
+        for message in [pasted, entered] {
+            assert!(message.starts_with("outcome_unknown: "), "{message}");
+            assert!(message.contains("could not be committed"), "{message}");
+            assert!(
+                message.contains("operation resolve run:r1/prompt/1 --as delivered|not-delivered"),
+                "{message}"
+            );
+        }
+        assert!(core.broken);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_busy_core_that_never_took_the_enter_leaves_the_paste_only() {
+        let (outcome, record, broken, _) = enter_case(|_| Ok(ledger_error("bridge_busy"))).await;
+        let message = outcome.unwrap_err();
+        assert!(
+            message.contains("did not send Enter (bridge_busy)"),
+            "{message}"
+        );
+        assert_eq!(record.state, UNKNOWN);
+        assert!(!broken);
+        assert_eq!(
+            decide_two_step(&record),
+            TwoStepDecision::StayUnknown("paste_only")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_enter_whose_fate_is_unknown_is_never_called_paste_only() {
+        type Answer = Box<dyn Fn(&Value) -> Result<Value, Error> + Send>;
+        let cases: Vec<(&str, Answer)> = vec![
+            (
+                "idempotency_conflict",
+                Box::new(|_| Ok(ledger_error("idempotency_conflict"))),
+            ),
+            (
+                "receipt_not_retained",
+                Box::new(|_| Ok(ledger_error("receipt_not_retained"))),
+            ),
+            ("ticket_gap", Box::new(|_| Ok(ledger_error("ticket_gap")))),
+            (
+                "epoch_closed",
+                Box::new(|_| Ok(ledger_error("epoch_closed"))),
+            ),
+            (
+                "epoch_unknown",
+                Box::new(|_| Ok(ledger_error("epoch_unknown"))),
+            ),
+            ("lost", Box::new(|_| Err(Error::Lost("peer closed".into())))),
+            (
+                "unavailable",
+                Box::new(|_| Err(Error::Unavailable("gone".into()))),
+            ),
+            ("protocol", Box::new(|_| Ok(json!({"v": 1})))),
+        ];
+        for (name, answer) in cases {
+            let (outcome, record, broken, _) = enter_case(answer).await;
+            let message = outcome.unwrap_err();
+            assert!(
+                message.starts_with("outcome_unknown: "),
+                "{name}: {message}"
+            );
+            assert!(
+                message.contains("masil sent Enter, but its result is unknown"),
+                "{name}: {message}"
+            );
+            assert!(!message.contains("did not send Enter"), "{name}: {message}");
+            assert_eq!(record.state, UNKNOWN, "{name}");
+            let evidence = final_evidence(&record);
+            assert_eq!(evidence["two_step"], "enter_unknown", "{name}");
+            // The Enter's ticket stays queryable: its intent is on record, and
+            // no receipt answers for it until reconcile records the core's.
+            let intents = intents_in(attempt_receipts(&record));
+            assert_eq!(intents.len(), 2, "{name}");
+            assert_eq!(
+                evidence["enter_ticket"],
+                intents[1].ticket.value(),
+                "{name}"
+            );
+            assert!(evidence.get("core_ticket").is_none(), "{name}");
+            assert!(
+                !has_ticket_receipt(&record, intents[1].ticket, &two_step_key()),
+                "{name}"
+            );
+            assert!(broken, "{name}: the next coordinator reconciles");
+            assert_eq!(
+                decide_two_step(&record),
+                TwoStepDecision::StayUnknown("enter_unknown"),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enter_ticket_that_cannot_be_recorded_is_not_sent() {
+        let (mut store, directory) = temp_store();
+        let ticket = admit_two_step(&mut store);
+        pasted_result(&mut store, &ticket);
+        // The record is no longer dispatching, so noting a ticket fails.
+        store
+            .finish(
+                &ticket,
+                UNKNOWN,
+                "core_ledger",
+                Some(&json!({"path": "core_ledger"})),
+                12,
+            )
+            .unwrap();
+        let (mut core, _frames, received) = wired_test_client();
+        let (seen, task) = scripted_core(received, |request| {
+            Ok(guarded_reply(&request["dispatch_ticket"], "applied"))
+        });
+        let actions = CoordinatorActions::new(
+            PathBuf::from("/nonexistent/masil-test.sock"),
+            Arc::new(PaneActionLocks::default()),
+        );
+        let message = actions
+            .send_two_step_enter(
+                &mut core,
+                &mut store,
+                &ticket,
+                &two_step_key(),
+                1,
+                &judged_cursor(),
+            )
+            .await
+            .unwrap_err();
+        task.abort();
+        assert!(message.starts_with("outcome_unknown: "), "{message}");
+        assert!(core.broken);
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_two_step_read_extra_covers_the_settle_and_the_enter() {
+        // The bridge client pauses 50, 100, 200 and 400 ms between five sends.
+        assert_eq!(busy_backoff_total(), Duration::from_millis(750));
+        assert_eq!(TWO_STEP_READ_EXTRA, Duration::from_millis(2_750));
     }
 }
