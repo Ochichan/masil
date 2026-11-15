@@ -24,12 +24,9 @@ pub(super) struct Preferences {
 
 impl Preferences {
     pub fn load() -> Self {
-        let path = std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
-            .filter(|p| p.is_absolute())
-            .map(|p| p.join("masil/ui.json"));
+        // The same directory as settings.conf.
+        let path =
+            super::settings::store::config_dir().map(|directory| directory.join("masil/ui.json"));
         Self::from_path(path)
     }
 

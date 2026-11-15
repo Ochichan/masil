@@ -333,6 +333,14 @@ impl App {
                         self.overlay = None;
                         self.one_effect(Action::Changes)
                     }
+                    KeyCode::Char('m') if self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::Dictate)
+                    }
+                    KeyCode::Char('c') if !self.managed => {
+                        self.overlay = None;
+                        self.one_effect(Action::CopyId)
+                    }
                     _ => Vec::new(),
                 }
             }
@@ -345,6 +353,9 @@ impl App {
                 self.focus = Focus::List;
                 self.dirty = true;
             }
+            // Search is one stop of the focus cycle, not its end.
+            KeyCode::Tab => self.cycle_focus(!key.modifiers.contains(KeyModifiers::SHIFT)),
+            KeyCode::BackTab => self.cycle_focus(false),
             KeyCode::Left => {
                 self.search_cursor = self.search_cursor.saturating_sub(1);
                 self.dirty = true;
@@ -395,6 +406,13 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Vec<Effect> {
         match mouse.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                if mouse.kind == MouseEventKind::Moved && self.drag.is_some() {
+                    // A plain move reports no held button: the release was
+                    // lost, so the drag ends here.
+                    self.drag = None;
+                    self.pressed = None;
+                    self.dirty = true;
+                }
                 if self.drag.is_some() {
                     self.update_drag(mouse.column, mouse.row);
                 } else {
@@ -997,7 +1015,8 @@ impl App {
         if self.compact && self.native_available {
             actions.push(Action::Expand);
         }
-        if !self.connected {
+        // The managed desk polls again every second and has no retry to run.
+        if !self.connected && !self.managed {
             actions.push(Action::Retry);
         }
         actions
@@ -1162,6 +1181,106 @@ mod tests {
                     "pending": true, "available": true}
             })).collect::<Vec<_>>()
         })
+    }
+
+    #[test]
+    fn a_plain_move_ends_a_drag_whose_release_was_lost() {
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        app.last_area = Rect::new(0, 0, 120, 30);
+        app.drag = Some(Drag::Divider {
+            start_x: 48,
+            start_width: 48,
+        });
+        let motion = |kind, column| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let now = Instant::now();
+        // A held button reports a drag and moves the divider.
+        app.handle(motion(MouseEventKind::Drag(MouseButton::Left), 52), now);
+        assert_eq!(app.divider_width, 52);
+        // No button is held on a plain move: the divider stays where it is.
+        app.dirty = false;
+        app.handle(motion(MouseEventKind::Moved, 70), now);
+        assert!(app.drag.is_none());
+        assert!(app.pressed.is_none());
+        assert!(app.dirty);
+        assert_eq!(app.divider_width, 52);
+        app.handle(motion(MouseEventKind::Moved, 80), now);
+        assert_eq!(app.divider_width, 52);
+    }
+
+    #[test]
+    fn tab_and_shift_tab_pass_through_the_search_field() {
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        let press = |app: &mut App, code| {
+            app.handle(
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                Instant::now(),
+            );
+        };
+        assert_eq!(app.focus, Focus::List);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.focus, Focus::Search);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.focus, Focus::Filters);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.focus, Focus::Header);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Search);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::List);
+        assert!(app.search.is_empty());
+    }
+
+    #[test]
+    fn the_context_menu_runs_every_key_it_prints() {
+        let press = |app: &mut App, key: char| {
+            app.overlay = Some(Overlay::Context);
+            let effects = app.handle(
+                Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                Instant::now(),
+            );
+            assert_eq!(app.overlay, None, "{key} closes the menu");
+            effects
+        };
+        let mut observer = App::new(false, Language::English, Theme::Dark);
+        observer.apply_snapshot(snapshot(&["alpha"]));
+        observer.set_connection(true, None);
+        observer.set_native_available(true);
+        assert!(matches!(
+            press(&mut observer, 'c').as_slice(),
+            [Effect::CopyId { value, .. }] if value == "alpha"
+        ));
+        let mut managed = App::new(false, Language::English, Theme::Dark);
+        managed.set_managed();
+        managed.apply_snapshot(snapshot(&["alpha"]));
+        managed.set_connection(true, None);
+        assert_eq!(
+            press(&mut managed, 'm'),
+            vec![Effect::Dictate { id: "alpha".into() }]
+        );
+        // Every listed action except Details has a key, and Details shows none.
+        for app in [&observer, &managed] {
+            for action in app.context_actions() {
+                let key = crate::ui::view::menu_shortcut(action);
+                assert_eq!(key.is_empty(), action == Action::Details, "{action:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_managed_desk_offers_no_retry_it_cannot_run() {
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        assert!(app.visible_actions().contains(&Action::Retry));
+        app.set_managed();
+        assert!(!app.connected);
+        assert!(!app.visible_actions().contains(&Action::Retry));
     }
 
     #[test]

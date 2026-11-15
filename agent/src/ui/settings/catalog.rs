@@ -230,6 +230,20 @@ pub(crate) const SETTINGS: &[Setting] = &[
         help_en: "Off gives clicks to the terminal; masil buttons and menus stop responding.",
         help_ko: "끄면 클릭이 터미널로 갑니다. masil 버튼과 메뉴는 반응하지 않습니다.",
     },
+    // The layer binds the click only while this is on when its keys
+    // section runs, so a change runs that section again.
+    Setting {
+        key: "@masil-open-links",
+        default: "off",
+        kind: Kind::Choices(ON_OFF),
+        group: Group::Input,
+        sections: &["keys"],
+        readback: None,
+        en: "Open links on click",
+        ko: "클릭으로 링크 열기",
+        help_en: "A click on an http or https link opens it when the program in the pane does not use the mouse.",
+        help_ko: "pane의 프로그램이 마우스를 쓰지 않을 때 http, https 링크를 클릭하면 엽니다.",
+    },
     Setting {
         key: "@masil-base-index",
         default: "0",

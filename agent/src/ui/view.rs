@@ -27,12 +27,16 @@ pub(super) struct Palette {
     pub(super) danger: Color,
     pub(super) success: Color,
     pub(super) track: Color,
+    /// The terminal theme: roles follow the host terminal's own colours, so
+    /// `muted` and `raised` are drawn by `muted_style` and `raise` instead.
+    pub(super) host: bool,
 }
 
 impl Palette {
     pub(super) fn for_theme(theme: Theme) -> Self {
         match theme {
             Theme::Dark => Self {
+                host: false,
                 canvas: Color::Rgb(12, 16, 22),
                 panel: Color::Rgb(20, 26, 34),
                 raised: Color::Rgb(31, 39, 49),
@@ -46,19 +50,23 @@ impl Palette {
                 track: Color::Rgb(48, 58, 69),
             },
             Theme::Light => Self {
+                host: false,
                 canvas: Color::Rgb(238, 242, 244),
                 panel: Color::Rgb(250, 251, 251),
                 raised: Color::Rgb(220, 227, 230),
                 text: Color::Rgb(25, 34, 41),
                 muted: Color::Rgb(84, 100, 111),
                 accent: Color::Rgb(0, 112, 127),
-                accent_text: Color::White,
+                accent_text: Color::Rgb(255, 255, 255),
                 warning: Color::Rgb(144, 84, 0),
                 danger: Color::Rgb(170, 42, 52),
                 success: Color::Rgb(22, 112, 54),
                 track: Color::Rgb(190, 202, 207),
             },
+            // `raised` and `muted` are fixed greys that a light host can
+            // make unreadable. They stay for callers that need a colour.
             Theme::Terminal => Self {
+                host: true,
                 canvas: Color::Reset,
                 panel: Color::Reset,
                 raised: Color::DarkGray,
@@ -81,6 +89,52 @@ impl Palette {
             Tone::Good => self.success,
             Tone::Warn => self.warning,
             Tone::Bad => self.danger,
+        }
+    }
+
+    /// Muted text. The terminal theme dims the host's own foreground, which
+    /// stays readable on a light and on a dark host.
+    pub(super) fn muted_style(self) -> Style {
+        if self.host {
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(self.muted)
+        }
+    }
+
+    /// Text in a semantic role.
+    pub(super) fn tone_style(self, tone: Tone) -> Style {
+        match tone {
+            Tone::Muted => self.muted_style(),
+            other => Style::default().fg(self.tone(other)),
+        }
+    }
+
+    /// The background to draw a raised region on, before `raise`.
+    pub(super) fn raised_fill(self) -> Color {
+        if self.host { Color::Reset } else { self.raised }
+    }
+
+    /// Finishes a raised region drawn on `raised_fill`. The terminal theme
+    /// has no raised colour of its own. It shows the region in reverse
+    /// video, which uses the host's own foreground and background. Dim is
+    /// removed there, because terminals differ on dim with reverse video.
+    pub(super) fn raise(self, frame: &mut Frame, rect: Rect) {
+        if !self.host {
+            return;
+        }
+        let rect = rect.intersection(frame.area());
+        let buffer = frame.buffer_mut();
+        for y in rect.top()..rect.bottom() {
+            for x in rect.left()..rect.right() {
+                if let Some(cell) = buffer.cell_mut((x, y)) {
+                    cell.set_fg(Color::Reset).set_bg(Color::Reset);
+                    cell.modifier.remove(Modifier::DIM);
+                    cell.modifier.insert(Modifier::REVERSED);
+                }
+            }
         }
     }
 }
@@ -309,16 +363,16 @@ impl App {
             area.width,
             area.height
         );
-        for (text, color) in [
-            (tr(self.language, Text::MinimumSize), palette.muted),
-            (current.as_str(), palette.text),
+        for (text, style) in [
+            (tr(self.language, Text::MinimumSize), palette.muted_style()),
+            (current.as_str(), Style::default().fg(palette.text)),
         ] {
             if bottom <= inner.y + 1 {
                 break;
             }
             bottom -= 1;
             frame.render_widget(
-                Paragraph::new(clip(text, inner.width as usize)).style(Style::default().fg(color)),
+                Paragraph::new(clip(text, inner.width as usize)).style(style),
                 Rect::new(inner.x, bottom, inner.width, 1),
             );
         }
@@ -711,18 +765,14 @@ impl App {
             let placeholder = vec![
                 Span::styled(
                     "/ ",
-                    Style::default()
-                        .fg(if focused {
-                            palette.muted
-                        } else {
-                            palette.accent
-                        })
-                        .add_modifier(Modifier::BOLD),
+                    if focused {
+                        palette.muted_style()
+                    } else {
+                        Style::default().fg(palette.accent)
+                    }
+                    .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    tr(self.language, Text::Search),
-                    Style::default().fg(palette.muted),
-                ),
+                Span::styled(tr(self.language, Text::Search), palette.muted_style()),
             ];
             frame.render_widget(
                 Paragraph::new(clip_line(placeholder, field.width as usize)),
@@ -757,7 +807,8 @@ impl App {
                 false,
             );
         }
-        if focused && self.overlay.is_none() && field.width > 0 {
+        // A window above the desk places the cursor in its own field.
+        if focused && self.overlay.is_none() && !self.modal_open && field.width > 0 {
             let x = field
                 .x
                 .saturating_add(cursor_x.min(field.width.saturating_sub(1) as usize) as u16);
@@ -774,7 +825,7 @@ impl App {
                     .fg(palette.accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(palette.muted)
+                palette.muted_style()
             })
             .border_style(Style::default().fg(if focused {
                 palette.accent
@@ -785,8 +836,9 @@ impl App {
     }
 
     /// Activity column: a disconnected observer or unavailable source never
-    /// shows a current activity claim.
-    fn row_state(&self, row: &Observation) -> (&'static str, Tone) {
+    /// shows a current activity claim. `brief` asks for the short label of
+    /// an agent that waits for input, for a row with little room.
+    fn row_state(&self, row: &Observation, brief: bool) -> (&'static str, Tone) {
         if !self.connected {
             (tr(self.language, Text::LastKnown), Tone::Bad)
         } else if row.is_unavailable() {
@@ -794,10 +846,14 @@ impl App {
         } else {
             let tone = match row.activity.as_str() {
                 "working" => Tone::Good,
-                "retrying" => Tone::Warn,
+                "retrying" | "blocked" => Tone::Warn,
                 _ => Tone::Muted,
             };
-            (activity_label(self.language, &row.activity), tone)
+            if brief && row.activity == "blocked" {
+                (tr(self.language, Text::Waiting), tone)
+            } else {
+                (activity_label(self.language, &row.activity), tone)
+            }
         }
     }
 
@@ -863,11 +919,12 @@ impl App {
             .collect::<Vec<_>>();
         // Columns are sized from every filtered row, not just the visible
         // page, so they stay put while the list scrolls.
-        let state_width = rows
-            .iter()
-            .map(|row| cell_width(self.row_state(row).0))
-            .max()
-            .unwrap_or(0);
+        let state_column = |brief: bool| {
+            rows.iter()
+                .map(|row| cell_width(self.row_state(row, brief).0))
+                .max()
+                .unwrap_or(0)
+        };
         let id_width = rows
             .iter()
             .map(|row| cell_width(&row.id))
@@ -888,9 +945,16 @@ impl App {
         // One line keeps the whole attention column and at least a short
         // identity prefix; otherwise attention moves to a second line.
         let one_line_scroll = rows.len() > inner.height as usize;
-        let two_line = two_line
-            || 2 + id_width.min(MIN_ID_COLUMN) + 2 + state_width + 2 + short_attention
-                > inner.width.saturating_sub(u16::from(one_line_scroll)) as usize;
+        let one_line_width = inner.width.saturating_sub(u16::from(one_line_scroll)) as usize;
+        let fits = |state_width: usize| {
+            2 + id_width.min(MIN_ID_COLUMN) + 2 + state_width + 2 + short_attention
+                <= one_line_width
+        };
+        // The long label of an agent that waits for input is kept only
+        // where a one-line row has room for it beside the identity.
+        let brief = two_line || !fits(state_column(false));
+        let state_width = state_column(brief);
+        let two_line = two_line || !fits(state_width);
         let row_height = if two_line { 2 } else { 1 };
         let previous_page = self.list_page;
         self.list_page = (inner.height / row_height).max(1) as usize;
@@ -916,7 +980,7 @@ impl App {
             let top = (height / 3).min(height - lines.len()) as u16;
             frame.render_widget(
                 Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
-                    .style(Style::default().fg(palette.muted))
+                    .style(palette.muted_style())
                     .alignment(Alignment::Center),
                 inset_x(
                     Rect::new(inner.x, inner.y + top, inner.width, inner.height - top),
@@ -959,7 +1023,7 @@ impl App {
             let hovered = self.hover.as_ref() == Some(&target);
             frame.render_widget(
                 Block::default().style(Style::default().bg(if selected {
-                    palette.raised
+                    palette.raised_fill()
                 } else {
                     palette.panel
                 })),
@@ -967,34 +1031,31 @@ impl App {
             );
             let marker = Span::styled(
                 if selected || hovered { "› " } else { "  " },
-                Style::default()
-                    .fg(if selected {
-                        palette.accent
-                    } else {
-                        palette.muted
-                    })
-                    .add_modifier(Modifier::BOLD),
+                if selected {
+                    Style::default().fg(palette.accent)
+                } else {
+                    palette.muted_style()
+                }
+                .add_modifier(Modifier::BOLD),
             );
             let id_style = Style::default().fg(palette.text).add_modifier(if selected {
                 Modifier::BOLD
             } else {
                 Modifier::empty()
             });
-            let (state, state_tone) = self.row_state(observation);
-            let state_style = Style::default().fg(palette.tone(state_tone));
+            let (state, state_tone) = self.row_state(observation, brief);
+            let state_style = palette.tone_style(state_tone);
             let attention = self
                 .row_attention(observation, verbose)
                 .into_iter()
                 .map(|(text, tone, bold)| {
                     Span::styled(
                         text,
-                        Style::default()
-                            .fg(palette.tone(tone))
-                            .add_modifier(if bold {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
+                        palette.tone_style(tone).add_modifier(if bold {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1048,6 +1109,9 @@ impl App {
                     Paragraph::new(clip_line(line, content_width)),
                     Rect::new(rect.x, rect.y, rect.width, 1),
                 );
+            }
+            if selected {
+                palette.raise(frame, rect);
             }
             self.push_hit(rect, target, 1);
         }
@@ -1131,13 +1195,12 @@ impl App {
             let top = divider.y + divider.height.saturating_sub(grip) / 2;
             frame.render_widget(
                 Paragraph::new(vec![Line::from("┃"); grip as usize]).style(
-                    Style::default()
-                        .fg(if hovered {
-                            palette.accent
-                        } else {
-                            palette.muted
-                        })
-                        .add_modifier(Modifier::BOLD),
+                    if hovered {
+                        Style::default().fg(palette.accent)
+                    } else {
+                        palette.muted_style()
+                    }
+                    .add_modifier(Modifier::BOLD),
                 ),
                 Rect::new(divider.x, top, 1, grip),
             );
@@ -1225,7 +1288,7 @@ impl App {
         } else {
             match row.activity.as_str() {
                 "working" => Tone::Good,
-                "retrying" => Tone::Warn,
+                "retrying" | "blocked" => Tone::Warn,
                 "idle" => Tone::Normal,
                 _ => Tone::Muted,
             }
@@ -1308,11 +1371,15 @@ impl App {
             native,
             native_tone,
         ));
-        entries.push(Entry::Field(
-            tr(language, Text::Observed),
-            utc_timestamp(row.observed_at_ms),
-            Tone::Normal,
-        ));
+        // The managed desk stamps a row when its projection changes, not
+        // when it was last read, so it has no observation time to show.
+        if !self.managed {
+            entries.push(Entry::Field(
+                tr(language, Text::Observed),
+                utc_timestamp(row.observed_at_ms),
+                Tone::Normal,
+            ));
+        }
         let (binding, binding_tone) = match row.binding.as_str() {
             "explicit_unverified" => (Text::ConfiguredUnverified, Tone::Warn),
             "invalidated" => (Text::BindingInvalidated, Tone::Bad),
@@ -1411,7 +1478,7 @@ impl App {
             + 2;
         // Stack labels above values when two columns would squeeze values.
         let stacked = width < label_width + 20;
-        let muted = Style::default().fg(palette.muted);
+        let muted = palette.muted_style();
         let mut lines = Vec::new();
         for entry in entries {
             match entry {
@@ -1453,7 +1520,7 @@ impl App {
                         .map(|line| Line::styled(line, Style::default().fg(palette.text))),
                 ),
                 Entry::Field(label, value, tone) => {
-                    let value_style = Style::default().fg(palette.tone(tone));
+                    let value_style = palette.tone_style(tone);
                     if stacked {
                         lines.push(Line::styled(clip(label, width), muted));
                         lines.extend(wrap(&value, width.saturating_sub(2)).into_iter().map(
@@ -1583,12 +1650,12 @@ impl App {
         );
         let line = inset_x(area, gutter);
         let width = line.width as usize;
-        let color = if self.toast.is_some() {
-            palette.accent
+        let style = if self.toast.is_some() {
+            Style::default().fg(palette.accent)
         } else if self.connected {
-            palette.muted
+            palette.muted_style()
         } else {
-            palette.warning
+            Style::default().fg(palette.warning)
         };
         // A message may take every footer row except the server status
         // line's; a hint shortens to one row.
@@ -1607,7 +1674,7 @@ impl App {
         };
         for (index, text) in lines.iter().enumerate() {
             frame.render_widget(
-                Paragraph::new(text.as_str()).style(Style::default().fg(color)),
+                Paragraph::new(text.as_str()).style(style),
                 Rect::new(line.x, line.y + index as u16, line.width, 1),
             );
         }
@@ -1618,11 +1685,12 @@ impl App {
         if let Some((note, offline)) = &self.endpoint_line {
             frame.render_widget(
                 Paragraph::new(ellipsize(note, area.width as usize)).style(
-                    Style::default().bg(palette.panel).fg(if *offline {
-                        palette.warning
+                    if *offline {
+                        Style::default().fg(palette.warning)
                     } else {
-                        palette.muted
-                    }),
+                        palette.muted_style()
+                    }
+                    .bg(palette.panel),
                 ),
                 Rect::new(area.x, y, area.width, 1),
             );
@@ -1632,7 +1700,7 @@ impl App {
                     tr(self.language, Text::SharedSidebarShort),
                     width,
                 ))
-                .style(Style::default().fg(palette.muted)),
+                .style(palette.muted_style()),
                 Rect::new(line.x, y, line.width, 1),
             );
         }
@@ -1652,10 +1720,7 @@ impl App {
         if count == 0 {
             return Span::raw("");
         }
-        let label = match self.language {
-            Language::English => "Column windows: attention",
-            Language::Korean => "열 window 주의",
-        };
+        let label = tr(self.language, Text::ColumnsAttention);
         Span::styled(
             format!("  {label} {count}"),
             Style::default().fg(palette.warning),
@@ -1665,12 +1730,12 @@ impl App {
     fn inbox_span(&self, palette: Palette) -> Span<'static> {
         match self.inbox_label() {
             Some(label) => {
-                let color = if self.inbox.view.unseen > 0 || self.inbox.mismatch {
-                    palette.warning
+                let style = if self.inbox.view.unseen > 0 || self.inbox.mismatch {
+                    Style::default().fg(palette.warning)
                 } else {
-                    palette.muted
+                    palette.muted_style()
                 };
-                Span::styled(format!("  {label}"), Style::default().fg(color))
+                Span::styled(format!("  {label}"), style)
             }
             None => Span::raw(""),
         }
@@ -1743,12 +1808,7 @@ impl App {
             match item {
                 HelpItem::Gap => lines.push(Line::default()),
                 HelpItem::Group(name) => lines.extend(wrap(name, width).into_iter().map(|line| {
-                    Line::styled(
-                        line,
-                        Style::default()
-                            .fg(palette.muted)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    Line::styled(line, palette.muted_style().add_modifier(Modifier::BOLD))
                 })),
                 HelpItem::Note(text) => lines.extend(
                     wrap(text, width)
@@ -1884,7 +1944,7 @@ impl App {
             .iter()
             .map(|action| {
                 let mut control = Control::new(
-                    action_shortcut(*action),
+                    menu_shortcut(*action),
                     action_label(
                         self.language,
                         *action,
@@ -2027,45 +2087,58 @@ impl App {
             }
             _ => true,
         };
-        let (fg, key_fg, bg) = if !enabled {
-            (palette.muted, palette.muted, palette.panel)
+        let plain = |color: Color| Style::default().fg(color);
+        let muted = palette.muted_style();
+        // A focused disabled control keeps its muted text. The raised fill
+        // and a marker show where the focus is.
+        let focused_disabled = selected && !enabled;
+        let (label_style, key_style, bg, raised) = if !enabled {
+            let fill = if selected {
+                palette.raised_fill()
+            } else {
+                palette.panel
+            };
+            (muted, muted, fill, selected)
         } else if pressed {
-            (palette.accent_text, palette.accent_text, palette.warning)
+            let text = plain(palette.accent_text);
+            (text, text, palette.warning, false)
         } else if selected || hovered {
-            (palette.accent_text, palette.accent_text, palette.accent)
+            let text = plain(palette.accent_text);
+            (text, text, palette.accent, false)
         } else if control.key_right {
-            (palette.text, palette.muted, palette.panel)
+            (plain(palette.text), muted, palette.panel, false)
         } else {
             (
                 if control.quiet {
-                    palette.muted
+                    muted
                 } else {
-                    palette.text
+                    plain(palette.text)
                 },
-                palette.accent,
-                palette.raised,
+                plain(palette.accent),
+                palette.raised_fill(),
+                true,
             )
         };
-        let base = Style::default().fg(fg).bg(bg).add_modifier(if selected {
+        let weight = if selected {
             Modifier::BOLD
         } else {
             Modifier::empty()
-        });
+        };
+        let base = label_style.bg(bg).add_modifier(weight);
         let key = Span::styled(
             control.key.clone(),
-            base.fg(key_fg).add_modifier(if enabled {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
+            key_style
+                .bg(bg)
+                .add_modifier(if enabled { Modifier::BOLD } else { weight }),
         );
+        let lead = Span::styled(if focused_disabled { "›" } else { " " }, base);
         let spans = if control.key_right {
             let inner = (rect.width as usize).saturating_sub(2);
             let key_width = cell_width(&control.key);
             let label = clip(&control.label, inner.saturating_sub(key_width + 1));
             let gap = inner.saturating_sub(cell_width(&label) + key_width);
             vec![
-                Span::raw(" "),
+                lead,
                 Span::styled(label, base),
                 Span::raw(" ".repeat(gap)),
                 key,
@@ -2078,7 +2151,7 @@ impl App {
                 " "
             };
             vec![
-                Span::raw(" "),
+                lead,
                 key,
                 Span::raw(gap),
                 Span::styled(control.label.clone(), base),
@@ -2089,6 +2162,9 @@ impl App {
             Paragraph::new(clip_line(spans, rect.width as usize)).style(base),
             rect,
         );
+        if raised {
+            palette.raise(frame, rect);
+        }
         self.push_hit(rect, target, 1);
     }
 
@@ -2256,6 +2332,15 @@ pub(super) fn action_shortcut(action: Action) -> &'static str {
         Action::Dictate => "m",
         Action::Inbox => "i",
         Action::NextUnseen => "u",
+    }
+}
+
+/// The key printed beside an action in a menu or the palette. Enter runs
+/// the highlighted entry there, so Details shows no key of its own.
+pub(super) fn menu_shortcut(action: Action) -> &'static str {
+    match action {
+        Action::Details => "",
+        other => action_shortcut(other),
     }
 }
 
@@ -2501,7 +2586,8 @@ mod tests {
             "builder",
             "hook:claude",
             "Bash: cargo test",
-            "00:00:00",
+            // The event's time is this machine's local date and time.
+            crate::ui::inbox::local_stamp(0).as_str(),
         ] {
             assert!(text.contains(wanted), "{wanted} missing in\n{text}");
         }
@@ -2709,6 +2795,232 @@ mod tests {
                 .contains("열window주의1")
         );
         assert!(!header(Language::English, false).contains("Column windows"));
+    }
+
+    /// Draws `app` and returns its rows with the terminal it was drawn on.
+    fn rendered(app: &mut App, width: u16, height: u16) -> (Vec<String>, Terminal<TestBackend>) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, terminal)
+    }
+
+    fn ready(compact: bool, language: Language, theme: Theme) -> App {
+        let mut app = App::new(compact, language, theme);
+        app.apply_snapshot(snapshot());
+        app.set_connection(true, None);
+        app.set_native_available(true);
+        app
+    }
+
+    #[test]
+    fn a_focused_disabled_control_shows_where_the_focus_is() {
+        let mut value = snapshot();
+        value["observations"][0]["attention"]["pending"] = json!(false);
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        app.apply_snapshot(value);
+        app.set_connection(true, None);
+        assert!(!app.action_enabled(Action::MarkSeen));
+        let palette = Palette::for_theme(Theme::Dark);
+        let cell = |app: &mut App| {
+            let (_, terminal) = rendered(app, 100, 30);
+            let rect = app
+                .hits
+                .iter()
+                .find(|hit| hit.target == HitTarget::Action(Action::MarkSeen))
+                .unwrap()
+                .rect;
+            terminal.backend().buffer()[(rect.x, rect.y)].clone()
+        };
+        let idle = cell(&mut app);
+        assert_eq!((idle.symbol(), idle.bg), (" ", palette.panel));
+        app.focus = Focus::Actions;
+        app.action_focus = 0;
+        let focused = cell(&mut app);
+        assert_eq!(focused.symbol(), "›");
+        assert_eq!((focused.fg, focused.bg), (palette.muted, palette.raised));
+    }
+
+    #[test]
+    fn the_terminal_theme_uses_the_host_colours_for_muted_and_raised() {
+        let mut app = ready(false, Language::English, Theme::Terminal);
+        let (rows, terminal) = rendered(&mut app, 100, 30);
+        let buffer = terminal.backend().buffer();
+        // The selected row is in reverse video with no colour of its own.
+        let row = app
+            .hits
+            .iter()
+            .find(|hit| matches!(hit.target, HitTarget::Row { .. }))
+            .unwrap()
+            .rect;
+        for x in row.left()..row.right() {
+            let cell = &buffer[(x, row.y)];
+            assert!(cell.modifier.contains(Modifier::REVERSED));
+            assert!(!cell.modifier.contains(Modifier::DIM));
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset));
+        }
+        // Muted text is the host's foreground, dimmed: the search hint.
+        let (y, line) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("Search agents"))
+            .unwrap();
+        let x = line.chars().take_while(|c| *c != 'S').count() as u16;
+        let cell = &buffer[(x, y as u16)];
+        assert_eq!(cell.fg, Color::Reset);
+        assert!(cell.modifier.contains(Modifier::DIM));
+        // The fixed themes keep their colours and draw nothing reversed.
+        let mut dark = ready(false, Language::English, Theme::Dark);
+        let (_, terminal) = rendered(&mut dark, 100, 30);
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| !cell.modifier.intersects(Modifier::REVERSED | Modifier::DIM))
+        );
+        assert_eq!(
+            Palette::for_theme(Theme::Light).accent_text,
+            Color::Rgb(255, 255, 255)
+        );
+    }
+
+    #[test]
+    fn the_managed_inspector_shows_no_observation_time() {
+        let mut app = ready(false, Language::English, Theme::Dark);
+        let labels = |app: &App| {
+            app.inspector_entries()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    Entry::Field(label, _, _) => Some(label),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(labels(&app).contains(&"Observed at"));
+        app.set_managed();
+        assert!(!labels(&app).contains(&"Observed at"));
+        assert!(labels(&app).contains(&"Evidence"));
+    }
+
+    #[test]
+    fn a_blocked_agent_reads_as_waiting_for_input() {
+        let mut value = snapshot();
+        value["observations"][0]["native"]["activity"] = json!("blocked");
+        for (language, wanted) in [
+            (Language::English, "Waiting for input"),
+            (Language::Korean, "입력 대기"),
+        ] {
+            let mut app = App::new(false, language, Theme::Dark);
+            app.set_managed();
+            app.apply_snapshot(value.clone());
+            app.set_connection(true, None);
+            let row = app.selected().unwrap().clone();
+            assert_eq!(app.row_state(&row, false), (wanted, Tone::Warn));
+            assert!(app.inspector_entries().contains(&Entry::Field(
+                tr(language, Text::Activity),
+                wanted.into(),
+                Tone::Warn
+            )));
+            // Waiting is not working: the filter and the prompt guard agree.
+            assert_eq!(app.filter_counts()[2], 0);
+            assert!(!app.action_enabled(Action::SendPrompt));
+        }
+    }
+
+    #[test]
+    fn a_narrow_row_keeps_the_identity_beside_a_waiting_agent() {
+        let mut value = snapshot();
+        value["observations"][0]["native"]["activity"] = json!("blocked");
+        let drawn = |compact: bool, width: u16| {
+            let mut app = App::new(compact, Language::English, Theme::Dark);
+            app.set_managed();
+            app.apply_snapshot(value.clone());
+            app.set_connection(true, None);
+            let (rows, _) = rendered(&mut app, width, 24);
+            rows.join("\n")
+        };
+        for width in [28, 34] {
+            let screen = drawn(true, width);
+            // The long label left the identity 4 cells at 28 columns and
+            // 10 at 34. The short one leaves room for all 11.
+            let row = screen
+                .lines()
+                .find(|line| line.contains("› build_agent "))
+                .unwrap_or_else(|| panic!("{width}: the identity was cut\n{screen}"));
+            assert!(row.contains("Waiting"), "{width}\n{screen}");
+            assert!(!screen.contains("Waiting for"), "{width}\n{screen}");
+        }
+        // A one-line row with room keeps the long label: at 90 columns the
+        // list takes the whole width.
+        let screen = drawn(false, 90);
+        let row = screen
+            .lines()
+            .find(|line| line.contains("› build_agent "))
+            .expect("the selected row");
+        assert!(row.contains("Waiting for input"), "{row}");
+    }
+
+    #[test]
+    fn the_context_menu_prints_no_key_for_details() {
+        for managed in [false, true] {
+            let mut app = ready(false, Language::English, Theme::Dark);
+            app.managed = managed;
+            app.overlay = Some(Overlay::Context);
+            app.context_anchor = (10, 5);
+            let (rows, _) = rendered(&mut app, 100, 40);
+            let details = rows
+                .iter()
+                .find(|row| row.contains("│ Details"))
+                .expect("Details is listed");
+            assert!(!details.contains("Enter"), "{details}");
+            let pane = rows
+                .iter()
+                .find(|row| row.contains("│ Go to pane"))
+                .unwrap();
+            assert!(pane.contains(" g │"), "{pane}");
+        }
+    }
+
+    #[test]
+    fn a_window_above_the_desk_keeps_the_search_cursor_away() {
+        let mut app = ready(false, Language::English, Theme::Dark);
+        app.focus = Focus::Search;
+        app.search = "ab".into();
+        app.search_cursor = 2;
+        let (_, mut terminal) = rendered(&mut app, 100, 30);
+        let field = app
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::Search)
+            .unwrap()
+            .rect;
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!((cursor.x, cursor.y), (field.x + 2, field.y));
+        app.modal_open = true;
+        let (_, mut terminal) = rendered(&mut app, 100, 30);
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_ne!((cursor.x, cursor.y), (field.x + 2, field.y));
+    }
+
+    #[test]
+    fn a_narrow_korean_sidebar_keeps_its_action_labels() {
+        for width in [28, 31, 34] {
+            let mut app = ready(true, Language::Korean, Theme::Dark);
+            app.set_managed();
+            let (rows, _) = rendered(&mut app, width, 20);
+            let screen = rows.join("\n").replace(' ', "");
+            for label in ["새로", "pane이동", "상세", "확장"] {
+                assert!(screen.contains(label), "{width}: {label} missing\n{screen}");
+            }
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Saved choices in `settings.conf` and the built-in UI layer text.
 
+use super::catalog::{self, UI_KEY};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -12,20 +13,27 @@ pub(crate) const LAYER: &str = include_str!("../../../../core/masil-ui-layer.con
 const HEADER: &str =
     "# masil settings, version 1. Written by `masil-agent settings`; other lines are kept.";
 const MAX_BYTES: u64 = 64 * 1024;
-const INTERNAL_MARKERS: &[&str] = &["@masil-autosave-used", "@masil-coordinator-boot"];
 
-/// The same rule as the core: an absolute XDG_CONFIG_HOME, else ~/.config.
-pub(crate) fn settings_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
+/// The configuration directory, by the core's rule (masil_ui_settings_path
+/// and find_home): an absolute XDG_CONFIG_HOME, else `.config` under the
+/// home directory. That is HOME when set and not empty, else the password
+/// database's entry; a relative one names no usable directory.
+pub(crate) fn config_dir() -> Option<PathBuf> {
+    config_dir_from(std::env::var_os("XDG_CONFIG_HOME"), std::env::home_dir())
+}
+
+fn config_dir_from(xdg: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    xdg.map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
+            home.filter(|path| path.is_absolute())
                 .map(|home| home.join(".config"))
-        })?;
-    Some(base.join("masil/settings.conf"))
+        })
+}
+
+/// settings.conf in the configuration directory.
+pub(crate) fn settings_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("masil/settings.conf"))
 }
 
 /// User configuration files the core reads after the layer, when present.
@@ -200,9 +208,13 @@ impl Saved {
             .retain(|line| Self::managed(line).is_none_or(|(candidate, _)| candidate != key));
     }
 
-    pub(crate) fn remove_all_managed(&mut self) {
+    /// Removes the lines the settings screen owns: the catalog's choices
+    /// and the layer switch. Other `@masil-*` lines stay, hand-written
+    /// ones and internal markers alike.
+    pub(crate) fn remove_screen_choices(&mut self) {
         self.lines.retain(|line| {
-            Self::managed(line).is_none_or(|(key, _)| INTERNAL_MARKERS.contains(&key))
+            Self::managed(line)
+                .is_none_or(|(key, _)| key != UI_KEY && catalog::setting(key).is_none())
         });
     }
 
@@ -535,7 +547,7 @@ pub(crate) fn managed_options() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::settings::catalog::{Kind, SETTINGS, UI_KEY};
+    use crate::ui::settings::catalog::{Kind, SETTINGS};
 
     #[test]
     fn set_replaces_in_place_and_keeps_other_lines() {
@@ -551,11 +563,31 @@ mod tests {
                 "{HEADER}\n# mine\nset -g @masil-theme terminal\nbind x kill-pane\nset -g @masil-lang ko\n"
             )
         );
-        saved.remove_all_managed();
+        saved.remove_screen_choices();
         assert_eq!(
             saved.render(),
             format!("{HEADER}\n# mine\nbind x kill-pane\n")
         );
+    }
+
+    #[test]
+    fn the_configuration_directory_follows_the_cores_rule() {
+        let os = |text: &str| Some(OsString::from(text));
+        let home = || Some(PathBuf::from("/home/me"));
+        assert_eq!(
+            config_dir_from(os("/xdg"), home()),
+            Some(PathBuf::from("/xdg"))
+        );
+        // A relative or empty XDG_CONFIG_HOME is not used.
+        for xdg in [os("relative/xdg"), os(""), None] {
+            assert_eq!(
+                config_dir_from(xdg, home()),
+                Some(PathBuf::from("/home/me/.config"))
+            );
+        }
+        // No usable home directory: no configuration directory.
+        assert_eq!(config_dir_from(None, None), None);
+        assert_eq!(config_dir_from(None, Some(PathBuf::from("relative"))), None);
     }
 
     #[test]
@@ -838,7 +870,7 @@ mod tests {
         let mut saved = Saved::parse(
             "set -g @masil-theme dark\nset -g @masil-autosave-used on\nset -g @masil-coordinator-boot '|/tmp/one|'\n",
         );
-        saved.remove_all_managed();
+        saved.remove_screen_choices();
         assert_eq!(saved.get("@masil-theme"), None);
         assert_eq!(
             saved.get_value("@masil-autosave-used").as_deref(),
@@ -848,6 +880,23 @@ mod tests {
             saved.get_value("@masil-coordinator-boot").as_deref(),
             Some("|/tmp/one|")
         );
+    }
+
+    #[test]
+    fn reset_removes_only_what_the_screen_owns() {
+        let kept = "set -g @masil-autosave 30\nset -g @masil-restore-commands \"vim less npm\"\nset -g @masil-inbox-badge on\nset -g @masil-mine 1\n";
+        let mut saved = Saved::parse(&format!(
+            "set -g @masil-ui off\nset -g @masil-theme light\n{kept}set -g @masil-open-links on\n"
+        ));
+        saved.remove_screen_choices();
+        assert_eq!(saved.render(), format!("{HEADER}\n{kept}"));
+        // Every catalog key is one the screen owns.
+        let mut all = Saved::default();
+        for setting in SETTINGS {
+            all.set(setting.key, setting.default);
+        }
+        all.remove_screen_choices();
+        assert_eq!(all.render(), format!("{HEADER}\n"));
     }
 
     #[test]

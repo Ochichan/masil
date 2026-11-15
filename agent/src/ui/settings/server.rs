@@ -12,6 +12,16 @@ use std::time::{Duration, Instant};
 const TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_LIMIT: u64 = 256 * 1024;
 const NO_ANSWER: &str = "masil did not answer";
+/// The line that ends one command's output in a chain of reads. No option
+/// value or expanded style is this line.
+const NEXT: &str = "==masil-settings-next==";
+/// Chained commands stay well under the client's command size limit.
+const CHAIN_BYTES: usize = 12 * 1024;
+/// The option that turns the layer's link click on, and the key and note
+/// of the binding its keys section makes for it.
+const LINK_OPTION: &str = "@masil-open-links";
+const LINK_KEY: &str = "MouseUp1Pane";
+const LINK_NOTE: &str = "masil-ui: open hyperlink";
 
 pub(crate) struct Server {
     binary: PathBuf,
@@ -131,14 +141,55 @@ impl Server {
 
     /// The global value of an option, or None when it is unset.
     pub(crate) fn global(&self, option: &str, scope: Scope) -> Option<String> {
-        let flags = match scope {
-            Scope::Session => "-gqv",
-            Scope::Window => "-gwqv",
-        };
-        self.run(&["show-options", flags, option])
+        self.run(&["show-options", global_flags(scope), option])
             .ok()
             .map(|text| text.trim_end_matches('\n').to_owned())
             .filter(|text| !text.is_empty())
+    }
+
+    /// The global values of several options, as `global` gives them. They
+    /// are read in one client call; when that chain fails, one at a time.
+    pub(crate) fn globals(&self, options: &[(&str, Scope)]) -> Vec<Option<String>> {
+        let commands = options
+            .iter()
+            .map(|(option, scope)| vec!["show-options", global_flags(*scope), option])
+            .collect::<Vec<_>>();
+        match self.read_chain(&commands) {
+            Ok(values) => values
+                .into_iter()
+                .map(|value| Some(value).filter(|value| !value.is_empty()))
+                .collect(),
+            // A server that stops answering would make every retry wait.
+            Err(error) if error.starts_with(NO_ANSWER) => vec![None; options.len()],
+            Err(_) => options
+                .iter()
+                .map(|(option, scope)| self.global(option, *scope))
+                .collect(),
+        }
+    }
+
+    /// Runs commands that only read as one client call and returns each
+    /// one's output without its final line breaks. An error when the chain
+    /// is too long, fails, or its output does not divide into one part per
+    /// command; unless masil did not answer, the caller then runs them one
+    /// at a time.
+    fn read_chain(&self, commands: &[Vec<&str>]) -> Result<Vec<String>, String> {
+        let mut args = Vec::new();
+        for command in commands {
+            if !args.is_empty() {
+                args.push(";");
+            }
+            args.extend(command.iter().copied());
+            args.extend([";", "display-message", "-p", NEXT]);
+        }
+        if args.is_empty() {
+            return Ok(Vec::new());
+        }
+        if args.iter().map(|arg| arg.len() + 1).sum::<usize>() > CHAIN_BYTES {
+            return Err("too many commands for one call".into());
+        }
+        chain_parts(&self.run(&args)?, commands.len())
+            .ok_or_else(|| "unexpected output from chained commands".into())
     }
 
     /// A value set on this session or window that hides the global one.
@@ -160,7 +211,6 @@ impl Server {
     /// client's command size limit; a chain that fails, as when a target
     /// closes meanwhile, is read again one target at a time.
     fn hidden(&self, option: &str, scope: Scope, value: &str) -> bool {
-        const CHAIN_BYTES: usize = 12 * 1024;
         if self.pane.is_some() {
             return self
                 .local(option, scope)
@@ -259,6 +309,51 @@ impl Server {
         }
         Ok(())
     }
+
+    /// Unbinds the layer's link click while the binding on that key is
+    /// still the layer's own, found by its note. Another binding stays.
+    fn unbind_link_click(&self) -> Result<(), String> {
+        let listing = self.run(&["list-keys", "-N", "-T", "root"])?;
+        if has_link_binding(&listing) {
+            self.run(&["unbind-key", "-T", "root", LINK_KEY])?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether a `list-keys -N` listing has the layer's link click: a line with
+/// its key followed by exactly its note.
+fn has_link_binding(listing: &str) -> bool {
+    listing.lines().any(|line| {
+        let words = line.split_whitespace().collect::<Vec<_>>();
+        words
+            .iter()
+            .position(|word| *word == LINK_KEY)
+            .is_some_and(|index| words[index + 1..].join(" ") == LINK_NOTE)
+    })
+}
+
+/// A chain's output divided into one part per command, each without its
+/// final line breaks. None when the parts do not match the commands.
+fn chain_parts(output: &str, commands: usize) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut lines = Vec::new();
+    for line in output.lines() {
+        if line == NEXT {
+            parts.push(lines.join("\n").trim_end_matches('\n').to_owned());
+            lines.clear();
+        } else {
+            lines.push(line);
+        }
+    }
+    (parts.len() == commands && lines.is_empty()).then_some(parts)
+}
+
+fn global_flags(scope: Scope) -> &'static str {
+    match scope {
+        Scope::Session => "-gqv",
+        Scope::Window => "-gwqv",
+    }
 }
 
 fn save_choice(path: Option<&Path>, key: &str, value: &str) -> Result<(), String> {
@@ -285,6 +380,49 @@ impl Server {
             line.value.clone()
         };
         current.trim_end_matches('\n') == expected.trim_end_matches('\n')
+    }
+
+    /// `owned` for each line, or with `defaults` whether each option still
+    /// holds its given tmux default. The values are read in one client
+    /// call; when that chain fails, one line at a time.
+    fn owned_lines(&self, lines: &[store::LayerLine], defaults: Option<&[String]>) -> Vec<bool> {
+        let mut commands = Vec::new();
+        for line in lines {
+            commands.push(vec!["show-options", "-gv", line.option.as_str()]);
+            if defaults.is_none() && line.format {
+                commands.push(vec!["display-message", "-p", line.value.as_str()]);
+            }
+        }
+        let values = match self.read_chain(&commands) {
+            Ok(values) => values,
+            // A server that stops answering would make every retry wait.
+            Err(error) if error.starts_with(NO_ANSWER) => return vec![false; lines.len()],
+            Err(_) => {
+                return lines
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| match defaults {
+                        Some(defaults) => self
+                            .run(&["show-options", "-gv", &line.option])
+                            .is_ok_and(|current| current.trim_end_matches('\n') == defaults[index]),
+                        None => self.owned(line),
+                    })
+                    .collect();
+            }
+        };
+        let mut values = values.into_iter();
+        lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let current = values.next().unwrap_or_default();
+                match defaults {
+                    Some(defaults) => current == defaults[index],
+                    None if line.format => current == values.next().unwrap_or_default(),
+                    None => current == line.value.trim_end_matches('\n'),
+                }
+            })
+            .collect()
     }
 
     /// tmux's own defaults for the given global options, read from a
@@ -404,13 +542,8 @@ pub(crate) fn apply(
             } else {
                 None
             };
-            for (index, line) in candidates.into_iter().enumerate() {
-                let owned = match &defaults {
-                    Some(values) => server
-                        .run(&["show-options", "-gv", &line.option])
-                        .is_ok_and(|current| current.trim_end_matches('\n') == values[index]),
-                    None => server.owned(&line),
-                };
+            let owned = server.owned_lines(&candidates, defaults.as_deref());
+            for (line, owned) in candidates.into_iter().zip(owned) {
                 if line.value.contains(setting.key) || owned {
                     lines.push(line);
                 }
@@ -433,13 +566,34 @@ pub(crate) fn apply(
             return Outcome::Failed(error);
         }
     }
-    // The tmux theme leaves styles at their tmux defaults.
+    // The keys section binds the link click while the option is on and
+    // never unbinds it, so off takes the binding away here.
+    if setting.key == LINK_OPTION
+        && value == "off"
+        && let Err(error) = server.unbind_link_click()
+    {
+        return Outcome::Failed(error);
+    }
+    // The tmux theme leaves styles at their tmux defaults. The lines go in
+    // one client call: one chain of unsets, or one sourced file.
     let unset = setting.key == "@masil-theme" && value == "tmux";
-    for line in &lines {
+    if !lines.is_empty() {
         let result = if unset {
-            server.run(&["set-option", "-gu", &line.option]).map(drop)
+            let mut args = Vec::new();
+            for line in &lines {
+                if !args.is_empty() {
+                    args.push(";");
+                }
+                args.extend(["set-option", "-gu", line.option.as_str()]);
+            }
+            server.run(&args).map(drop)
         } else {
-            server.source(&line.text)
+            let mut text = String::new();
+            for line in &lines {
+                text.push_str(&line.text);
+                text.push('\n');
+            }
+            server.source(&text)
         };
         if let Err(error) = result {
             return Outcome::Failed(error);
@@ -510,13 +664,14 @@ pub(crate) fn set_layer(server: &Server, path: Option<&Path>, on: bool) -> Outco
     )
 }
 
-/// Forgets every saved choice and applies the layer defaults, then the
-/// user's tmux.conf.
+/// Forgets the choices the settings screen owns (the catalog and the layer
+/// switch), in the file and on the server alike, and applies the layer
+/// defaults, then the user's tmux.conf. Other `@masil-*` options stay.
 pub(crate) fn reset(server: &Server, path: Option<&Path>) -> Outcome {
     let saved = match path {
         Some(path) => store::Lock::take(path).and_then(|_lock| {
             let mut saved = store::load(path)?;
-            saved.remove_all_managed();
+            saved.remove_screen_choices();
             store::save(path, &saved)
         }),
         None => Err("no configuration directory".into()),
@@ -536,4 +691,53 @@ pub(crate) fn reset(server: &Server, path: Option<&Path>) -> Outcome {
             Err(error) => Outcome::Failed(error),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chain_of_reads_divides_into_one_part_per_command() {
+        // A set option, an unset one, a value of two lines, an empty line.
+        let output = format!("light\n{NEXT}\n{NEXT}\na\n\nb\n{NEXT}\n\n{NEXT}\n");
+        assert_eq!(
+            chain_parts(&output, 4),
+            Some(vec![
+                "light".to_owned(),
+                String::new(),
+                "a\n\nb".to_owned(),
+                String::new()
+            ])
+        );
+        assert_eq!(chain_parts("", 0), Some(Vec::new()));
+        // Output that stops early, or goes on after the last command, is
+        // not trusted.
+        assert_eq!(chain_parts(&format!("light\n{NEXT}\n"), 2), None);
+        assert_eq!(chain_parts(&format!("light\n{NEXT}\nmore\n"), 1), None);
+        assert_eq!(chain_parts("light\n", 1), None);
+    }
+
+    #[test]
+    fn only_the_layers_own_link_binding_is_found() {
+        // The names here are the layer's.
+        assert!(store::LAYER.contains(&format!("bind -N \"{LINK_NOTE}\" -n {LINK_KEY} ")));
+        assert!(store::LAYER.contains(&format!("#{{==:#{{{LINK_OPTION}}},on}}")));
+        assert!(crate::ui::settings::catalog::setting(LINK_OPTION).is_some());
+        // list-keys -N pads the key column and puts the prefix first.
+        let other = "C-b MouseDown1Control5 masil-ui: menu\n";
+        assert!(has_link_binding(&format!(
+            "{other}C-b MouseUp1Pane       masil-ui: open hyperlink\n"
+        )));
+        // A binding of the user's on the same key, noted or with a longer
+        // note, is not the layer's; one without a note is not listed.
+        assert!(!has_link_binding(&format!(
+            "{other}C-b MouseUp1Pane       my own note\n"
+        )));
+        assert!(!has_link_binding(&format!(
+            "{other}C-b MouseUp1Pane       masil-ui: open hyperlink in a tab\n"
+        )));
+        assert!(!has_link_binding(other));
+        assert!(!has_link_binding(""));
+    }
 }

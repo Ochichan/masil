@@ -24,6 +24,15 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use server::{Outcome, Server};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+/// How long after an Enter or click on Reset the next one does not count
+/// yet. It is longer than the delay before a held key starts to repeat, and
+/// every repeat starts it again, so a held key or a double click cannot
+/// confirm.
+const RESET_PAUSE: Duration = Duration::from_secs(1);
+/// How long the Reset question waits for its answer.
+const RESET_EXPIRY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Hit {
@@ -31,6 +40,8 @@ enum Hit {
     Row(usize),
     Value(usize, String),
     Step(usize, i64),
+    /// The Reset row's button.
+    Reset(usize),
     Close,
 }
 
@@ -61,6 +72,10 @@ struct App {
     values: HashMap<&'static str, String>,
     /// Effective values that differ from the saved choice, per key.
     configured: HashMap<&'static str, String>,
+    /// When Reset was last asked for: an Enter or click on it between
+    /// `RESET_PAUSE` and `RESET_EXPIRY` later runs it. Any other key, click,
+    /// wheel step, resize or focus change takes the question back.
+    reset_armed: Option<Instant>,
     receipt: Option<(Tone, String)>,
     hits: Vec<(Rect, Hit)>,
     hover: Option<Hit>,
@@ -90,6 +105,7 @@ impl App {
             layer_on: true,
             values: HashMap::new(),
             configured: HashMap::new(),
+            reset_armed: None,
             receipt: None,
             hits: Vec::new(),
             hover: None,
@@ -105,30 +121,30 @@ impl App {
         app
     }
 
-    /// Reads choices and their effective values from the server.
+    /// Reads choices and their effective values from the server, all in
+    /// one client call.
     fn reload(&mut self) {
-        self.layer_on = self.server.layer_on();
+        let mut options = vec![(UI_KEY, Scope::Session)];
+        for setting in SETTINGS {
+            options.push((setting.key, Scope::Session));
+            options.extend(setting.readback);
+        }
+        let mut values = self.server.globals(&options).into_iter();
+        let mut next = || values.next().flatten();
+        self.layer_on = next().as_deref() != Some("off");
         self.configured.clear();
         for setting in SETTINGS {
-            let chosen = self
-                .server
-                .global(setting.key, Scope::Session)
-                .filter(|value| setting.accepts(value))
-                .unwrap_or_else(|| setting.default.to_owned());
+            let chosen = next();
+            // The option a choice drives counts while the layer is on, and
+            // always when the choice is that option itself.
             let effective = setting
                 .readback
-                .filter(|_| self.layer_on)
-                .and_then(|(option, scope)| self.server.global(option, scope))
-                .filter(|value| setting.accepts(value));
-            match effective {
-                Some(effective) if effective != chosen => {
-                    self.configured.insert(setting.key, effective.clone());
-                    self.values.insert(setting.key, effective);
-                }
-                _ => {
-                    self.values.insert(setting.key, chosen);
-                }
+                .and_then(|(option, _)| next().filter(|_| self.layer_on || option == setting.key));
+            let (value, configured) = shown(setting, chosen, effective);
+            if let Some(configured) = configured {
+                self.configured.insert(setting.key, configured);
             }
+            self.values.insert(setting.key, value);
         }
         self.language = match self.values.get("@masil-lang").map(String::as_str) {
             Some("ko") => Language::Korean,
@@ -244,11 +260,41 @@ impl App {
         self.reload();
         let what = text(
             self.language,
-            "every masil setting is back to its default",
-            "모든 masil 설정을 기본값으로 되돌렸습니다",
+            "the settings on this screen are back to their defaults",
+            "이 화면의 설정을 기본값으로 되돌렸습니다",
         )
         .to_owned();
         self.receipt(outcome, what);
+    }
+
+    /// The first Enter or click on Reset asks, and the row says what will
+    /// happen; one that answers in time runs it.
+    fn confirm_reset(&mut self, asked: Option<Instant>, now: Instant) {
+        match reset_press(asked, now) {
+            None => self.reset(),
+            asked => self.reset_armed = asked,
+        }
+    }
+
+    /// How long the Reset question still waits, when it is open.
+    fn reset_wait(&self, now: Instant) -> Option<Duration> {
+        self.reset_armed
+            .map(|asked| (asked + RESET_EXPIRY).saturating_duration_since(now))
+    }
+
+    /// One terminal event at `now`.
+    fn event(&mut self, event: Event, now: Instant) {
+        match event {
+            Event::Key(key) => self.key(key, now),
+            Event::Mouse(mouse) => self.mouse(mouse, now),
+            Event::Resize(..) => {
+                self.hover = None;
+                self.pressed = None;
+                self.reset_armed = None;
+            }
+            // A focus change or a paste is no answer to the Reset question.
+            _ => self.reset_armed = None,
+        }
     }
 
     /// Moves a row's value by one choice or step and applies it.
@@ -289,8 +335,9 @@ impl App {
         }
     }
 
-    fn activate(&mut self, hit: Hit) {
+    fn activate(&mut self, hit: Hit, now: Instant) {
         let rows = self.rows();
+        let armed = self.reset_armed.take();
         match hit {
             Hit::Group(index) => {
                 if index != self.group {
@@ -300,11 +347,16 @@ impl App {
                 }
                 self.focus = Focus::Groups;
             }
+            // A row's label only takes the focus.
             Hit::Row(index) => {
                 self.row = index.min(rows.len().saturating_sub(1));
                 self.focus = Focus::Rows;
+            }
+            Hit::Reset(index) => {
+                self.row = index.min(rows.len().saturating_sub(1));
+                self.focus = Focus::Rows;
                 if rows.get(index) == Some(&Row::Reset) {
-                    self.reset();
+                    self.confirm_reset(armed, now);
                 }
             }
             Hit::Value(index, value) => {
@@ -336,11 +388,12 @@ impl App {
         }
     }
 
-    fn key(&mut self, key: KeyEvent) {
+    fn key(&mut self, key: KeyEvent, now: Instant) {
         if key.kind == KeyEventKind::Release {
             return;
         }
         let rows = self.rows();
+        let armed = self.reset_armed.take();
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
@@ -371,7 +424,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') => match self.focus {
                 Focus::Groups => self.focus = Focus::Rows,
                 Focus::Rows => match rows.get(self.row) {
-                    Some(Row::Reset) => self.reset(),
+                    Some(Row::Reset) => self.confirm_reset(armed, now),
                     Some(Row::Layer) => self.set_layer(!self.layer_on),
                     _ => {}
                 },
@@ -399,24 +452,36 @@ impl App {
             .map(|(_, hit)| hit.clone())
     }
 
-    fn mouse(&mut self, mouse: MouseEvent) {
+    fn mouse(&mut self, mouse: MouseEvent, now: Instant) {
         match mouse.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
                 self.hover = self.hit_at(mouse.column, mouse.row);
             }
+            // Only a press and release on the Reset button keep its
+            // question open; any other press, a release elsewhere and the
+            // wheel take it back.
             MouseEventKind::Down(MouseButton::Left) => {
                 self.pressed = self.hit_at(mouse.column, mouse.row);
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let released = self.hit_at(mouse.column, mouse.row);
-                if let Some(hit) = self.pressed.take()
-                    && released.as_ref() == Some(&hit)
-                {
-                    self.activate(hit);
+                if !matches!(self.pressed, Some(Hit::Reset(_))) {
+                    self.reset_armed = None;
                 }
             }
-            MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_add(2),
-            MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(2),
+            MouseEventKind::Down(_) => self.reset_armed = None,
+            MouseEventKind::Up(MouseButton::Left) => {
+                let released = self.hit_at(mouse.column, mouse.row);
+                match self.pressed.take() {
+                    Some(hit) if released.as_ref() == Some(&hit) => self.activate(hit, now),
+                    _ => self.reset_armed = None,
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll = self.scroll.saturating_add(2);
+                self.reset_armed = None;
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(2);
+                self.reset_armed = None;
+            }
             _ => {}
         }
     }
@@ -726,11 +791,24 @@ impl App {
                     "Off restores tmux defaults, removes masil buttons and re-reads your tmux.conf.",
                     "끄면 tmux 기본값으로 돌아가고 masil 버튼을 없애며 tmux.conf를 다시 읽습니다.",
                 ),
-                Row::Reset => text(
-                    language,
-                    "Removes saved choices; the masil defaults apply at once.",
-                    "저장한 선택을 지우고 masil 기본값을 바로 적용합니다.",
-                ),
+                Row::Reset => {
+                    if self.reset_armed.is_some() {
+                        notes.push((
+                            Tone::Warn,
+                            text(
+                                language,
+                                "After one second, Enter or a click on Reset now runs it. Any other key or click cancels, and so do 5 seconds without one.",
+                                "1초 뒤부터 Enter나 '지금 초기화' 클릭으로 실행합니다. 다른 키나 클릭은 취소하고, 5초 동안 누르지 않아도 취소됩니다.",
+                            )
+                            .to_owned(),
+                        ));
+                    }
+                    text(
+                        language,
+                        "Puts every setting on this screen back to its default. Other @masil lines in settings.conf stay.",
+                        "이 화면의 설정을 모두 기본값으로 되돌립니다. settings.conf의 다른 @masil 줄은 그대로 둡니다.",
+                    )
+                }
             };
             let mut lines = wrap(help, inner.width as usize)
                 .into_iter()
@@ -854,12 +932,16 @@ impl App {
                 })
                 .collect(),
             Row::Reset => vec![(
-                text(
-                    language,
-                    "Reset all masil settings",
-                    "모든 masil 설정 초기화",
-                ),
-                Hit::Row(index),
+                if self.reset_armed.is_some() {
+                    text(language, "Reset now", "지금 초기화")
+                } else {
+                    text(
+                        language,
+                        "Reset the settings on this screen",
+                        "이 화면의 설정 초기화",
+                    )
+                },
+                Hit::Reset(index),
                 false,
             )],
         }
@@ -944,6 +1026,46 @@ impl App {
     }
 }
 
+/// What a row shows: the value in effect and, when it is not what the saved
+/// choice asks for, that value for the row's note. `chosen` is the saved
+/// `@masil-*` option and `effective` the tmux option it drives, both as the
+/// server reports them. A value outside the catalog is shown as it is, a
+/// hand-edited choice included: only an effect that differs from the choice
+/// was set by something else.
+fn shown(
+    setting: &Setting,
+    chosen: Option<String>,
+    effective: Option<String>,
+) -> (String, Option<String>) {
+    let choice = chosen.unwrap_or_else(|| setting.default.to_owned());
+    match effective {
+        Some(effective) if effective != choice => (effective.clone(), Some(effective)),
+        _ => (choice, None),
+    }
+}
+
+/// What an Enter or click on Reset does at `now`, given when it was last
+/// asked for: None runs the reset, else the question is open from the
+/// returned instant. A press sooner than `RESET_PAUSE` after the last one
+/// (a held key, a double click) or after `RESET_EXPIRY` asks again.
+fn reset_press(asked: Option<Instant>, now: Instant) -> Option<Instant> {
+    match asked.map(|asked| now.saturating_duration_since(asked)) {
+        Some(waited) if waited >= RESET_PAUSE && waited < RESET_EXPIRY => None,
+        _ => Some(now),
+    }
+}
+
+/// Each --set pair with its catalog entry. An unknown key is an error.
+fn known_sets(sets: &[(String, String)]) -> Result<Vec<(&'static Setting, &str)>, String> {
+    sets.iter()
+        .map(|(key, value)| {
+            catalog::setting(key)
+                .map(|setting| (setting, value.as_str()))
+                .ok_or_else(|| format!("unknown setting {key}"))
+        })
+        .collect()
+}
+
 fn chip_widths(chips: &[(&str, Hit, bool)]) -> Vec<u16> {
     chips
         .iter()
@@ -1021,6 +1143,19 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     if reload && (reset || layer.is_some() || !sets.is_empty() || get) {
         return Err(usage());
     }
+    // Every --set is checked before anything is applied, a reset included.
+    let sets = known_sets(&sets)?;
+    let mut refused = false;
+    for (setting, value) in &sets {
+        if !setting.accepts(value) {
+            refused = true;
+            let outcome = Outcome::Failed(format!("unsupported value {value}"));
+            println!("{}={value}: {outcome:?}", setting.key);
+        }
+    }
+    if refused {
+        return Ok(1);
+    }
     let server = Server::locate(socket.as_deref())?;
     if reload {
         return Ok(match server.reload_user_config() {
@@ -1047,11 +1182,10 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
                 server::set_layer(&server, path.as_deref(), on),
             );
         }
-        for (key, value) in sets {
-            let setting = catalog::setting(&key).ok_or_else(|| format!("unknown setting {key}"))?;
+        for (setting, value) in sets {
             report(
-                format!("{key}={value}"),
-                server::apply(&server, path.as_deref(), setting, &value),
+                format!("{}={value}", setting.key),
+                server::apply(&server, path.as_deref(), setting, value),
             );
         }
         if get {
@@ -1073,15 +1207,15 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
             .terminal()
             .draw(|frame| app.draw(frame))
             .map_err(|error| error.to_string())?;
-        match event::read().map_err(|error| error.to_string())? {
-            Event::Key(key) => app.key(key),
-            Event::Mouse(mouse) => app.mouse(mouse),
-            Event::Resize(..) => {
-                app.hover = None;
-                app.pressed = None;
-            }
-            _ => {}
+        // An open Reset question ends on its own, and the row shows that.
+        if let Some(wait) = app.reset_wait(Instant::now())
+            && !event::poll(wait).map_err(|error| error.to_string())?
+        {
+            app.reset_armed = None;
+            continue;
         }
+        let event = event::read().map_err(|error| error.to_string())?;
+        app.event(event, Instant::now());
     }
     Ok(0)
 }
@@ -1103,5 +1237,229 @@ mod tests {
             assert!(setting.key.starts_with("@masil-"));
             assert!(!setting.help(Language::Korean).is_empty());
         }
+    }
+
+    #[test]
+    fn a_value_outside_the_catalog_is_shown_as_it_is() {
+        let some = |text: &str| Some(text.to_owned());
+        // The sidebar's collapse button sets a width the catalog has no
+        // step for: the row shows it, and nothing else set it.
+        let width = catalog::setting("@masil-status-width").unwrap();
+        assert_eq!(shown(width, some("8"), some("8")), ("8".to_owned(), None));
+        assert_eq!(
+            shown(width, some("30"), some("30")),
+            ("30".to_owned(), None)
+        );
+        assert_eq!(shown(width, None, None), ("24".to_owned(), None));
+        // A choice edited by hand in settings.conf drives the option: the
+        // row shows it and blames nothing else.
+        let history = catalog::setting("@masil-history").unwrap();
+        assert_eq!(shown(history, some("7"), some("7")), ("7".to_owned(), None));
+        assert_eq!(shown(history, some("7"), None), ("7".to_owned(), None));
+        // tmux.conf sets a history limit that is not one of the choices:
+        // the row shows it and notes where it comes from.
+        assert_eq!(
+            shown(history, None, some("100000")),
+            ("100000".to_owned(), some("100000"))
+        );
+        assert_eq!(
+            shown(history, some("50000"), some("2000")),
+            ("2000".to_owned(), some("2000"))
+        );
+        // The effect matches the choice, or there is none to read.
+        assert_eq!(
+            shown(history, some("50000"), some("50000")),
+            ("50000".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn every_set_is_checked_before_anything_is_applied() {
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        assert_eq!(
+            known_sets(&[pair("@masil-theme", "light"), pair("BAD", "x")]).unwrap_err(),
+            "unknown setting BAD"
+        );
+        // The link setting is one the screen and --set can change.
+        let sets = [pair("@masil-open-links", "on"), pair("@masil-theme", "up")];
+        let known = known_sets(&sets).unwrap();
+        assert_eq!(known[0].0.sections, ["keys"]);
+        assert!(known[0].0.accepts(known[0].1) && !known[1].0.accepts(known[1].1));
+        assert!(!known[0].0.accepts("yes"));
+    }
+
+    /// A screen over a server that does not exist; nothing is read from it.
+    fn screen() -> App {
+        App {
+            server: Server::locate(Some("/nonexistent/masil-settings-test.sock")).unwrap(),
+            path: None,
+            language: Language::English,
+            theme: Theme::Dark,
+            group: Group::ALL.len() - 1,
+            row: 0,
+            focus: Focus::Rows,
+            scroll: 0,
+            layer_on: true,
+            values: HashMap::new(),
+            configured: HashMap::new(),
+            reset_armed: None,
+            receipt: None,
+            hits: Vec::new(),
+            hover: None,
+            pressed: None,
+            quit: false,
+        }
+    }
+
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    fn drawn(app: &mut App, width: u16, height: u16) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_reset_row_says_what_a_second_press_will_do() {
+        let mut app = screen();
+        let text = drawn(&mut app, 100, 30);
+        assert!(
+            text.contains(" Reset the settings on this screen "),
+            "{text}"
+        );
+        assert!(text.contains("in settings.conf stay."), "{text}");
+        // The label and the button are separate targets.
+        assert!(app.hits.iter().any(|(_, hit)| *hit == Hit::Row(1)));
+        assert!(app.hits.iter().any(|(_, hit)| *hit == Hit::Reset(1)));
+        app.activate(Hit::Reset(1), Instant::now());
+        let text = drawn(&mut app, 100, 30);
+        assert!(text.contains(" Reset now "), "{text}");
+        assert!(
+            text.contains("After one second, Enter or a click"),
+            "{text}"
+        );
+        app.language = Language::Korean;
+        assert_eq!(app.row_chips(Row::Reset, 1)[0].0, "지금 초기화");
+        assert!(app.reset_armed.is_some());
+    }
+
+    #[test]
+    fn a_second_press_on_reset_counts_only_after_the_pause_and_before_the_expiry() {
+        let start = Instant::now();
+        let at = |milliseconds: u64| start + Duration::from_millis(milliseconds);
+        // The first press asks.
+        assert_eq!(reset_press(None, at(0)), Some(at(0)));
+        // A second one at 500 ms does not run it; one at 1.1 s does.
+        assert_eq!(reset_press(Some(at(0)), at(500)), Some(at(500)));
+        assert_eq!(reset_press(Some(at(0)), at(1_100)), None);
+        // A held key repeats from about 500 ms on, every 30 ms: each repeat
+        // starts the pause again, so none of them runs it.
+        let mut asked = reset_press(None, at(0));
+        for repeat in 0..200 {
+            asked = reset_press(asked, at(500 + repeat * 30));
+            assert!(asked.is_some(), "repeat {repeat} ran the reset");
+        }
+        // After the expiry a press asks again.
+        assert_eq!(reset_press(Some(at(0)), at(4_900)), None);
+        assert_eq!(reset_press(Some(at(0)), at(5_000)), Some(at(5_000)));
+    }
+
+    #[test]
+    fn reset_asks_first_and_its_label_only_takes_the_focus() {
+        let start = Instant::now();
+        let at = |milliseconds: u64| start + Duration::from_millis(milliseconds);
+        let mut app = screen();
+        assert_eq!(app.rows(), [Row::Layer, Row::Reset]);
+        // A click on the row's label focuses it and asks nothing.
+        app.activate(Hit::Row(1), at(0));
+        assert_eq!((app.row, app.reset_armed), (1, None));
+        // The first Enter asks. One 500 ms later, as from a held key,
+        // neither runs the reset nor takes the question back.
+        app.key(enter(), at(0));
+        assert_eq!(app.reset_armed, Some(at(0)));
+        app.key(enter(), at(500));
+        assert_eq!(app.reset_armed, Some(at(500)));
+        assert!(app.receipt.is_none());
+        assert_eq!(app.reset_wait(at(1_500)), Some(Duration::from_secs(4)));
+        let chips = app.row_chips(Row::Reset, 1);
+        assert_eq!((chips[0].0, &chips[0].1), ("Reset now", &Hit::Reset(1)));
+        // Any other key takes it back, and so does a click elsewhere.
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), at(600));
+        assert_eq!((app.row, app.reset_armed), (0, None));
+        app.activate(Hit::Reset(1), at(700));
+        assert!(app.reset_armed.is_some());
+        app.activate(Hit::Row(1), at(800));
+        assert!(app.reset_armed.is_none() && app.receipt.is_none());
+        assert_eq!(
+            app.row_chips(Row::Reset, 1)[0].0,
+            "Reset the settings on this screen"
+        );
+    }
+
+    #[test]
+    fn input_that_is_not_an_answer_takes_the_reset_question_back() {
+        let start = Instant::now();
+        let mouse = |kind, column, row| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let mut app = screen();
+        drawn(&mut app, 100, 30);
+        let (button, _) = app
+            .hits
+            .iter()
+            .find(|(_, hit)| *hit == Hit::Reset(1))
+            .cloned()
+            .expect("the Reset button");
+        let left = MouseButton::Left;
+        let events = [
+            // A press on blank space, and one with another button.
+            mouse(MouseEventKind::Down(left), 99, 29),
+            mouse(MouseEventKind::Down(MouseButton::Right), button.x, button.y),
+            mouse(MouseEventKind::ScrollDown, button.x, button.y),
+            mouse(MouseEventKind::ScrollUp, button.x, button.y),
+            Event::Resize(90, 30),
+            Event::FocusLost,
+            Event::FocusGained,
+        ];
+        for event in events {
+            app.reset_armed = Some(start);
+            app.event(event.clone(), start);
+            assert_eq!(app.reset_armed, None, "{event:?} kept the question");
+        }
+        // A press on the button released somewhere else.
+        app.reset_armed = Some(start);
+        app.event(mouse(MouseEventKind::Down(left), button.x, button.y), start);
+        assert_eq!(app.reset_armed, Some(start));
+        app.event(mouse(MouseEventKind::Up(left), 99, 29), start);
+        assert_eq!(app.reset_armed, None);
+        // Moving the pointer and releasing a key leave it open.
+        app.reset_armed = Some(start);
+        app.event(mouse(MouseEventKind::Moved, 3, 3), start);
+        let mut release = enter();
+        release.kind = KeyEventKind::Release;
+        app.event(Event::Key(release), start);
+        assert_eq!(app.reset_armed, Some(start));
+        // A click on the button itself asks, and nothing ran.
+        app.reset_armed = None;
+        app.event(mouse(MouseEventKind::Down(left), button.x, button.y), start);
+        app.event(mouse(MouseEventKind::Up(left), button.x, button.y), start);
+        assert_eq!(app.reset_armed, Some(start));
+        assert!(app.receipt.is_none());
     }
 }

@@ -424,6 +424,9 @@ pub struct App {
     pub(crate) help_lines: usize,
     pub(crate) divider_width: u16,
     pub(crate) overlay: Option<Overlay>,
+    /// A window of the managed desk is drawn above this view and owns the
+    /// terminal cursor.
+    pub(crate) modal_open: bool,
     pub(crate) context_selection: usize,
     pub(crate) context_anchor: (u16, u16),
     pub(crate) hits: Vec<HitRegion>,
@@ -433,6 +436,8 @@ pub struct App {
     pub(crate) last_click: Option<ClickRecord>,
     pub(crate) ack_in_flight: Option<(String, String)>,
     pub(crate) prompt_in_flight: bool,
+    /// Counts started prompts: a late result ends only the prompt it sent.
+    pub(crate) prompt_serial: u64,
     /// The latest `y` press: only its request list may open a dialog.
     pub(crate) answer_request: u64,
     /// The latest `e` press: only its list may open the queue window.
@@ -484,6 +489,7 @@ impl App {
             help_lines: 0,
             divider_width: 48,
             overlay: None,
+            modal_open: false,
             context_selection: 0,
             context_anchor: (0, 0),
             hits: Vec::new(),
@@ -493,6 +499,7 @@ impl App {
             last_click: None,
             ack_in_flight: None,
             prompt_in_flight: false,
+            prompt_serial: 0,
             answer_request: 0,
             queue_request: 0,
             changes_request: 0,
@@ -558,6 +565,11 @@ impl App {
             self.selected_id = current_ids
                 .get(previous_position.min(current_ids.len().saturating_sub(1)))
                 .cloned();
+            // The menu was opened for the row that left; its items must not
+            // act on the row that took its place.
+            if self.overlay == Some(Overlay::Context) {
+                self.overlay = None;
+            }
         }
         if epoch_changed {
             self.cancel_interactions();
@@ -635,6 +647,7 @@ impl App {
 
     pub(crate) fn start_prompt(&mut self) {
         self.prompt_in_flight = true;
+        self.prompt_serial = self.prompt_serial.wrapping_add(1);
         self.dirty = true;
     }
 
@@ -897,5 +910,50 @@ mod managed_tests {
                 .collect::<Vec<_>>(),
             ["alpha-idle", "zulu-blocked"]
         );
+    }
+
+    #[test]
+    fn a_context_menu_closes_when_its_row_leaves() {
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        let snapshot = |ids: &[&str]| {
+            json!({
+                "epoch":"boot","revision":"1",
+                "observations":ids.iter().map(|id| row(id, true)).collect::<Vec<_>>()
+            })
+        };
+        app.apply_snapshot(snapshot(&["alpha", "beta"]));
+        app.selected_id = Some("alpha".into());
+        app.overlay = Some(Overlay::Context);
+        // The same rows again: the menu still belongs to its row.
+        app.apply_snapshot(snapshot(&["alpha", "beta"]));
+        assert_eq!(app.overlay, Some(Overlay::Context));
+        app.apply_snapshot(snapshot(&["beta"]));
+        assert_eq!(app.selected_id.as_deref(), Some("beta"));
+        assert_eq!(app.overlay, None);
+        // Help is about no row and stays.
+        app.overlay = Some(Overlay::Help);
+        app.apply_snapshot(snapshot(&["alpha"]));
+        assert_eq!(app.overlay, Some(Overlay::Help));
+    }
+
+    #[test]
+    fn only_a_changed_epoch_resets_receipts_and_actions_in_flight() {
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        app.set_managed();
+        let snapshot = |epoch: &str| json!({"epoch":epoch,"revision":"1","observations":[row("alpha", true), row("beta", true)]});
+        app.apply_snapshot(snapshot("identity-of-alpha"));
+        app.selected_id = Some("beta".into());
+        app.notify("Marked beta as seen".into());
+        app.ack_in_flight = Some(("beta".into(), "beta".into()));
+        // The managed desk names the selection's identity as the epoch. It
+        // sets the new one before the snapshot, so moving the selection is
+        // not read as a restart.
+        app.epoch = "identity-of-beta".into();
+        app.apply_snapshot(snapshot("identity-of-beta"));
+        assert_eq!(app.toast.as_deref(), Some("Marked beta as seen"));
+        assert!(app.ack_in_flight.is_some());
+        app.apply_snapshot(snapshot("another-daemon"));
+        assert!(app.toast.is_none());
+        assert!(app.ack_in_flight.is_none());
     }
 }

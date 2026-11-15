@@ -6,7 +6,7 @@
 use super::{
     managed::dialog_colors,
     model::{Language, Theme},
-    view::{cell_width, ellipsize},
+    view::{cell_width, ellipsize, wrap_rows},
 };
 use crate::managed::{Agent, changes::ChangesOp};
 use crossterm::event::{
@@ -21,6 +21,9 @@ use ratatui::{
 use serde_json::Value;
 
 const LIST_ROWS: usize = 8;
+/// Diff lines one PageUp or PageDown moves, and one wheel step.
+const PAGE_LINES: isize = 10;
+const WHEEL_LINES: isize = 3;
 /// The pause after a result before keys act again, so a key typed while
 /// waiting never confirms what just appeared.
 const QUIET: std::time::Duration = std::time::Duration::from_millis(400);
@@ -151,7 +154,7 @@ impl ChangesWindow {
 
     fn list_index(&self) -> usize {
         match (self.tab, &self.mode) {
-            (_, Mode::Since { .. }) => 2,
+            (_, Mode::Since { .. } | Mode::Confirm { .. }) => 2,
             (Tab::Files, _) => 0,
             (Tab::Checkpoints, _) => 1,
         }
@@ -173,7 +176,7 @@ impl ChangesWindow {
                 .unwrap_or_default()
         }
         match (self.tab, &self.mode) {
-            (_, Mode::Since { .. }) => array(&self.since, "since.files"),
+            (_, Mode::Since { .. } | Mode::Confirm { .. }) => array(&self.since, "since.files"),
             (Tab::Files, _) => array(&self.files, "files"),
             (Tab::Checkpoints, _) => array(&self.checkpoints, "checkpoints"),
         }
@@ -357,6 +360,18 @@ impl ChangesWindow {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
             Event::Mouse(mouse) => {
+                // The wheel scrolls the diff, as PageUp and PageDown do.
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.scroll_by(-WHEEL_LINES);
+                        return ChangesOutcome::None;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.scroll_by(WHEEL_LINES);
+                        return ChangesOutcome::None;
+                    }
+                    _ => {}
+                }
                 let target = self
                     .hits
                     .iter()
@@ -378,6 +393,10 @@ impl ChangesWindow {
                     return ChangesOutcome::None;
                 }
                 match target {
+                    // The list under a restore preview is not a choice.
+                    Some(Hit::Row(_)) if matches!(self.mode, Mode::Confirm { .. }) => {
+                        ChangesOutcome::None
+                    }
                     Some(Hit::Row(index)) => {
                         let list = self.list_index();
                         if let Mode::Handoff { selected } = &mut self.mode {
@@ -414,6 +433,18 @@ impl ChangesWindow {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             return ChangesOutcome::None;
+        }
+        // The diff scrolls in every mode, and the notice stays.
+        match key.code {
+            KeyCode::PageUp => {
+                self.scroll_by(-PAGE_LINES);
+                return ChangesOutcome::None;
+            }
+            KeyCode::PageDown => {
+                self.scroll_by(PAGE_LINES);
+                return ChangesOutcome::None;
+            }
+            _ => {}
         }
         self.notice = None;
         match self.mode.clone() {
@@ -469,11 +500,21 @@ impl ChangesWindow {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected[index] = (self.selected[index] + 1).min(count.saturating_sub(1));
             }
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::PageDown => self.scroll += 10,
             _ => return false,
         }
         true
+    }
+
+    /// Scrolls the diff on show by `lines`. Draw bounds it to the last page.
+    fn scroll_by(&mut self, lines: isize) {
+        let count = self
+            .diff
+            .as_ref()
+            .map_or(0, |(_, diff, _)| diff.lines().count());
+        self.scroll = self
+            .scroll
+            .saturating_add_signed(lines)
+            .min(count.saturating_sub(1));
     }
 
     fn browse_key(&mut self, key: KeyEvent) -> ChangesOutcome {
@@ -772,10 +813,18 @@ impl ChangesWindow {
             Mode::Handoff { selected } => *selected,
             _ => self.selected[self.list_index()],
         };
-        let shown = rows
-            .len()
-            .clamp(1, LIST_ROWS)
-            .min(bottom.saturating_sub(y) as usize);
+        // The notice, on up to two rows, keeps its place in a short pane:
+        // the list gives up rows for it, down to one.
+        let notice = self
+            .notice
+            .as_deref()
+            .map(|notice| wrap_rows(notice, text_width, 2))
+            .unwrap_or_default();
+        let shown = rows.len().clamp(1, LIST_ROWS).min(
+            (bottom.saturating_sub(y) as usize)
+                .saturating_sub(notice.len())
+                .max(1),
+        );
         let first = (selected + 1).saturating_sub(shown);
         if rows.is_empty() {
             line(
@@ -802,11 +851,14 @@ impl ChangesWindow {
         }
         y += 1;
         // The diff, then the notice.
-        let notice_rows = usize::from(self.notice.is_some());
-        let room = (bottom.saturating_sub(y) as usize).saturating_sub(notice_rows);
+        let room = (bottom.saturating_sub(y) as usize).saturating_sub(notice.len());
         if let Some((path, diff, truncated)) = &self.diff {
             let lines: Vec<&str> = diff.lines().collect();
-            let skip = self.scroll.min(lines.len().saturating_sub(1));
+            // One row is the path. Past the last page there is nothing more
+            // to show, so the scroll stops there.
+            let page = room.saturating_sub(1).max(1);
+            let skip = self.scroll.min(lines.len().saturating_sub(page));
+            self.scroll = skip;
             if room > 0 {
                 let mark = if *truncated {
                     self.word(" (cut at 256 KiB)", " (256 KiB에서 자름)")
@@ -838,13 +890,14 @@ impl ChangesWindow {
                 y += 1;
             }
         }
-        if let Some(notice) = &self.notice {
-            line(
-                frame,
-                bottom.saturating_sub(1).max(y),
-                notice,
-                Style::default().fg(accent).bg(panel),
-            );
+        let first = bottom.saturating_sub(notice.len() as u16).max(y);
+        for (index, text) in notice.iter().enumerate() {
+            let row = first + index as u16;
+            // Never on the button row.
+            if row > bottom {
+                break;
+            }
+            line(frame, row, text, Style::default().fg(accent).bg(panel));
         }
         let button_y = modal.bottom().saturating_sub(2);
         let mut right = inner.right();
@@ -956,6 +1009,186 @@ mod tests {
             }
             _ => panic!("expected the confirmed restore"),
         }
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn drawn(window: &mut ChangesWindow, width: u16, height: u16) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| window.draw(frame, Theme::Dark))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    /// A window on the restore preview of `b.txt`, the second file changed
+    /// since the second of two checkpoints.
+    fn confirming() -> ChangesWindow {
+        let mut window = ChangesWindow::new(1, Language::English, agent(), vec![], files());
+        window.handle(key(KeyCode::Tab));
+        window.receive(
+            &ChangesOp::Checkpoints,
+            Ok(json!({"checkpoints": [{"id": 3, "reason": "x"}, {"id": 4, "reason": "y"}]})),
+        );
+        settle(&mut window);
+        window.handle(key(KeyCode::Down));
+        window.handle(key(KeyCode::Enter));
+        window.receive(
+            &ChangesOp::Show { id: 4, path: None },
+            Ok(json!({"since": {"files": [
+                {"path": "a.txt", "kind": "modified"},
+                {"path": "b.txt", "kind": "modified"}]}})),
+        );
+        settle(&mut window);
+        window.handle(key(KeyCode::Down));
+        let ChangesOutcome::Op(op) = window.handle(key(KeyCode::Char('r'))) else {
+            panic!("expected a preview request");
+        };
+        window.receive(
+            &op,
+            Ok(json!({"token": "abc", "files": [{"action": "restore", "diff": "-x\n+y\n"}]})),
+        );
+        settle(&mut window);
+        window
+    }
+
+    #[test]
+    fn a_restore_preview_keeps_the_changed_files_and_ignores_row_clicks() {
+        let mut window = confirming();
+        assert!(matches!(window.mode, Mode::Confirm { .. }));
+        // The list is still the files changed since the checkpoint.
+        let paths: Vec<_> = window
+            .rows()
+            .iter()
+            .map(|row| row["path"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(paths, ["a.txt", "b.txt"]);
+        assert_eq!(window.current_path().as_deref(), Some("b.txt"));
+        let text = drawn(&mut window, 80, 24);
+        assert_eq!(text.matches("modified").count(), 2, "{text}");
+        // A click on a row moves neither the file nor the checkpoint cursor.
+        let (rect, _) = *window
+            .hits
+            .iter()
+            .find(|(_, hit)| *hit == Hit::Row(0))
+            .expect("a drawn row");
+        window.handle(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rect.x,
+            rect.y,
+        ));
+        window.handle(mouse(MouseEventKind::Up(MouseButton::Left), rect.x, rect.y));
+        assert_eq!(window.selected, [0, 1, 1]);
+        // Enter still confirms the file the preview was made for.
+        match window.handle(key(KeyCode::Enter)) {
+            ChangesOutcome::Op(ChangesOp::Restore {
+                id: 4,
+                paths,
+                token: Some(_),
+                ..
+            }) => assert_eq!(paths, ["b.txt"]),
+            _ => panic!("expected the confirmed restore"),
+        }
+    }
+
+    #[test]
+    fn the_diff_scroll_stops_at_the_last_page_for_keys_and_the_wheel() {
+        let mut window = ChangesWindow::new(1, Language::English, agent(), vec![], files());
+        let diff: String = (0..40).map(|line| format!("+line {line}\n")).collect();
+        window.diff = Some(("a.txt".into(), diff, false));
+        for _ in 0..12 {
+            window.handle(key(KeyCode::PageDown));
+        }
+        let text = drawn(&mut window, 80, 24);
+        // The last page is full: the last line is on show, with lines above.
+        assert!(
+            text.contains("+line 39") && text.contains("+line 30"),
+            "{text}"
+        );
+        let end = window.scroll;
+        assert!(end > 0 && end < 39);
+        // One PageUp moves the view.
+        window.handle(key(KeyCode::PageUp));
+        assert_eq!(window.scroll, end - 10);
+        window.handle(mouse(MouseEventKind::ScrollDown, 5, 5));
+        assert_eq!(window.scroll, end - 7);
+        window.handle(mouse(MouseEventKind::ScrollUp, 5, 5));
+        window.handle(mouse(MouseEventKind::ScrollUp, 5, 5));
+        assert_eq!(window.scroll, end - 13);
+    }
+
+    #[test]
+    fn the_restore_notice_wraps_instead_of_being_cut_at_80_columns() {
+        let mut window = confirming();
+        // The preview's diff can be scrolled without losing the notice.
+        window.handle(key(KeyCode::PageDown));
+        let text = drawn(&mut window, 80, 24);
+        assert!(
+            text.contains("Restore writes the saved file back."),
+            "{text}"
+        );
+        assert!(text.contains("rolled back."), "{text}");
+        assert!(!text.contains('…'), "{text}");
+    }
+
+    #[test]
+    fn a_short_pane_gives_list_rows_to_the_notice() {
+        let rows: Vec<Value> = (0..8)
+            .map(|file| json!({"path": format!("file{file}.txt"), "kind": "modified"}))
+            .collect();
+        // The pane heights and file counts at which the list used to take
+        // every row above the buttons.
+        for (height, count) in [(12, 5), (15, 8), (10, 3)] {
+            let list = json!({"base": {"branch": "main"}, "total": count, "truncated": false,
+                "files": rows[..count]});
+            let mut window = ChangesWindow::new(1, Language::English, agent(), vec![], list);
+            window.tell("Restore deletes this file.".into());
+            let text = drawn(&mut window, 80, height);
+            assert!(
+                text.contains("Restore deletes this file."),
+                "at 80x{height}:\n{text}"
+            );
+            assert!(text.contains("file0.txt"), "at 80x{height}:\n{text}");
+            // A notice of two rows fits as well.
+            window.tell(
+                "Restore writes the saved file back. Files only: the conversation is not rolled back."
+                    .into(),
+            );
+            let text = drawn(&mut window, 80, height);
+            assert!(
+                text.contains("Restore writes") && text.contains("rolled back."),
+                "at 80x{height}:\n{text}"
+            );
+        }
+        // The selected row stays on show in the shorter list.
+        let list = json!({"base": {"branch": "main"}, "total": 5, "truncated": false,
+            "files": rows[..5]});
+        let mut window = ChangesWindow::new(1, Language::English, agent(), vec![], list);
+        for _ in 0..4 {
+            window.handle(key(KeyCode::Down));
+        }
+        window.tell("Restore deletes this file.".into());
+        let text = drawn(&mut window, 80, 12);
+        assert!(
+            text.contains("file4.txt") && text.contains("Restore deletes this file."),
+            "{text}"
+        );
     }
 
     #[test]

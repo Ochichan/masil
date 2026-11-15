@@ -3,12 +3,12 @@
 use super::{
     answer::{AnswerDialog, Outcome},
     i18n::action_label,
-    model::{Action, App, Effect, Language, Theme},
+    model::{Action, App, Effect, Language, Overlay, Theme},
     palette::{self, Palette, PaletteResult},
     preferences,
     queue::{QueueOutcome, QueueWindow},
     terminal,
-    view::{action_shortcut, cell_width, ellipsize, wrap_rows},
+    view::{cell_width, ellipsize, menu_shortcut, wrap_rows},
 };
 use crate::managed::{
     Agent, Manager, Through,
@@ -125,6 +125,21 @@ enum DialogKind {
     Close(Agent),
 }
 
+impl DialogKind {
+    /// The agent a dialog acts on. The start dialog has none.
+    fn agent(&self) -> Option<&Agent> {
+        match self {
+            Self::Start { .. } => None,
+            Self::Resume(agent)
+            | Self::Rename(agent)
+            | Self::Draft(agent)
+            | Self::Prompt(agent)
+            | Self::Interrupt(agent)
+            | Self::Close(agent) => Some(agent),
+        }
+    }
+}
+
 struct Field {
     label: &'static str,
     value: String,
@@ -141,8 +156,10 @@ enum DialogHit {
 struct Dialog {
     language: Language,
     kind: DialogKind,
-    title: &'static str,
-    note: &'static str,
+    title: String,
+    note: String,
+    /// What the last input or submit did not take. Drawn above the note.
+    notice: Option<String>,
     submit: &'static str,
     fields: Vec<Field>,
     focus: usize,
@@ -208,12 +225,17 @@ impl Dialog {
                 endpoint_field,
                 endpoint_keys: endpoints.iter().cloned().collect(),
             },
-            title: word(language, "New native agent", "새 네이티브 에이전트"),
-            note: word(
-                language,
-                "Starts a new pane. Idle is not treated as task completion.",
-                "새 창에서 시작합니다. 대기 상태를 작업 완료로 취급하지 않습니다.",
+            title: word(language, "New native agent", "새 네이티브 에이전트").to_owned(),
+            note: format!(
+                "{} {}",
+                word(
+                    language,
+                    "Starts a new pane. Idle is not treated as task completion.",
+                    "새 pane을 시작합니다. 대기 상태를 작업 완료로 취급하지 않습니다.",
+                ),
+                name_rule(language)
             ),
+            notice: None,
             submit: word(language, "Start", "시작"),
             fields,
             focus: 0,
@@ -226,12 +248,17 @@ impl Dialog {
         Self {
             language,
             kind: DialogKind::Resume(agent.clone()),
-            title: word(language, "Resume native session", "네이티브 세션 재개"),
-            note: word(
-                language,
-                "Creates a new pane from the reported session reference; acceptance remains unverified.",
-                "보고된 세션 참조로 새 창을 만듭니다. 세션 수락 여부는 확인되지 않습니다.",
+            title: word(language, "Resume native session", "네이티브 세션 재개").to_owned(),
+            note: format!(
+                "{} {}",
+                word(
+                    language,
+                    "Creates a new pane from the reported session reference; acceptance remains unverified.",
+                    "보고된 세션 참조로 새 pane을 만듭니다. 세션 수락 여부는 확인되지 않습니다.",
+                ),
+                name_rule(language)
             ),
+            notice: None,
             submit: word(language, "Resume", "재개"),
             fields: vec![Field {
                 label: word(language, "New name", "새 이름"),
@@ -248,12 +275,21 @@ impl Dialog {
         Self {
             language,
             kind: DialogKind::Rename(agent.clone()),
-            title: word(language, "Rename managed agent", "관리 에이전트 이름 변경"),
-            note: word(
+            title: message(
                 language,
-                "Updates masil metadata for this pane.",
-                "이 창의 masil 메타데이터를 변경합니다.",
+                format!("Rename {}", subject(agent)),
+                format!("이름 변경: {}", subject(agent)),
             ),
+            note: format!(
+                "{} {}",
+                word(
+                    language,
+                    "Updates masil metadata for this pane.",
+                    "이 pane의 masil 메타데이터를 변경합니다.",
+                ),
+                name_rule(language)
+            ),
+            notice: None,
             submit: word(language, "Rename", "이름 변경"),
             fields: vec![Field {
                 label: word(language, "Name", "이름"),
@@ -270,12 +306,14 @@ impl Dialog {
         Self {
             language,
             kind: DialogKind::Draft(agent.clone()),
-            title: word(language, "Prepare draft", "초안 준비"),
+            title: word(language, "Prepare draft", "초안 준비").to_owned(),
             note: word(
                 language,
                 "Copies text to a tmux buffer only. It does not paste or submit it.",
                 "텍스트를 tmux 버퍼에만 복사합니다. 붙여넣거나 전송하지 않습니다.",
-            ),
+            )
+            .to_owned(),
+            notice: None,
             submit: word(language, "Prepare", "준비"),
             fields: vec![Field {
                 label: word(language, "Draft text", "초안 텍스트"),
@@ -292,12 +330,18 @@ impl Dialog {
         Self {
             language,
             kind: DialogKind::Prompt(agent.clone()),
-            title: word(language, "Send prompt", "프롬프트 전송"),
+            title: message(
+                language,
+                format!("Send prompt to {}", subject(agent)),
+                format!("프롬프트 전송: {}", subject(agent)),
+            ),
             note: word(
                 language,
                 "Sends this text with Enter to the verified idle agent. Delivery does not prove provider acceptance or task success.",
                 "검증된 대기 에이전트에 이 텍스트와 Enter를 전달합니다. 전달은 제공자 수락이나 작업 성공을 뜻하지 않습니다.",
-            ),
+            )
+            .to_owned(),
+            notice: None,
             submit: word(language, "Send", "전송"),
             fields: vec![Field {
                 label: word(language, "Prompt text", "프롬프트 텍스트"),
@@ -310,10 +354,48 @@ impl Dialog {
         }
     }
 
+    /// Confirms sending the provider's interrupt key to this agent.
+    fn interrupt(agent: &Agent, language: Language) -> Self {
+        Self::confirm(
+            language,
+            DialogKind::Interrupt(agent.clone()),
+            message(
+                language,
+                format!("Interrupt {}?", subject(agent)),
+                format!("{} 중단할까요?", subject(agent)),
+            ),
+            word(
+                language,
+                "Sends the provider's interrupt key (Esc for Claude and Codex) while its screen shows a turn. Whether the provider stopped is not asserted.",
+                "화면에 turn이 보일 때 provider의 끊기 key(Claude, Codex는 Esc)를 보냅니다. provider가 멈췄는지는 확인하지 않습니다.",
+            ),
+            word(language, "Interrupt", "중단"),
+        )
+    }
+
+    /// Confirms killing this agent's pane.
+    fn close(agent: &Agent, language: Language) -> Self {
+        Self::confirm(
+            language,
+            DialogKind::Close(agent.clone()),
+            message(
+                language,
+                format!("Close the pane of {}?", subject(agent)),
+                format!("{} pane을 닫을까요?", subject(agent)),
+            ),
+            word(
+                language,
+                "This kills the selected native pane and its running process.",
+                "선택한 네이티브 pane과 실행 중인 프로세스를 종료합니다.",
+            ),
+            word(language, "Close pane", "pane 닫기"),
+        )
+    }
+
     fn confirm(
         language: Language,
         kind: DialogKind,
-        title: &'static str,
+        title: String,
         note: &'static str,
         submit: &'static str,
     ) -> Self {
@@ -321,7 +403,8 @@ impl Dialog {
             language,
             kind,
             title,
-            note,
+            note: note.to_owned(),
+            notice: None,
             submit,
             fields: Vec::new(),
             focus: 0,
@@ -330,7 +413,57 @@ impl Dialog {
         }
     }
 
+    /// The field and the reason this dialog cannot be submitted as it
+    /// stands. Checked while the dialog is open, so typed text is kept.
+    fn refusal(&self) -> Option<(usize, String)> {
+        let value = |index: usize| {
+            self.fields
+                .get(index)
+                .map_or("", |field| field.value.as_str())
+        };
+        let name = |index: usize| {
+            (!name_allowed(value(index))).then(|| (index, name_rule(self.language).to_owned()))
+        };
+        match &self.kind {
+            DialogKind::Start {
+                default_endpoint,
+                endpoint_field,
+                endpoint_keys,
+            } => {
+                let endpoint = if *endpoint_field {
+                    value(0)
+                } else {
+                    default_endpoint.as_str()
+                };
+                if !endpoint_keys.contains_key(endpoint) {
+                    let mut known = endpoint_keys.keys().map(String::as_str).collect::<Vec<_>>();
+                    known.sort_unstable();
+                    let known = known.join(", ");
+                    return Some((
+                        0,
+                        message(
+                            self.language,
+                            format!(
+                                "Select a server that was available when this dialog opened: {known}"
+                            ),
+                            format!(
+                                "이 대화 상자를 열 때 사용 가능했던 서버를 선택하세요: {known}"
+                            ),
+                        ),
+                    ));
+                }
+                name(usize::from(*endpoint_field))
+            }
+            DialogKind::Resume(_) | DialogKind::Rename(_) => name(0),
+            _ => None,
+        }
+    }
+
     fn handle(&mut self, event: Event) -> DialogResult {
+        // A notice is about the last key or paste only.
+        if matches!(event, Event::Key(_) | Event::Paste(_)) {
+            self.notice = None;
+        }
         match event {
             Event::Key(key) => self.key(key),
             Event::Paste(text) => {
@@ -414,11 +547,35 @@ impl Dialog {
         let Some(field) = self.fields.get_mut(self.focus) else {
             return;
         };
-        for character in text.chars().filter(|character| !character.is_control()) {
+        // A field is one line: a line break or tab between words becomes
+        // one space, so pasted lines do not run together. One at either end
+        // of the text is dropped, so a copied path or name gains no space.
+        let text = text.trim_matches(['\r', '\n', '\t']);
+        let mut cut = false;
+        let mut characters = text.chars().peekable();
+        while let Some(character) = characters.next() {
+            let character = match character {
+                '\r' => {
+                    characters.next_if_eq(&'\n');
+                    ' '
+                }
+                '\n' | '\t' => ' ',
+                other if other.is_control() => continue,
+                other => other,
+            };
             if field.value.len() + character.len_utf8() > field.limit {
+                cut = true;
                 break;
             }
             field.value.push(character);
+        }
+        if cut {
+            let limit = field.limit;
+            self.notice = Some(message(
+                self.language,
+                format!("This field holds {limit} bytes; the rest was not inserted."),
+                format!("이 칸은 {limit}바이트까지입니다. 나머지는 넣지 않았습니다."),
+            ));
         }
     }
 
@@ -433,19 +590,24 @@ impl Dialog {
         let total = self.fields.len() as u16;
         let shown = total.min(space / 2);
         let first = (self.focus + 1).saturating_sub(shown as usize);
-        let note = wrap_rows(
-            self.note,
-            text_width,
-            space.saturating_sub(shown * 2) as usize,
-        );
-        let height = (shown * 2 + note.len() as u16 + 4).min(room);
+        // The notice comes first, so a short screen cuts the note instead.
+        let rows = space.saturating_sub(shown * 2) as usize;
+        let notice = self
+            .notice
+            .as_deref()
+            .map(|notice| wrap_rows(notice, text_width, rows))
+            .unwrap_or_default();
+        let note = wrap_rows(&self.note, text_width, rows - notice.len());
+        let height = (shown * 2 + (notice.len() + note.len()) as u16 + 4).min(room);
         let modal = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
             width,
             height,
         );
-        let (panel, text, muted, accent, accent_text) = dialog_colors(theme);
+        let (panel, text, _, accent, accent_text) = dialog_colors(theme);
+        let palette = super::view::Palette::for_theme(theme);
+        let muted = palette.muted_style();
         frame.render_widget(Clear, modal);
         frame.render_widget(
             Block::default()
@@ -490,18 +652,26 @@ impl Dialog {
             .take(shown as usize)
         {
             frame.render_widget(
-                Paragraph::new(ellipsize(field.label, text_width))
-                    .style(Style::default().fg(muted)),
+                Paragraph::new(ellipsize(field.label, text_width)).style(muted),
                 Rect::new(inner.x, y, inner.width, 1),
             );
             let selected = self.focus == index;
-            // Typing appends, so a long value keeps its end in view.
+            // Typing appends, so a long value keeps its end in view. The
+            // focused field keeps one cell after the text for the cursor.
             let value = if field.value.is_empty() {
-                " ".to_owned()
+                String::new()
             } else {
-                tail(&field.value, text_width)
+                tail(
+                    &field.value,
+                    text_width.saturating_sub(usize::from(selected)),
+                )
             };
             let rect = Rect::new(inner.x, y + 1, inner.width, 1);
+            if selected && rect.width > 0 {
+                // An IME draws its preedit at the terminal cursor.
+                let column = (cell_width(&value) as u16).min(rect.width - 1);
+                frame.set_cursor_position((rect.x + column, rect.y));
+            }
             frame.render_widget(
                 Paragraph::new(value).style(
                     Style::default()
@@ -515,14 +685,16 @@ impl Dialog {
         }
         let note_room = inner.bottom().saturating_sub(y + 2);
         if note_room > 0 {
+            let warning = Style::default().fg(palette.warning);
             frame.render_widget(
                 Paragraph::new(
-                    note.into_iter()
+                    notice
+                        .into_iter()
+                        .map(|line| Line::styled(line, warning))
+                        .chain(note.into_iter().map(|line| Line::styled(line, muted)))
                         .take(note_room as usize)
-                        .map(Line::from)
                         .collect::<Vec<_>>(),
-                )
-                .style(Style::default().fg(muted)),
+                ),
                 Rect::new(inner.x, y, inner.width, note_room),
             );
         }
@@ -569,7 +741,7 @@ impl Dialog {
 
 /// The end of `text` within `width` cells, marked with a leading ellipsis
 /// when the start is hidden.
-fn tail(text: &str, width: usize) -> String {
+pub(super) fn tail(text: &str, width: usize) -> String {
     if cell_width(text) <= width {
         return text.to_owned();
     }
@@ -601,6 +773,121 @@ fn message(language: Language, english: String, korean: String) -> String {
     }
 }
 
+/// The agent a dialog title names: its listed name and its pane.
+fn subject(agent: &Agent) -> String {
+    format!(
+        "{} ({})",
+        crate::managed::find::agent_label(agent),
+        agent.pane_id
+    )
+}
+
+/// The rule `managed::valid_name` applies when an agent is started, resumed
+/// or renamed. That function is private to its module, so the desk repeats
+/// the rule to refuse a name while its dialog is still open.
+fn name_allowed(name: &str) -> bool {
+    name.len() <= 32
+        && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn name_rule(language: Language) -> &'static str {
+    word(
+        language,
+        "A name begins with a lowercase letter and uses 1 to 32 lowercase letters, digits, '-' or '_'.",
+        "이름은 영문 소문자로 시작하고 영문 소문자, 숫자, '-', '_'를 1~32자까지 씁니다.",
+    )
+}
+
+/// An error for the footer. An unknown outcome is not a failure that is
+/// safe to send again (CONTEXT.md), so it keeps its own wording, and the
+/// `operation resolve` command comes first where the text names one.
+fn action_error(language: Language, error: &str) -> String {
+    let text = crate::managed::failure::human(error);
+    if !outcome_is_unknown(error) {
+        return message(
+            language,
+            format!("Action failed: {text}"),
+            format!("작업 실패: {text}"),
+        );
+    }
+    match operation_key(text) {
+        Some(key) => format!("{} {text}", unknown_outcome(language, key)),
+        None => message(
+            language,
+            format!("Outcome unknown: {text}"),
+            format!("결과를 모릅니다: {text}"),
+        ),
+    }
+}
+
+/// Whether an error's code is in the unknown-outcome class, which holds
+/// more codes than `outcome_unknown` (`interrupt_partial`, `api_timeout`).
+fn outcome_is_unknown(error: &str) -> bool {
+    use crate::managed::failure::{Class, classify};
+    classify(error).0 == Class::Unknown
+}
+
+/// What to do about an operation whose outcome is unknown.
+fn unknown_outcome(language: Language, key: &str) -> String {
+    message(
+        language,
+        format!("Outcome unknown: check the pane, then `agent operation resolve {key}`."),
+        format!("결과를 모릅니다: pane을 본 뒤 `agent operation resolve {key}`로 정하세요."),
+    )
+}
+
+/// The operation key in an error that names its `operation resolve` command.
+fn operation_key(text: &str) -> Option<&str> {
+    let (_, rest) = text.split_once("operation resolve ")?;
+    let key = rest
+        .split(|character: char| character.is_whitespace() || character == '`')
+        .next()?;
+    (!key.is_empty()).then_some(key)
+}
+
+/// A receipt or error for a run that is no longer listed names its agent.
+fn for_unlisted(language: Language, name: Option<&str>, text: String) -> String {
+    match name {
+        Some(name) => message(
+            language,
+            format!("{name} (that run is no longer listed): {text}"),
+            format!("{name} (그 실행은 목록에 없음): {text}"),
+        ),
+        None => text,
+    }
+}
+
+/// The receipt for a prompt, worded for the stage its operation reached.
+fn prompt_receipt(language: Language, value: &Value) -> String {
+    let key = value["operation_key"].as_str().unwrap_or_default();
+    match value["stage"].as_str().unwrap_or_default() {
+        "native_accepted" => message(
+            language,
+            "Prompt and Enter delivered; the provider reported that it accepted the prompt".into(),
+            "프롬프트와 Enter를 전달했습니다. 제공자가 프롬프트를 수락했다고 보고했습니다".into(),
+        ),
+        "delivered" | "user_confirmed_delivered" => message(
+            language,
+            "Prompt and Enter delivered; provider acceptance is unverified".into(),
+            "프롬프트와 Enter를 전달했습니다. 제공자 수락 여부는 확인되지 않습니다".into(),
+        ),
+        "not_delivered" => message(
+            language,
+            format!("Prompt not delivered: operation {key} is recorded as not delivered"),
+            format!(
+                "프롬프트를 전달하지 않았습니다: 작업 {key}는 전달되지 않은 것으로 기록되어 있습니다"
+            ),
+        ),
+        _ => unknown_outcome(language, key),
+    }
+}
+
+/// Panel, text, muted, accent and accent text. The terminal theme's muted
+/// entry is a fixed grey; `view::Palette::muted_style` dims the host's own
+/// foreground instead and stays readable on a light host.
 pub(super) fn dialog_colors(theme: Theme) -> (Color, Color, Color, Color, Color) {
     match theme {
         Theme::Dark => (
@@ -615,7 +902,7 @@ pub(super) fn dialog_colors(theme: Theme) -> (Color, Color, Color, Color, Color)
             Color::Rgb(25, 34, 41),
             Color::Rgb(84, 100, 111),
             Color::Rgb(0, 112, 127),
-            Color::White,
+            Color::Rgb(255, 255, 255),
         ),
         Theme::Terminal => (
             Color::Reset,
@@ -714,6 +1001,16 @@ struct TargetIdentity {
     boot: String,
     generation: String,
     run: String,
+    /// The agent's listed name, for a result that arrives after it left.
+    name: String,
+    /// Whether the list held the agent when the action began. An agent the
+    /// saved view hides was never listed, so its absence says nothing.
+    listed: bool,
+    /// The Mark seen press this action answers, as `App::ack_in_flight`
+    /// holds it.
+    ack: Option<(String, String)>,
+    /// The prompt this action delivers, as `App::start_prompt` counted it.
+    prompt: Option<u64>,
 }
 enum ActionResult {
     Receipt(String),
@@ -740,7 +1037,29 @@ impl TargetIdentity {
             boot: agent.boot.clone(),
             generation: agent.generation.clone(),
             run: agent.run.clone(),
+            name: crate::managed::find::agent_label(agent),
+            listed: true,
+            ack: None,
+            prompt: None,
         }
+    }
+
+    /// Ends the action this result belongs to. A result for a run that is no
+    /// longer current clears only the flag its own action set, so it cannot
+    /// end a newer action that is still in flight.
+    fn end_action(target: Option<&Self>, current: bool, app: &mut App) {
+        if current {
+            app.finish_action();
+            return;
+        }
+        let Some(target) = target else { return };
+        if target.ack.is_some() && app.ack_in_flight == target.ack {
+            app.ack_in_flight = None;
+        }
+        if app.prompt_in_flight && target.prompt == Some(app.prompt_serial) {
+            app.prompt_in_flight = false;
+        }
+        app.dirty = true;
     }
 
     fn same_run(&self, agents: &HashMap<String, Agent>) -> bool {
@@ -768,6 +1087,89 @@ fn agent_identity(agent: &Agent) -> String {
     )
 }
 
+/// Whether the list still holds this run of the agent, as fresh as it was.
+fn listed(agent: &Agent, agents: &HashMap<String, Agent>) -> bool {
+    let identity = agent_identity(agent);
+    agents
+        .values()
+        .any(|other| other.pane_id == agent.pane_id && agent_identity(other) == identity)
+}
+
+/// Whether the agent of an open dialog is gone. For an agent that was never
+/// listed, only another run at its pane shows that it left.
+fn left(agent: &Agent, was_listed: bool, agents: &HashMap<String, Agent>) -> bool {
+    if was_listed {
+        return !listed(agent, agents);
+    }
+    let identity = agent_identity(agent);
+    agents.values().any(|other| {
+        other.endpoint_key == agent.endpoint_key
+            && other.pane_id == agent.pane_id
+            && agent_identity(other) != identity
+    })
+}
+
+/// Whether ui.json exists where `Preferences::load` looks for it.
+fn preferences_file_exists() -> bool {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".config")))
+        .filter(|path| path.is_absolute())
+        .is_some_and(|path| path.join("masil/ui.json").exists())
+}
+
+/// A global option of the server, or None when it is unset or unreadable.
+async fn server_option(manager: &Manager, option: &str) -> Option<String> {
+    let output = manager
+        .native
+        .tmux(["show-options", "-gqv", option].map(Into::into), None)
+        .await
+        .ok()?;
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// The theme for a value of `@masil-theme`. Its `tmux` choice keeps the
+/// server's own colours, which the terminal theme follows.
+fn server_theme(value: &str) -> Option<Theme> {
+    match value {
+        "tmux" => Some(Theme::Terminal),
+        other => other.parse().ok(),
+    }
+}
+
+/// Language and theme for a new desk: a flag first, then ui.json, then the
+/// `@masil-lang` and `@masil-theme` the settings screen sets on the server,
+/// then the defaults.
+async fn initial_look(
+    language: Option<Language>,
+    theme: Option<Theme>,
+    preferences: &preferences::Preferences,
+    manager: &Manager,
+) -> (Language, Theme) {
+    let stored = preferences.warning.is_none() && preferences_file_exists();
+    if stored || (language.is_some() && theme.is_some()) {
+        return (
+            language.unwrap_or(preferences.language),
+            theme.unwrap_or(preferences.theme),
+        );
+    }
+    let (server_language, server_look) = tokio::join!(
+        server_option(manager, "@masil-lang"),
+        server_option(manager, "@masil-theme")
+    );
+    (
+        language
+            .or_else(|| server_language.and_then(|value| value.parse().ok()))
+            .unwrap_or(preferences.language),
+        theme
+            .or_else(|| server_look.as_deref().and_then(server_theme))
+            .unwrap_or(preferences.theme),
+    )
+}
+
 fn action_message(
     boot: String,
     target: Option<TargetIdentity>,
@@ -782,17 +1184,15 @@ fn action_message(
 
 async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     let preferences = preferences::Preferences::load();
-    let mut app = App::new(
-        options.compact,
-        options.language.unwrap_or(preferences.language),
-        options.theme.unwrap_or(preferences.theme),
-    );
+    let manager = Manager::new(socket.clone(), options.client)?;
+    let (language, theme) =
+        initial_look(options.language, options.theme, &preferences, &manager).await;
+    let mut app = App::new(options.compact, language, theme);
     app.set_managed();
     app.set_native_available(true);
     if let Some(warning) = &preferences.warning {
         app.notify(warning.clone());
     }
-    let manager = Manager::new(socket.clone(), options.client)?;
     // This client's own list view and desk state (D1).
     let (mut client_view, local_view, notice) =
         super::client_view::ClientView::open(&manager, app.language, options.compact).await;
@@ -831,6 +1231,8 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut dialog: Option<Dialog> = None;
     let mut answering: Option<AnswerDialog> = None;
+    // Whether the list has held the answer dialog's agent since it opened.
+    let mut answering_listed = false;
     let mut queueing: Option<QueueWindow> = None;
     let mut changing: Option<super::changes::ChangesWindow> = None;
     let mut palette: Option<Palette> = None;
@@ -845,7 +1247,13 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     let mut events = EventStream::new();
     let result = async {
         loop {
+            // The panic hook gave the terminal back: a task panicked.
+            if terminal.panicked() {
+                return Err("a background task panicked; the desk closed".into());
+            }
             if app.dirty {
+                // The search cursor stays out from under a window drawn above the desk.
+                app.modal_open = dialog.is_some() || answering.is_some() || queueing.is_some() || changing.is_some() || palette.is_some();
                 terminal.terminal().draw(|frame| {
                     app.draw(frame);
                     if let Some(dialog) = &mut dialog { dialog.draw(frame, app.theme); }
@@ -932,7 +1340,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 Outcome::Cancel => answering = None,
                                 Outcome::Submit { request, reply } => {
                                     let agent = answering.take().expect("active answer dialog").agent;
-                                    submit_answer(agent, request, reply, fleet.clone(), &mut tasks, app.language, &current_epoch);
+                                    submit_answer(agent, answering_listed, request, reply, fleet.clone(), &mut tasks, app.language, &current_epoch);
                                 }
                             }
                             Vec::new()
@@ -943,14 +1351,20 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 DialogResult::None => Vec::new(),
                                 DialogResult::Cancel => { dialog = None; Vec::new() },
                                 DialogResult::Submit => {
-                                    let submitted = dialog.take().expect("active dialog");
-                                    submit_dialog(submitted, fleet.clone(), &mut tasks, &mut app, &current_epoch);
+                                    // Refused while open: the typed fields stay.
+                                    if let Some((field, reason)) = active.refusal() {
+                                        active.focus = field;
+                                        active.notice = Some(reason);
+                                    } else {
+                                        let submitted = dialog.take().expect("active dialog");
+                                        submit_dialog(submitted, fleet.clone(), &mut tasks, &mut app, &current_epoch);
+                                    }
                                     Vec::new()
                                 }
                             }
                         } else if !app.inbox.open && matches!(&event, Event::Key(key) if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
                             if let Some(agent) = selected_agent(&app, &agents).filter(|agent| !agent.stale) {
-                                dialog = Some(Dialog::confirm(app.language, DialogKind::Interrupt(agent.clone()), word(app.language, "Interrupt agent?", "에이전트를 중단할까요?"), word(app.language, "Sends the provider's interrupt key (Esc for Claude and Codex) while its screen shows a turn. Whether the provider stopped is not asserted.", "화면에 turn이 보일 때 provider의 끊기 key(Claude, Codex는 Esc)를 보냅니다. provider가 멈췄는지는 확인하지 않습니다."), word(app.language, "Interrupt", "중단")));
+                                dialog = Some(Dialog::interrupt(agent, app.language));
                                 app.dirty = true;
                             }
                             Vec::new()
@@ -1011,24 +1425,59 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         app.endpoint_line = Some(next_endpoint_line);
                                         app.dirty = true;
                                     }
-                                    if identity_changed {
-                                        // The queue window stays: it shows the agent's new run
-                                        // and keeps typed text from reaching the desk's keys.
-                                        if let Some(window) = &queueing {
-                                            let agent = window.agent.clone();
-                                            queue_task(&mut tasks, fleet.clone(), agent, None, None);
-                                        }
+                                    // A dialog about an agent closes when that run of it is
+                                    // no longer listed, whichever row is selected. The start
+                                    // dialog is about no agent and stays.
+                                    let mut dropped = None;
+                                    if let Some(agent) = dialog.as_ref().and_then(|dialog| dialog.kind.agent())
+                                        && !listed(agent, &agents)
+                                    {
+                                        dropped = Some(crate::managed::find::agent_label(agent));
                                         dialog = None;
-                                        answering = None;
+                                    }
+                                    if let Some(active) = &answering {
+                                        // An agent the saved view hides can be answered from
+                                        // the inbox without ever being listed.
+                                        answering_listed |= listed(&active.agent, &agents);
+                                        if left(&active.agent, answering_listed, &agents) {
+                                            dropped = Some(crate::managed::find::agent_label(&active.agent));
+                                            answering = None;
+                                        }
+                                    }
+                                    // The queue window stays: it shows the agent's new run
+                                    // and keeps typed text from reaching the desk's keys.
+                                    // A first run after an empty selection is a new run too.
+                                    if identity_changed && let Some(window) = &queueing {
+                                        let agent = window.agent.clone();
+                                        queue_task(&mut tasks, fleet.clone(), agent, None, None);
+                                    }
+                                    // The first agent of an empty or new desk replaces no
+                                    // identity: notices and open windows stay as they are.
+                                    if identity_changed && previous_selected_identity.is_some() {
                                         palette = None;
                                         app.cancel_interactions();
-                                        app.overlay = None;
+                                        // Help is not about the agent and stays open.
+                                        if app.overlay == Some(Overlay::Context) {
+                                            app.overlay = None;
+                                        }
                                         app.ack_in_flight = None;
                                         app.prompt_in_flight = false;
                                         app.toast = None;
+                                        app.dirty = true;
+                                    }
+                                    if let Some(name) = dropped {
+                                        app.notify(message(
+                                            app.language,
+                                            format!("{name}: its run changed or it left the list, so its dialog was closed"),
+                                            format!("{name}: 실행이 바뀌었거나 목록에서 빠져 대화 상자를 닫았습니다"),
+                                        ));
                                     }
                                     if epoch != current_epoch || last_projection.as_ref() != Some(&stable_projection) {
                                         revision = revision.wrapping_add(1);
+                                        // The selection's identity is not a daemon epoch: the block
+                                        // above made the resets a new identity needs, so the
+                                        // snapshot must not read a moved selection as a restart.
+                                        app.epoch.clone_from(&app_epoch);
                                         app.apply_snapshot(json!({"epoch":app_epoch,"revision":revision.to_string(),"observations":projection}));
                                         last_projection = Some(stable_projection);
                                     }
@@ -1037,7 +1486,11 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     if !app.connected || app.connection_message.is_some() { app.set_connection(true, None); }
                                 }
                                 Err(error) => {
-                                    let message = format!("Native inventory unavailable: {error}");
+                                    let message = self::message(
+                                        app.language,
+                                        format!("Native inventory unavailable: {error}"),
+                                        format!("네이티브 목록을 읽을 수 없습니다: {error}"),
+                                    );
                                     if app.connected || app.connection_message.as_deref() != Some(&message) { app.set_connection(false, Some(message)); }
                                 }
                             }
@@ -1048,8 +1501,19 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 app.dirty = true;
                             }
                         }
-                        Ok(Work::Action(message)) if message.target.as_ref().is_some_and(|target| target.same_run(&agents)) || (message.target.is_none() && message.boot == current_epoch) => match message.result {
-                            Ok(ActionResult::Receipt(receipt)) => { app.finish_action(); app.notify(receipt); app.inbox.refresh = true; },
+                        Ok(Work::Action(message)) => {
+                            let current = match &message.target {
+                                Some(target) => target.same_run(&agents),
+                                None => message.boot == current_epoch,
+                            };
+                            // A result for a run that left the list, or from before the
+                            // server changed, still ends its own action and is shown with
+                            // the agent's name. Only the views it would open are dropped.
+                            let target = message.target.as_ref();
+                            let unlisted = target.filter(|target| !current && target.listed).map(|target| target.name.as_str());
+                            match message.result {
+                            Ok(ActionResult::Receipt(receipt)) => { TargetIdentity::end_action(target, current, &mut app); app.notify(for_unlisted(app.language, unlisted, receipt)); app.inbox.refresh = true; },
+                            Ok(ActionResult::Details { .. } | ActionResult::Requests { .. }) if !current => {},
                             Ok(ActionResult::Details { id, value }) => app.set_details(&id, value),
                             Ok(ActionResult::Requests { agent, value, press, event }) => {
                                 app.dirty = true;
@@ -1076,14 +1540,16 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         "요청 목록이 오기 전에 화면이 바뀌었습니다. y를 다시 누르세요".into(),
                                     ));
                                 } else if let Some(opened) = open_answers(*agent, value, &mut app) {
+                                    answering_listed = listed(&opened.agent, &agents);
                                     answering = Some(opened);
                                 }
                             }
-                            Err(error) => { app.finish_action(); app.notify(format!("Action failed: {}", crate::managed::failure::human(&error))); app.inbox.refresh = true; },
+                            Err(error) => { TargetIdentity::end_action(target, current, &mut app); app.notify(for_unlisted(app.language, unlisted, action_error(app.language, &error))); app.inbox.refresh = true; },
+                            }
                         },
-                        Ok(Work::Action(_)) => {},
                         Ok(Work::Pager(Err(error))) => {
-                            let notice = format!("Pager: {}", crate::managed::failure::human(&error));
+                            let text = crate::managed::failure::human(&error);
+                            let notice = self::message(app.language, format!("Pager: {text}"), format!("페이저: {text}"));
                             match &mut changing {
                                 Some(window) => window.tell(notice),
                                 None => app.notify(notice),
@@ -1129,7 +1595,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                             ));
                                         }
                                     }
-                                    Err(error) => app.notify(format!("Action failed: {}", crate::managed::failure::human(&error))),
+                                    Err(error) => app.notify(action_error(app.language, &error)),
                                 }
                             }
                         }
@@ -1141,7 +1607,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             if let Some((kind, result)) = done {
                                 match (&result, window) {
                                     (Ok(value), Some(window)) if kind == "show" => window.edit_body(value),
-                                    (_, Some(window)) => window.finished(result.as_ref().map(|_| ()).map_err(String::as_str), queue_done(app.language, kind, &result)),
+                                    (_, Some(window)) => window.finished(kind, result.as_ref().map(|_| ()).map_err(String::as_str), queue_done(app.language, kind, &result)),
                                     (_, None) => app.notify(queue_done(app.language, kind, &result)),
                                 }
                             }
@@ -1171,7 +1637,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     }
                                 }
                                 Err(error) if press.is_some() => {
-                                    app.notify(format!("Action failed: {}", crate::managed::failure::human(&error)));
+                                    app.notify(action_error(app.language, &error));
                                 }
                                 Err(_) => {}
                             }
@@ -1182,7 +1648,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 app.dirty = true;
                             }
                         }
-                        Err(error) => { poll_pending = false; app.finish_action(); app.notify(format!("Action failed: {error}")); }
+                        Err(error) => { poll_pending = false; app.finish_action(); app.notify(self::message(app.language, format!("Action failed: {error}"), format!("작업 실패: {error}"))); }
                     }
                     Vec::new()
                 },
@@ -1215,7 +1681,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 }
                 if tasks.len() >= 8 {
                     app.finish_action();
-                    app.notify("An action is pending; try again shortly".into());
+                    app.notify(message(app.language, "An action is pending; try again shortly".into(), "작업을 처리하고 있습니다. 잠시 후 다시 시도하세요".into()));
                     continue;
                 }
                 dispatch_effect(effect, &mut dialog, &mut app, &agents, fleet.clone(), &mut tasks, owned_pane.as_deref(), &current_epoch, last_poll_ms);
@@ -1245,7 +1711,7 @@ fn palette_items(app: &App, agents: &HashMap<String, Agent>) -> Vec<palette::Ite
                 kind: palette::Kind::Action,
                 label: action_label(app.language, action, false, false).to_owned(),
                 detail: String::new(),
-                hint: action_shortcut(action).to_owned(),
+                hint: menu_shortcut(action).to_owned(),
                 target: palette::Target::Action(action),
                 enabled: app.action_enabled(action),
                 pane: None,
@@ -1280,7 +1746,7 @@ fn palette_items(app: &App, agents: &HashMap<String, Agent>) -> Vec<palette::Ite
                 label: action_label(app.language, action, app.ack_in_flight.is_some(), false)
                     .to_owned(),
                 detail: String::new(),
-                hint: action_shortcut(action).to_owned(),
+                hint: menu_shortcut(action).to_owned(),
                 target: palette::Target::Action(action),
                 enabled: app.action_enabled(action),
                 pane: None,
@@ -1316,7 +1782,7 @@ fn activate_palette(
                     app.notify(message(
                         language,
                         format!("Selected {id}; its pane cannot be focused now"),
-                        format!("{id} 선택. 지금은 창으로 이동할 수 없습니다"),
+                        format!("{id} 선택. 지금은 pane으로 이동할 수 없습니다"),
                     ));
                     Vec::new()
                 }
@@ -1342,7 +1808,7 @@ fn activate_palette(
                         ActionResult::Receipt(message(
                             language,
                             format!("Selected pane {}", pane.pane_id),
-                            format!("창 {} 선택 완료", pane.pane_id),
+                            format!("pane {} 선택 완료", pane.pane_id),
                         ))
                     });
                 action_message(boot, None, result)
@@ -1385,7 +1851,11 @@ fn dispatch_effect(
                         selected_agent(app, agents),
                     ));
                 }
-                Err(error) => app.notify(format!("Could not open start dialog: {error}")),
+                Err(error) => app.notify(message(
+                    language,
+                    format!("Could not open start dialog: {error}"),
+                    format!("시작 대화 상자를 열 수 없습니다: {error}"),
+                )),
             }
         }
         Effect::RenameAgent => {
@@ -1410,38 +1880,19 @@ fn dispatch_effect(
         }
         Effect::InterruptAgent => {
             if let Some(agent) = selected_agent(app, agents).filter(|agent| !agent.stale) {
-                *dialog = Some(Dialog::confirm(
-                    app.language,
-                    DialogKind::Interrupt(agent.clone()),
-                    word(app.language, "Interrupt agent?", "에이전트를 중단할까요?"),
-                    word(
-                        app.language,
-                        "Sends the provider's interrupt key (Esc for Claude and Codex) while its screen shows a turn. Whether the provider stopped is not asserted.",
-                        "화면에 turn이 보일 때 provider의 끊기 key(Claude, Codex는 Esc)를 보냅니다. provider가 멈췄는지는 확인하지 않습니다.",
-                    ),
-                    word(app.language, "Interrupt", "중단"),
-                ));
+                *dialog = Some(Dialog::interrupt(agent, app.language));
             }
         }
         Effect::CloseAgent => {
             if let Some(agent) = selected_agent(app, agents).filter(|agent| !agent.stale) {
-                *dialog = Some(Dialog::confirm(
-                    app.language,
-                    DialogKind::Close(agent.clone()),
-                    word(app.language, "Close agent pane?", "에이전트 창을 닫을까요?"),
-                    word(
-                        app.language,
-                        "This kills the selected native pane and its running process.",
-                        "선택한 네이티브 창과 실행 중인 프로세스를 종료합니다.",
-                    ),
-                    word(app.language, "Close pane", "창 닫기"),
-                ));
+                *dialog = Some(Dialog::close(agent, app.language));
             }
         }
-        Effect::Ack { id, .. } => {
+        Effect::Ack { id, revision, .. } => {
             if let Some(agent) = agents.get(&id).filter(|agent| !agent.stale).cloned() {
                 let boot = expected_boot.to_owned();
-                let target = TargetIdentity::for_agent(&agent);
+                let mut target = TargetIdentity::for_agent(&agent);
+                target.ack = Some((id.clone(), revision));
                 // Read inbox events only as far as this window showed them.
                 let through = if app.inbox.view.enabled {
                     Through::Seq(app.inbox.newest_seq_of(&agent.run).unwrap_or(0))
@@ -1504,7 +1955,7 @@ fn dispatch_effect(
                     Ok(ActionResult::Receipt(message(
                         language,
                         format!("Selected pane {}", agent.pane_id),
-                        format!("창 {} 선택 완료", agent.pane_id),
+                        format!("pane {} 선택 완료", agent.pane_id),
                     )))
                 }
                 .await;
@@ -1645,7 +2096,7 @@ fn dispatch_effect(
                         ActionResult::Receipt(message(
                             language,
                             format!("Selected pane {}", agent.pane_id),
-                            format!("창 {} 선택 완료", agent.pane_id),
+                            format!("pane {} 선택 완료", agent.pane_id),
                         ))
                     });
                     action_message(boot, Some(target), result)
@@ -1923,7 +2374,7 @@ fn queue_done(
                         "Outcome unknown; check the pane, then `agent operation resolve {key}`"
                     ),
                     format!(
-                        "결과를 모릅니다. 창을 본 뒤 `agent operation resolve {key}`로 정하세요"
+                        "결과를 모릅니다. pane을 본 뒤 `agent operation resolve {key}`로 정하세요"
                     ),
                 ),
             };
@@ -1945,7 +2396,17 @@ fn queue_done(
         }
         Err(error) => error,
     };
-    crate::managed::failure::human(error).to_owned()
+    // An unknown outcome keeps its name: the plain text reads as a failure.
+    let text = crate::managed::failure::human(error);
+    if outcome_is_unknown(error) {
+        message(
+            language,
+            format!("Outcome unknown: {text}"),
+            format!("결과를 모릅니다: {text}"),
+        )
+    } else {
+        text.to_owned()
+    }
 }
 
 /// The answer dialog for these requests, or a note when there is nothing
@@ -1957,7 +2418,7 @@ fn open_answers(agent: Agent, value: Value, app: &mut App) -> Option<AnswerDialo
         app.notify(message(
             language,
             format!("{}: {reason}. Press g to go to its pane.", agent.name),
-            format!("{}: 창에서 답하세요 (g로 이동). {reason}", agent.name),
+            format!("{}: pane에서 답하세요 (g로 이동). {reason}", agent.name),
         ));
         return None;
     }
@@ -1966,15 +2427,17 @@ fn open_answers(agent: Agent, value: Value, app: &mut App) -> Option<AnswerDialo
         app.notify(message(
             language,
             format!("{} has no pending request", agent.name),
-            format!("{}에 대기 중인 요청이 없습니다", agent.name),
+            format!("{}에 열린 요청이 없습니다", agent.name),
         ));
         return None;
     }
     Some(AnswerDialog::new(language, agent, requests))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn submit_answer(
     agent: Agent,
+    listed: bool,
     request: String,
     reply: crate::managed::answer::Reply,
     fleet: Arc<Fleet>,
@@ -1983,7 +2446,8 @@ fn submit_answer(
     current_epoch: &str,
 ) {
     let epoch = current_epoch.to_owned();
-    let target = TargetIdentity::for_agent(&agent);
+    let mut target = TargetIdentity::for_agent(&agent);
+    target.listed = listed;
     let label = crate::managed::answer::profile(&agent.provider).map_or_else(
         || agent.provider.clone(),
         |profile| profile.label.to_owned(),
@@ -2132,17 +2596,14 @@ fn submit_dialog(
         DialogKind::Prompt(agent) => {
             let text = values.first().cloned().unwrap_or_default();
             let epoch = current_epoch.to_owned();
-            let target = TargetIdentity::for_agent(&agent);
+            let mut target = TargetIdentity::for_agent(&agent);
             app.start_prompt();
+            target.prompt = Some(app.prompt_serial);
             tasks.spawn(async move {
-                let result = fleet.prompt(&agent, &text).await.map(|_| {
-                    ActionResult::Receipt(message(
-                        language,
-                        "Prompt and Enter delivered; provider acceptance is unverified".into(),
-                        "프롬프트와 Enter를 전달했습니다. 제공자 수락 여부는 확인되지 않습니다"
-                            .into(),
-                    ))
-                });
+                let result = fleet
+                    .prompt(&agent, &text)
+                    .await
+                    .map(|value| ActionResult::Receipt(prompt_receipt(language, &value)));
                 action_message(epoch, Some(target), result)
             });
         }
@@ -2155,7 +2616,7 @@ fn submit_dialog(
                         language,
                         "The interrupt key reached the selected pane; whether the provider stopped is unverified"
                             .into(),
-                        "선택한 창에 끊기 key를 보냈습니다. 제공자가 멈췄는지는 확인되지 않습니다"
+                        "선택한 pane에 끊기 key를 보냈습니다. 제공자가 멈췄는지는 확인되지 않습니다"
                             .into(),
                     ))
                 });
@@ -2170,11 +2631,358 @@ fn submit_dialog(
                     ActionResult::Receipt(message(
                         language,
                         format!("Closed pane {}", agent.pane_id),
-                        format!("창 {} 닫기 완료", agent.pane_id),
+                        format!("pane {} 닫기 완료", agent.pane_id),
                     ))
                 });
                 action_message(epoch, Some(target), result)
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn agent(name: &str, state: &str) -> Agent {
+        serde_json::from_value(json!({
+            "id": name, "name": name, "provider": "codex", "pane_id": "%7",
+            "window_id": "@1", "workspace": "main", "cwd": "/tmp", "boot": "b",
+            "generation": "1", "run": "r1", "process": "running", "state": state,
+            "evidence": {"state": state, "source": "screen"},
+            "seen": false, "revision": "1", "returned_idle": false,
+        }))
+        .unwrap()
+    }
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// The drawn rows and where the draw left the terminal cursor.
+    fn screen(dialog: &mut Dialog, width: u16, height: u16) -> (String, (u16, u16)) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| dialog.draw(frame, Theme::Dark))
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, (cursor.x, cursor.y))
+    }
+
+    #[test]
+    fn a_pasted_line_break_or_tab_becomes_one_space() {
+        let mut dialog = Dialog::prompt(&agent("builder", "idle"), Language::English);
+        dialog.handle(Event::Paste("fix the bug in\nmain.rs".into()));
+        assert_eq!(dialog.fields[0].value, "fix the bug in main.rs");
+        dialog.fields[0].value.clear();
+        dialog.handle(Event::Paste("a\r\nb\rc\td\u{1b}e".into()));
+        assert_eq!(dialog.fields[0].value, "a b c de");
+        assert!(dialog.notice.is_none());
+    }
+
+    #[test]
+    fn a_pasted_line_break_at_either_end_adds_no_space() {
+        let mut dialog = Dialog::rename(&agent("builder", "idle"), Language::English);
+        dialog.fields[0].value.clear();
+        dialog.handle(Event::Paste("reviewer\n".into()));
+        assert_eq!(dialog.fields[0].value, "reviewer");
+        assert!(dialog.refusal().is_none());
+        let mut dialog = Dialog::prompt(&agent("builder", "idle"), Language::English);
+        dialog.handle(Event::Paste("\r\n\t/tmp/work dir\r\n".into()));
+        assert_eq!(dialog.fields[0].value, "/tmp/work dir");
+        dialog.handle(Event::Paste("\n".into()));
+        assert_eq!(dialog.fields[0].value, "/tmp/work dir");
+    }
+
+    #[test]
+    fn an_insert_cut_at_the_field_limit_says_so_until_the_next_key() {
+        let mut dialog = Dialog::rename(&agent("builder", "idle"), Language::English);
+        dialog.fields[0].value.clear();
+        dialog.handle(Event::Paste("a".repeat(40)));
+        assert_eq!(dialog.fields[0].value.len(), 32);
+        let notice = dialog.notice.clone().expect("a notice for the cut");
+        assert!(notice.contains("32 bytes"), "{notice}");
+        let (text, _) = screen(&mut dialog, 80, 24);
+        assert!(text.contains("32 bytes"), "{text}");
+        dialog.handle(key(KeyCode::Backspace));
+        assert!(dialog.notice.is_none());
+    }
+
+    #[test]
+    fn a_refused_name_or_server_keeps_the_dialog_and_names_the_rule() {
+        let endpoints = [
+            ("local".to_owned(), "k1".to_owned()),
+            ("build".to_owned(), "k2".to_owned()),
+        ];
+        let mut dialog = Dialog::start(Language::English, &endpoints, None);
+        assert!(dialog.note.contains("lowercase letter"));
+        // Server, name, provider, working directory.
+        dialog.fields[0].value = "buld".into();
+        dialog.fields[1].value = "reviewer".into();
+        let (field, reason) = dialog.refusal().expect("an unknown server is refused");
+        assert_eq!(field, 0);
+        assert!(reason.contains("build, local"), "{reason}");
+        dialog.fields[0].value = "build".into();
+        assert!(dialog.refusal().is_none());
+        for name in ["Reviewer", "", "9lives", "re viewer", "한글"] {
+            dialog.fields[1].value = name.into();
+            assert_eq!(
+                dialog.refusal().map(|(field, _)| field),
+                Some(1),
+                "{name:?}"
+            );
+        }
+        for name in ["reviewer", "r", "api-review_2"] {
+            assert!(name_allowed(name), "{name}");
+        }
+        assert!(!name_allowed(&"a".repeat(33)));
+
+        let mut rename = Dialog::rename(&agent("builder", "idle"), Language::Korean);
+        rename.fields[0].value = "Builder".into();
+        assert!(rename.refusal().is_some());
+        // Text and confirmation dialogs have nothing to refuse.
+        assert!(
+            Dialog::draft(&agent("builder", "idle"), Language::English)
+                .refusal()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_dialogs_name_the_agent_and_its_pane() {
+        let builder = agent("builder", "idle");
+        for dialog in [
+            Dialog::prompt(&builder, Language::English),
+            Dialog::rename(&builder, Language::English),
+            Dialog::interrupt(&builder, Language::English),
+            Dialog::close(&builder, Language::English),
+            Dialog::close(&builder, Language::Korean),
+        ] {
+            assert!(dialog.title.contains("builder (%7)"), "{}", dialog.title);
+            assert!(dialog.kind.agent().is_some());
+        }
+        assert!(
+            Dialog::start(Language::English, &[], None)
+                .kind
+                .agent()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_focused_field_places_the_terminal_cursor_after_its_text() {
+        let mut dialog = Dialog::prompt(&agent("builder", "idle"), Language::English);
+        dialog.handle(Event::Paste("한글 ab".into()));
+        let (text, (x, y)) = screen(&mut dialog, 80, 24);
+        let line = text.lines().nth(y as usize).unwrap();
+        // Two wide characters, a space and two letters end seven cells in.
+        let start = line.chars().take_while(|c| *c != '한').count() as u16;
+        assert_eq!(x, start + 7, "{line}");
+        // A value wider than the field keeps a free cell for the cursor.
+        dialog.handle(Event::Paste("x".repeat(200)));
+        let (text, (x, y)) = screen(&mut dialog, 80, 24);
+        let line = text
+            .lines()
+            .nth(y as usize)
+            .unwrap()
+            .chars()
+            .collect::<Vec<_>>();
+        assert_eq!(line[x as usize], ' ', "the cursor covers no character");
+        assert_eq!(line[x as usize - 1], 'x');
+    }
+
+    #[test]
+    fn a_dialog_closes_for_its_own_agent_only() {
+        let builder = agent("builder", "idle");
+        let mut other = agent("reviewer", "idle");
+        other.pane_id = "%8".into();
+        other.run = "r2".into();
+        let mut agents = HashMap::from([
+            (builder.id.clone(), builder.clone()),
+            (other.id.clone(), other.clone()),
+        ]);
+        assert!(listed(&builder, &agents));
+        // Another agent's run changing does not concern this one.
+        agents.get_mut("reviewer").unwrap().run = "r3".into();
+        assert!(listed(&builder, &agents));
+        assert!(!listed(&other, &agents));
+        agents.get_mut("builder").unwrap().stale = true;
+        assert!(!listed(&builder, &agents));
+        agents.remove("builder");
+        assert!(!listed(&builder, &agents));
+    }
+
+    #[test]
+    fn a_dialog_for_a_hidden_agent_stays_until_its_pane_runs_another() {
+        let hidden = agent("builder", "blocked");
+        let mut other = agent("reviewer", "idle");
+        other.pane_id = "%8".into();
+        let mut agents = HashMap::from([(other.id.clone(), other)]);
+        // The saved view hides the agent: it was never listed.
+        assert!(!listed(&hidden, &agents));
+        assert!(!left(&hidden, false, &agents));
+        // A listed agent that drops out of the list did leave.
+        assert!(left(&hidden, true, &agents));
+        // The view shows it again, with the same run and then a new one.
+        agents.insert(hidden.id.clone(), hidden.clone());
+        assert!(!left(&hidden, false, &agents));
+        agents.get_mut("builder").unwrap().run = "r2".into();
+        assert!(left(&hidden, false, &agents));
+    }
+
+    #[test]
+    fn a_late_result_ends_only_its_own_action() {
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        let older = agent("builder", "idle");
+        // A prompt to an old run, then a prompt to the run that replaced it.
+        app.start_prompt();
+        let mut first = TargetIdentity::for_agent(&older);
+        first.prompt = Some(app.prompt_serial);
+        app.prompt_in_flight = false;
+        app.start_prompt();
+        TargetIdentity::end_action(Some(&first), false, &mut app);
+        assert!(app.prompt_in_flight, "the newer prompt is still in flight");
+        let mut second = TargetIdentity::for_agent(&older);
+        second.prompt = Some(app.prompt_serial);
+        TargetIdentity::end_action(Some(&second), false, &mut app);
+        assert!(!app.prompt_in_flight);
+
+        // Mark seen: only the press the result answers is cleared.
+        app.ack_in_flight = Some(("builder".into(), "2".into()));
+        let mut ack = TargetIdentity::for_agent(&older);
+        ack.ack = Some(("builder".into(), "1".into()));
+        TargetIdentity::end_action(Some(&ack), false, &mut app);
+        assert!(app.ack_in_flight.is_some());
+        // A late rename result holds no flag at all.
+        TargetIdentity::end_action(Some(&TargetIdentity::for_agent(&older)), false, &mut app);
+        assert!(app.ack_in_flight.is_some());
+        ack.ack = Some(("builder".into(), "2".into()));
+        TargetIdentity::end_action(Some(&ack), false, &mut app);
+        assert!(app.ack_in_flight.is_none());
+
+        // A result for the current run ends the action as before.
+        app.start_prompt();
+        TargetIdentity::end_action(Some(&TargetIdentity::for_agent(&older)), true, &mut app);
+        assert!(!app.prompt_in_flight);
+    }
+
+    #[test]
+    fn an_unknown_outcome_is_never_worded_as_a_failure() {
+        let failed = action_error(Language::English, "target_absent: agent target not found");
+        assert_eq!(failed, "Action failed: agent target not found");
+        let unknown = action_error(
+            Language::English,
+            "outcome_unknown: server_unreachable: native command timed out",
+        );
+        assert_eq!(unknown, "Outcome unknown: native command timed out");
+        assert!(
+            action_error(Language::Korean, "outcome_unknown: timed out")
+                .starts_with("결과를 모릅니다:")
+        );
+        // The resolve command leads, so a cut footer keeps it.
+        let keyed = action_error(
+            Language::English,
+            "outcome_unknown: prompt operation 1 pasted its text and masil sent Enter, but its result is unknown (x); look at the pane, then run `masil-agent agent operation resolve run:r1/prompt/1 --as delivered|not-delivered`",
+        );
+        assert!(
+            keyed.starts_with(
+                "Outcome unknown: check the pane, then `agent operation resolve run:r1/prompt/1`."
+            ),
+            "{keyed}"
+        );
+        assert!(!keyed.contains("Action failed"));
+        assert_eq!(operation_key("no command here"), None);
+        // Every code of the unknown class reads the same way.
+        let partial = action_error(
+            Language::English,
+            "interrupt_partial: one key of two reached the pane",
+        );
+        assert_eq!(partial, "Outcome unknown: one key of two reached the pane");
+        let sent = queue_done(
+            Language::English,
+            "sent",
+            &Err("api_timeout: no reply in time".into()),
+        );
+        assert_eq!(sent, "Outcome unknown: no reply in time");
+        let refused = queue_done(
+            Language::English,
+            "sent",
+            &Err("busy: agent is working".into()),
+        );
+        assert!(!refused.starts_with("Outcome unknown"), "{refused}");
+    }
+
+    #[test]
+    fn the_prompt_receipt_follows_the_returned_stage() {
+        let receipt = |stage: &str| {
+            prompt_receipt(
+                Language::English,
+                &json!({"stage": stage, "operation_key": "run:r1/prompt/1"}),
+            )
+        };
+        assert_eq!(
+            receipt("delivered"),
+            "Prompt and Enter delivered; provider acceptance is unverified"
+        );
+        assert!(receipt("native_accepted").contains("provider reported"));
+        assert!(receipt("not_delivered").starts_with("Prompt not delivered"));
+        for stage in ["pending", "", "something_new"] {
+            let text = receipt(stage);
+            assert!(text.starts_with("Outcome unknown"), "{stage}: {text}");
+            assert!(text.contains("operation resolve run:r1/prompt/1"), "{text}");
+            assert!(!text.contains("delivered;"), "{text}");
+        }
+        // A reply without a stage claims no delivery either.
+        assert!(prompt_receipt(Language::Korean, &json!({})).starts_with("결과를 모릅니다"));
+    }
+
+    #[test]
+    fn a_result_for_an_unlisted_run_names_its_agent() {
+        assert_eq!(
+            for_unlisted(Language::English, Some("builder"), "Closed pane %7".into()),
+            "builder (that run is no longer listed): Closed pane %7"
+        );
+        assert_eq!(
+            for_unlisted(Language::English, None, "Closed pane %7".into()),
+            "Closed pane %7"
+        );
+        let target = TargetIdentity::for_agent(&agent("builder", "idle"));
+        assert_eq!(target.name, "builder");
+        assert!(!target.same_run(&HashMap::new()));
+    }
+
+    #[test]
+    fn a_blocked_agent_projects_as_waiting_for_input() {
+        use crate::ui::i18n::activity_label;
+        for (state, activity, label) in [
+            ("blocked", "blocked", "Waiting for input"),
+            ("idle", "idle", "Idle"),
+            ("working", "working", "Working"),
+            ("exited", "unknown", "Unknown"),
+        ] {
+            let projection = agent("builder", state).projection();
+            assert_eq!(projection["native"]["activity"], activity, "{state}");
+            assert_eq!(activity_label(Language::English, activity), label);
+        }
+        assert_eq!(activity_label(Language::Korean, "blocked"), "입력 대기");
+    }
+
+    #[test]
+    fn the_server_theme_names_map_to_desk_themes() {
+        assert_eq!(server_theme("light"), Some(Theme::Light));
+        assert_eq!(server_theme("tmux"), Some(Theme::Terminal));
+        assert_eq!(server_theme("terminal"), Some(Theme::Terminal));
+        assert_eq!(server_theme("dark"), Some(Theme::Dark));
+        assert_eq!(server_theme("solarized"), None);
     }
 }

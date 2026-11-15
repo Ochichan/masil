@@ -149,19 +149,22 @@ fn text(language: Language, en: &str, ko: &str) -> String {
 
 fn native_receipt(language: Language, tag: &str) -> String {
     let (en, ko) = match tag {
-        "selected" => ("Selected the configured pane", "설정된 창으로 이동했습니다"),
+        "selected" => (
+            "Selected the configured pane",
+            "설정된 pane으로 이동했습니다",
+        ),
         "expanded" => (
             "Expanded agent sidebar",
             "에이전트 사이드패널을 확대했습니다",
         ),
-        "restored" => ("Restored window layout", "창 분할을 복원했습니다"),
+        "restored" => ("Restored window layout", "window 레이아웃을 복원했습니다"),
         "copied" => (
             "Copied ID to tmux buffer masil-agent-id",
             "tmux 버퍼 masil-agent-id에 ID를 복사했습니다",
         ),
         _ => (
             "Unknown native action response",
-            "창 조작의 응답을 확인할 수 없습니다",
+            "pane 조작의 응답을 확인할 수 없습니다",
         ),
     };
     text(language, en, ko)
@@ -187,7 +190,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
         None
     };
     let (tx, mut rx) = watch::channel(network::Update::Disconnected(
-        "Connecting to observer".into(),
+        i18n::tr(app.language, i18n::Text::Connecting).into(),
     ));
     let retry = Arc::new(Notify::new());
     let reader = tokio::spawn(network::watch(socket.clone(), tx, retry.clone()));
@@ -205,6 +208,10 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     let mut events = crossterm::event::EventStream::new();
     let result = async {
         loop {
+            // The panic hook gave the terminal back: a task panicked.
+            if terminal.panicked() {
+                return Err("a background task panicked; the desk closed".into());
+            }
             if app.dirty {
                 terminal.terminal().draw(|frame| app.draw(frame)).map_err(|e| e.to_string())?;
                 app.dirty = false;
@@ -266,7 +273,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 }
                             }
                         },
-                        Err(error) => { native_busy = false; app.finish_action(); app.notify(format!("Action failed: {error}")); },
+                        Err(error) => { native_busy = false; app.finish_action(); app.notify(text(app.language, &format!("Action failed: {error}"), &format!("작업 실패: {error}"))); },
                     }
                     Vec::new()
                 },
@@ -306,13 +313,14 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             },
                             effect => {
                                 if native_busy {
-                                    app.notify(text(app.language, "A pane action is still running", "창 조작을 처리하고 있습니다"));
+                                    app.notify(text(app.language, "A pane action is still running", "pane 조작을 처리하고 있습니다"));
                                     continue;
                                 }
                                 let (Some(context), Some(expected_boot)) = (native.clone(), boot.clone()) else { continue; };
                                 native_busy = true;
                                 let epoch = app.epoch.clone();
                                 let owned = owned_pane.clone();
+                                let language = app.language;
                                 tasks.spawn(async move {
                                     let result = match effect {
                                         Effect::Navigate {pane_id, pty_generation, ..} => context.navigate(&expected_boot, &pane_id, &pty_generation, owned.as_deref(), &socket).await.map(|_| "selected".to_owned()),
@@ -321,7 +329,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                                 crate::native_ui::ZoomOutcome::Expanded => "expanded".into(),
                                                 crate::native_ui::ZoomOutcome::Restored => "restored".into(),
                                             }),
-                                            None => Err("Expand is available from the native sidebar".into()),
+                                            None => Err(text(language, "Expand is available from the native sidebar", "확장은 네이티브 사이드패널에서만 쓸 수 있습니다")),
                                         },
                                         Effect::CopyId {value, ..} => context.copy_to_buffer(&expected_boot, &value).await.map(|_| "copied".to_owned()),
                                         _ => unreachable!(),

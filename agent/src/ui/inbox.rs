@@ -4,7 +4,7 @@
 //! agent.
 
 use super::model::{App, Effect, HitRegion, HitTarget, Language, Overlay};
-use super::view::{Palette, clip_line, inset_x, pad, utc_timestamp};
+use super::view::{Palette, clip_line, inset_x, pad};
 use crate::managed::inbox::{InboxItem, InboxView};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -114,6 +114,36 @@ impl InboxState {
         self.view.events.iter().map(|event| event.seq).max()
     }
 
+    /// What the second `A` will do. Marking read goes up to the newest
+    /// event shown, so it also covers unseen events the list leaves out
+    /// (it holds the newest 100): the text then gives both counts.
+    fn read_all_question(&self, language: Language) -> String {
+        let listed = self
+            .view
+            .events
+            .iter()
+            .filter(|event| waiting(event))
+            .count() as i64;
+        let unseen = self.view.unseen;
+        let unlisted = unseen - listed;
+        if unlisted <= 0 {
+            return word(
+                language,
+                "Press A again to mark every listed event read",
+                "A를 한 번 더 누르면 보이는 사건을 모두 읽음으로 바꿉니다",
+            )
+            .to_owned();
+        }
+        match language {
+            Language::English => format!(
+                "Press A again to mark all {unseen} unseen events read, including {unlisted} not listed here"
+            ),
+            Language::Korean => format!(
+                "A를 한 번 더 누르면 안 읽은 사건 {unseen}개를 모두 읽음으로 바꿉니다. 여기 없는 {unlisted}개도 포함합니다"
+            ),
+        }
+    }
+
     /// The newest sequence displayed for a run, if any.
     pub(crate) fn newest_seq_of(&self, run: &str) -> Option<i64> {
         self.view
@@ -134,6 +164,16 @@ fn word(language: Language, english: &'static str, korean: &'static str) -> &'st
         Language::English => english,
         Language::Korean => korean,
     }
+}
+
+/// When an event was seen, as this machine's date and wall-clock time. The
+/// list keeps events of earlier days, so the date is part of it.
+pub(super) fn local_stamp(milliseconds: u64) -> String {
+    let at = crate::schedule::cron::system_local(milliseconds as i64);
+    format!(
+        "{:02}-{:02} {:02}:{:02}",
+        at.month, at.day, at.hour, at.minute
+    )
 }
 
 pub(crate) fn kind_label(language: Language, kind: &str) -> &'static str {
@@ -311,14 +351,7 @@ impl App {
                     return Vec::new();
                 };
                 self.inbox.confirm = Some((Instant::now() + CONFIRM, through));
-                self.toast = Some(
-                    word(
-                        self.language,
-                        "Press A again to mark every listed event read",
-                        "A를 한 번 더 누르면 보이는 사건을 모두 읽음으로 바꿉니다",
-                    )
-                    .to_owned(),
-                );
+                self.toast = Some(self.inbox.read_all_question(self.language));
             }
             KeyCode::Char('o') => {
                 self.inbox.all = !self.inbox.all;
@@ -469,10 +502,7 @@ impl App {
             let dim = event.read || event.resolution.is_some();
             let text_style = if dim { base.fg(palette.muted) } else { base };
             let mark = if waiting(event) { "● " } else { "  " };
-            let time = utc_timestamp(event.observed_ms)
-                .get(11..19)
-                .unwrap_or("")
-                .to_owned();
+            let time = local_stamp(event.observed_ms);
             let kind = kind_label(language, &event.kind);
             let agent = names
                 .iter()
@@ -623,6 +653,37 @@ mod tests {
         assert_eq!(state.oldest_unseen().map(|event| event.id), Some(0));
         state.set_names(vec![("%1".into(), "r".into(), "builder".into())]);
         assert_eq!(state.oldest_unseen().map(|event| event.id), Some(1));
+    }
+
+    #[test]
+    fn mark_all_read_says_how_many_unlisted_events_it_covers() {
+        let mut state = InboxState::default();
+        state.apply(view(vec![
+            item(1, 10, "r", "blocked"),
+            item(2, 11, "r", "blocked"),
+        ]));
+        // Every unseen event is listed: the plain question.
+        assert_eq!(
+            state.read_all_question(Language::English),
+            "Press A again to mark every listed event read"
+        );
+        // 130 unseen in the store, two of them listed.
+        let mut more = view(vec![
+            item(1, 10, "r", "blocked"),
+            item(2, 11, "r", "blocked"),
+        ]);
+        more.unseen = 130;
+        state.apply(more);
+        let english = state.read_all_question(Language::English);
+        assert!(
+            english.contains("all 130 unseen") && english.contains("128 not listed"),
+            "{english}"
+        );
+        let korean = state.read_all_question(Language::Korean);
+        assert!(
+            korean.contains("130개") && korean.contains("128개"),
+            "{korean}"
+        );
     }
 
     #[test]

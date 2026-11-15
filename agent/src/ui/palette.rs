@@ -354,7 +354,7 @@ impl Palette {
     fn kind_label(&self, kind: Kind) -> &'static str {
         match kind {
             Kind::Agent => word(self.language, "Agent", "에이전트"),
-            Kind::Pane => word(self.language, "Pane", "창"),
+            Kind::Pane => word(self.language, "Pane", "pane"),
             Kind::Action => word(self.language, "Action", "작업"),
         }
     }
@@ -381,7 +381,8 @@ impl Palette {
             height,
         );
         self.modal = modal;
-        let (panel, text, muted, accent, accent_text) = super::managed::dialog_colors(theme);
+        let (panel, text, _, accent, accent_text) = super::managed::dialog_colors(theme);
+        let muted = super::view::Palette::for_theme(theme).muted_style();
         frame.render_widget(Clear, modal);
         let inner = Rect::new(
             modal.x + 2,
@@ -416,32 +417,29 @@ impl Palette {
         );
         self.hits.push((close, Hit::Close));
 
-        // Query line: the end of a long query stays visible.
+        // Query line: the end of a long query stays visible. The marker
+        // takes two cells and the caret one, so the text gets the rest.
         let count = format!(" {}", self.shown.len());
         let field_width = text_width.saturating_sub(cell_width(&count));
+        let visible = super::managed::tail(&self.query, field_width.saturating_sub(3));
+        // An IME draws its preedit at the terminal cursor, on the caret.
+        let caret = 2 + cell_width(&visible);
+        if caret < field_width {
+            frame.set_cursor_position((inner.x + caret as u16, inner.y));
+        }
         let query = if self.query.is_empty() {
             Span::styled(
                 ellipsize(
                     word(
                         self.language,
                         "Type to find agents, panes and actions",
-                        "에이전트, 창, 작업 찾기",
+                        "에이전트, pane, 작업 찾기",
                     ),
                     field_width.saturating_sub(2),
                 ),
-                Style::default().fg(muted),
+                muted,
             )
         } else {
-            let mut visible = String::new();
-            let mut used = 3;
-            for grapheme in self.query.graphemes(true).rev() {
-                used += cell_width(grapheme);
-                if used > field_width {
-                    visible.insert(0, '…');
-                    break;
-                }
-                visible.insert_str(0, grapheme);
-            }
             Span::styled(format!("{visible}▏"), Style::default().fg(text))
         };
         frame.render_widget(
@@ -455,7 +453,7 @@ impl Palette {
             Rect::new(inner.x, inner.y, field_width as u16, 1),
         );
         frame.render_widget(
-            Paragraph::new(count.clone()).style(Style::default().fg(muted)),
+            Paragraph::new(count.clone()).style(muted),
             Rect::new(
                 inner.right().saturating_sub(cell_width(&count) as u16),
                 inner.y,
@@ -468,17 +466,17 @@ impl Palette {
             PaneState::Loading => Some(word(
                 self.language,
                 "Loading panes…",
-                "창 목록 불러오는 중…",
+                "pane 목록 불러오는 중…",
             )),
             PaneState::Failed => Some(word(
                 self.language,
                 "Pane list unavailable",
-                "창 목록을 불러올 수 없음",
+                "pane 목록을 불러올 수 없음",
             )),
             PaneState::Loaded { truncated: true } => Some(word(
                 self.language,
                 "Only the first 2048 panes are listed",
-                "처음 2048개 창만 표시",
+                "처음 2048개 pane만 표시",
             )),
             PaneState::Loaded { .. } => None,
         };
@@ -507,7 +505,7 @@ impl Palette {
                     word(self.language, "No match", "일치하는 항목 없음"),
                     text_width,
                 ))
-                .style(Style::default().fg(muted)),
+                .style(muted),
                 Rect::new(inner.x, list_top, inner.width, 1),
             );
         }
@@ -525,10 +523,19 @@ impl Palette {
             let y = list_top + row as u16;
             let rect = Rect::new(modal.x + 1, y, modal.width.saturating_sub(2), 1);
             let selected = position == self.selected;
-            let (fg, bg) = if selected {
-                (accent_text, accent)
+            // A selected entry that cannot run keeps its muted text on the
+            // panel. The marker, the underline and the hint show that it is
+            // selected and that Enter does nothing now.
+            let active = selected && item.enabled;
+            let unavailable = selected && !item.enabled;
+            let plain = |color| Style::default().fg(color);
+            let bg = if active { accent } else { panel };
+            let label_style = if active {
+                plain(accent_text)
+            } else if item.enabled {
+                plain(text)
             } else {
-                (if item.enabled { text } else { muted }, panel)
+                muted
             };
             let marker = if selected {
                 "›"
@@ -537,7 +544,12 @@ impl Palette {
             } else {
                 " "
             };
-            let hint_width = cell_width(&item.hint).min(text_width / 3);
+            let hint = if unavailable {
+                word(self.language, "unavailable", "지금은 불가")
+            } else {
+                item.hint.as_str()
+            };
+            let hint_width = cell_width(hint).min(text_width / 3);
             let body_width = text_width.saturating_sub(kind_width + hint_width + 1);
             let label = ellipsize(&item.label, body_width);
             let detail_width = body_width.saturating_sub(cell_width(&label) + 2);
@@ -548,12 +560,10 @@ impl Palette {
             };
             let used = kind_width + cell_width(&label) + cell_width(&detail);
             let gap = text_width.saturating_sub(used + hint_width);
-            let secondary = if selected { accent_text } else { muted };
+            let secondary = if active { plain(accent_text) } else { muted };
+            let edge = plain(if active { accent_text } else { accent });
             let line = Line::from(vec![
-                Span::styled(
-                    format!("{marker} "),
-                    Style::default().fg(if selected { accent_text } else { accent }),
-                ),
+                Span::styled(format!("{marker} "), edge),
                 Span::styled(
                     {
                         let kind = self.kind_label(item.kind);
@@ -562,21 +572,23 @@ impl Palette {
                             " ".repeat(kind_width.saturating_sub(cell_width(kind)))
                         )
                     },
-                    Style::default().fg(secondary),
+                    secondary,
                 ),
                 Span::styled(
                     label,
-                    Style::default().fg(fg).add_modifier(if selected {
+                    label_style.add_modifier(if active {
                         Modifier::BOLD
+                    } else if unavailable {
+                        Modifier::UNDERLINED
                     } else {
                         Modifier::empty()
                     }),
                 ),
-                Span::styled(detail, Style::default().fg(secondary)),
+                Span::styled(detail, secondary),
                 Span::raw(" ".repeat(gap)),
                 Span::styled(
-                    ellipsize(&item.hint, hint_width),
-                    Style::default().fg(if selected { accent_text } else { accent }),
+                    ellipsize(hint, hint_width),
+                    if unavailable { muted } else { edge },
                 ),
             ]);
             frame.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), rect);
@@ -600,7 +612,7 @@ impl Palette {
         }
         if let Some(status) = status {
             frame.render_widget(
-                Paragraph::new(ellipsize(&status, text_width)).style(Style::default().fg(muted)),
+                Paragraph::new(ellipsize(&status, text_width)).style(muted),
                 Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
             );
         }
@@ -709,6 +721,73 @@ mod tests {
             palette.handle(mouse(MouseEventKind::Up(MouseButton::Left), 20), now),
             PaletteResult::Close
         ));
+    }
+
+    fn drawn(palette: &mut Palette, width: u16, height: u16) -> (Vec<String>, (u16, u16)) {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| palette.draw(frame, Theme::Dark))
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, (cursor.x, cursor.y))
+    }
+
+    #[test]
+    fn a_selected_entry_that_cannot_run_says_so() {
+        let mut blocked = item(Kind::Action, "Close pane", false);
+        blocked.hint = "X".into();
+        for (language, wanted) in [
+            (Language::English, "unavailable"),
+            (Language::Korean, "지금은불가"),
+        ] {
+            let mut palette = Palette::new(language, vec![blocked.clone()], None);
+            let (rows, _) = drawn(&mut palette, 60, 12);
+            let row = rows
+                .iter()
+                .find(|row| row.contains("Close pane"))
+                .expect("the entry is listed");
+            assert!(row.contains('›'), "{row}");
+            // A wide character leaves a blank cell after it.
+            assert!(row.replace(' ', "").contains(wanted), "{row}");
+        }
+        // An entry that can run keeps its own key in the hint column.
+        let mut ready = item(Kind::Action, "New agent", true);
+        ready.hint = "n".into();
+        let mut palette = Palette::new(Language::English, vec![ready], None);
+        let (rows, _) = drawn(&mut palette, 60, 12);
+        assert!(!rows.iter().any(|row| row.contains("unavailable")));
+    }
+
+    #[test]
+    fn a_long_query_keeps_its_caret_and_the_terminal_cursor_on_it() {
+        let mut palette = Palette::new(Language::English, Vec::new(), None);
+        for query in ["ab", &"abcdefghij".repeat(12)] {
+            palette.query = query.to_owned();
+            let (rows, (x, y)) = drawn(&mut palette, 40, 12);
+            let line = rows[y as usize].chars().collect::<Vec<_>>();
+            assert_eq!(line[x as usize], '▏', "{}", rows[y as usize]);
+            assert_eq!(line[x as usize - 1], query.chars().last().unwrap());
+        }
+        assert!(
+            drawn(&mut palette, 40, 12)
+                .0
+                .iter()
+                .any(|row| row.contains('…'))
+        );
+        // An empty query puts the cursor where typing starts.
+        palette.query.clear();
+        let (rows, (x, y)) = drawn(&mut palette, 40, 12);
+        let line = rows[y as usize].chars().collect::<Vec<_>>();
+        assert_eq!(line[x as usize - 2], '›', "{}", rows[y as usize]);
     }
 
     #[test]

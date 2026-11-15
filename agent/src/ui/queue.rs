@@ -23,8 +23,14 @@ use unicode_segmentation::UnicodeSegmentation;
 const BODY_LIMIT: usize = 32_768;
 const PATH_LIMIT: usize = 4_096;
 const LIST_ROWS: usize = 8;
+/// The editor's cursor, drawn between two graphemes.
+const CURSOR: char = '▏';
 /// The pause in typing after a save before list keys act again.
 const QUIET: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long after an Esc that asked the next Esc is not an answer yet. It is
+/// longer than the delay before a held key starts to repeat, and every such
+/// Esc starts it again, so a held key or a double tap cannot answer.
+const ESC_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub(super) struct QueueWindow {
     language: Language,
@@ -40,6 +46,15 @@ pub(super) struct QueueWindow {
     /// After a save, keys are ignored until typing pauses: someone who
     /// typed on must not remove or send with the letters and Enter.
     quiet_until: Option<std::time::Instant>,
+    /// The prompt editor holds text that was typed or pasted, or that a
+    /// failed save gave back.
+    touched: bool,
+    /// When an Esc asked before dropping that text or closing during a
+    /// save. An Esc more than `ESC_PAUSE` later does it; any other key
+    /// takes the question back.
+    leaving: Option<std::time::Instant>,
+    /// The first editor row on show.
+    editor_top: usize,
     notice: Option<String>,
     hits: Vec<(Rect, Hit)>,
     pressed: Option<Hit>,
@@ -48,16 +63,19 @@ pub(super) struct QueueWindow {
 #[derive(Clone)]
 enum Mode {
     List,
-    /// Writing a new prompt (`id` None) or changing one.
+    /// Writing a new prompt (`id` None) or changing one. `cursor` is a byte
+    /// offset between two graphemes of `text`.
     Edit {
         id: Option<i64>,
         revision: i64,
         text: String,
+        cursor: usize,
     },
     Attach {
         id: i64,
         revision: i64,
         text: String,
+        cursor: usize,
     },
     Remove {
         id: i64,
@@ -99,6 +117,9 @@ impl QueueWindow {
             mode: Mode::List,
             pending: None,
             quiet_until: None,
+            touched: false,
+            leaving: None,
+            editor_top: 0,
             notice: None,
             hits: Vec::new(),
             pressed: None,
@@ -131,16 +152,27 @@ impl QueueWindow {
     }
 
     /// The result of a change: shown here, whatever the agent runs now. A
-    /// failed save gives the text back.
-    pub(super) fn finished(&mut self, result: Result<(), &str>, notice: String) {
-        let saved = self.pending.take();
+    /// failed save gives the text back. `kind` names the change, as
+    /// `queue_done` words it: only the result of the save that is on its
+    /// way ends it, so a move or removal that answers meanwhile does not.
+    pub(super) fn finished(&mut self, kind: &str, result: Result<(), &str>, notice: String) {
+        let own = match &self.pending {
+            Some(Mode::Edit { id: None, .. }) => kind == "added",
+            Some(Mode::Edit { id: Some(_), .. }) => kind == "saved",
+            Some(Mode::Attach { .. }) => kind == "attached",
+            _ => false,
+        };
+        let saved = if own { self.pending.take() } else { None };
+        if own {
+            self.leaving = None;
+        }
         match (result, saved) {
             (Ok(()), Some(_)) => {
                 self.quiet_until = Some(std::time::Instant::now() + QUIET);
             }
             // The item changed, was sent, or belongs to an earlier run: the
             // text can only go in as a new prompt.
-            (Err(error), Some(Mode::Edit { text, .. }))
+            (Err(error), Some(Mode::Edit { text, cursor, .. }))
                 if ["queue_stale", "queue_held", "queue_not_staged"]
                     .iter()
                     .any(|code| error.starts_with(code)) =>
@@ -149,7 +181,9 @@ impl QueueWindow {
                     id: None,
                     revision: 0,
                     text,
+                    cursor,
                 };
+                self.touched = true;
                 self.notice = Some(format!(
                     "{} {}",
                     crate::managed::failure::human(error),
@@ -160,7 +194,10 @@ impl QueueWindow {
                 ));
                 return;
             }
-            (Err(_), Some(pending @ Mode::Edit { .. })) => self.mode = pending,
+            (Err(_), Some(pending @ Mode::Edit { .. })) => {
+                self.mode = pending;
+                self.touched = true;
+            }
             _ => {}
         }
         self.notice = Some(notice);
@@ -178,7 +215,9 @@ impl QueueWindow {
                 id: Some(id),
                 revision: value["revision"].as_i64().unwrap_or(0),
                 text: body.to_owned(),
+                cursor: body.len(),
             };
+            self.touched = false;
         }
     }
 
@@ -222,9 +261,19 @@ impl QueueWindow {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
             Event::Paste(pasted) => {
+                // Pasting on takes the Esc question back, as typing does.
+                if self.leaving.take().is_some() {
+                    self.notice = None;
+                }
                 match &mut self.mode {
-                    Mode::Edit { text, .. } => push(text, &pasted, BODY_LIMIT, true),
-                    Mode::Attach { text, .. } => push(text, &pasted, PATH_LIMIT, false),
+                    Mode::Edit { text, cursor, .. } => {
+                        let before = text.len();
+                        insert(text, cursor, &pasted, BODY_LIMIT, true);
+                        self.touched |= text.len() != before;
+                    }
+                    Mode::Attach { text, cursor, .. } => {
+                        insert(text, cursor, &pasted, PATH_LIMIT, false);
+                    }
                     _ => {}
                 }
                 QueueOutcome::None
@@ -264,14 +313,40 @@ impl QueueWindow {
     }
 
     fn key(&mut self, key: KeyEvent) -> QueueOutcome {
+        self.key_at(key, std::time::Instant::now())
+    }
+
+    fn key_at(&mut self, key: KeyEvent, now: std::time::Instant) -> QueueOutcome {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Whether this Esc follows one that asked first. One that follows
+        // within the pause, as from a held key or a double tap, is not an
+        // answer: the question stays and the pause starts again.
+        let asked = self.leaving.take();
+        let leaving = asked.is_some() && key.code == KeyCode::Esc;
+        if leaving && asked.is_some_and(|at| now.saturating_duration_since(at) < ESC_PAUSE) {
+            self.leaving = Some(now);
+            return QueueOutcome::None;
+        }
         // Keys typed on after Enter must not act on the list meanwhile, nor
-        // until typing pauses after the save; Esc still closes the window.
-        let now = std::time::Instant::now();
+        // until typing pauses after the save. Esc closes the window once no
+        // save is on its way.
         let typing_on = self.quiet_until.is_some_and(|until| now < until);
         if self.pending.is_some() || typing_on {
             if key.code == KeyCode::Esc {
-                return QueueOutcome::Close;
+                // A save on its way can still fail and give the text back,
+                // so the first Esc only says so.
+                if self.pending.is_none() || leaving {
+                    return QueueOutcome::Close;
+                }
+                self.leaving = Some(now);
+                self.notice = Some(
+                    self.word(
+                        "Still saving. Esc again closes now; if the save fails, the text is lost.",
+                        "저장 중입니다. Esc를 한 번 더 누르면 지금 닫습니다. 저장이 실패하면 본문을 잃습니다.",
+                    )
+                    .into(),
+                );
+                return QueueOutcome::None;
             }
             if typing_on {
                 self.quiet_until = Some(now + QUIET);
@@ -286,21 +361,47 @@ impl QueueWindow {
                 id,
                 revision,
                 mut text,
+                mut cursor,
             } => match key.code {
-                KeyCode::Esc => QueueOutcome::None,
+                // Typed text is asked about once before it is dropped.
+                KeyCode::Esc => {
+                    if self.touched && !text.is_empty() && !leaving {
+                        self.leaving = Some(now);
+                        self.notice = Some(
+                            self.word(
+                                "Esc again closes the editor and drops this text.",
+                                "Esc를 한 번 더 누르면 편집기를 닫고 이 본문을 버립니다.",
+                            )
+                            .into(),
+                        );
+                        self.mode = Mode::Edit {
+                            id,
+                            revision,
+                            text,
+                            cursor,
+                        };
+                    }
+                    QueueOutcome::None
+                }
                 KeyCode::Enter if !control => {
                     if text.trim().is_empty() {
                         self.notice = Some(
                             self.word("Write the prompt first.", "먼저 prompt를 쓰세요.")
                                 .into(),
                         );
-                        self.mode = Mode::Edit { id, revision, text };
+                        self.mode = Mode::Edit {
+                            id,
+                            revision,
+                            text,
+                            cursor,
+                        };
                         return QueueOutcome::None;
                     }
                     self.pending = Some(Mode::Edit {
                         id,
                         revision,
                         text: text.clone(),
+                        cursor,
                     });
                     QueueOutcome::Op(match id {
                         None => QueueOp::Add { body: text },
@@ -311,9 +412,14 @@ impl QueueWindow {
                         },
                     })
                 }
-                code => {
-                    edit(&mut text, code, control, BODY_LIMIT, true);
-                    self.mode = Mode::Edit { id, revision, text };
+                _ => {
+                    self.touched |= edit(&mut text, &mut cursor, key, BODY_LIMIT, true);
+                    self.mode = Mode::Edit {
+                        id,
+                        revision,
+                        text,
+                        cursor,
+                    };
                     QueueOutcome::None
                 }
             },
@@ -321,6 +427,7 @@ impl QueueWindow {
                 id,
                 revision,
                 mut text,
+                mut cursor,
             } => match key.code {
                 KeyCode::Esc => QueueOutcome::None,
                 KeyCode::Enter if !text.trim().is_empty() => {
@@ -328,6 +435,7 @@ impl QueueWindow {
                         id,
                         revision,
                         text: text.clone(),
+                        cursor,
                     });
                     QueueOutcome::Op(QueueOp::Attach {
                         id,
@@ -335,9 +443,14 @@ impl QueueWindow {
                         revision,
                     })
                 }
-                code => {
-                    edit(&mut text, code, control, PATH_LIMIT, false);
-                    self.mode = Mode::Attach { id, revision, text };
+                _ => {
+                    edit(&mut text, &mut cursor, key, PATH_LIMIT, false);
+                    self.mode = Mode::Attach {
+                        id,
+                        revision,
+                        text,
+                        cursor,
+                    };
                     QueueOutcome::None
                 }
             },
@@ -383,7 +496,9 @@ impl QueueWindow {
                     id: None,
                     revision: 0,
                     text: String::new(),
+                    cursor: 0,
                 };
+                self.touched = false;
             }
             KeyCode::Enter => match self.staged() {
                 Some((id, _)) => return QueueOutcome::Op(QueueOp::Show { id }),
@@ -395,6 +510,7 @@ impl QueueWindow {
                         id,
                         revision,
                         text: String::new(),
+                        cursor: 0,
                     };
                 }
                 None => self.notice = Some(not_here.into()),
@@ -483,13 +599,16 @@ impl QueueWindow {
         )
     }
 
-    fn detail(&self, width: usize) -> Vec<(String, bool)> {
+    /// The rows under the list and, for an editor, the row its cursor is on.
+    fn detail(&self, width: usize) -> (Vec<(String, bool)>, Option<usize>) {
         let mut rows = Vec::new();
         let mut push = |text: &str, muted: bool| {
             rows.extend(wrap(text, width).into_iter().map(|line| (line, muted)));
         };
         match &self.mode {
-            Mode::Edit { text, id, .. } => {
+            Mode::Edit {
+                text, id, cursor, ..
+            } => {
                 push(
                     if id.is_some() {
                         self.word("Edit the prompt:", "prompt 고치기:")
@@ -498,17 +617,12 @@ impl QueueWindow {
                     },
                     true,
                 );
-                let lines: Vec<&str> = text.split('\n').collect();
-                let count = lines.len();
-                for (index, line) in lines.iter().enumerate() {
-                    let cursor = if index + 1 == count { "▏" } else { "" };
-                    for wrapped in wrap(&format!("{}{cursor}", plain(line)), width) {
-                        rows.push((wrapped, false));
-                    }
-                }
-                return rows;
+                let (field, at) = field_rows(text, *cursor, width);
+                let cursor_row = rows.len() + at;
+                rows.extend(field.into_iter().map(|row| (row, false)));
+                return (rows, Some(cursor_row));
             }
-            Mode::Attach { text, .. } => {
+            Mode::Attach { text, cursor, .. } => {
                 push(
                     self.word(
                         "Path to attach (drop a file or type it; relative to the agent's directory):",
@@ -516,8 +630,10 @@ impl QueueWindow {
                     ),
                     true,
                 );
-                push(&format!("{}▏", plain(text)), false);
-                return rows;
+                let (field, at) = field_rows(text, *cursor, width);
+                let cursor_row = rows.len() + at;
+                rows.extend(field.into_iter().map(|row| (row, false)));
+                return (rows, Some(cursor_row));
             }
             Mode::Remove { .. } => {
                 push(
@@ -527,7 +643,7 @@ impl QueueWindow {
                     ),
                     false,
                 );
-                return rows;
+                return (rows, None);
             }
             Mode::Send { .. } => {
                 push(
@@ -537,7 +653,7 @@ impl QueueWindow {
                     ),
                     false,
                 );
-                return rows;
+                return (rows, None);
             }
             Mode::List => {}
         }
@@ -590,14 +706,24 @@ impl QueueWindow {
                 true,
             );
         }
-        rows
+        (rows, None)
     }
 
     fn buttons(&self) -> Vec<(String, KeyCode)> {
         let label = |key: &str, text: &str| format!(" {key} {text} ");
         match &self.mode {
             Mode::Edit { .. } => vec![
-                (label("Esc", self.word("Cancel", "취소")), KeyCode::Esc),
+                (
+                    label(
+                        "Esc",
+                        if self.leaving.is_some() {
+                            self.word("Discard", "버리기")
+                        } else {
+                            self.word("Cancel", "취소")
+                        },
+                    ),
+                    KeyCode::Esc,
+                ),
                 (label("^J", self.word("New line", "줄 바꿈")), KeyCode::Null),
                 (label("Enter", self.word("Save", "저장")), KeyCode::Enter),
             ],
@@ -622,6 +748,13 @@ impl QueueWindow {
             Mode::List => vec![
                 (label("Esc", self.word("Close", "닫기")), KeyCode::Esc),
                 (label("n", self.word("New", "새로")), KeyCode::Char('n')),
+                (label("Enter", self.word("Edit", "고치기")), KeyCode::Enter),
+                (
+                    label("a", self.word("Attach", "붙이기")),
+                    KeyCode::Char('a'),
+                ),
+                (label("K", "↑"), KeyCode::Char('K')),
+                (label("J", "↓"), KeyCode::Char('J')),
                 (
                     label("x", self.word("Remove", "지우기")),
                     KeyCode::Char('x'),
@@ -648,7 +781,7 @@ impl QueueWindow {
         } else {
             0
         };
-        let detail = self.detail(text_width);
+        let (detail, cursor_row) = self.detail(text_width);
         let notice = self
             .notice
             .as_deref()
@@ -716,11 +849,20 @@ impl QueueWindow {
             }
             y += 1;
         }
-        // The editor keeps its end in view.
-        let skip = if listing {
-            0
-        } else {
-            detail.len().saturating_sub(detail_rows)
+        // An editor keeps its cursor in view.
+        let skip = match cursor_row {
+            Some(row) => {
+                if row < self.editor_top {
+                    self.editor_top = row;
+                } else if row >= self.editor_top + detail_rows {
+                    self.editor_top = (row + 1).saturating_sub(detail_rows);
+                }
+                self.editor_top = self
+                    .editor_top
+                    .min(detail.len().saturating_sub(detail_rows));
+                self.editor_top
+            }
+            None => 0,
         };
         for (line, quiet) in detail.into_iter().skip(skip).take(detail_rows) {
             if y >= bottom {
@@ -756,7 +898,22 @@ impl QueueWindow {
         );
         let button_y = modal.bottom().saturating_sub(2);
         let mut right = inner.right();
-        let buttons = self.buttons();
+        let mut buttons = self.buttons();
+        if listing {
+            // A narrow row gives up the move buttons first, then Attach,
+            // then Edit. Their keys still work.
+            for group in [
+                &[KeyCode::Char('K'), KeyCode::Char('J')][..],
+                &[KeyCode::Char('a')],
+                &[KeyCode::Enter],
+            ] {
+                let row: usize = buttons.iter().map(|(label, _)| cell_width(label) + 1).sum();
+                if row.saturating_sub(1) <= inner.width as usize {
+                    break;
+                }
+                buttons.retain(|(_, code)| !group.contains(code));
+            }
+        }
         let last = buttons.len().saturating_sub(1);
         for (index, (label, code)) in buttons.into_iter().enumerate().rev() {
             let label_width = cell_width(&label) as u16;
@@ -782,36 +939,112 @@ impl QueueWindow {
     }
 }
 
-/// Typing into a field. `lines` keeps line breaks (Ctrl-J adds one).
-fn edit(text: &mut String, code: KeyCode, control: bool, limit: usize, lines: bool) {
-    match code {
-        KeyCode::Backspace => {
-            if let Some((end, _)) = text.grapheme_indices(true).next_back() {
-                text.truncate(end);
-            }
+/// Typing into a field at `cursor`, a byte offset between two graphemes.
+/// `lines` keeps line breaks (Ctrl-J adds one). Returns whether the text
+/// changed.
+fn edit(text: &mut String, cursor: &mut usize, key: KeyEvent, limit: usize, lines: bool) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let before = text.len();
+    let previous = |text: &str, at: usize| {
+        text[..at]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(start, _)| start)
+    };
+    let next = |text: &str, at: usize| {
+        text[at..]
+            .graphemes(true)
+            .next()
+            .map_or(at, |grapheme| at + grapheme.len())
+    };
+    match key.code {
+        KeyCode::Left => *cursor = previous(text, *cursor),
+        KeyCode::Right => *cursor = next(text, *cursor),
+        // The start and end of the cursor's line.
+        KeyCode::Home => *cursor = text[..*cursor].rfind('\n').map_or(0, |at| at + 1),
+        KeyCode::End => {
+            *cursor = text[*cursor..]
+                .find('\n')
+                .map_or(text.len(), |at| *cursor + at);
         }
-        KeyCode::Char('u') if control => text.clear(),
-        KeyCode::Char('j') if control && lines => push(text, "\n", limit, true),
-        KeyCode::Tab if lines => push(text, "\t", limit, true),
-        KeyCode::Char(character) if !control => push(text, &character.to_string(), limit, lines),
+        KeyCode::Backspace => {
+            let start = previous(text, *cursor);
+            text.replace_range(start..*cursor, "");
+            *cursor = start;
+        }
+        KeyCode::Delete => {
+            let end = next(text, *cursor);
+            text.replace_range(*cursor..end, "");
+        }
+        KeyCode::Char('u') if control => {
+            text.clear();
+            *cursor = 0;
+        }
+        KeyCode::Char('j') if control && lines => insert(text, cursor, "\n", limit, true),
+        KeyCode::Tab if lines => insert(text, cursor, "\t", limit, true),
+        // A letter with Ctrl, Alt or Super is a shortcut, not text.
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            insert(text, cursor, &character.to_string(), limit, lines);
+        }
         _ => {}
     }
+    text.len() != before
 }
 
-/// Adds typed or pasted text: line breaks (CRLF and CR as LF) and tabs only
-/// where `lines`, no other control characters, up to `limit` bytes.
-fn push(text: &mut String, added: &str, limit: usize, lines: bool) {
+/// Adds typed or pasted text at `cursor`: line breaks (CRLF and CR as LF)
+/// and tabs only where `lines`, no other control characters, up to `limit`
+/// bytes in all.
+fn insert(text: &mut String, cursor: &mut usize, added: &str, limit: usize, lines: bool) {
     let added = added.replace("\r\n", "\n").replace('\r', "\n");
+    let mut kept = String::new();
     for character in added.chars() {
-        let kept = !character.is_control() || (lines && matches!(character, '\n' | '\t'));
-        if !kept {
+        let keep = !character.is_control() || (lines && matches!(character, '\n' | '\t'));
+        if !keep {
             continue;
         }
-        if text.len() + character.len_utf8() > limit {
+        if text.len() + kept.len() + character.len_utf8() > limit {
             break;
         }
-        text.push(character);
+        kept.push(character);
     }
+    text.insert_str(*cursor, &kept);
+    *cursor += kept.len();
+}
+
+/// An editor's text wrapped to `width` with the cursor mark at `cursor`,
+/// and the index of the row the mark is on.
+fn field_rows(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize) {
+    let mut rows = Vec::new();
+    let mut cursor_row = 0;
+    let mut start = 0;
+    for line in text.split('\n') {
+        let end = start + line.len();
+        if (start..=end).contains(&cursor) {
+            let (before, after) = line.split_at(cursor - start);
+            let before = plain(before);
+            // The text may hold the mark's character too: the cursor is the
+            // first one after those before it.
+            let earlier = before.matches(CURSOR).count();
+            let wrapped = wrap(&format!("{before}{CURSOR}{}", plain(after)), width);
+            let mut seen = 0;
+            for (index, row) in wrapped.iter().enumerate() {
+                seen += row.matches(CURSOR).count();
+                if seen > earlier {
+                    cursor_row = rows.len() + index;
+                    break;
+                }
+            }
+            rows.extend(wrapped);
+        } else {
+            rows.extend(wrap(&plain(line), width));
+        }
+        start = end + 1;
+    }
+    (rows, cursor_row)
 }
 
 /// Text drawn as is: control characters become spaces.
@@ -911,7 +1144,7 @@ mod tests {
             QueueOutcome::None
         ));
         assert!(matches!(window.mode, Mode::List));
-        window.finished(Err("queue_full: no room"), "queue_full".into());
+        window.finished("added", Err("queue_full: no room"), "queue_full".into());
         match &window.mode {
             Mode::Edit { text, .. } => assert_eq!(text, "kept text"),
             _ => panic!("expected the editor back"),
@@ -921,7 +1154,7 @@ mod tests {
             key(&mut window, KeyCode::Enter, KeyModifiers::NONE),
             QueueOutcome::Op(QueueOp::Add { .. })
         ));
-        window.finished(Ok(()), "Queued".into());
+        window.finished("added", Ok(()), "Queued".into());
         assert!(matches!(window.mode, Mode::List));
         assert!(window.pending.is_none());
         // Typing on right after the save: `x` and Enter do nothing.
@@ -936,6 +1169,268 @@ mod tests {
         assert!(matches!(window.mode, Mode::List));
     }
 
+    fn drawn(window: &mut QueueWindow, width: u16, height: u16) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| window.draw(frame, Theme::Dark))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    fn click(window: &mut QueueWindow, code: KeyCode) -> QueueOutcome {
+        let (rect, _) = *window
+            .hits
+            .iter()
+            .find(|(_, hit)| *hit == Hit::Key(code))
+            .expect("a drawn button");
+        let event = |kind| {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        window.handle(event(MouseEventKind::Down(MouseButton::Left)));
+        window.handle(event(MouseEventKind::Up(MouseButton::Left)))
+    }
+
+    #[test]
+    fn the_editor_edits_at_its_cursor_by_grapheme() {
+        let mut window = QueueWindow::new(Language::English, agent(), view());
+        let none = KeyModifiers::NONE;
+        key(&mut window, KeyCode::Char('n'), none);
+        window.handle(Event::Paste("가나c".into()));
+        key(&mut window, KeyCode::Left, none);
+        key(&mut window, KeyCode::Left, none);
+        key(&mut window, KeyCode::Char('b'), none);
+        key(&mut window, KeyCode::Home, none);
+        key(&mut window, KeyCode::Char('a'), none);
+        key(&mut window, KeyCode::End, none);
+        key(&mut window, KeyCode::Backspace, none);
+        key(&mut window, KeyCode::Left, none);
+        key(&mut window, KeyCode::Delete, none);
+        // Alt and Super chords are shortcuts, not text.
+        key(&mut window, KeyCode::Char('x'), KeyModifiers::ALT);
+        key(&mut window, KeyCode::Char('y'), KeyModifiers::SUPER);
+        key(&mut window, KeyCode::Left, none);
+        let (rows, at) = window.detail(80);
+        assert_eq!((rows[1].0.as_str(), at), ("a가▏b", Some(1)));
+        // A line break goes in at the cursor, and the mark follows it.
+        key(&mut window, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        let (rows, at) = window.detail(80);
+        assert_eq!(
+            (rows[1].0.as_str(), rows[2].0.as_str(), at),
+            ("a가", "▏b", Some(2))
+        );
+        // Home and End stay on the cursor's line.
+        key(&mut window, KeyCode::End, none);
+        key(&mut window, KeyCode::Char('!'), none);
+        key(&mut window, KeyCode::Home, none);
+        key(&mut window, KeyCode::Char('>'), none);
+        match key(&mut window, KeyCode::Enter, none) {
+            QueueOutcome::Op(QueueOp::Add { body }) => assert_eq!(body, "a가\n>b!"),
+            _ => panic!("expected add"),
+        }
+    }
+
+    #[test]
+    fn a_long_draft_keeps_its_cursor_row_on_show() {
+        let mut window = QueueWindow::new(Language::English, agent(), view());
+        key(&mut window, KeyCode::Char('n'), KeyModifiers::NONE);
+        let lines: Vec<String> = (0..40).map(|line| format!("line {line}")).collect();
+        window.handle(Event::Paste(lines.join("\n")));
+        let text = drawn(&mut window, 80, 20);
+        assert!(
+            text.contains("line 39▏") && !text.contains("line 0 "),
+            "{text}"
+        );
+        // Moving back to the first line brings it into view.
+        for _ in 0..400 {
+            key(&mut window, KeyCode::Left, KeyModifiers::NONE);
+        }
+        let text = drawn(&mut window, 80, 20);
+        assert!(
+            text.contains("▏line 0") && !text.contains("line 39"),
+            "{text}"
+        );
+    }
+
+    /// Esc at `milliseconds` after `start`.
+    fn esc(window: &mut QueueWindow, start: std::time::Instant, milliseconds: u64) -> QueueOutcome {
+        window.key_at(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            start + std::time::Duration::from_millis(milliseconds),
+        )
+    }
+
+    #[test]
+    fn another_changes_result_does_not_end_a_save_on_its_way() {
+        let mut window = QueueWindow::new(Language::English, agent(), view());
+        let none = KeyModifiers::NONE;
+        key(&mut window, KeyCode::Char('n'), none);
+        window.handle(Event::Paste("kept text".into()));
+        assert!(matches!(
+            key(&mut window, KeyCode::Enter, none),
+            QueueOutcome::Op(QueueOp::Add { .. })
+        ));
+        // A removal started before the save answers first.
+        window.finished("removed", Ok(()), "Removed".into());
+        assert!(window.pending.is_some());
+        // The save fails afterwards: the text is still given back.
+        window.finished("added", Err("queue_full: no room"), "queue_full".into());
+        assert!(matches!(&window.mode, Mode::Edit { text, .. } if text == "kept text"));
+    }
+
+    #[test]
+    fn esc_asks_once_before_dropping_typed_text() {
+        let mut window = QueueWindow::new(Language::English, agent(), view());
+        let none = KeyModifiers::NONE;
+        let start = std::time::Instant::now();
+        key(&mut window, KeyCode::Char('n'), none);
+        window.handle(Event::Paste("a draft".into()));
+        assert!(matches!(esc(&mut window, start, 0), QueueOutcome::None));
+        assert!(matches!(window.mode, Mode::Edit { .. }));
+        assert!(
+            window
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Esc again"))
+        );
+        assert!(window.buttons()[0].0.contains("Discard"));
+        // A double tap and a held Esc are not the answer: the text and the
+        // question stay.
+        esc(&mut window, start, 300);
+        for repeat in 0..100 {
+            esc(&mut window, start, 800 + repeat * 30);
+        }
+        assert!(matches!(&window.mode, Mode::Edit { text, .. } if text == "a draft"));
+        assert!(window.notice.is_some() && window.leaving.is_some());
+        // Typing on takes the question back.
+        key(&mut window, KeyCode::Char('!'), none);
+        assert!(window.notice.is_none() && window.leaving.is_none());
+        esc(&mut window, start, 10_000);
+        assert!(matches!(&window.mode, Mode::Edit { text, .. } if text == "a draft!"));
+        // An Esc after the pause drops the text.
+        esc(&mut window, start, 11_100);
+        assert!(matches!(window.mode, Mode::List));
+        // Nothing typed: an opened prompt and an empty editor close at once.
+        window.edit_body(&json!({"id": 1, "revision": 3, "body": "my edit"}));
+        key(&mut window, KeyCode::Right, none);
+        key(&mut window, KeyCode::Esc, none);
+        assert!(matches!(window.mode, Mode::List));
+        key(&mut window, KeyCode::Char('n'), none);
+        key(&mut window, KeyCode::Esc, none);
+        assert!(matches!(window.mode, Mode::List));
+    }
+
+    #[test]
+    fn esc_during_a_save_keeps_the_window_for_the_result() {
+        let mut window = QueueWindow::new(Language::English, agent(), view());
+        let none = KeyModifiers::NONE;
+        let start = std::time::Instant::now();
+        key(&mut window, KeyCode::Char('n'), none);
+        window.handle(Event::Paste("kept text".into()));
+        assert!(matches!(
+            key(&mut window, KeyCode::Enter, none),
+            QueueOutcome::Op(QueueOp::Add { .. })
+        ));
+        assert!(matches!(esc(&mut window, start, 0), QueueOutcome::None));
+        assert!(
+            window
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Still saving"))
+        );
+        // A second Esc inside the pause does not close either.
+        assert!(matches!(esc(&mut window, start, 400), QueueOutcome::None));
+        // The save fails: the text is back, and Esc asks before dropping it.
+        window.finished("added", Err("queue_full: no room"), "queue_full".into());
+        assert!(matches!(&window.mode, Mode::Edit { text, .. } if text == "kept text"));
+        assert!(matches!(esc(&mut window, start, 5_000), QueueOutcome::None));
+        assert!(matches!(window.mode, Mode::Edit { .. }));
+        // An Esc after the pause closes during a save without waiting.
+        assert!(matches!(
+            key(&mut window, KeyCode::Enter, none),
+            QueueOutcome::Op(QueueOp::Add { .. })
+        ));
+        assert!(matches!(esc(&mut window, start, 6_000), QueueOutcome::None));
+        assert!(matches!(
+            esc(&mut window, start, 7_100),
+            QueueOutcome::Close
+        ));
+    }
+
+    #[test]
+    fn the_list_has_buttons_for_edit_attach_and_move_where_they_fit() {
+        for language in [Language::English, Language::Korean] {
+            let mut window = QueueWindow::new(language, agent(), view());
+            drawn(&mut window, 100, 24);
+            for code in [
+                KeyCode::Esc,
+                KeyCode::Char('n'),
+                KeyCode::Enter,
+                KeyCode::Char('a'),
+                KeyCode::Char('K'),
+                KeyCode::Char('J'),
+                KeyCode::Char('x'),
+                KeyCode::Char('s'),
+            ] {
+                assert!(
+                    window.hits.iter().any(|(_, hit)| *hit == Hit::Key(code)),
+                    "{code:?} missing in {language:?}"
+                );
+            }
+        }
+        let mut window = QueueWindow::new(Language::English, agent(), view());
+        let text = drawn(&mut window, 100, 24);
+        assert!(
+            text.contains(" Enter Edit ") && text.contains(" a Attach "),
+            "{text}"
+        );
+        // The buttons do what their keys do.
+        assert!(matches!(
+            click(&mut window, KeyCode::Char('J')),
+            QueueOutcome::Op(QueueOp::Move {
+                id: 1,
+                position: 2,
+                revision: 3
+            })
+        ));
+        assert!(matches!(
+            click(&mut window, KeyCode::Enter),
+            QueueOutcome::Op(QueueOp::Show { id: 1 })
+        ));
+        click(&mut window, KeyCode::Char('a'));
+        assert!(matches!(window.mode, Mode::Attach { id: 1, .. }));
+        // A narrow row gives up the move buttons, then Attach, and keeps
+        // Close, New, Edit, Remove and Send.
+        let mut window = QueueWindow::new(Language::English, agent(), view());
+        drawn(&mut window, 60, 24);
+        let has =
+            |window: &QueueWindow, code| window.hits.iter().any(|(_, hit)| *hit == Hit::Key(code));
+        assert!(!has(&window, KeyCode::Char('K')) && !has(&window, KeyCode::Char('J')));
+        assert!(!has(&window, KeyCode::Char('a')));
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('n'),
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+            KeyCode::Char('s'),
+        ] {
+            assert!(has(&window, code), "{code:?} missing at 60 columns");
+        }
+    }
+
     #[test]
     fn an_edit_of_an_item_that_moved_on_comes_back_as_a_new_prompt() {
         let mut window = QueueWindow::new(Language::English, agent(), view());
@@ -944,7 +1439,7 @@ mod tests {
             key(&mut window, KeyCode::Enter, KeyModifiers::NONE),
             QueueOutcome::Op(QueueOp::Edit { id: 1, .. })
         ));
-        window.finished(Err("queue_stale: changed"), "changed".into());
+        window.finished("saved", Err("queue_stale: changed"), "changed".into());
         match key(&mut window, KeyCode::Enter, KeyModifiers::NONE) {
             QueueOutcome::Op(QueueOp::Add { body }) => assert_eq!(body, "my edit"),
             _ => panic!("expected a new prompt"),
@@ -965,7 +1460,7 @@ mod tests {
             key(&mut window, KeyCode::Char('n'), KeyModifiers::NONE),
             QueueOutcome::None
         ));
-        let rows = window.detail(80);
+        let (rows, _) = window.detail(80);
         assert!(rows.iter().any(|(row, _)| row.contains("restarted")));
     }
 }
