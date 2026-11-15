@@ -18,7 +18,7 @@ masil
 ```
 
 Homebrew builds both programs from source and installs their dependencies.
-It installs the manual as `masil.1` and leaves the `tmux` command unchanged.
+It installs the manual as `masil.1` and `THIRD-PARTY-LICENSES.txt`, the licences of the Rust crates in `masil-agent`, in the formula's share directory. It leaves the `tmux` command unchanged.
 To update a development installation, run
 `brew upgrade --fetch-HEAD Ochichan/masil/masil`.
 After a stable formula is promoted, new installations can omit `--HEAD`.
@@ -32,7 +32,7 @@ Ubuntu 24.04 on x86_64. Download the matching archive and `SHA256SUMS` from
 [GitHub Releases](https://github.com/Ochichan/masil/releases). Check the archive
 against its entry in `SHA256SUMS` with `shasum -a 256 ARCHIVE` on macOS or
 `sha256sum ARCHIVE` on Linux before extracting it. Each archive contains both
-programs, a manual, licenses, build metadata and a list of linked libraries.
+programs, the manual `share/man/man1/masil.1`, licenses, `THIRD-PARTY-LICENSES.txt` (the licences of the Rust crates in `masil-agent`), build metadata and a list of linked libraries.
 
 The binaries need runtime libraries. On macOS with Homebrew in `/opt/homebrew`:
 
@@ -110,7 +110,7 @@ and [formula cookbook](https://docs.brew.sh/Formula-Cookbook).
 
 ## Using masil as tmux
 
-The prefix is `C-b` and the key tables are the tmux defaults. masil adds no default key bindings. It reads the same configuration files as tmux, such as `~/.tmux.conf` and `~/.config/tmux/tmux.conf`.
+The prefix is `C-b` and the key tables are the tmux defaults. With `-f FILE`, masil adds no key bindings. Without `-f`, the UI layer described below adds a few, but only for keys that tmux does not bind by default, such as `prefix C-s` and `prefix C-r`. It reads the same configuration files as tmux, such as `~/.tmux.conf` and `~/.config/tmux/tmux.conf`.
 
 masil keeps its sockets in a `masil-UID` directory, apart from the `tmux-UID` directory that tmux uses. Its native protocol version is 136, so a masil client and a stock tmux server reject each other's connections. `masil -V` prints `tmux next-3.9` because existing scripts parse that string. For scripts that call `tmux` by name, `compat/tmux` is an optional shim. Add `compat/` to `PATH` only in the shells that need it. masil does not modify a system tmux or Herdr installation.
 
