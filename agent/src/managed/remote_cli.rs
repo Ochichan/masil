@@ -50,16 +50,44 @@ fn local_socket() -> Option<PathBuf> {
 }
 
 async fn get(endpoint: &Endpoint, target: &str) -> Result<Agent, String> {
-    let value = endpoint
-        .call_through(
+    get_routed(endpoint, target).await.map(|(agent, _)| agent)
+}
+
+/// The agent, and whether the answer came through this server's link
+/// rather than a call of its own.
+async fn get_routed(endpoint: &Endpoint, target: &str) -> Result<(Agent, bool), String> {
+    let (value, linked) = endpoint
+        .call_routed(
             &Request::Get {
                 target: target.into(),
             },
             local_socket().as_deref(),
         )
-        .await?;
-    serde_json::from_value(value)
-        .map_err(|e| format!("endpoint_unreachable: invalid remote agent: {e}"))
+        .await;
+    Ok((remote_agent(value?)?, linked))
+}
+
+/// An agent as an endpoint answered it. Its identities go on command lines
+/// and into keys here, so only the shapes a listing gives are taken.
+fn remote_agent(value: Value) -> Result<Agent, String> {
+    let agent: Agent = serde_json::from_value(value)
+        .map_err(|e| format!("endpoint_unreachable: invalid remote agent: {e}"))?;
+    if !endpoints::valid_agent(&agent) {
+        return Err("endpoint_unreachable: invalid remote agent identities".into());
+    }
+    Ok(agent)
+}
+
+/// Between two looks of `wait`. Without a link each look is a call of its
+/// own (an ssh login for an endpoint on another host), so they come every
+/// 2 s; never past the time that is left.
+fn wait_pause(linked: bool, left: Duration) -> Duration {
+    let pause = if linked {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_secs(2)
+    };
+    pause.min(left)
 }
 async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i32, String> {
     let value = match command {
@@ -196,6 +224,17 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
                 })
                 .await?
         }
+        // These verbs take no agent target: another shape of theirs is a
+        // usage error, not a call for an agent named by the first word.
+        "list" => return Err("usage: --endpoint ID list [--json]".into()),
+        "save" => return Err("usage: --endpoint ID save FILE".into()),
+        "restore" => return Err("usage: --endpoint ID restore FILE [--allow-fresh]".into()),
+        "start" => {
+            return Err(
+                "usage: --endpoint ID start NAME PROVIDER --cwd DIR [--split %N] [--session ID] [--worktree W] [--answers] [--boot BOOT --operation ID] [-- ARGS...]"
+                    .into(),
+            );
+        }
         _ => {
             let target = args
                 .first()
@@ -245,7 +284,7 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
             }
             if command == "explain" && args.len() == 1 {
                 print(
-                    &json!({"pane_id":agent.pane_id,"provider":agent.provider,"state":agent.state,"evidence":agent.evidence}),
+                    &json!({"pane_id":agent.pane_id,"run":agent.run,"provider":agent.provider,"state":agent.state,"evidence":agent.evidence}),
                 )?;
                 return Ok(0);
             }
@@ -319,43 +358,7 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
                 // takes the key press: the provider's measured keys, while
                 // it is listed as working (it cannot check its own screen).
                 Err(error) if unkeyed && error.starts_with("remote_unsupported") => {
-                    // Its own evidence, judged by this side's rules: a
-                    // request anywhere on the screen, or a turn these keys
-                    // do not end, and nothing is sent.
-                    let engine = crate::detection::Engine::load()?;
-                    let evidence = serde_json::to_value(&*agent.evidence).unwrap_or_default();
-                    let screen = if evidence["source"] == "run_report" {
-                        &evidence["screen"]
-                    } else {
-                        &evidence
-                    };
-                    let blocked = screen["explanations"].as_array().is_some_and(|rules| {
-                        rules
-                            .iter()
-                            .any(|rule| rule["matched"] == true && rule["state"] == "blocked")
-                    });
-                    let rule = screen["matched_rule"]["id"].as_str().unwrap_or_default();
-                    if agent.state != "working"
-                        || blocked
-                        || !engine.interruptible_rule(&agent.provider, rule)
-                    {
-                        return Err("interrupt_not_working: the endpoint's screen shows no turn these keys end; nothing was sent".into());
-                    }
-                    let keys = engine.interrupt_keys(&agent.provider);
-                    if keys.is_empty() {
-                        return Err(format!(
-                            "interrupt_unverified: masil has not measured how {} interrupts a turn; nothing was sent",
-                            agent.provider
-                        ));
-                    }
-                    let mut sent = endpoint
-                        .call(&Request::Action {
-                            expected: Expected::from(&agent),
-                            action: Action::Keys { keys },
-                        })
-                        .await?;
-                    sent["durable"] = json!(false);
-                    print(&sent)?;
+                    print(&plain_interrupt(&endpoint, &agent).await?)?;
                     return Ok(0);
                 }
                 result => result?,
@@ -392,6 +395,54 @@ async fn execute(endpoint: Endpoint, command: &str, args: &[String]) -> Result<i
         false => 0,
     })
 }
+/// The interrupt for an endpoint whose masil-agent predates durable remote
+/// interrupts (docs/agent-endpoints.md), for `interrupt` here and the desk:
+/// a plain key press (`"durable": false`) of this side's measured keys for
+/// the provider, sent only while the endpoint lists the agent as working.
+pub(super) async fn plain_interrupt(endpoint: &Endpoint, agent: &Agent) -> Result<Value, String> {
+    let keys = plain_interrupt_keys(&crate::detection::Engine::load()?, agent)?;
+    let mut sent = endpoint
+        .call(&Request::Action {
+            expected: Expected::from(agent),
+            action: Action::Keys { keys },
+        })
+        .await?;
+    sent["durable"] = json!(false);
+    Ok(sent)
+}
+
+/// The keys `plain_interrupt` sends, or why it sends nothing. The agent's
+/// own evidence is judged by this side's rules: a request anywhere on the
+/// screen, or a turn these keys do not end, and nothing is sent.
+fn plain_interrupt_keys(
+    engine: &crate::detection::Engine,
+    agent: &Agent,
+) -> Result<Vec<String>, String> {
+    let evidence = serde_json::to_value(&*agent.evidence).unwrap_or_default();
+    let screen = if evidence["source"] == "run_report" {
+        &evidence["screen"]
+    } else {
+        &evidence
+    };
+    let blocked = screen["explanations"].as_array().is_some_and(|rules| {
+        rules
+            .iter()
+            .any(|rule| rule["matched"] == true && rule["state"] == "blocked")
+    });
+    let rule = screen["matched_rule"]["id"].as_str().unwrap_or_default();
+    if agent.state != "working" || blocked || !engine.interruptible_rule(&agent.provider, rule) {
+        return Err("interrupt_not_working: the endpoint's screen shows no turn these keys end; nothing was sent".into());
+    }
+    let keys = engine.interrupt_keys(&agent.provider);
+    if keys.is_empty() {
+        return Err(format!(
+            "interrupt_unverified: masil has not measured how {} interrupts a turn; nothing was sent",
+            agent.provider
+        ));
+    }
+    Ok(keys)
+}
+
 /// `queue T attach ID --upload LOCAL`: the file goes to the agent's
 /// attachment directory there first, and the item names it there.
 async fn upload(
@@ -525,8 +576,8 @@ async fn wait(endpoint: &Endpoint, initial: &Agent, args: &[String]) -> Result<i
     let until = Instant::now() + Duration::from_secs_f64(timeout);
     let mut changed = !after_change;
     loop {
-        let value = match get(endpoint, &initial.pane_id).await {
-            Ok(a) if a.run == initial.run && a.boot == initial.boot => a,
+        let (value, linked) = match get_routed(endpoint, &initial.pane_id).await {
+            Ok((a, linked)) if a.run == initial.run && a.boot == initial.boot => (a, linked),
             Ok(_) => {
                 print(
                     &json!({"stage":"run_changed","end_reason":"run_changed","run":initial.run}),
@@ -568,11 +619,12 @@ async fn wait(endpoint: &Endpoint, initial: &Agent, args: &[String]) -> Result<i
             )?;
             return Ok(5);
         }
-        if Instant::now() >= until {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             print(&json!({"stage":"timeout","end_reason":"timeout","run":initial.run}))?;
             return Ok(6);
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(wait_pause(linked, left)).await;
     }
 }
 pub(super) async fn serve(manager: &Manager) -> Result<i32, String> {
@@ -772,4 +824,119 @@ fn print(value: &Value) -> Result<(), String> {
         serde_json::to_string_pretty(value).map_err(|e| e.to_string())?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Claude agent as an endpoint answers it, with `change` applied.
+    fn listed(change: impl FnOnce(&mut Value)) -> Value {
+        let mut agent = json!({
+            "id": "builder", "name": "builder", "provider": "claude", "pane_id": "%3",
+            "window_id": "@1", "workspace": "main", "cwd": "/srv",
+            "boot": "01234567-89ab-cdef-0123-456789abcdef",
+            "generation": "2", "run": "0123456789abcdef0123456789abcdef",
+            "process": "running", "state": "working",
+            "evidence": {
+                "state": "working", "source": "screen",
+                "matched_rule": {"id": "live_turn_working"},
+                "explanations": [
+                    {"id": "live_turn_working", "matched": true, "state": "working"},
+                ],
+            },
+            "seen": true, "revision": "1", "returned_idle": false,
+        });
+        change(&mut agent);
+        agent
+    }
+
+    fn words(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_remote_agent_with_identities_of_another_shape_is_refused() {
+        assert_eq!(remote_agent(listed(|_| {})).unwrap().name, "builder");
+        for (field, value) in [
+            ("boot", "01234567-89ab-cdef-0123-456789abcde;"),
+            ("generation", "run-shell"),
+            ("name", "builder;"),
+            ("run", "touch /tmp/x"),
+            ("pane_id", "%3;"),
+        ] {
+            let error = remote_agent(listed(|agent| agent[field] = json!(value))).unwrap_err();
+            assert_eq!(
+                error, "endpoint_unreachable: invalid remote agent identities",
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plain_interrupt_sends_measured_keys_only_to_a_working_turn() {
+        let engine = crate::detection::Engine::load().unwrap();
+        let keys = |agent: Value| plain_interrupt_keys(&engine, &remote_agent(agent).unwrap());
+        // Claude's measured key is Escape, not C-c.
+        assert_eq!(keys(listed(|_| {})).unwrap(), ["Escape"]);
+        let refused = [
+            // Idle: a key would go into the prompt box.
+            listed(|agent| {
+                agent["state"] = json!("idle");
+                agent["evidence"] = json!({"state": "idle", "source": "screen"});
+            }),
+            // An approval on screen: the key would decline it.
+            listed(|agent| {
+                agent["evidence"]["explanations"] = json!([
+                    {"id": "live_turn_working", "matched": true, "state": "working"},
+                    {"id": "bash_permission_prompt", "matched": true, "state": "blocked"},
+                ]);
+            }),
+            // Working by a rule whose turn these keys do not end.
+            listed(|agent| {
+                agent["evidence"]["matched_rule"] = json!({"id": "osc_title_working"});
+            }),
+        ];
+        for agent in refused {
+            let error = keys(agent).unwrap_err();
+            assert!(error.starts_with("interrupt_not_working:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_wait_without_a_link_looks_every_two_seconds() {
+        let long = Duration::from_secs(60);
+        assert_eq!(wait_pause(true, long), Duration::from_millis(250));
+        assert_eq!(wait_pause(false, long), Duration::from_secs(2));
+        assert_eq!(
+            wait_pause(false, Duration::from_millis(40)),
+            Duration::from_millis(40)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_verb_in_another_shape_is_a_usage_error_before_any_call() {
+        // A call would fail as unreachable: the binary does not exist.
+        let endpoint = Endpoint {
+            id: "build".into(),
+            label: "Build".into(),
+            enabled: true,
+            socket: "/tmp/unused-masil.sock".into(),
+            host: None,
+            binary: "/nonexistent/masil-agent".into(),
+        };
+        for (command, args) in [
+            ("list", words(&["--all"])),
+            ("save", words(&["a", "b"])),
+            ("save", vec![]),
+            ("restore", words(&["/srv/s.json", "--again"])),
+            ("start", words(&["builder"])),
+        ] {
+            let error = execute(endpoint.clone(), command, &args).await.unwrap_err();
+            assert!(
+                error.starts_with(&format!("usage: --endpoint ID {command}")),
+                "{command}: {error}"
+            );
+        }
+    }
 }

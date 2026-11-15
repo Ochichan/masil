@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -351,7 +352,12 @@ pub(crate) async fn send(
     let path = local.to_owned();
     let (bytes, digest) = tokio::task::spawn_blocking(move || {
         let shown = path.display().to_string();
-        let file = std::fs::File::open(&path)
+        // Without waiting: opening a FIFO blocks until it has a writer. A
+        // regular file, the only kind read below, reads the same either way.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
             .map_err(|error| format!("invalid_argument: {shown}: {error}"))?;
         let metadata = file
             .metadata()
@@ -477,8 +483,49 @@ pub(crate) async fn send(
                 format!("endpoint_unreachable: endpoint '{}': {first}", endpoint.id)
             }
         });
+    // The endpoint's text: shown without control characters, bounded.
+    let message = super::endpoints::printable(&message, 1024);
     if written.is_err() && message.starts_with("endpoint_unreachable") {
         return Err(format!("{message} (sending stopped)"));
     }
     Err(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sending_a_fifo_is_refused_without_waiting_for_its_writer() {
+        let directory =
+            std::env::temp_dir().join(format!("masil-transfer-fifo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let fifo = directory.join("fifo");
+        let name = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid C string naming a path in a directory just made.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // The check comes before anything is started for the endpoint.
+        let endpoint = Endpoint {
+            id: "build".into(),
+            label: "Build".into(),
+            enabled: true,
+            socket: "/tmp/unused-masil.sock".into(),
+            host: None,
+            binary: "/nonexistent/masil-agent".into(),
+        };
+        let destination = Destination::Directory {
+            dir: "/srv".into(),
+            name: "fifo".into(),
+        };
+        let sent =
+            tokio::time::timeout(Duration::from_secs(5), send(&endpoint, &fifo, destination))
+                .await
+                .expect("opening the FIFO waited for a writer");
+        assert_eq!(
+            sent.unwrap_err(),
+            format!("invalid_argument: {} is not a file", fifo.display())
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

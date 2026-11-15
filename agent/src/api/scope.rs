@@ -280,7 +280,7 @@ const VERBS: [&str; 37] = [
 
 /// The verbs a scope may call in some form.
 pub(crate) fn methods(scope: Scope) -> Vec<&'static str> {
-    let forms: [&[&str]; 8] = [
+    let forms: [&[&str]; 10] = [
         &[],
         &["x"],
         &["get"],
@@ -289,6 +289,9 @@ pub(crate) fn methods(scope: Scope) -> Vec<&'static str> {
         &["x", "list"],
         &["x", "text"],
         &["x", "make"],
+        // `dictate` is offered only with these flags.
+        &["--status"],
+        &["--stop"],
     ];
     let mut methods: Vec<&'static str> = VERBS
         .into_iter()
@@ -395,6 +398,32 @@ mod tests {
         assert!(methods(Scope::Read).contains(&"list"));
         assert!(!methods(Scope::Read).contains(&"prompt"));
         assert!(methods(Scope::Act).contains(&"prompt"));
+    }
+
+    /// The hello names every verb a scope may call in some form, and no
+    /// verb above the scope.
+    #[test]
+    fn the_hello_lists_every_verb_a_scope_may_call() {
+        // A read connection may ask `dictate --status`.
+        assert!(methods(Scope::Read).contains(&"dictate"));
+        assert!(methods(Scope::Act).contains(&"dictate"));
+        for verb in VERBS {
+            assert!(methods(Scope::Admin).contains(&verb), "{verb}");
+        }
+        for above in [
+            "start",
+            "close",
+            "interrupt",
+            "ack",
+            "save",
+            "restore",
+            "reload",
+        ] {
+            assert!(!methods(Scope::Read).contains(&above), "{above}");
+        }
+        for above in ["interrupt", "ack", "save", "restore", "reload"] {
+            assert!(!methods(Scope::Act).contains(&above), "{above}");
+        }
     }
 
     /// Every verb the CLI has is either in the table or refused on purpose.

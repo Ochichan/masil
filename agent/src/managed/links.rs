@@ -34,6 +34,18 @@ const STEADY: Duration = Duration::from_secs(60);
 const MAX_FRAME: usize = 1024 * 1024 + 4096;
 /// A call through a link takes no longer than a call of its own would.
 pub(crate) const CALL_DEADLINE: Duration = Duration::from_secs(8);
+/// The most inbox items one frame carries: what the far side sends at a
+/// time (`BATCH` in stream.rs).
+const MAX_ITEMS: usize = 200;
+/// Inbox kinds the store itself records (operations.rs), beside the
+/// producers' kinds in `inbox::ALL`.
+const STORE_KINDS: &[&str] = &["operation_unknown", "missed_schedule"];
+/// Summary keys `link_merge` writes itself (operations.rs); an endpoint's
+/// own value for one is not taken.
+const DERIVED_SUMMARY_KEYS: &[&str] = &["endpoint_agent"];
+/// The longest string in a merged summary: what a stored summary holds in
+/// all (`INBOX_SUMMARY_BYTES` in operations.rs).
+const SUMMARY_TEXT: usize = 2048;
 
 fn now_ms() -> u64 {
     crate::observation::now_ms()
@@ -88,6 +100,8 @@ pub(crate) struct Links {
     wake: Notify,
     stopping: AtomicBool,
     running: AtomicBool,
+    /// The last failure to read an endpoint configuration, logged once.
+    unread: Mutex<Option<String>>,
 }
 
 impl Links {
@@ -277,28 +291,43 @@ impl Links {
         let rows = store.links()?;
         let local = store.instance()?;
         let mut wanted: HashMap<String, (Endpoint, String, LinkRow)> = HashMap::new();
+        // Wanted endpoints whose configuration could not be read, as after
+        // a hand edit: their links stay as they are and nothing is settled.
+        let mut unread: Vec<&str> = Vec::new();
+        let mut failure = None;
         for row in rows.iter().filter(|row| row.desired == "connected") {
             let root = row.config_root.as_deref().map(Path::new);
-            let found = endpoints::load_in(root)
-                .ok()
-                .and_then(|all| all.into_iter().find(|e| e.id == row.endpoint && e.enabled));
-            match found {
-                Some(endpoint) => {
+            match enabled_endpoint(&row.endpoint, endpoints::load_in(root)) {
+                Ok(Some(endpoint)) => {
                     let key = super::fleet::key(&endpoint);
                     wanted.insert(row.endpoint.clone(), (endpoint, key, row.clone()));
                 }
                 // Removed or disabled: nothing of it waits here.
-                None => {
+                Ok(None) => {
                     store.link_settle(&row.endpoint, "remote_unavailable", now_ms())?;
                 }
+                Err(error) => {
+                    unread.push(&row.endpoint);
+                    failure = failure.or(Some(error));
+                }
             }
+        }
+        // A file being edited is said once, not every pass.
+        if let Ok(mut last) = self.unread.lock() {
+            if let Some(error) = &failure
+                && last.as_ref() != Some(error)
+            {
+                log(&format!("links: {error}; links are kept as they are"));
+            }
+            *last = failure;
         }
         let mut links = self.links.lock().map_err(|_| "links unavailable")?;
         links.retain(|id, link| {
             let keep = !link.stopped.load(Ordering::SeqCst)
-                && wanted
-                    .get(id)
-                    .is_some_and(|(_, key, row)| *key == link.key && row.revision == link.revision);
+                && (unread.contains(&id.as_str())
+                    || wanted.get(id).is_some_and(|(_, key, row)| {
+                        *key == link.key && row.revision == link.revision
+                    }));
             if !keep {
                 link.halt();
             }
@@ -327,6 +356,7 @@ impl Links {
                 manager: manager.clone(),
                 poke: poke.clone(),
                 log: log.clone(),
+                dropped: AtomicBool::new(false),
             };
             tokio::spawn(task.run(receiver));
             links.insert(id, link);
@@ -357,6 +387,8 @@ struct Task {
     manager: Arc<Manager>,
     poke: Arc<dyn Fn() + Send + Sync>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Inbox items of another shape were dropped and it was logged.
+    dropped: AtomicBool,
 }
 
 impl Task {
@@ -550,7 +582,8 @@ impl Task {
                             let result = if frame["ok"] == true {
                                 Ok(frame["value"].clone())
                             } else {
-                                Err(frame["error"].as_str().unwrap_or("the endpoint failed").to_owned())
+                                let error = frame["error"].as_str().unwrap_or("the endpoint failed");
+                                Err(endpoints::printable(error, 4096))
                             };
                             let _ = reply.send(result);
                         }
@@ -626,6 +659,21 @@ impl Task {
         match (event, instance) {
             ("inbox", Some(instance)) => {
                 let items = frame["items"].as_array().cloned().unwrap_or_default();
+                if items.len() > MAX_ITEMS {
+                    return Err(format!(
+                        "an inbox frame of {} items; at most {MAX_ITEMS} are sent",
+                        items.len()
+                    ));
+                }
+                let sent = items.len();
+                let items = merged_items(items);
+                if items.len() < sent && !self.dropped.swap(true, Ordering::SeqCst) {
+                    (self.log)(&format!(
+                        "link {}: {} inbox items of an unknown kind or shape were not merged",
+                        self.endpoint.id,
+                        sent - items.len()
+                    ));
+                }
                 let cursor = frame["cursor"]
                     .as_i64()
                     .ok_or("inbox event without a cursor")?;
@@ -666,15 +714,106 @@ impl Task {
     }
 }
 
+/// The enabled endpoint `id` in a configuration as read: None when it was
+/// removed or disabled, the error when the configuration could not be read.
+fn enabled_endpoint(
+    id: &str,
+    loaded: Result<Vec<Endpoint>, String>,
+) -> Result<Option<Endpoint>, String> {
+    Ok(loaded?
+        .into_iter()
+        .find(|endpoint| endpoint.id == id && endpoint.enabled))
+}
+
+/// The items of an inbox frame that are merged: only what this side's own
+/// inbox could hold, without the summary keys this side writes itself. An
+/// endpoint that sent `endpoint_agent` would otherwise name the agent in
+/// local notifications, where the store sets it from the checked `agent`
+/// only when the item has one.
+fn merged_items(mut items: Vec<Value>) -> Vec<Value> {
+    items.retain(mergeable);
+    for item in &mut items {
+        if let Some(summary) = item.get_mut("summary").and_then(Value::as_object_mut) {
+            for key in DERIVED_SUMMARY_KEYS {
+                summary.remove(*key);
+            }
+        }
+    }
+    items
+}
+
+/// Whether a summary's text is what this side's producers write: each
+/// string at most as long as a stored summary, without control characters
+/// other than newline and tab (a command a provider asks about may have
+/// several lines), nested no deeper than `depth`.
+fn summary_text(value: &Value, depth: usize) -> bool {
+    let plain = |text: &str| {
+        text.len() <= SUMMARY_TEXT
+            && !text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+    };
+    match value {
+        Value::String(text) => plain(text),
+        Value::Array(items) => depth > 0 && items.iter().all(|item| summary_text(item, depth - 1)),
+        Value::Object(fields) => {
+            depth > 0
+                && fields
+                    .iter()
+                    .all(|(key, value)| plain(key) && summary_text(value, depth - 1))
+        }
+        _ => true,
+    }
+}
+
+/// Whether an inbox item an endpoint sent is one this side's own inbox
+/// could hold: a kind recorded here, the pane, run, provider, agent and
+/// resolution in the shapes they have here, and a summary that is an
+/// object of plain text.
+fn mergeable(item: &Value) -> bool {
+    // A field left out or null is empty, as the store reads it.
+    let text = |field: &str| match &item[field] {
+        Value::Null => Some(""),
+        Value::String(text) => Some(text.as_str()),
+        _ => None,
+    };
+    let empty_or = |field: &str, valid: &dyn Fn(&str) -> bool| {
+        text(field).is_some_and(|text| text.is_empty() || valid(text))
+    };
+    let kind = item["kind"].as_str().unwrap_or_default();
+    (super::inbox::ALL.contains(&kind) || STORE_KINDS.contains(&kind))
+        // An operation's event names its target: a pane, or a launch's name.
+        && empty_or("pane", &|pane| {
+            crate::pane_id(pane).is_ok() || super::valid_name(pane)
+        })
+        && empty_or("run", &endpoints::valid_run)
+        && empty_or("provider", &super::valid_name)
+        && empty_or("agent", &super::valid_name)
+        && empty_or("resolution", &|resolution| {
+            resolution.len() <= 64
+                && resolution
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        && match &item["summary"] {
+            Value::Null => true,
+            summary @ Value::Object(_) => summary_text(summary, 4),
+            _ => false,
+        }
+}
+
 /// Settles the merged events of every link: the links are ending.
 async fn settle_all(manager: &Manager, poke: &Arc<dyn Fn() + Send + Sync>) -> Result<(), String> {
     let mut store = manager.operation_store().await?;
     let mut settled = 0;
     for row in store.links()? {
         let root = row.config_root.as_deref().map(Path::new);
-        let present = endpoints::load_in(root)
-            .ok()
-            .is_some_and(|all| all.iter().any(|e| e.id == row.endpoint && e.enabled));
+        // A configuration that cannot be read does not say the endpoint is
+        // gone.
+        let present = !matches!(
+            enabled_endpoint(&row.endpoint, endpoints::load_in(root)),
+            Ok(None)
+        );
         let resolution = if present {
             "remote_disconnected"
         } else {
@@ -881,4 +1020,138 @@ async fn status(manager: &Manager, only: Option<&str>) -> Result<Value, String> 
         "coordinator": if running.is_some() { "running" } else { "not_running" },
         "links": links,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A configuration root whose `masil/endpoints.json` holds `text` with
+    /// `mode`.
+    fn root(label: &str, text: &str, mode: u32) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("masil-links-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("masil")).unwrap();
+        std::fs::set_permissions(root.join("masil"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let path = root.join("masil/endpoints.json");
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        root
+    }
+
+    const BUILD: &str = r#"{"version":1,"endpoints":[
+        {"id":"build","label":"Build","enabled":true,"socket":"/tmp/b.sock","host":null,"binary":"masil-agent"},
+        {"id":"off","label":"Off","enabled":false,"socket":"/tmp/o.sock","host":null,"binary":"masil-agent"}]}"#;
+
+    #[test]
+    fn an_unreadable_configuration_is_an_error_not_a_removed_endpoint() {
+        let found = |root: &Path, id: &str| enabled_endpoint(id, endpoints::load_in(Some(root)));
+        let good = root("good", BUILD, 0o600);
+        assert_eq!(found(&good, "build").unwrap().unwrap().id, "build");
+        // Disabled, removed, or no file at all: the link ends and settles.
+        assert!(found(&good, "off").unwrap().is_none());
+        assert!(found(&good, "gone").unwrap().is_none());
+        std::fs::remove_file(good.join("masil/endpoints.json")).unwrap();
+        assert!(found(&good, "build").unwrap().is_none());
+        // A hand edit that left invalid JSON, or other permissions: the
+        // link is kept.
+        let broken = root("broken", "{\"version\":1,", 0o600);
+        assert!(found(&broken, "build").is_err());
+        let open = root("open", BUILD, 0o644);
+        assert!(found(&open, "build").is_err());
+        for root in [good, broken, open] {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn inbox_items_of_another_kind_or_shape_are_not_merged() {
+        let item = |change: &dyn Fn(&mut Value)| {
+            let mut item = json!({
+                "id": 7, "seq": 41, "kind": "blocked", "provider": "claude",
+                "pane": "%3", "run": "0123456789abcdef0123456789abcdef",
+                "summary": {"tool": "Bash"}, "observed_ms": 1, "read": false,
+                "resolution": null, "agent": "builder",
+            });
+            change(&mut item);
+            item
+        };
+        assert!(mergeable(&item(&|_| {})));
+        // The store's own events name no provider, and a schedule's no pane.
+        assert!(mergeable(&json!({
+            "id": 1, "seq": 2, "kind": "missed_schedule", "provider": "", "pane": "", "run": "",
+        })));
+        assert!(mergeable(&item(&|item| {
+            item["kind"] = json!("operation_unknown");
+            item["pane"] = json!("builder");
+            item["resolution"] = json!("remote_resolved");
+        })));
+        // An agent masil did not start.
+        assert!(mergeable(&item(&|item| {
+            item["run"] = json!("01234567-89ab-cdef-0123-456789abcdef-%3-2-4242");
+        })));
+        for (field, value) in [
+            ("kind", json!("anything")),
+            ("kind", json!(null)),
+            ("pane", json!("%3;")),
+            ("pane", json!("x".repeat(4096))),
+            ("run", json!("run shell")),
+            ("provider", json!("Claude Code")),
+            ("agent", json!("builder;")),
+            ("resolution", json!("x".repeat(65))),
+            ("resolution", json!("done; run-shell")),
+            ("pane", json!(3)),
+            // A summary is an object of plain, bounded text.
+            ("summary", json!("builder: approval requested")),
+            ("summary", json!(["builder"])),
+            ("summary", json!({"tool": "a\u{1b}]52;c;eA==\u{7}"})),
+            ("summary", json!({"tool": "a\u{9b}31m"})),
+            ("summary", json!({"patterns": ["ok", "a\rb"]})),
+            ("summary", json!({"tool": "x".repeat(2049)})),
+            ("summary", json!({"a\u{1b}[2J": "x"})),
+            ("summary", json!({"a": {"b": {"c": {"d": {"e": "deep"}}}}})),
+        ] {
+            assert!(
+                !mergeable(&item(&|item| item[field] = value.clone())),
+                "{field} {value}"
+            );
+        }
+        // A command over several lines, as a provider asks about one.
+        assert!(mergeable(&item(&|item| {
+            item["summary"] =
+                json!({"tool": "Bash", "command": "cd /srv &&\n\tmake", "patterns": ["a"]});
+        })));
+    }
+
+    #[test]
+    fn an_endpoint_cannot_name_the_agent_of_a_merged_event() {
+        let item = |agent: Value, summary: Value| {
+            json!({
+                "id": 7, "seq": 41, "kind": "approval_requested", "provider": "claude",
+                "pane": "%3", "run": "0123456789abcdef0123456789abcdef",
+                "agent": agent, "summary": summary,
+            })
+        };
+        let merged = merged_items(vec![
+            // No agent, and a name of its own choosing: local-looking, or
+            // one that reads as an option to tmux.
+            item(
+                json!(null),
+                json!({"endpoint_agent": "builder", "tool": "Bash"}),
+            ),
+            item(json!(null), json!({"endpoint_agent": "-t"})),
+            item(json!("builder"), json!({"endpoint_agent": "local"})),
+            item(json!("builder"), json!(null)),
+            // Not text at all: the item goes.
+            item(json!(null), json!({"endpoint_agent": "a\u{1b}[2J"})),
+        ]);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0]["summary"], json!({"tool": "Bash"}));
+        assert_eq!(merged[1]["summary"], json!({}));
+        assert_eq!(merged[2]["summary"], json!({}));
+        assert_eq!(merged[2]["agent"], "builder");
+        assert!(merged[3]["summary"].is_null());
+    }
 }

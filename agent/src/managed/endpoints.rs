@@ -11,6 +11,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -208,6 +209,16 @@ impl Endpoint {
         request: &Request,
         local: Option<&Path>,
     ) -> Result<Value, String> {
+        self.call_routed(request, local).await.0
+    }
+
+    /// As `call_through`, and whether the answer came through the link;
+    /// false when a call of its own was made.
+    pub(super) async fn call_routed(
+        &self,
+        request: &Request,
+        local: Option<&Path>,
+    ) -> (Result<Value, String>, bool) {
         let streamed = matches!(
             request,
             Request::List
@@ -221,18 +232,21 @@ impl Endpoint {
             let local = local.to_owned();
             let id = self.id.clone();
             let key = super::fleet::key(self);
-            let body = serde_json::to_value(request).map_err(|error| error.to_string())?;
+            let body = match serde_json::to_value(request) {
+                Ok(body) => body,
+                Err(error) => return (Err(error.to_string()), false),
+            };
             let through = tokio::task::spawn_blocking(move || {
                 crate::coordinator::endpoint_call(&local, &id, &key, &body)
             })
-            .await
-            .map_err(|error| error.to_string())?;
+            .await;
             match through {
-                Err(error) if error.starts_with("not_connected") => {}
-                result => return result,
+                Err(error) => return (Err(error.to_string()), false),
+                Ok(Err(error)) if error.starts_with("not_connected") => {}
+                Ok(result) => return (result, true),
             }
         }
-        self.call(request).await
+        (self.call(request).await, false)
     }
 
     async fn call_owned(self, request: Request) -> Result<Value, String> {
@@ -246,8 +260,9 @@ impl Endpoint {
     /// while the endpoint's coordinator goes on to send its action would be
     /// reported as unreachable, and a caller that sends the same keys or
     /// prompt again would deliver it twice. The busy answer means nothing was
-    /// sent there, and each RPC plans its action anew on the endpoint. A
-    /// budget of zero makes a single call.
+    /// sent there, and each RPC plans its action anew on the endpoint. Only
+    /// that exact answer is called again: an `outcome_unknown` from
+    /// `call_once` is final. A budget of zero makes a single call.
     async fn call_within(self, request: Request, budget: Duration) -> Result<Value, String> {
         let limit = deadline(&request);
         let mut busy = crate::coordinator::BusyRetry::with_room(budget, limit);
@@ -270,6 +285,11 @@ impl Endpoint {
             return Err("invalid_argument: endpoint request exceeds 262144 bytes".into());
         }
         let id = self.id.clone();
+        // The remote `rpc` has no terminal and gets no signal when the local
+        // ssh is killed: once a request that changes the endpoint is written
+        // whole, it may take effect there whatever comes back.
+        let changes = !reads_only(request);
+        let sent = AtomicBool::new(false);
 
         let mut command = self.command();
         command.process_group(0);
@@ -303,11 +323,13 @@ impl Endpoint {
         let stderr_bytes = Arc::clone(&output_bytes);
 
         let operation = async {
+            let sent = &sent;
             let write = async move {
                 stdin
                     .write_all(&input)
                     .await
                     .map_err(|error| format!("endpoint request write failed: {error}"))?;
+                sent.store(true, Ordering::SeqCst);
                 stdin
                     .shutdown()
                     .await
@@ -324,30 +346,60 @@ impl Endpoint {
             Err(_) => {
                 process_group.kill();
                 let _ = child.wait().await;
-                return Err(endpoint_unreachable(
-                    &id,
-                    format!("timed out after {} seconds", limit.as_secs()),
-                ));
+                return Err(if changes && sent.load(Ordering::SeqCst) {
+                    format!(
+                        "outcome_unknown: endpoint '{id}' did not answer in {} seconds; the request was sent",
+                        limit.as_secs()
+                    )
+                } else {
+                    endpoint_unreachable(
+                        &id,
+                        format!("timed out after {} seconds", limit.as_secs()),
+                    )
+                });
             }
         };
         process_group.disarm();
-        write.map_err(|error| endpoint_unreachable(&id, error))?;
-        let stdout = stdout.map_err(|error| endpoint_unreachable(&id, error))?;
-        let stderr = stderr.map_err(|error| endpoint_unreachable(&id, error))?;
-        let status =
-            status.map_err(|error| endpoint_unreachable(&id, format!("wait failed: {error}")))?;
-        if !status.success() {
-            let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
-            return Err(if host_key_failure(&detail) {
-                format!("host_key: endpoint '{id}' refused its SSH host key: {detail}")
-            } else if detail.is_empty() {
-                endpoint_unreachable(&id, format!("exited with {status}"))
+        // No answer to read: unreachable before the request was written or
+        // for a read, an unknown outcome after.
+        let lost = |detail: String| {
+            if changes && sent.load(Ordering::SeqCst) {
+                format!("outcome_unknown: endpoint '{id}' {detail}; the request was sent")
             } else {
-                endpoint_unreachable(&id, format!("exited with {status}: {detail}"))
-            });
+                endpoint_unreachable(&id, detail)
+            }
+        };
+        write.map_err(&lost)?;
+        let stdout = stdout.map_err(&lost)?;
+        let stderr = stderr.map_err(&lost)?;
+        let status = status.map_err(|error| lost(format!("wait failed: {error}")))?;
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
+            let detail = printable(stderr.trim(), 1024);
+            if host_key_failure(&detail) {
+                return Err(format!(
+                    "host_key: endpoint '{id}' refused its SSH host key: {detail}"
+                ));
+            }
+            let said = if detail.is_empty() {
+                format!("exited with {status}")
+            } else {
+                format!("exited with {status}: {detail}")
+            };
+            // A connection that died after the request arrived, or a
+            // command that failed after acting, ends the same way: only a
+            // failure that shows the request was never taken up is
+            // unreachable.
+            return Err(
+                if never_dispatched(self.host.is_some(), status.code(), &stderr) {
+                    endpoint_unreachable(&id, said)
+                } else {
+                    lost(said)
+                },
+            );
         }
         let envelope: Envelope = serde_json::from_slice(&stdout)
-            .map_err(|_| endpoint_unreachable(&id, "returned an invalid RPC response"))?;
+            .map_err(|_| lost("returned an invalid RPC response".into()))?;
         if envelope.version != VERSION {
             return Err(format!(
                 "unknown_method: endpoint '{id}' uses unsupported RPC version {}",
@@ -357,12 +409,9 @@ impl Endpoint {
         match (envelope.ok, envelope.value, envelope.error) {
             (true, Some(value), None) => Ok(value),
             (false, None, Some(error)) if !error.is_empty() && error.len() <= 4096 => {
-                Err(older(&id, error))
+                Err(older(&id, printable(&error, 4096)))
             }
-            _ => Err(endpoint_unreachable(
-                &id,
-                "returned an invalid RPC envelope",
-            )),
+            _ => Err(lost("returned an invalid RPC envelope".into())),
         }
     }
 
@@ -478,6 +527,131 @@ impl Endpoint {
 
 fn endpoint_unreachable(id: &str, detail: impl AsRef<str>) -> String {
     format!("endpoint_unreachable: endpoint '{id}' {}", detail.as_ref())
+}
+
+/// Text an endpoint sent, for an error message a terminal may show: control
+/// characters (C0, DEL and C1, so no escape sequence survives) become
+/// spaces, and at most `limit` characters are kept.
+pub(super) fn printable(text: &str, limit: usize) -> String {
+    text.chars()
+        .take(limit)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// What ssh says on its own failure (status 255) before a session exists.
+const NO_SESSION: &[&str] = &[
+    "Permission denied",
+    "Host key verification failed",
+    "Could not resolve hostname",
+    "Connection refused",
+    "Connection timed out",
+    "No route to host",
+    "Operation timed out",
+];
+
+/// Whether a call that ended with a status other than 0 shows that its
+/// request was never taken up: masil-agent's own error (`rpc` fails that
+/// way only before it acts; past that every result is an envelope and
+/// status 0) unless it says the outcome is unknown, as a signal during the
+/// call does; a shell that could not run the command (126, 127); or, over
+/// ssh, ssh's own failure before a session.
+fn never_dispatched(ssh: bool, code: Option<i32>, stderr: &str) -> bool {
+    let own_error = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("masil-agent: error["))
+        .and_then(|rest| rest.split_once("]: "));
+    if let Some((_, message)) = own_error {
+        return super::failure::classify(message).0 != super::failure::Class::Unknown;
+    }
+    match code {
+        Some(126 | 127) => true,
+        Some(255) if ssh => NO_SESSION.iter().any(|said| stderr.contains(said)),
+        _ => false,
+    }
+}
+
+/// Whether a request only reads on the endpoint. The API's scope table
+/// decides, for the CLI form the request stands for; the two requests
+/// without a CLI form (what a path is, a connection's lease) read. A form
+/// the table does not offer counts as a change.
+fn reads_only(request: &Request) -> bool {
+    use crate::api::scope::{Scope, needed};
+    let (verb, words): (&str, Vec<String>) = match request {
+        Request::Stat { .. } => return true,
+        Request::List => ("list", vec![]),
+        Request::View { args } => ("view", args.clone()),
+        Request::Save { path } => ("save", vec![path.clone()]),
+        Request::Restore { path, .. } => ("restore", vec![path.clone()]),
+        Request::Get { target } => ("get", vec![target.clone()]),
+        Request::Start { name, provider, .. } => ("start", vec![name.clone(), provider.clone()]),
+        Request::Find { args } => ("find", args.clone()),
+        Request::Operations { single: true, args } => ("operation", args.clone()),
+        Request::Operations { args, .. } => ("operations", args.clone()),
+        Request::Inbox { args } => ("inbox", args.clone()),
+        Request::Worktrees { args } => ("worktree", args.clone()),
+        Request::Action { expected, action } => {
+            let (verb, rest): (&str, &[String]) = match action {
+                Action::ConnectionStatus { .. } => return true,
+                Action::Read { .. } => ("read", &[]),
+                Action::Receipt { .. } => ("prompt-receipt", &[]),
+                Action::Requests => ("requests", &[]),
+                Action::Queue { args } => ("queue", args),
+                Action::Changes { args } => ("changes", args),
+                Action::Rename { .. } => ("rename", &[]),
+                Action::Keys { .. } => ("send-keys", &[]),
+                Action::Draft { .. } => ("draft", &[]),
+                Action::Prompt { .. } => ("prompt", &[]),
+                Action::Ack => ("ack", &[]),
+                Action::Close | Action::CloseOperation { .. } => ("close", &[]),
+                Action::Resume { .. } => ("resume", &[]),
+                Action::Interrupt { .. } => ("interrupt", &[]),
+                Action::Answer { .. } => ("answer", &[]),
+            };
+            let mut words = vec![expected.pane_id.clone()];
+            words.extend_from_slice(rest);
+            (verb, words)
+        }
+    };
+    needed(verb, &words) == Some(Scope::Read)
+}
+
+/// Whether an agent an endpoint returned has identities of the shapes this
+/// side's own listing gives. They are compared, stored and put on local
+/// command lines (the connection window), so anything else is refused where
+/// it arrives.
+pub(super) fn valid_agent(agent: &Agent) -> bool {
+    super::valid_boot(&agent.boot).is_ok()
+        && crate::pane_id(&agent.pane_id).is_ok()
+        && valid_generation(&agent.generation)
+        && valid_run(&agent.run)
+        && super::valid_name(&agent.name)
+}
+
+/// A PTY generation: a decimal number, the rule of `valid_generation` in
+/// native_ui.rs.
+fn valid_generation(generation: &str) -> bool {
+    !generation.is_empty()
+        && generation.len() <= 20
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// A run an endpoint names. A launch's run has the letters, digits, `-` and
+/// `_` of `valid_run` in transfer.rs; the run of an agent masil did not
+/// start is `{boot}-%N-{generation}-{group}` (`unmanaged_run` in mod.rs),
+/// so `%` is allowed too.
+pub(super) fn valid_run(run: &str) -> bool {
+    !run.is_empty()
+        && run.len() <= 128
+        && run
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_%".contains(&byte))
 }
 
 pub(super) fn host_key_failure(detail: &str) -> bool {
@@ -838,6 +1012,9 @@ fn save(path: &Path, endpoints: &[Endpoint]) -> Result<(), String> {
         return Err("endpoint configuration is too large".into());
     }
     let temporary = directory.join(format!(".endpoints.json.{}.tmp", std::process::id()));
+    // Both callers hold the configuration lock, so a file of this name was
+    // left by an ended process that had this process ID.
+    let _ = fs::remove_file(&temporary);
     let result = (|| -> Result<(), String> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -1139,7 +1316,9 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
                 })),
                 Action::Rename { name } => {
                     manager.rename(&agent, &name).await?;
-                    Ok(json!({"stage":"registered", "pane_id":agent.pane_id, "name":name}))
+                    Ok(
+                        json!({"stage":"registered", "pane_id":agent.pane_id, "run":agent.run, "name":name}),
+                    )
                 }
                 Action::Keys { keys } => {
                     manager
@@ -1158,7 +1337,9 @@ pub(crate) async fn rpc(manager: &Manager, request: Request) -> Result<Value, St
                     manager
                         .acknowledge(&agent, super::Through::Before(read_at))
                         .await?;
-                    Ok(json!({"stage":"seen", "revision":agent.revision}))
+                    Ok(
+                        json!({"stage":"seen", "pane_id":agent.pane_id, "run":agent.run, "revision":agent.revision}),
+                    )
                 }
                 Action::Close => {
                     let path = manager.action_path().await?.name();
@@ -1532,6 +1713,322 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, crate::managed::core_action::COORDINATOR_BUSY);
         assert_eq!(call_count(&directory), "1");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A local endpoint whose masil-agent reads its request, counts the call
+    /// in `calls` and then runs `then`.
+    fn scripted_endpoint(label: &str, then: &str) -> (Endpoint, PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("masil-endpoint-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let script = directory.join("scripted-agent");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > /dev/null\necho x >> {calls}\n{then}\n",
+                calls = shell_quote(directory.join("calls").to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = Endpoint {
+            binary: script.to_string_lossy().into_owned(),
+            socket: "/tmp/unused-masil.sock".into(),
+            ..endpoint(None)
+        };
+        (endpoint, directory)
+    }
+
+    fn action(action: Action) -> Request {
+        let Request::Action { expected, .. } = keys_request() else {
+            unreachable!()
+        };
+        Request::Action { expected, action }
+    }
+
+    fn words(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn requests_that_only_read_follow_the_scope_table() {
+        for request in [
+            Request::List,
+            Request::Get {
+                target: "builder".into(),
+            },
+            Request::Stat {
+                path: "/srv".into(),
+            },
+            Request::Find {
+                args: words(&["tests"]),
+            },
+            Request::View {
+                args: words(&["get"]),
+            },
+            Request::Inbox {
+                args: words(&["--all"]),
+            },
+            Request::Operations {
+                single: true,
+                args: words(&["run:r/close/k"]),
+            },
+            Request::Worktrees {
+                args: words(&["list"]),
+            },
+            action(Action::Read { history: true }),
+            action(Action::Receipt { operation: None }),
+            action(Action::ConnectionStatus {
+                lease: "0".repeat(32),
+            }),
+            action(Action::Requests),
+            action(Action::Queue { args: vec![] }),
+            action(Action::Queue {
+                args: words(&["show", "3"]),
+            }),
+            action(Action::Changes {
+                args: words(&["--file", "src/main.rs"]),
+            }),
+        ] {
+            assert!(reads_only(&request), "{request:?}");
+        }
+        for request in [
+            keys_request(),
+            Request::Save {
+                path: "/srv/s.json".into(),
+            },
+            Request::Restore {
+                path: "/srv/s.json".into(),
+                allow_fresh: false,
+            },
+            Request::Start {
+                name: "builder".into(),
+                provider: "codex".into(),
+                cwd: "/srv".into(),
+                args: vec![],
+                session: None,
+                split: None,
+                boot: None,
+                operation_id: None,
+                worktree: None,
+                answers: false,
+            },
+            Request::View {
+                args: words(&["set", "--state", "idle"]),
+            },
+            Request::Inbox {
+                args: words(&["ack", "3"]),
+            },
+            Request::Operations {
+                single: true,
+                args: words(&["resolve", "run:r/prompt/1", "--as", "delivered"]),
+            },
+            action(Action::Prompt {
+                text: "go on".into(),
+                operation: None,
+            }),
+            action(Action::Draft {
+                text: "go on".into(),
+            }),
+            action(Action::Rename {
+                name: "other".into(),
+            }),
+            action(Action::Ack),
+            action(Action::Close),
+            action(Action::CloseOperation {
+                operation: "k".into(),
+            }),
+            action(Action::Resume {
+                name: "again".into(),
+            }),
+            action(Action::Interrupt { operation: None }),
+            action(Action::Answer {
+                request: "per_1".into(),
+                args: words(&["--choice", "once"]),
+            }),
+            action(Action::Queue {
+                args: words(&["add", "look at the tests"]),
+            }),
+            action(Action::Queue {
+                args: words(&["send"]),
+            }),
+        ] {
+            assert!(!reads_only(&request), "{request:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_that_times_out_after_it_was_sent_has_an_unknown_outcome() {
+        let (endpoint, directory) = scripted_endpoint("sent-timeout", "sleep 30");
+        let limit = Duration::from_millis(1500);
+        let error = endpoint
+            .call_once(&keys_request(), limit)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "outcome_unknown: endpoint 'build' did not answer in 1 seconds; the request was sent"
+        );
+        // A read that times out changed nothing and may be made again.
+        let error = endpoint.call_once(&Request::List, limit).await.unwrap_err();
+        assert_eq!(
+            error,
+            "endpoint_unreachable: endpoint 'build' timed out after 1 seconds"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_change_without_a_valid_answer_is_unknown_and_never_sent_again() {
+        let (endpoint, directory) = scripted_endpoint("sent-no-answer", "printf 'not an envelope'");
+        let error = endpoint
+            .clone()
+            .call_within(keys_request(), Duration::from_secs(12))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "outcome_unknown: endpoint 'build' returned an invalid RPC response; the request was sent"
+        );
+        assert_eq!(call_count(&directory), "x");
+        let error = endpoint.call(&Request::List).await.unwrap_err();
+        assert_eq!(
+            error,
+            "endpoint_unreachable: endpoint 'build' returned an invalid RPC response"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_change_whose_call_ended_badly_is_unknown_unless_it_was_never_taken_up() {
+        // The command ended after it had the request, as when the
+        // connection dies or masil-agent fails after acting.
+        let (endpoint, directory) = scripted_endpoint("sent-status", "exit 1");
+        let error = endpoint
+            .clone()
+            .call_within(keys_request(), Duration::from_secs(12))
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("outcome_unknown: endpoint 'build' exited with")
+                && error.ends_with("; the request was sent"),
+            "{error}"
+        );
+        assert_eq!(call_count(&directory), "x");
+        let error = endpoint.call(&Request::List).await.unwrap_err();
+        assert!(
+            error.starts_with("endpoint_unreachable: endpoint 'build' exited with"),
+            "{error}"
+        );
+        fs::remove_dir_all(directory).unwrap();
+        // masil-agent's own error comes before it acts.
+        let (endpoint, directory) = scripted_endpoint(
+            "sent-refused",
+            "echo 'masil-agent: error[server_unreachable]: server_unreachable: native socket: gone' >&2\nexit 4",
+        );
+        let error = endpoint
+            .call_once(&keys_request(), CALL_DEADLINE)
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("endpoint_unreachable: endpoint 'build' exited with"),
+            "{error}"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_a_failure_before_the_request_was_taken_up_is_never_dispatched() {
+        // ssh's own failures before a session, on status 255.
+        for said in [
+            "dev@host: Permission denied (publickey).",
+            "Host key verification failed.",
+            "ssh: Could not resolve hostname build: nodename nor servname provided",
+            "ssh: connect to host build port 22: Connection refused",
+            "ssh: connect to host build port 22: Connection timed out",
+            "ssh: connect to host build port 22: No route to host",
+            "ssh: connect to host build port 22: Operation timed out",
+        ] {
+            assert!(never_dispatched(true, Some(255), said), "{said}");
+            // Without ssh, 255 is the command's own status.
+            assert!(!never_dispatched(false, Some(255), said), "{said}");
+        }
+        // The session was up and then died, or the command failed.
+        for (code, said) in [
+            (Some(255), "Connection to build closed by remote host."),
+            (Some(255), "client_loop: send disconnect: Broken pipe"),
+            (Some(255), ""),
+            (Some(1), "Connection refused"),
+            (Some(101), "thread 'main' panicked at src/main.rs"),
+            (None, ""),
+            // A signal during the call: masil-agent says so itself.
+            (
+                Some(6),
+                "masil-agent: error[outcome_unknown]: outcome_unknown: agent request terminated; outcome may be unknown",
+            ),
+        ] {
+            assert!(!never_dispatched(true, code, said), "{code:?} {said}");
+        }
+        for (code, said) in [
+            (
+                Some(4),
+                "masil-agent: error[server_unreachable]: server_unreachable: native socket: gone",
+            ),
+            (
+                Some(2),
+                "warning: x\nmasil-agent: error[usage]: usage: unknown agent command",
+            ),
+            (Some(127), "zsh:1: command not found: masil-agent"),
+            (Some(126), "sh: /opt/masil-agent: Permission denied"),
+        ] {
+            assert!(never_dispatched(true, code, said), "{code:?} {said}");
+            assert!(never_dispatched(false, code, said), "{code:?} {said}");
+        }
+    }
+
+    #[test]
+    fn text_from_an_endpoint_is_shown_without_control_characters() {
+        assert_eq!(
+            printable("a\x1b]0;title\x07b\nc\u{9b}31m\x7f", 64),
+            "a ]0;title b c 31m "
+        );
+        assert_eq!(
+            printable("target_absent: no such agent", 64),
+            "target_absent: no such agent"
+        );
+        assert_eq!(printable(&"é".repeat(10), 4), "éééé");
+    }
+
+    #[test]
+    fn remote_runs_are_launch_tickets_or_unmanaged_runs() {
+        assert!(valid_run("0123456789abcdef0123456789abcdef"));
+        assert!(valid_run(
+            "01234567-89ab-cdef-0123-456789abcdef-%12-3-4567-1700000000"
+        ));
+        for run in ["", "run shell", "run;", "a\tb", &"r".repeat(129)] {
+            assert!(!valid_run(run), "{run:?}");
+        }
+        assert!(valid_generation("18446744073709551615"));
+        for generation in ["", "run-shell", "1;", "+1", &"1".repeat(21)] {
+            assert!(!valid_generation(generation), "{generation:?}");
+        }
+    }
+
+    #[test]
+    fn saving_replaces_a_temporary_file_left_under_this_process_id() {
+        let directory =
+            std::env::temp_dir().join(format!("masil-endpoint-save-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("endpoints.json");
+        let stale = directory.join(format!(".endpoints.json.{}.tmp", std::process::id()));
+        fs::write(&stale, b"left by a process that died").unwrap();
+        save(&path, &[endpoint(None)]).unwrap();
+        assert!(!stale.exists());
+        assert_eq!(load_from(&path).unwrap().len(), 1);
         fs::remove_dir_all(directory).unwrap();
     }
 }

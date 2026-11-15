@@ -32,6 +32,8 @@ const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Calls at once across all of a coordinator's extensions.
 const SHARED_CALLS: usize = 4;
+/// How soon the residents are looked at again while one is ending.
+const ENDING_PAUSE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -662,9 +664,16 @@ impl Residents {
                 {
                     log(&format!("extensions: {error}"));
                 }
+                // While one is ending, the next look comes soon: what
+                // replaces it starts once it is gone.
+                let pause = if matches!(result, Ok(true)) {
+                    ENDING_PAUSE
+                } else {
+                    Duration::from_secs(30)
+                };
                 last_error = result.err();
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = tokio::time::sleep(pause) => {}
                     _ = self.wake.notified() => {}
                 }
             }
@@ -686,7 +695,9 @@ impl Residents {
     }
 
     /// Runs what the store has on and extensions.toml configures as
-    /// resident; ends the rest, and any whose configuration changed.
+    /// resident; ends the rest, and any whose configuration changed. True
+    /// when one is still ending or ended in this pass while wanted: the
+    /// caller looks again soon.
     async fn reconcile(
         &self,
         socket: &Path,
@@ -694,7 +705,7 @@ impl Residents {
         shared: &Arc<Semaphore>,
         feed: &broadcast::Sender<Value>,
         log: &Log,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let path = socket.to_owned();
         let (rows, configured) = tokio::task::spawn_blocking(move || {
             Ok::<_, String>((crate::managed::extension_rows(&path)?, load()?))
@@ -714,44 +725,13 @@ impl Residents {
                 Some((extension.name.clone(), (extension.clone(), row)))
             })
             .collect();
-        let afresh = {
+        let (afresh, again) = {
             let mut running = self.running.lock().map_err(|_| "extensions unavailable")?;
-            // One that ended since the rows were read is started again only
-            // after they are read again (it may have recorded `failed`).
-            let mut ended = Vec::new();
-            let mut afresh = Vec::new();
-            running.retain(|name, resident| {
-                if resident.task.is_finished() {
-                    ended.push(name.clone());
-                }
-                let keep = wanted
-                    .get(name)
-                    .is_some_and(|(extension, _)| *extension == resident.extension)
-                    && !resident.stopped.load(Ordering::SeqCst)
-                    && !resident.task.is_finished();
-                if !keep {
-                    resident.end();
-                } else if let Some(changed) = wanted
-                    .get(name)
-                    .and_then(|(_, row)| row["changed_ms"].as_i64())
-                    .filter(|changed| *changed > resident.changed_ms)
-                {
-                    // Enabled again while it runs: its failures count
-                    // afresh, and the row says what it is doing now.
-                    resident.changed_ms = changed;
-                    if let Ok(mut counters) = resident.counters.lock() {
-                        *counters = (0, 0);
-                    }
-                    let state = resident
-                        .status
-                        .lock()
-                        .ok()
-                        .and_then(|status| status["state"].as_str().map(str::to_owned))
-                        .unwrap_or_else(|| "running".into());
-                    afresh.push((name.clone(), state));
-                }
-                keep
-            });
+            let Pass {
+                ended,
+                afresh,
+                again,
+            } = pass(&mut running, &wanted);
             for (name, (extension, row)) in wanted {
                 if running.contains_key(&name) || ended.contains(&name) {
                     continue;
@@ -783,7 +763,7 @@ impl Residents {
                 };
                 running.insert(name, resident);
             }
-            afresh
+            (afresh, again)
         };
         for (name, state) in afresh {
             let (socket, extension) = (socket.to_owned(), name.clone());
@@ -796,7 +776,71 @@ impl Residents {
                 log(&format!("extension {name}: {error}"));
             }
         }
-        Ok(())
+        Ok(again)
+    }
+}
+
+/// What one look at the running residents found.
+struct Pass {
+    /// Their tasks had finished; they are no longer tracked.
+    ended: Vec<String>,
+    /// Enabled again while running, with the state each is in.
+    afresh: Vec<(String, String)>,
+    /// One is still ending, or ended while wanted: look again soon.
+    again: bool,
+}
+
+/// Compares the running residents with what is `wanted`. One that is not
+/// wanted as it runs (switched off, or its configuration changed) is asked
+/// to end and stays tracked until its task finishes, so what replaces it
+/// never runs beside it. One whose task finished is dropped; it is started
+/// again only after the rows are read again (it may have recorded
+/// `failed`).
+fn pass(
+    running: &mut HashMap<String, Resident>,
+    wanted: &HashMap<String, (Extension, Value)>,
+) -> Pass {
+    let mut ended = Vec::new();
+    let mut afresh = Vec::new();
+    let mut again = false;
+    running.retain(|name, resident| {
+        if resident.task.is_finished() {
+            again |= wanted.contains_key(name);
+            ended.push(name.clone());
+            return false;
+        }
+        let keep = wanted
+            .get(name)
+            .is_some_and(|(extension, _)| *extension == resident.extension)
+            && !resident.stopped.load(Ordering::SeqCst);
+        if !keep {
+            resident.end();
+            again = true;
+        } else if let Some(changed) = wanted
+            .get(name)
+            .and_then(|(_, row)| row["changed_ms"].as_i64())
+            .filter(|changed| *changed > resident.changed_ms)
+        {
+            // Enabled again while it runs: its failures count
+            // afresh, and the row says what it is doing now.
+            resident.changed_ms = changed;
+            if let Ok(mut counters) = resident.counters.lock() {
+                *counters = (0, 0);
+            }
+            let state = resident
+                .status
+                .lock()
+                .ok()
+                .and_then(|status| status["state"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "running".into());
+            afresh.push((name.clone(), state));
+        }
+        true
+    });
+    Pass {
+        ended,
+        afresh,
+        again,
     }
 }
 
@@ -1065,5 +1109,91 @@ async fn pump(
             let _ = log.write_all(bytes);
         }
         size += read as u64;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extension(program: &str) -> Extension {
+        Extension {
+            name: "notes".into(),
+            command: vec![program.into()],
+            scope: "read".into(),
+            events: vec![],
+            resident: true,
+            actions: vec![],
+            timeout: None,
+        }
+    }
+
+    /// A resident whose task ends 100 ms after it is asked to, as one that
+    /// has its process group to end.
+    fn resident(extension: Extension) -> Resident {
+        let stop = Arc::new(Notify::new());
+        let asked = stop.clone();
+        Resident {
+            extension,
+            stop,
+            stopped: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(Mutex::new(json!({"state": "running"}))),
+            counters: Arc::new(Mutex::new((3, 9))),
+            changed_ms: 0,
+            task: tokio::spawn(async move {
+                asked.notified().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }),
+        }
+    }
+
+    fn wanted(extension: Extension, changed_ms: i64) -> HashMap<String, (Extension, Value)> {
+        HashMap::from([(
+            "notes".to_owned(),
+            (extension, json!({"changed_ms": changed_ms})),
+        )])
+    }
+
+    #[tokio::test]
+    async fn a_resident_whose_configuration_changed_is_tracked_until_it_ended() {
+        let mut running = HashMap::from([("notes".to_owned(), resident(extension("/bin/old")))]);
+        let changed = wanted(extension("/bin/new"), 0);
+        // Asked to end and still tracked: nothing is started beside it.
+        let first = pass(&mut running, &changed);
+        assert!(first.again && first.ended.is_empty());
+        assert!(running["notes"].stopped.load(Ordering::SeqCst));
+        assert!(!running["notes"].task.is_finished());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !running["notes"].task.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Gone: what replaces it starts once the rows are read again.
+        let second = pass(&mut running, &changed);
+        assert!(running.is_empty());
+        assert_eq!(second.ended, ["notes"]);
+        assert!(second.again);
+        let third = pass(&mut running, &changed);
+        assert!(!third.again && third.ended.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resident_that_runs_as_configured_is_left_running() {
+        let same = extension("/bin/same");
+        let mut running = HashMap::from([("notes".to_owned(), resident(same.clone()))]);
+        let kept = pass(&mut running, &wanted(same.clone(), 0));
+        assert!(!kept.again && kept.ended.is_empty() && kept.afresh.is_empty());
+        assert!(!running["notes"].stopped.load(Ordering::SeqCst));
+        // Enabled again while it runs: its failures count afresh.
+        let again = pass(&mut running, &wanted(same, 5));
+        assert_eq!(again.afresh, [("notes".to_owned(), "running".to_owned())]);
+        assert_eq!(*running["notes"].counters.lock().unwrap(), (0, 0));
+        // Switched off: asked to end, tracked until it has.
+        let off = pass(&mut running, &HashMap::new());
+        assert!(off.again && running.contains_key("notes"));
+        assert!(running["notes"].stopped.load(Ordering::SeqCst));
+        running["notes"].task.abort();
     }
 }

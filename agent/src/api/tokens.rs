@@ -113,21 +113,33 @@ fn change<T>(work: impl FnOnce(&mut Registry, &Path) -> Result<T, String>) -> Re
     }
     let mut registry = read_registry(&directory)?;
     let result = work(&mut registry, &directory)?;
+    write_registry(&directory, &registry)?;
+    Ok(result)
+}
+
+/// Writes the registry whole and renames it in. The caller holds the lock.
+fn write_registry(directory: &Path, registry: &Registry) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(registry).map_err(|error| error.to_string())?;
     let temporary = directory.join(format!(".registry-{}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
+    // Under the lock, a file of this name was left by an ended process
+    // that had this process ID.
+    let _ = std::fs::remove_file(&temporary);
+    let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&temporary)
-        .map_err(|error| format!("api_token: {error}"))?;
-    let bytes = serde_json::to_vec_pretty(&registry).map_err(|error| error.to_string())?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("api_token: {error}"))?;
-    std::fs::rename(&temporary, directory.join(REGISTRY))
-        .map_err(|error| format!("api_token: {error}"))?;
-    Ok(result)
+        .and_then(|mut file| {
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temporary, directory.join(REGISTRY)))
+        .map_err(|error| format!("api_token: {error}"));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 /// A new token: its file, readable only by you, and its hash on the books.
@@ -247,4 +259,38 @@ pub(crate) fn alive(held: &Held) -> Result<(), String> {
         .any(|entry| entry.sha256 == held.sha256 && entry.revoked_ms.is_none())
         .then_some(())
         .ok_or_else(|| format!("api_token: token {} was revoked", held.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_registry_replaces_a_left_temporary_file_and_leaves_none_on_failure() {
+        let directory =
+            std::env::temp_dir().join(format!("masil-api-tokens-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let temporary = directory.join(format!(".registry-{}", std::process::id()));
+        std::fs::write(&temporary, b"left by a process that died").unwrap();
+        let registry = Registry {
+            tokens: vec![Entry {
+                name: "phone".into(),
+                scope: "read".into(),
+                sha256: "0".repeat(64),
+                created_ms: 1,
+                revoked_ms: None,
+            }],
+        };
+        write_registry(&directory, &registry).unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(read_registry(&directory).unwrap().tokens[0].name, "phone");
+        // A file cannot be renamed over a directory.
+        std::fs::remove_file(directory.join(REGISTRY)).unwrap();
+        std::fs::create_dir(directory.join(REGISTRY)).unwrap();
+        let error = write_registry(&directory, &registry).unwrap_err();
+        assert!(error.starts_with("api_token:"), "{error}");
+        assert!(!temporary.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

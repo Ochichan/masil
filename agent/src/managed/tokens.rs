@@ -12,9 +12,6 @@ use std::time::Duration;
 
 /// The variable a launched pane carries.
 pub(crate) const VARIABLE: &str = "MASIL_AGENT_TOKEN_FILE";
-/// Token files older than this are removed at the next launch, for runs
-/// whose end nothing saw.
-const KEEP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// A run not listed yet may be starting: its token stays this long.
 const STARTING: Duration = Duration::from_secs(120);
 
@@ -36,13 +33,18 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// A new token for `run`: the file it is in and its SHA-256.
+/// A new token for `run`: the file it is in and its SHA-256. Nothing is
+/// removed here by age: a run that lives for months keeps reporting with
+/// its token, and what this module knows cannot tell it from an ended one.
+/// The tokens of ended runs go with `remove` and `prune_ended`.
 pub(crate) fn create(socket: &Path, run: &str) -> Result<(PathBuf, String), String> {
     if !valid(run) {
         return Err("invalid run for a token".into());
     }
-    let directory = directory(socket)?;
-    prune(&directory, |_| true, KEEP);
+    create_in(&directory(socket)?, run)
+}
+
+fn create_in(directory: &Path, run: &str) -> Result<(PathBuf, String), String> {
     let mut token = [0u8; 32];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut random| random.read_exact(&mut token))
@@ -127,7 +129,7 @@ pub(crate) fn check(socket: &Path, expected: &str) -> Result<(), String> {
     if hex(&Sha256::digest(&token)) != expected {
         return refused("does not match this run");
     }
-    // In use: the prune of month-old tokens leaves it.
+    // In use: `prune_ended` counts its age from now.
     let now = std::time::SystemTime::now();
     let _ = file.set_times(
         std::fs::FileTimes::new()
@@ -135,4 +137,44 @@ pub(crate) fn check(socket: &Path, expected: &str) -> Result<(), String> {
             .set_accessed(now),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aged(path: &Path, age: Duration) {
+        let then = std::time::SystemTime::now() - age;
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(then))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_launch_leaves_the_tokens_of_other_runs_and_the_sweep_removes_ended_ones() {
+        let directory =
+            std::env::temp_dir().join(format!("masil-run-tokens-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        // A run that has lived for two months without a hook report, and one
+        // that ended an hour ago.
+        let (live, _) = create_in(&directory, "live").unwrap();
+        let (ended, _) = create_in(&directory, "ended").unwrap();
+        aged(&live, Duration::from_secs(60 * 24 * 60 * 60));
+        aged(&ended, Duration::from_secs(60 * 60));
+        let (fresh, hash) = create_in(&directory, "fresh").unwrap();
+        assert_eq!(hash.len(), 64);
+        assert!(live.exists() && ended.exists() && fresh.exists());
+        // What the resident sweep does with the runs it lists.
+        let listed = std::collections::HashSet::from(["live".to_owned()]);
+        prune(&directory, |run| !listed.contains(run), STARTING);
+        assert!(live.exists());
+        assert!(!ended.exists());
+        // Not listed yet, but still starting.
+        assert!(fresh.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

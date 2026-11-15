@@ -40,6 +40,37 @@ struct State {
     pending: HashMap<String, (String, AbortHandle)>,
     work: JoinSet<PollResult>,
 }
+impl State {
+    /// Ends the pending poll of the task that died without a result, and
+    /// keeps `error` as that endpoint's error.
+    fn task_failed(&mut self, task: tokio::task::Id, error: String) {
+        let Some(id) = self
+            .pending
+            .iter()
+            .find(|(_, (_, handle))| handle.id() == task)
+            .map(|(id, _)| id.clone())
+        else {
+            return;
+        };
+        let Some((fingerprint, _)) = self.pending.remove(&id) else {
+            return;
+        };
+        let entry = self.cache.entry(id).or_insert_with(|| Cached {
+            key: fingerprint.clone(),
+            boot: String::new(),
+            agents: Vec::new(),
+            error: None,
+            updated: Instant::now(),
+        });
+        if entry.key != fingerprint {
+            entry.agents.clear();
+            entry.boot.clear();
+            entry.key = fingerprint;
+        }
+        entry.error = Some(error);
+        entry.updated = Instant::now();
+    }
+}
 pub(crate) struct Fleet {
     pub local: Arc<Manager>,
     /// The terminal client's saved view (as stored) the local list follows
@@ -104,9 +135,19 @@ impl Fleet {
                 }
                 keep
             });
-            while let Some(completed) = state.work.try_join_next() {
-                let Ok((id, fingerprint, result)) = completed else {
-                    continue;
+            while let Some(completed) = state.work.try_join_next_with_id() {
+                let (id, fingerprint, result) = match completed {
+                    Ok((_, done)) => done,
+                    Err(error) => {
+                        // A panicked task has no result. Drop its pending
+                        // mark and record the failure, or the endpoint is
+                        // never polled again.
+                        state.task_failed(
+                            error.id(),
+                            format!("job_failed: inventory task failed: {error}"),
+                        );
+                        continue;
+                    }
                 };
                 if id != "local" && !endpoints.iter().any(|e| e.enabled && key(e) == fingerprint) {
                     continue;
@@ -325,19 +366,10 @@ impl Fleet {
                 .await
             {
                 // An endpoint older than durable remote interrupts still
-                // takes the key press.
+                // takes the key press: the provider's measured keys, while
+                // it is listed as working.
                 Err(error) if error.starts_with("remote_unsupported") => {
-                    let mut sent = self
-                        .action(
-                            e,
-                            agent,
-                            Action::Keys {
-                                keys: vec!["C-c".into()],
-                            },
-                        )
-                        .await?;
-                    sent["durable"] = json!(false);
-                    Ok(sent)
+                    super::remote_cli::plain_interrupt(&e, agent).await
                 }
                 result => result,
             }
@@ -568,10 +600,13 @@ impl Fleet {
         let Some(endpoint) = self.remote(agent)? else {
             return self.local.focus_from(agent, origin).await.map(|_| ());
         };
+        // The identities go on a local command line below.
+        if !endpoints::valid_agent(agent) {
+            return Err("invalid endpoint agent identities".into());
+        }
         // Revalidate before creating a connection window; no remote process is started by polling.
         self.action(endpoint.clone(), agent, Action::Read { history: false })
             .await?;
-        let _lock = self.local.lock()?;
         let marker = format!(
             "{:x}",
             Sha256::digest(format!(
@@ -582,7 +617,83 @@ impl Fleet {
                 agent.run
             ))
         );
-        let existing = self
+        // The management lock covers finding this agent's connection window
+        // and creating one, so two desks cannot both create it. The calls
+        // to the endpoint that verify the connection take seconds and are
+        // made without the lock: a local start, rename or close would be
+        // refused meanwhile.
+        let (boot, pane, generation, lease) = {
+            let _lock = self.local.lock()?;
+            let existing = self.connection_window(&marker).await?;
+            let boot = self.local.boot().await?;
+            match existing {
+                Some((pane, generation, lease)) => (boot, pane, generation, lease),
+                None => {
+                    let lease = super::nonce()?;
+                    let args = connection_command(&endpoint, agent, &lease)?;
+                    let output = self
+                        .local
+                        .command(&args.iter().map(String::as_str).collect::<Vec<_>>())
+                        .await?;
+                    let fields: Vec<_> = output.trim().split('\t').collect();
+                    if fields.len() != 2 {
+                        return Err("connection window outcome unknown; inspect local panes".into());
+                    }
+                    self.local
+                        .command(&[
+                            "set-option",
+                            "-p",
+                            "-t",
+                            fields[0],
+                            "@masil-agent-connection",
+                            &format!("{marker}:{}:{lease}", fields[1]),
+                        ])
+                        .await?;
+                    (boot, fields[0].to_owned(), fields[1].to_owned(), lease)
+                }
+            }
+        };
+        // A window found may be one another open created a moment ago and
+        // is still verifying: it gets the same wait as one created here.
+        let verified = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match self
+                    .action(
+                        endpoint.clone(),
+                        agent,
+                        Action::ConnectionStatus {
+                            lease: lease.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => return Ok::<(), String>(()),
+                    Err(error) if error.contains("starting or no longer exists") => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            "remote connection was not confirmed; inspect its local connection window".to_owned()
+        })?;
+        verified?;
+        self.local
+            .native
+            .navigate(&boot, &pane, &generation, origin, &self.local.native.socket)
+            .await
+            .map(|_| ())
+    }
+
+    /// The live local pane that holds the connection `marker` names: its
+    /// pane ID, PTY generation and the lease it was opened with.
+    async fn connection_window(
+        &self,
+        marker: &str,
+    ) -> Result<Option<(String, String, String)>, String> {
+        let panes = self
             .local
             .command(&[
                 "list-panes",
@@ -591,150 +702,272 @@ impl Fleet {
                 "#{pane_id}\t#{masil_pty_generation}\t#{pane_dead}\t#{@masil-agent-connection}",
             ])
             .await?;
-        let mut target = None;
-        for line in existing.lines() {
+        for line in panes.lines() {
             let f: Vec<_> = line.split('\t').collect();
             if f.len() != 4 || f[2] != "0" {
                 continue;
             }
             let parts: Vec<_> = f[3].split(':').collect();
             if parts.len() == 3 && parts[0] == marker && parts[1] == f[1] {
-                self.action(
-                    endpoint.clone(),
-                    agent,
-                    Action::ConnectionStatus {
-                        lease: parts[2].into(),
-                    },
-                )
-                .await?;
-                target = Some((f[0].to_owned(), f[1].to_owned()));
-                break;
+                return Ok(Some((
+                    f[0].to_owned(),
+                    f[1].to_owned(),
+                    parts[2].to_owned(),
+                )));
             }
         }
-        let boot = self.local.boot().await?;
-        if target.is_none() {
-            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-            let fingerprint = key(&endpoint);
-            let lease = super::nonce()?;
-            let mut args = vec![
-                "new-window".to_owned(),
-                "-d".into(),
-                "-P".into(),
-                "-F".into(),
-                "#{pane_id}\t#{masil_pty_generation}".into(),
-                "-n".into(),
-                format!("{}:{}", endpoint.id, agent.name),
-            ];
-            let config_root = std::env::var_os("XDG_CONFIG_HOME")
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(std::path::PathBuf::from)
-                        .filter(|p| p.is_absolute())
-                        .map(|p| p.join(".config"))
-                })
-                .ok_or("endpoint configuration root unavailable")?;
-            args.extend([
-                "-e".into(),
-                format!(
-                    "XDG_CONFIG_HOME={}",
-                    config_root
-                        .to_str()
-                        .ok_or("endpoint configuration root is not UTF-8")?
-                ),
-            ]);
-            for name in ["HOME", "PATH", "SSH_AUTH_SOCK"] {
-                if let Ok(value) = std::env::var(name) {
-                    args.extend(["-e".into(), format!("{name}={value}")]);
-                } else if name == "SSH_AUTH_SOCK" {
-                    args.extend(["-e".into(), "SSH_AUTH_SOCK=".into()]);
-                }
-            }
-            args.extend([
-                "--".into(),
-                executable.to_string_lossy().into_owned(),
-                "agent".into(),
-                "endpoint-connect".into(),
-                endpoint.id.clone(),
-                fingerprint,
-                agent.pane_id.clone(),
-                agent.boot.clone(),
-                agent.generation.clone(),
-                agent.run.clone(),
-                lease.clone(),
-            ]);
-            let output = self
-                .local
-                .command(&args.iter().map(String::as_str).collect::<Vec<_>>())
-                .await?;
-            let fields: Vec<_> = output.trim().split('\t').collect();
-            if fields.len() != 2 {
-                return Err("connection window outcome unknown; inspect local panes".into());
-            }
-            self.local
-                .command(&[
-                    "set-option",
-                    "-p",
-                    "-t",
-                    fields[0],
-                    "@masil-agent-connection",
-                    &format!("{marker}:{}:{lease}", fields[1]),
-                ])
-                .await?;
-            let verified = tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    match self
-                        .action(
-                            endpoint.clone(),
-                            agent,
-                            Action::ConnectionStatus {
-                                lease: lease.clone(),
-                            },
-                        )
-                        .await
-                    {
-                        Ok(_) => return Ok::<(), String>(()),
-                        Err(error) if error.contains("starting or no longer exists") => {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            })
-            .await
-            .map_err(|_| {
-                "remote connection was not confirmed; inspect its local connection window"
-                    .to_owned()
-            })?;
-            verified?;
-            target = Some((fields[0].into(), fields[1].into()));
-        }
-        let (pane, generation) = target.ok_or("missing connection pane")?;
-        self.local
-            .native
-            .navigate(&boot, &pane, &generation, origin, &self.local.native.socket)
-            .await
-            .map(|_| ())
+        Ok(None)
     }
 }
+
+/// The local `new-window` command that opens the connection to `agent`:
+/// `endpoint-connect` with the endpoint and the identities the agent was
+/// listed with.
+fn connection_command(
+    endpoint: &Endpoint,
+    agent: &Agent,
+    lease: &str,
+) -> Result<Vec<String>, String> {
+    let name = window_name(&endpoint.id, &agent.name)?;
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut args = vec![
+        "new-window".to_owned(),
+        "-d".into(),
+        "-P".into(),
+        "-F".into(),
+        "#{pane_id}\t#{masil_pty_generation}".into(),
+        "-n".into(),
+        name,
+    ];
+    let config_root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|p| p.join(".config"))
+        })
+        .ok_or("endpoint configuration root unavailable")?;
+    args.extend([
+        "-e".into(),
+        format!(
+            "XDG_CONFIG_HOME={}",
+            config_root
+                .to_str()
+                .ok_or("endpoint configuration root is not UTF-8")?
+        ),
+    ]);
+    for name in ["HOME", "PATH", "SSH_AUTH_SOCK"] {
+        if let Ok(value) = std::env::var(name) {
+            args.extend(["-e".into(), format!("{name}={value}")]);
+        } else if name == "SSH_AUTH_SOCK" {
+            args.extend(["-e".into(), "SSH_AUTH_SOCK=".into()]);
+        }
+    }
+    args.extend([
+        "--".into(),
+        executable.to_string_lossy().into_owned(),
+        "agent".into(),
+        "endpoint-connect".into(),
+        endpoint.id.clone(),
+        key(endpoint),
+        agent.pane_id.clone(),
+        agent.boot.clone(),
+        agent.generation.clone(),
+        agent.run.clone(),
+        lease.to_owned(),
+    ]);
+    without_separator(args)
+}
+
+/// The connection window's name. The core expands `new-window -n` as a
+/// format, so a name with '#' is refused here, whatever was checked before.
+fn window_name(endpoint: &str, agent: &str) -> Result<String, String> {
+    let name = format!("{endpoint}:{agent}");
+    if name.contains('#') {
+        return Err("invalid_argument: the connection window name contains '#'".into());
+    }
+    Ok(name)
+}
+
+/// tmux ends a command at an argument that ends in ';' and reads what
+/// follows as another command, so a command built from an endpoint's or the
+/// environment's text is refused when one of its arguments does.
+fn without_separator(args: Vec<String>) -> Result<Vec<String>, String> {
+    if args.iter().any(|arg| arg.ends_with(';')) {
+        return Err("invalid_argument: an argument of the connection window ends in ';'".into());
+    }
+    Ok(args)
+}
+
 fn parse_inventory(value: Value) -> Result<(String, Vec<Agent>), String> {
     let boot = value["boot"]
         .as_str()
-        .filter(|s| s.len() == 36)
+        .filter(|boot| super::valid_boot(boot).is_ok())
         .ok_or("invalid endpoint boot identity")?
         .to_owned();
     let agents: Vec<Agent> = serde_json::from_value(value["agents"].clone())
         .map_err(|e| format!("invalid endpoint inventory: {e}"))?;
     if agents.len() > 64
-        || agents.iter().any(|a| {
-            a.boot != boot
-                || crate::pane_id(&a.pane_id).is_err()
-                || a.run.is_empty()
-                || a.run.len() > 128
-        })
+        || agents
+            .iter()
+            .any(|a| a.boot != boot || !endpoints::valid_agent(a))
     {
         return Err("invalid endpoint agent identities".into());
     }
     Ok((boot, agents))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOOT: &str = "01234567-89ab-cdef-0123-456789abcdef";
+
+    #[tokio::test]
+    async fn a_panicked_poll_task_ends_its_pending_mark_with_an_error() {
+        let mut state = State::default();
+        let handle = state.work.spawn(async { panic!("poll task panic") });
+        let task = handle.id();
+        state.pending.insert("edge".into(), ("key".into(), handle));
+        let (_, joined) = state
+            .work
+            .join_next_with_id()
+            .await
+            .map(|r| (0, r))
+            .unwrap();
+        let error = joined.unwrap_err();
+        assert_eq!(error.id(), task);
+        state.task_failed(error.id(), "job_failed: inventory task failed".into());
+        assert!(state.pending.is_empty());
+        let cached = &state.cache["edge"];
+        assert_eq!(cached.key, "key");
+        assert!(cached.error.as_deref().unwrap().starts_with("job_failed:"));
+    }
+
+    /// An inventory of one agent as an endpoint lists it, with `change`
+    /// applied to the agent.
+    fn inventory(change: impl FnOnce(&mut Value)) -> Value {
+        let mut agent = json!({
+            "id": "builder", "name": "builder", "provider": "claude", "pane_id": "%3",
+            "window_id": "@1", "workspace": "main", "cwd": "/srv", "boot": BOOT,
+            "generation": "2", "run": "0123456789abcdef0123456789abcdef",
+            "process": "running", "state": "idle",
+            "evidence": {"state": "idle", "source": "screen"},
+            "seen": true, "revision": "1", "returned_idle": false,
+        });
+        change(&mut agent);
+        json!({"boot": BOOT, "agents": [agent]})
+    }
+
+    #[test]
+    fn an_inventory_with_listed_identities_is_taken() {
+        let (boot, agents) = parse_inventory(inventory(|_| {})).unwrap();
+        assert_eq!(boot, BOOT);
+        assert_eq!(agents[0].name, "builder");
+        // An agent masil did not start: its name and run come from the pane.
+        let (_, agents) = parse_inventory(inventory(|agent| {
+            agent["name"] = json!("claude-3");
+            agent["run"] = json!(format!("{BOOT}-%3-2-4242"));
+        }))
+        .unwrap();
+        assert_eq!(agents[0].run, format!("{BOOT}-%3-2-4242"));
+    }
+
+    #[test]
+    fn an_inventory_with_identities_of_another_shape_is_refused() {
+        // 35 characters and ';': the length a boot has, ending a tmux
+        // command where it is an argument.
+        let ending = format!("{};", &BOOT[..35]);
+        let cases: [(&str, Value); 9] = [
+            ("boot", json!(ending)),
+            ("generation", json!("run-shell")),
+            ("generation", json!("2;")),
+            ("name", json!("builder;")),
+            ("name", json!("Builder")),
+            ("run", json!("touch /tmp/x")),
+            ("run", json!("run;")),
+            ("run", json!("")),
+            ("pane_id", json!("%3;")),
+        ];
+        for (field, value) in cases {
+            let error = parse_inventory(inventory(|agent| agent[field] = value.clone()))
+                .err()
+                .unwrap_or_else(|| panic!("{field} {value} was taken"));
+            assert_eq!(
+                error, "invalid endpoint agent identities",
+                "{field} {value}"
+            );
+        }
+        // The endpoint's own boot, ending the same way.
+        let mut whole = inventory(|agent| agent["boot"] = json!(ending));
+        whole["boot"] = json!(ending);
+        assert_eq!(
+            parse_inventory(whole).err().as_deref(),
+            Some("invalid endpoint boot identity")
+        );
+    }
+
+    #[test]
+    fn a_command_argument_that_ends_a_tmux_command_is_refused() {
+        let words = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect();
+        let args: Vec<String> = words(&["new-window", "-n", "build:builder", "--", "/bin/a;b"]);
+        assert_eq!(without_separator(args.clone()).unwrap(), args);
+        for last in ["run;", ";", "run\\;"] {
+            let error = without_separator(words(&["new-window", "--", "exe", last, "run-shell"]))
+                .unwrap_err();
+            assert!(error.starts_with("invalid_argument:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_connection_command_refuses_an_identity_that_ends_a_tmux_command() {
+        let (_, mut agents) = parse_inventory(inventory(|_| {})).unwrap();
+        let mut agent = agents.remove(0);
+        let endpoint = Endpoint {
+            id: "build".into(),
+            label: "Build".into(),
+            enabled: true,
+            socket: "/tmp/masil.sock".into(),
+            host: None,
+            binary: "masil-agent".into(),
+        };
+        let lease = "0".repeat(32);
+        // Without HOME or XDG_CONFIG_HOME there is no command to check.
+        if let Ok(args) = connection_command(&endpoint, &agent, &lease) {
+            assert_eq!(args.last(), Some(&lease));
+            assert!(args.contains(&"build:builder".to_owned()));
+        }
+        agent.run = "run;".into();
+        assert!(connection_command(&endpoint, &agent, &lease).is_err());
+        assert!(connection_command(&endpoint, &agent, "lease;").is_err());
+    }
+
+    #[test]
+    fn a_window_name_the_core_would_expand_is_refused() {
+        assert_eq!(window_name("build", "builder").unwrap(), "build:builder");
+        for name in ["x#(id)", "v#{socket_path}", "#"] {
+            assert_eq!(
+                window_name("build", name).unwrap_err(),
+                "invalid_argument: the connection window name contains '#'"
+            );
+        }
+        // The name is checked before anything else of the command is read.
+        let (_, mut agents) = parse_inventory(inventory(|_| {})).unwrap();
+        let mut agent = agents.remove(0);
+        agent.name = "x#(id)".into();
+        let endpoint = Endpoint {
+            id: "build".into(),
+            label: "Build".into(),
+            enabled: true,
+            socket: "/tmp/masil.sock".into(),
+            host: None,
+            binary: "masil-agent".into(),
+        };
+        assert_eq!(
+            connection_command(&endpoint, &agent, &"0".repeat(32)).unwrap_err(),
+            "invalid_argument: the connection window name contains '#'"
+        );
+    }
 }
