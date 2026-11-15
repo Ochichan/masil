@@ -6,6 +6,9 @@
 use std::fs;
 
 const MAX_ARGS: usize = 256;
+/// Largest pid list buffer the macOS listing calls grow to.
+#[cfg(target_os = "macos")]
+const MAX_PIDS: usize = 1_048_576;
 
 /// The exact argv of a process.
 #[cfg(target_os = "macos")]
@@ -79,15 +82,23 @@ fn parse_procargs(buffer: &[u8]) -> Option<Vec<String>> {
 /// readable by the calls above.
 #[cfg(target_os = "macos")]
 pub(crate) fn all() -> Vec<i32> {
-    let mut buffer = vec![0 as libc::pid_t; 8192];
-    let bytes = (buffer.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-    // SAFETY: the buffer holds `bytes` bytes; the call writes at most that.
-    let written = unsafe { libc::proc_listallpids(buffer.as_mut_ptr().cast(), bytes) };
-    if written <= 0 {
-        return Vec::new();
+    // A full buffer may be truncated, so retry with a larger one.
+    let mut size = 8192;
+    loop {
+        let mut buffer = vec![0 as libc::pid_t; size];
+        let bytes = (buffer.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: the buffer holds `bytes` bytes; the call writes at most that.
+        let written = unsafe { libc::proc_listallpids(buffer.as_mut_ptr().cast(), bytes) };
+        if written <= 0 {
+            return Vec::new();
+        }
+        if written as usize >= buffer.len() && size < MAX_PIDS {
+            size *= 2;
+            continue;
+        }
+        buffer.truncate((written as usize).min(buffer.len()));
+        return buffer.into_iter().filter(|pid| *pid > 0).collect();
     }
-    buffer.truncate((written as usize).min(buffer.len()));
-    buffer.into_iter().filter(|pid| *pid > 0).collect()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -182,14 +193,24 @@ pub(crate) fn environment(pid: i32) -> Option<Vec<String>> {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn argv(pid: i32) -> Option<Vec<String>> {
-    let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    parse_cmdline(&fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+}
+
+/// Splits /proc/PID/cmdline. Interior empty arguments stay. All trailing NULs
+/// are dropped, because a process that rewrote its title in place leaves NUL
+/// padding; trailing empty arguments cannot be told apart from that padding.
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_cmdline(bytes: &[u8]) -> Option<Vec<String>> {
+    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |at| at + 1);
+    let bytes = &bytes[..end];
+    if bytes.is_empty() {
+        return None;
+    }
     let mut argv = Vec::new();
     for part in bytes.split(|&b| b == 0) {
-        if !part.is_empty() {
-            argv.push(String::from_utf8(part.to_vec()).ok()?);
-        }
+        argv.push(String::from_utf8(part.to_vec()).ok()?);
     }
-    (!argv.is_empty() && argv.len() <= MAX_ARGS).then_some(argv)
+    (argv.len() <= MAX_ARGS).then_some(argv)
 }
 
 /// A process's parent, group and start time, read in one call so the three
@@ -287,16 +308,24 @@ pub(crate) fn owner(pid: i32) -> Option<u32> {
 /// The direct children of `pid`.
 #[cfg(target_os = "macos")]
 pub(crate) fn children(pid: i32) -> Vec<i32> {
-    let mut buffer = vec![0 as libc::pid_t; 256];
-    let bytes = (buffer.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-    // SAFETY: the buffer holds `bytes` bytes; the call writes at most that.
-    let written = unsafe { libc::proc_listchildpids(pid, buffer.as_mut_ptr().cast(), bytes) };
-    if written <= 0 {
-        return Vec::new();
+    // A full buffer may be truncated, so retry with a larger one.
+    let mut size = 256;
+    loop {
+        let mut buffer = vec![0 as libc::pid_t; size];
+        let bytes = (buffer.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: the buffer holds `bytes` bytes; the call writes at most that.
+        let written = unsafe { libc::proc_listchildpids(pid, buffer.as_mut_ptr().cast(), bytes) };
+        if written <= 0 {
+            return Vec::new();
+        }
+        if written as usize >= buffer.len() && size < MAX_PIDS {
+            size *= 2;
+            continue;
+        }
+        // The return value is a count of PIDs on macOS.
+        buffer.truncate((written as usize).min(buffer.len()));
+        return buffer.into_iter().filter(|child| *child > 0).collect();
     }
-    // The return value is a count of PIDs on macOS.
-    buffer.truncate((written as usize).min(buffer.len()));
-    buffer.into_iter().filter(|child| *child > 0).collect()
 }
 
 /// The direct children of `pid`, from every process's parent field.
@@ -329,6 +358,21 @@ pub(crate) fn info(pid: i32) -> Option<Info> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmdline_keeps_empty_arguments() {
+        assert_eq!(
+            parse_cmdline(b"tool\0\0x\0"),
+            Some(vec!["tool".to_string(), String::new(), "x".to_string()])
+        );
+        assert_eq!(parse_cmdline(b"tool\0"), Some(vec!["tool".to_string()]));
+        assert_eq!(parse_cmdline(b""), None);
+        for size in [60, 300] {
+            let mut padded = b"claude".to_vec();
+            padded.resize(size, 0);
+            assert_eq!(parse_cmdline(&padded), Some(vec!["claude".to_string()]));
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

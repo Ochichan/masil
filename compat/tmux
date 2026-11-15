@@ -1,4 +1,13 @@
 #!/bin/sh
 # Opt-in PATH entry only. Never replace the system tmux executable.
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
+# Resolve symlinks so a link to this file still finds the repository root.
+self=$0
+while [ -L "$self" ]; do
+	link=$(readlink -- "$self") || exit 1
+	case $link in
+	/*) self=$link ;;
+	*) self=$(dirname -- "$self")/$link ;;
+	esac
+done
+root=$(CDPATH= cd -P -- "$(dirname -- "$self")/.." && pwd -P) || exit 1
 exec "$root/bin/masil" "$@"

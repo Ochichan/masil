@@ -65,6 +65,8 @@ struct Report {
 #[derive(Debug)]
 struct Options {
     socket: Option<PathBuf>,
+    /// The socket came from `TMUX`, which a stock tmux pane also sets.
+    socket_from_tmux: bool,
     versions: bool,
     bundle: Option<PathBuf>,
 }
@@ -155,19 +157,22 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             option => return Err(format!("unknown or repeated doctor option: {option}")),
         }
     }
+    let mut socket_from_tmux = false;
     if socket.is_none() {
-        socket = std::env::var("TMUX")
+        let from_tmux = std::env::var("TMUX")
             .ok()
             .and_then(|value| value.rsplitn(3, ',').last().map(str::to_owned))
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("MASIL_AGENT_SOCKET")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-            });
+            .map(PathBuf::from);
+        socket_from_tmux = from_tmux.is_some();
+        socket = from_tmux.or_else(|| {
+            std::env::var_os("MASIL_AGENT_SOCKET")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        });
     }
     Ok(Options {
+        socket_from_tmux,
         socket,
         versions,
         bundle,
@@ -179,7 +184,8 @@ async fn diagnose(options: &Options) -> Vec<Check> {
     checks.push(binary_check());
     checks.push(platform_check());
 
-    let (reachable, server) = server_check(options.socket.as_deref()).await;
+    let (reachable, server) =
+        server_check(options.socket.as_deref(), options.socket_from_tmux).await;
     checks.push(reachable);
     let terminals = match (options.socket.as_deref(), server.as_ref()) {
         (Some(socket), Some(_)) => Some(server_terminals(socket).await),
@@ -618,7 +624,7 @@ fn kernel_release() -> Result<String, String> {
         .map_err(|_| "kernel release is not UTF-8".into())
 }
 
-async fn server_check(socket: Option<&Path>) -> (Check, Option<ServerInfo>) {
+async fn server_check(socket: Option<&Path>, from_tmux: bool) -> (Check, Option<ServerInfo>) {
     let Some(socket) = socket else {
         return (
             Check {
@@ -664,15 +670,26 @@ async fn server_check(socket: Option<&Path>) -> (Check, Option<ServerInfo>) {
                 Some(info),
             )
         }
-        Err(error) => (
-            Check {
-                id: "server.reachable",
-                status: Status::Fail,
-                summary: "masil server did not answer".into(),
-                detail: json!({"socket": socket.to_string_lossy(), "error": error}),
-            },
-            None,
-        ),
+        Err(error) => (unreachable_check(socket, &error, from_tmux), None),
+    }
+}
+
+/// The failed `server.reachable` check. A protocol mismatch on a socket that
+/// came from `TMUX` means the user is in a stock tmux pane, not a masil one.
+fn unreachable_check(socket: &Path, error: &str, from_tmux: bool) -> Check {
+    if from_tmux && error.contains("protocol version mismatch") {
+        return Check {
+            id: "server.reachable",
+            status: Status::Warn,
+            summary: "TMUX points at a server that is not masil; pass --socket".into(),
+            detail: json!({"socket": socket.to_string_lossy(), "error": error}),
+        };
+    }
+    Check {
+        id: "server.reachable",
+        status: Status::Fail,
+        summary: "masil server did not answer".into(),
+        detail: json!({"socket": socket.to_string_lossy(), "error": error}),
     }
 }
 
@@ -886,6 +903,36 @@ fn agent_pids(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether the value of `--socket`, `--core-native` or `--core` is exactly
+/// `socket`.
+fn names_socket(command: &str, socket: &str) -> bool {
+    // `ps` joins arguments with spaces, so match by prefix and require the
+    // value to end at whitespace or the end of the line.
+    // The unmanaged sidebar passes the core socket as `--core-native`, and
+    // `serve` as `--core`.
+    [
+        "--socket ",
+        "--socket=",
+        "--core-native ",
+        "--core-native=",
+        "--core ",
+        "--core=",
+    ]
+    .iter()
+    .any(|flag| {
+        command.match_indices(flag).any(|(at, _)| {
+            let before_ok = at == 0 || command[..at].ends_with(char::is_whitespace);
+            let rest = &command[at + flag.len()..];
+            before_ok
+                && rest.starts_with(socket)
+                && rest[socket.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace)
+        })
+    })
+}
+
 fn parse_agent_ps(text: &str, socket: &str) -> (usize, u64) {
     let mut count = 0usize;
     let mut total_rss_kib = 0u64;
@@ -897,7 +944,7 @@ fn parse_agent_ps(text: &str, socket: &str) -> (usize, u64) {
         let role = command
             .split_whitespace()
             .any(|word| matches!(word, "ui" | "sidebar" | "serve"));
-        if !command.contains("masil-agent") || !command.contains(socket) || !role {
+        if !command.contains("masil-agent") || !names_socket(command, socket) || !role {
             continue;
         }
         let Ok(rss) = rss.parse::<u64>() else {
@@ -1059,6 +1106,15 @@ where
 fn detection_check() -> Check {
     let override_files = detection_override_files();
     match Engine::load() {
+        Ok(engine) if !engine.override_warnings().is_empty() => Check {
+            id: "detection",
+            status: Status::Warn,
+            summary: "detection manifests loaded, but some override files are not read".into(),
+            detail: json!({
+                "override_files": override_files,
+                "warnings": engine.override_warnings(),
+            }),
+        },
         Ok(_) => Check {
             id: "detection",
             status: Status::Ok,
@@ -1166,40 +1222,115 @@ fn inspect_settings(path: &Path) -> Result<(bool, Option<u64>), String> {
     Ok((true, Some(metadata.len())))
 }
 
-async fn observer_query(context: native_ui::Context) -> Result<String, String> {
-    let output = context
-        .tmux(
-            [
-                OsString::from("show-environment"),
-                OsString::from("-g"),
-                OsString::from("MASIL_BRIDGE_SOCKET"),
-            ],
-            None,
-        )
-        .await?;
-    String::from_utf8(output.stdout).map_err(|_| "observer environment is not UTF-8".into())
+/// What the server says about its observer bridge: the live path from the
+/// `#{masil_bridge_socket}` format, and the `MASIL_BRIDGE_SOCKET` global
+/// environment value (the fallback for a core without the format).
+struct ObserverProbe {
+    format: Result<String, String>,
+    environment: Result<String, String>,
 }
 
-fn observer_check(result: Result<String, String>) -> Check {
-    let value = result.ok().and_then(|text| {
+async fn observer_query(context: native_ui::Context) -> ObserverProbe {
+    let format = async {
+        let output = context
+            .tmux(
+                [
+                    OsString::from("display-message"),
+                    OsString::from("-p"),
+                    OsString::from("#{masil_bridge_socket}"),
+                ],
+                None,
+            )
+            .await?;
+        String::from_utf8(output.stdout)
+            .map_err(|_| "observer bridge path is not UTF-8".to_string())
+    };
+    let environment = async {
+        let output = context
+            .tmux(
+                [
+                    OsString::from("show-environment"),
+                    OsString::from("-g"),
+                    OsString::from("MASIL_BRIDGE_SOCKET"),
+                ],
+                None,
+            )
+            .await?;
+        String::from_utf8(output.stdout)
+            .map_err(|_| "observer environment is not UTF-8".to_string())
+    };
+    let (format, environment) = tokio::join!(format, environment);
+    ObserverProbe {
+        format,
+        environment,
+    }
+}
+
+fn observer_check(probe: ObserverProbe) -> Check {
+    let live = probe
+        .format
+        .as_ref()
+        .ok()
+        .map(|text| text.trim_end_matches('\n'))
+        .filter(|value| !value.is_empty() && value.len() <= 4096)
+        .map(|value| (PathBuf::from(value), "format"));
+    // `show-environment` fails when the variable is unset, so `None` means
+    // unset and `Some("")` means set to the empty string.
+    let environment = probe.environment.as_ref().ok().and_then(|text| {
         text.lines()
             .find_map(|line| line.strip_prefix("MASIL_BRIDGE_SOCKET="))
-            .filter(|value| !value.is_empty() && value.len() <= 4096)
-            .map(PathBuf::from)
+            .map(str::to_owned)
     });
-    let Some(path) = value else {
-        return Check {
-            id: "observer",
-            status: Status::Ok,
-            summary: "observer bridge is not configured".into(),
-            detail: json!({"configured": false, "path": Value::Null, "exists": false, "is_socket": false}),
-        };
+    let env_path = environment
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "off" && value.len() <= 4096)
+        .map(PathBuf::from);
+    // The environment path stands in for the live one only when the format
+    // query failed (a core without the format). An empty answer means the
+    // server is not listening, whatever the environment says.
+    let format_failed = probe.format.is_err();
+    let (path, source) = match (live, env_path) {
+        (Some((path, source)), _) => (path, source),
+        (None, Some(path)) if format_failed => (path, "environment"),
+        (None, Some(path)) => {
+            let (exists, is_socket) = socket_facts(&path);
+            return Check {
+                id: "observer",
+                status: Status::Warn,
+                summary: "observer bridge is not listening on the configured path".into(),
+                detail: json!({
+                    "configured": true,
+                    "path": path.to_string_lossy(),
+                    "exists": exists,
+                    "is_socket": is_socket,
+                    "state": "not_listening",
+                    "source": "environment",
+                    "note": "the server did not start its bridge on that path; a socket file there belongs to another server or is stale",
+                }),
+            };
+        }
+        (None, None) => {
+            let disabled = matches!(environment.as_deref(), Some("" | "off"));
+            return Check {
+                id: "observer",
+                status: if disabled { Status::Ok } else { Status::Warn },
+                summary: if disabled {
+                    "observer bridge is off".into()
+                } else {
+                    "observer bridge is not running although it is on by default; check the server messages".into()
+                },
+                detail: json!({
+                    "configured": false,
+                    "path": Value::Null,
+                    "exists": false,
+                    "is_socket": false,
+                    "state": if disabled { "off" } else { "not_started" },
+                    "source": "none",
+                }),
+            };
+        }
     };
-    let metadata = fs::metadata(&path).ok();
-    let exists = metadata.is_some();
-    let is_socket = metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.file_type().is_socket());
+    let (exists, is_socket) = socket_facts(&path);
     Check {
         id: "observer",
         status: if is_socket { Status::Ok } else { Status::Warn },
@@ -1213,8 +1344,19 @@ fn observer_check(result: Result<String, String>) -> Check {
             "path": path.to_string_lossy(),
             "exists": exists,
             "is_socket": is_socket,
+            "state": "on",
+            "source": source,
         }),
     }
+}
+
+/// Whether `path` exists and whether it is a socket.
+fn socket_facts(path: &Path) -> (bool, bool) {
+    let metadata = fs::metadata(path).ok();
+    let is_socket = metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_socket());
+    (metadata.is_some(), is_socket)
 }
 
 /// The durable operation store for this server: present, readable, the one
@@ -1491,15 +1633,33 @@ fn redact_home_path(path: &Path, homes: &[PathBuf]) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Name fragments that mark an environment variable as holding a secret.
+const SECRET_NAME_PARTS: [&str; 8] = [
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+    "API_KEY",
+    "PASSWD",
+    "COOKIE",
+    "PRIVATE_KEY",
+];
+
+/// Whether an uppercased variable name marks a secret. A bare `AUTH` would
+/// also match `GIT_AUTHOR_NAME`, `SSH_AUTH_SOCK` and `XAUTHORITY`.
+fn is_secret_name(name: &str) -> bool {
+    if SECRET_NAME_PARTS.iter().any(|word| name.contains(word)) || name.contains("AUTHORIZATION") {
+        return true;
+    }
+    if name.contains("AUTHOR") || name == "SSH_AUTH_SOCK" {
+        return false;
+    }
+    name.ends_with("_AUTH") || name.contains("_AUTH_") || name.starts_with("AUTH_")
+}
+
 fn secret_values() -> Vec<String> {
     std::env::vars()
-        .filter(|(name, value)| {
-            let name = name.to_ascii_uppercase();
-            value.len() >= 8
-                && ["TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY"]
-                    .iter()
-                    .any(|word| name.contains(word))
-        })
+        .filter(|(name, value)| value.len() >= 8 && is_secret_name(&name.to_ascii_uppercase()))
         .map(|(_, value)| value)
         .take(128)
         .collect()
@@ -1534,6 +1694,11 @@ fn sanitize_value(value: &mut Value, homes: &[PathBuf], secrets: &[String]) {
 
 fn sanitize_text(value: &str, homes: &[PathBuf], secrets: &[String]) -> String {
     let mut value = value.to_owned();
+    // Secrets go first: one that contains the home path would stop matching
+    // after the home path became `~`.
+    for secret in secrets {
+        value = value.replace(secret, "[redacted]");
+    }
     // A root or one-letter HOME would rewrite unrelated path separators.
     for home in homes
         .iter()
@@ -1541,9 +1706,6 @@ fn sanitize_text(value: &str, homes: &[PathBuf], secrets: &[String]) -> String {
         .filter(|home| home.len() > 2)
     {
         value = value.replace(home, "~");
-    }
-    for secret in secrets {
-        value = value.replace(secret, "[redacted]");
     }
     value
 }
@@ -1581,6 +1743,121 @@ mod tests {
                        8192 /x/masil-agent agent --socket /tmp/other.sock sidebar\n\
                        bad /x/masil-agent --socket /tmp/core.sock sidebar\n";
         assert_eq!(parse_agent_ps(output, "/tmp/core.sock"), (2, 3072));
+    }
+
+    #[test]
+    fn protocol_mismatch_from_tmux_is_a_warning() {
+        let socket = Path::new("/tmp/tmux-501/default");
+        let error = "native command failed: protocol version mismatch (client 8, server 8)";
+        assert_eq!(unreachable_check(socket, error, true).status, Status::Warn);
+        assert_eq!(unreachable_check(socket, error, false).status, Status::Fail);
+        assert_eq!(
+            unreachable_check(socket, "connection refused", true).status,
+            Status::Fail
+        );
+    }
+
+    fn probe(format: Result<&str, &str>, environment: Result<&str, &str>) -> ObserverProbe {
+        ObserverProbe {
+            format: format.map(str::to_owned).map_err(str::to_owned),
+            environment: environment.map(str::to_owned).map_err(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn observer_default_without_a_live_path_warns() {
+        let check = observer_check(probe(Ok("\n"), Err("unknown variable")));
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.detail["configured"], false);
+        assert_eq!(check.detail["state"], "not_started");
+    }
+
+    #[test]
+    fn observer_off_by_choice_is_ok() {
+        for value in ["MASIL_BRIDGE_SOCKET=off\n", "MASIL_BRIDGE_SOCKET=\n"] {
+            let check = observer_check(probe(Ok("\n"), Ok(value)));
+            assert_eq!(check.status, Status::Ok);
+            assert_eq!(check.summary, "observer bridge is off");
+            assert_eq!(check.detail["configured"], false);
+        }
+    }
+
+    #[test]
+    fn observer_prefers_the_live_format_path() {
+        let check = observer_check(probe(
+            Ok("/nonexistent/live.bridge\n"),
+            Ok("MASIL_BRIDGE_SOCKET=/nonexistent/env.bridge\n"),
+        ));
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.detail["path"], "/nonexistent/live.bridge");
+        assert_eq!(check.detail["source"], "format");
+        assert_eq!(check.detail["configured"], true);
+        let stale = observer_check(probe(
+            Ok("\n"),
+            Ok("MASIL_BRIDGE_SOCKET=/nonexistent/env.bridge\n"),
+        ));
+        assert_eq!(stale.status, Status::Warn);
+        assert_eq!(stale.detail["state"], "not_listening");
+        assert_eq!(stale.detail["configured"], true);
+        assert_eq!(stale.detail["path"], "/nonexistent/env.bridge");
+        let fallback = observer_check(probe(
+            Err("no format"),
+            Ok("MASIL_BRIDGE_SOCKET=/nonexistent/env.bridge\n"),
+        ));
+        assert_eq!(fallback.detail["path"], "/nonexistent/env.bridge");
+        assert_eq!(fallback.detail["source"], "environment");
+    }
+
+    #[test]
+    fn secret_names_exclude_author_and_agent_socket() {
+        for name in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "SSH_AUTH_SOCK",
+            "XAUTHORITY",
+        ] {
+            assert!(!is_secret_name(name), "{name}");
+        }
+        for name in [
+            "AUTHORIZATION",
+            "HTTP_AUTHORIZATION",
+            "NPM_AUTH",
+            "REGISTRY_AUTH_TOKEN",
+            "X_AUTH_KEY",
+            "AUTH_KEY",
+            "DB_PASSWD",
+            "SESSION_COOKIE",
+        ] {
+            assert!(is_secret_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn socket_match_is_exact() {
+        let output = " 1024 /x/masil-agent --socket /tmp/m/default2 ui\n\
+                       2048 /x/masil-agent --socket=/tmp/m/default2 ui\n\
+                       4096 /x/masil-agent --socket /tmp/m/default ui\n\
+                       512 /x/masil-agent --socket=/tmp/m/default serve\n\
+                       256 /x/masil-agent --socket /tmp/mgr ui --compact --client c --core-native /tmp/m/default\n";
+        assert_eq!(parse_agent_ps(output, "/tmp/m/default"), (3, 4864));
+        assert!(!names_socket(
+            "masil-agent ui /tmp/m/default",
+            "/tmp/m/default"
+        ));
+    }
+
+    #[test]
+    fn secrets_are_replaced_before_the_home_path() {
+        let homes = [PathBuf::from("/home/ochi")];
+        let secrets = ["/home/ochi/key-material".to_string()];
+        assert_eq!(
+            sanitize_text(
+                "at /home/ochi/key-material and /home/ochi/x",
+                &homes,
+                &secrets
+            ),
+            "at [redacted] and ~/x"
+        );
     }
 
     #[test]

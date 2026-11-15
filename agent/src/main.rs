@@ -686,14 +686,17 @@ fn manager_query(socket: &str, command: &str, args: &[String]) -> Result<i32, St
 
 fn execute() -> Result<i32, String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.is_empty() || args == ["--help"] {
+    if args.is_empty()
+        || matches!(args.as_slice(), [flag] if matches!(flag.as_str(), "--help" | "-h" | "help"))
+    {
         println!(
-            "masil-agent 0.1.0 — native agents and terminal desk\n\nDiagnostics:\n  masil-agent doctor [--socket MASIL_SOCKET] [--versions] [--bundle DIR]\n\nNative management:\n  masil-agent agent --help\n  masil-agent agent [--socket MASIL_SOCKET] list|ui|sidebar\n\nCore socket:\n  masil-agent --socket PATH hello|inventory|snapshot %N|stats\n  masil-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nManager socket:\n  masil-agent --socket PATH serve --core CORE_SOCKET --config FILE\n  masil-agent --socket PATH status|agents|inspect ID|stop\n  masil-agent --socket PATH attention [--all]\n  masil-agent --socket PATH ack ID --epoch E --revision R\n  masil-agent --socket PATH watch-agents [--count N]\n  masil-agent --socket PATH ui [--core-native CORE_SOCKET] [--client CLIENT] [--lang en|ko] [--theme dark|light|terminal]\n  masil-agent --socket PATH sidebar --core-native CORE_SOCKET [--client CLIENT] [--target %N] [--lang en|ko]\n\nmasil server:\n  masil-agent settings [--socket MASIL_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get] | --reload-config\n  masil-agent session [--socket MASIL_SOCKET] [--client CLIENT] save|list|preview [NAME]|restore [NAME]|menu|autosave [--boot]\n  masil-agent layout [--socket MASIL_SOCKET] list|show NAME|plan NAME [--session NAME]|apply NAME [--session NAME] [--yes]\n  masil-agent open-link --socket MASIL_SOCKET --client CLIENT --remote 1|0 --uri URI\n\nThe sidebar changes the shared window layout. Expand uses native pane zoom. No default tmux bindings are changed.\nAcknowledgements are shared only for this daemon lifetime and never approve provider requests.\n\nCore bridge: on by default at <socket dir>/.masil/<socket name>.bridge (#{{masil_bridge_socket}}) when the socket directory is private; MASIL_BRIDGE_SOCKET=PATH chooses the path and MASIL_BRIDGE_SOCKET=off turns it off.\nProvider associations are unverified TUI bindings. Observer connections do not submit prompts or approve requests. Native prompt delivery is not provider acceptance. Queries never start a daemon; `agent coordinator start` and later mutating commands start the coordinator."
+            "masil-agent {} — native agents and terminal desk\n\nDiagnostics:\n  masil-agent doctor [--socket MASIL_SOCKET] [--versions] [--bundle DIR]\n\nNative management:\n  masil-agent agent --help\n  masil-agent agent [--socket MASIL_SOCKET] list|ui|sidebar\n\nCore socket:\n  masil-agent --socket PATH hello|inventory|snapshot %N|stats\n  masil-agent --socket PATH watch [--count N] %0 [%1 ...]\n\nManager socket:\n  masil-agent --socket PATH serve --core CORE_SOCKET --config FILE\n  masil-agent --socket PATH status|agents|inspect ID|stop\n  masil-agent --socket PATH attention [--all]\n  masil-agent --socket PATH ack ID --epoch E --revision R\n  masil-agent --socket PATH watch-agents [--count N]\n  masil-agent --socket PATH ui [--core-native CORE_SOCKET] [--client CLIENT] [--lang en|ko] [--theme dark|light|terminal]\n  masil-agent --socket PATH sidebar --core-native CORE_SOCKET [--client CLIENT] [--target %N] [--lang en|ko]\n\nmasil server:\n  masil-agent settings [--socket MASIL_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get] | --reload-config\n  masil-agent session [--socket MASIL_SOCKET] [--client CLIENT] save|list|preview [NAME]|restore [NAME]|menu|autosave [--boot]\n  masil-agent layout [--socket MASIL_SOCKET] list|show NAME|plan NAME [--session NAME]|apply NAME [--session NAME] [--yes]\n  masil-agent open-link --socket MASIL_SOCKET --client CLIENT --remote 1|0 --uri URI\n\nOther commands:\n  masil-agent worktree create|list|remove|forget|setup|trust|untrust|jobs|cancel ...  (git worktrees for agents; `worktree --help`)\n  masil-agent mcp [--socket SOCKET] [--allow-act]  (MCP server on stdio)\n  masil-agent api [--socket SOCKET] [--scope read|act|admin] [--token-file FILE]  (local API)\n  masil-agent ext list | run NAME [ACTION] | enable NAME | disable NAME | token create|list|revoke ...  (extensions and API tokens)\n  masil-agent --version | --ui-design\n\nThe sidebar changes the shared window layout. Expand uses native pane zoom. No default tmux bindings are changed.\nAcknowledgements are shared only for this daemon lifetime and never approve provider requests.\n\nCore bridge: on by default at <socket dir>/.masil/<socket name>.bridge (#{{masil_bridge_socket}}) when the socket directory is private; MASIL_BRIDGE_SOCKET=PATH chooses the path and MASIL_BRIDGE_SOCKET=off turns it off.\nProvider associations are unverified TUI bindings. Observer connections do not submit prompts or approve requests. Native prompt delivery is not provider acceptance. Queries never start a daemon; `agent coordinator start` and later mutating commands start the coordinator.",
+            env!("CARGO_PKG_VERSION")
         );
         return Ok(0);
     }
     if args == ["--version"] {
-        println!("masil-agent 0.1.0");
+        println!("masil-agent {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
     if args == ["--ui-design"] {
@@ -757,7 +760,7 @@ fn execute() -> Result<i32, String> {
         };
     }
     if args.len() < 3 || args[0] != "--socket" {
-        return Err("expected --socket PATH command".into());
+        return Err("expected --socket PATH command; see --help".into());
     }
     let command = args[2].as_str();
     if command == "ui" || command == "sidebar" {
