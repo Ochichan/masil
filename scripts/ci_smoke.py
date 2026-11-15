@@ -53,6 +53,31 @@ def smoke(binary_dir):
             assert report['summary']['fail'] == 0, report
         finally:
             tmux('kill-server', check=False)
+
+        # A start without -f loads the embedded UI layer. A layer that does
+        # not parse binds no keys. An error in one of its commands is shown
+        # only to an attached client, so this start does not detect it.
+        layered = str(home / 'layer.sock')
+        layer_env = {key: value for key, value in env.items() if key != 'MASIL_BRIDGE_SOCKET'}
+
+        def default(*args, check=True):
+            result = subprocess.run((core, '-S', layered, *args), env=layer_env, cwd=home,
+                                    text=True, stdin=subprocess.DEVNULL,
+                                    capture_output=True, timeout=15, check=False)
+            if check and result.returncode:
+                raise RuntimeError(f'{args!r}: {result.stdout}\n{result.stderr}')
+            return result.stdout.strip()
+
+        try:
+            default('new-session', '-d', '-s', 'ui', '-x', '80', '-y', '24', '/bin/sh')
+            state = default('display-message', '-p', '-t', 'ui',
+                            '#{@masil-agent}|#{masil_bridge_socket}')
+            found_agent, default_bridge = state.split('|')
+            assert Path(found_agent).resolve() == Path(agent).resolve(), state
+            assert Path(default_bridge).is_socket(), state
+            assert default('list-keys', '-T', 'prefix', 'C-s'), 'the UI layer bound no keys'
+        finally:
+            default('kill-server', check=False)
     print(f'Smoke passed: {binary_dir}')
 
 

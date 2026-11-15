@@ -2,7 +2,7 @@ class Masil < Formula
   desc "Terminal multiplexer with native coding-agent management"
   homepage "https://github.com/Ochichan/masil"
   # Stable release metadata is inserted here.
-  license "MIT"
+  license all_of: ["MIT", "ISC", "Apache-2.0"]
   head "https://github.com/Ochichan/masil.git", branch: "main"
 
   depends_on "autoconf" => :build
@@ -21,14 +21,14 @@ class Masil < Formula
   end
 
   def fetch
-    system "cargo", "fetch", "--manifest-path=agent/Cargo.toml", *std_cargo_fetch_args
+    system "cargo", "fetch", "--manifest-path=agent/Cargo.toml", "--locked"
   end
 
   def install
     %w[libevent ncurses utf8proc jemalloc].each do |dependency|
       ENV.prepend_path "PKG_CONFIG_PATH", formula_opt_lib(dependency)/"pkgconfig"
     end
-    ENV.prepend_path "ACLOCAL_PATH", formula_opt_share("pkgconf")/"aclocal"
+    ENV.prepend_path "ACLOCAL_PATH", formula_opt_prefix("pkgconf")/"share/aclocal"
 
     python = formula_opt_bin("python@3.13")/"python3.13"
     jobs = [ENV.make_jobs, 32].min
@@ -37,10 +37,14 @@ class Masil < Formula
     ENV["CARGO_NET_OFFLINE"] = "true"
     system python, "scripts/build.py", "--agent", "--jobs", jobs
 
+    system python, "scripts/licenses.py", "--output", "THIRD-PARTY-LICENSES.txt"
+
     bin.install "bin/masil", "bin/masil-agent"
+    # configure.ac sets sysconfdir to /etc for the default prefix.
+    inreplace "core/tmux.1", "@SYSCONFDIR@", "/etc"
     man1.install "core/tmux.1" => "masil.1"
 
-    pkgshare.install "LICENSE", "NOTICE"
+    pkgshare.install "LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.txt"
     (pkgshare/"core").install "core/COPYING", "core/UPSTREAM.json"
     (pkgshare/"core/compat/yyjson").install "core/compat/yyjson/LICENSE"
     (pkgshare/"agent/src/manifests").install "agent/src/manifests/LICENSE"

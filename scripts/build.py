@@ -43,7 +43,10 @@ def run(args, cwd, env, name):
 
 def environment():
     env = os.environ.copy()
-    env['PATH'] = str(BUILD / 'tools' / 'bin') + os.pathsep + env['PATH']
+    # Homebrew's m4 is keg-only; without it macOS's m4 1.4.6 forces a download.
+    keg_m4 = Path('/opt/homebrew/opt/m4/bin')
+    tools = [str(BUILD / 'tools' / 'bin')] + ([str(keg_m4)] if keg_m4.is_dir() else [])
+    env['PATH'] = os.pathsep.join(tools + [env['PATH']])
     pcs = [Path('/opt/homebrew/opt/libevent/lib/pkgconfig'),
            Path('/opt/homebrew/opt/ncurses/lib/pkgconfig'),
            Path('/opt/homebrew/opt/utf8proc/lib/pkgconfig'),
@@ -123,13 +126,25 @@ def baseline_source():
     if not archive.exists():
         clone = Path(os.environ.get('MASIL_TMUX_SOURCE',
                                     str(Path.home() / 'Documents/git_clones/tmux')))
-        actual = subprocess.check_output(['git', '-C', str(clone), 'rev-parse', SHA], text=True).strip()
-        if actual != SHA:
-            raise SystemExit('Wrong upstream commit')
-        archive.write_bytes(subprocess.check_output(['git', '-C', str(clone), 'archive', SHA]))
-    source.mkdir()
+        try:
+            found = subprocess.run(['git', '-C', str(clone), 'rev-parse', '--verify', '--quiet',
+                                    SHA + '^{commit}'], capture_output=True, text=True)
+        except FileNotFoundError:
+            raise SystemExit('the baseline needs git to read the tmux clone') from None
+        if found.returncode or found.stdout.strip() != SHA:
+            raise SystemExit(f'{clone} is not a tmux clone that has commit {SHA}; '
+                             'set MASIL_TMUX_SOURCE to one that does')
+        staged = archive.with_suffix('.partial')
+        staged.write_bytes(subprocess.check_output(['git', '-C', str(clone), 'archive', SHA]))
+        staged.replace(archive)
+    # An interrupted extraction must not look like a complete source tree.
+    staged = BUILD / 'upstream.partial'
+    if staged.exists():
+        shutil.rmtree(staged)
+    staged.mkdir()
     with tarfile.open(archive) as tar:
-        tar.extractall(source, filter='data')
+        tar.extractall(staged, filter='data')
+    staged.replace(source)
     return source
 
 
@@ -189,14 +204,22 @@ the compiler, flags, revision and binary hash. licenses/ holds the tmux
 """
 
 
-def git_revision():
-    """HEAD and whether the inputs of the core build differ from it."""
-    head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT,
-                          capture_output=True, text=True)
+CORE_INPUTS = ('core', 'scripts/build.py', 'LICENSE', 'NOTICE')
+# The agent embeds the UI layer configuration from core.
+AGENT_INPUTS = ('agent', '.cargo', 'core/masil-ui-layer.conf', 'scripts/build.py')
+
+
+def git_revision(inputs=CORE_INPUTS):
+    """HEAD and whether the inputs of a build differ from it."""
+    try:
+        head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT,
+                              capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
     if head.returncode:
         return None
-    dirty = subprocess.run(['git', 'status', '--porcelain', '--', 'core', 'scripts/build.py',
-                            'LICENSE', 'NOTICE'], cwd=ROOT, capture_output=True, text=True)
+    dirty = subprocess.run(['git', 'status', '--porcelain', '--', *inputs],
+                           cwd=ROOT, capture_output=True, text=True)
     return {'commit': head.stdout.strip(), 'dirty': bool(dirty.stdout.strip()) or dirty.returncode != 0}
 
 
@@ -223,7 +246,6 @@ def dist():
     name = f'masil-core-{rev}-{platform.system().lower()}-{platform.machine()}'
     files = [
         (binary, 'bin/masil'),
-        (ROOT / 'core/tmux.1', 'share/man/man1/tmux.1'),
         (ROOT / 'LICENSE', 'LICENSE'),
         (ROOT / 'NOTICE', 'NOTICE'),
         (ROOT / 'core/COPYING', 'licenses/tmux-COPYING'),
@@ -232,6 +254,8 @@ def dist():
     ]
     texts = {
         'README': DIST_README.format(rev=rev, sha=SHA),
+        # configure.ac sets sysconfdir to /etc for the default prefix.
+        'share/man/man1/tmux.1': (ROOT / 'core/tmux.1').read_text().replace('@SYSCONFDIR@', '/etc'),
         'build.json': json.dumps(metadata, indent=2) + '\n',
     }
 
@@ -293,6 +317,12 @@ def main():
         staged = destination.with_suffix('.new')
         shutil.copy2(ROOT/'agent/target/release/masil-agent', staged)
         staged.replace(destination)
+        record = BUILD / 'agent/build.json'
+        record.parent.mkdir(exist_ok=True)
+        record.write_text(json.dumps({
+            'binary': str(destination.relative_to(ROOT)),
+            'masil_revision': git_revision(AGENT_INPUTS),
+            'sha256': hashlib.sha256(destination.read_bytes()).hexdigest()}, indent=2) + '\n')
         return
     bootstrap(env)
     source = baseline_source() if args.baseline else ROOT / 'core'

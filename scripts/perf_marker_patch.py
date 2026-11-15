@@ -140,12 +140,17 @@ def run(args, cwd, env, name, logs):
 
 
 def prepare_cache():
-    """Create the cache dir with a sentinel. Refuse to delete anything under
-    an existing dir that lacks the sentinel."""
+    """Create the cache dir with a sentinel. An existing empty dir without the
+    sentinel is adopted. A non-empty dir without it is never touched, because
+    this script later deletes src/ and build/ under the cache dir."""
     sentinel = CACHE / SENTINEL
     if CACHE.exists() and not sentinel.is_file():
         if any(CACHE.iterdir()):
-            raise SystemExit(f'{CACHE} exists without {SENTINEL}; not touching it')
+            raise SystemExit(
+                f'{CACHE} exists, is not empty, and has no {SENTINEL} file, so it '
+                f'was not created by this script and will not be touched. Remove '
+                f'that directory yourself (rm -r {CACHE}) and run again. The '
+                f'location is fixed in this script and cannot be changed by an option.')
     CACHE.mkdir(parents=True, exist_ok=True)
     sentinel.write_text('masil perf marker cache\n')
 

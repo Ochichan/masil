@@ -11,6 +11,8 @@ import tarfile
 import tomllib
 from pathlib import Path
 
+import licenses
+
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / '.build/release'
 REPOSITORY = 'https://github.com/Ochichan/masil'
@@ -44,8 +46,10 @@ def formula(url, release_version, sha256):
     if source.count(MARKER) != 1:
         raise SystemExit('Formula/masil.rb must contain one stable metadata marker')
     # JSON string quoting is also valid for these Ruby string literals.
+    # Homebrew reads the version from a release URL; its audit flags one that
+    # only repeats it, so an empty field is left out.
     fields = '\n'.join(f'  {key} {json.dumps(value)}' for key, value in (
-        ('url', url), ('version', release_version), ('sha256', sha256)))
+        ('url', url), ('version', release_version), ('sha256', sha256)) if value)
     # Keep the marker when promoting a release so the next release can update it.
     pattern = re.escape(MARKER) + r'(?:\n  (?:url|version|sha256) "[^"\n]*"){0,3}'
     return re.sub(pattern, lambda _: MARKER + '\n' + fields, source, count=1)
@@ -77,6 +81,12 @@ def package(tag):
         raise SystemExit('core binary differs from build metadata; run make all')
     if core_build.get('masil_revision') != {'commit': commit, 'dirty': False}:
         raise SystemExit('core was not built from this clean source revision; run make all')
+    agent_record = ROOT / '.build/agent/build.json'
+    agent_build = json.loads(agent_record.read_text()) if agent_record.exists() else {}
+    if agent_build.get('sha256') != digest(ROOT / 'bin/masil-agent'):
+        raise SystemExit('agent binary differs from build metadata; run make all')
+    if agent_build.get('masil_revision') != {'commit': commit, 'dirty': False}:
+        raise SystemExit('agent was not built from this clean source revision; run make all')
     agent_version = command(str(ROOT / 'bin/masil-agent'), '--version')
     if agent_version != f'masil-agent {version()}':
         raise SystemExit('agent binary version differs from Cargo.toml; update the version and rebuild')
@@ -93,6 +103,7 @@ def package(tag):
 
 Keep bin/masil and bin/masil-agent together and add their directory to PATH.
 These binaries dynamically link system libraries. See dependencies.txt.
+THIRD-PARTY-LICENSES.txt holds the licences of the Rust crates in masil-agent.
 
 macOS: macOS 15 or newer on Apple Silicon, with Homebrew in /opt/homebrew:
   brew install libevent ncurses utf8proc jemalloc
@@ -106,14 +117,17 @@ although the compatible version command still reports tmux next-3.9.
 '''
     files = {
         'bin/masil': 'bin/masil', 'bin/masil-agent': 'bin/masil-agent',
-        'share/man/man1/masil.1': 'core/tmux.1',
         'LICENSE': 'LICENSE', 'NOTICE': 'NOTICE',
         'core/COPYING': 'core/COPYING', 'core/UPSTREAM.json': 'core/UPSTREAM.json',
         'core/compat/yyjson/LICENSE': 'core/compat/yyjson/LICENSE',
         'agent/src/manifests/LICENSE': 'agent/src/manifests/LICENSE',
     }
+    # configure.ac sets sysconfdir to /etc for the default prefix.
+    manual = (ROOT / 'core/tmux.1').read_text().replace('@SYSCONFDIR@', '/etc')
     texts = {'README.txt': readme, 'build.json': json.dumps(metadata, indent=2) + '\n',
-             'dependencies.txt': dependencies + '\n'}
+             'dependencies.txt': dependencies + '\n',
+             'share/man/man1/masil.1': manual,
+             'THIRD-PARTY-LICENSES.txt': licenses.text()}
     destination = OUTPUT / f'{name}.tar.gz'
     with tarfile.open(destination, 'w:gz') as archive:
         for member, source in files.items():
@@ -140,8 +154,11 @@ def prepare(tag):
             if metadata['commit'] != commit or metadata['dirty'] or metadata['version'] != tag:
                 raise SystemExit(f'{name} was not built from the release revision')
     source = source_archive(f'masil-{tag}')
+    # Homebrew reads a plain version from the URL. It misreads some
+    # prerelease suffixes (v0.1.0-dev.2 as 0.1.0), so those are stated.
+    stated = tag[1:] if '-' in tag else None
     (OUTPUT / 'masil.rb').write_text(formula(
-        f'{REPOSITORY}/releases/download/{tag}/{source.name}', tag[1:], digest(source)))
+        f'{REPOSITORY}/releases/download/{tag}/{source.name}', stated, digest(source)))
     paths = sorted([*OUTPUT.glob('*.tar.gz'), OUTPUT / 'masil.rb'])
     (OUTPUT / 'SHA256SUMS').write_text(''.join(f'{digest(path)}  {path.name}\n' for path in paths))
     print(f'Release files ready in {OUTPUT}')

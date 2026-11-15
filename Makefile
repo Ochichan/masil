@@ -12,14 +12,15 @@ baseline:
 	python3 scripts/build.py --baseline
 
 # Every tests/test_*.py runs, so a new suite is never left out. A failure
-# does not stop the rest; the failed suites are listed at the end.
+# does not stop the rest, the Rust tests included; the failed suites are
+# listed at the end.
 test: core baseline agent benchmark-env
 	@failed=; for suite in tests/test_*.py; do \
 		echo "== $$suite"; \
 		.build/bench-venv/bin/python "$$suite" || failed="$$failed $$suite"; \
 	done; \
+	cargo test --locked --manifest-path agent/Cargo.toml || failed="$$failed cargo-test"; \
 	if [ -n "$$failed" ]; then echo "failed:$$failed"; exit 1; fi
-	cargo test --locked --manifest-path agent/Cargo.toml
 
 benchmark-env:
 	python3 -m venv .build/bench-venv

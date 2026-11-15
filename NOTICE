@@ -4,7 +4,10 @@ the projects below, which keep their own licenses.
 core/
     Derived from tmux, commit 94796f6b1182507efac8a272fc309a79e22e58a5.
     ISC License. See core/COPYING and the copyright notice in each file.
-    core/UPSTREAM.json records the hashes of the imported files.
+    core/UPSTREAM.json records the hashes of the imported files. Its
+    regress/ and fuzz/ entries, SECURITY.md and SYNCING.md are not
+    distributed with masil. A file whose hash differs from its entry
+    there was changed by masil.
 
 core/compat/yyjson/
     yyjson 0.13.0. MIT License. See core/compat/yyjson/LICENSE.
@@ -13,5 +16,9 @@ agent/src/manifests/
     Agent screen detection manifests from Herdr, commit
     0d5d6f1f317e238c8297076bc6ab5c3a0cd56283.
     Apache License 2.0. See agent/src/manifests/LICENSE.
+    masil changed some of these files after importing them; each changed
+    file says so in its first line. masil added omp.toml.
 
 Rust dependencies are pinned in agent/Cargo.lock and keep their own licenses.
+Binary archives and the Homebrew formula include their licence texts in
+THIRD-PARTY-LICENSES.txt, which scripts/licenses.py generates.
