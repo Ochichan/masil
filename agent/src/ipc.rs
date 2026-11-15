@@ -184,6 +184,9 @@ pub(crate) async fn read_frame(
     Ok(body)
 }
 
+/// The error `write_frame` returns, before it writes anything, when a body is over the limit.
+pub(crate) const RESPONSE_TOO_LARGE: &str = "response exceeds frame limit";
+
 pub(crate) async fn write_frame(
     stream: &mut UnixStream,
     value: &Value,
@@ -191,7 +194,7 @@ pub(crate) async fn write_frame(
 ) -> Result<(), String> {
     let body = serde_json::to_vec(value).map_err(|_| "cannot encode response")?;
     if body.is_empty() || body.len() > max_response {
-        return Err("response exceeds frame limit".into());
+        return Err(RESPONSE_TOO_LARGE.into());
     }
     stream
         .write_all(&(body.len() as u32).to_be_bytes())

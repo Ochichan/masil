@@ -1338,10 +1338,22 @@ async fn run(listener: StdUnixListener, core: PathBuf, config: Config) -> Result
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|_| "cannot register termination signal")?;
 
+    // Set after a failed accept. EMFILE leaves the connection queued, so the
+    // accept branch pauses while the other branches (signals, stop) stay live.
+    let mut retry_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { continue; };
+            () = async {
+                match retry_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => retry_at = None,
+            accepted = listener.accept(), if retry_at.is_none() => {
+                let Ok((stream, _)) = accepted else {
+                    retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+                    continue;
+                };
                 let Ok(standard) = stream.into_std() else { continue; };
                 if !ipc::peer_is_owner(&standard) { continue; }
                 let Ok(stream) = UnixStream::from_std(standard) else { continue; };

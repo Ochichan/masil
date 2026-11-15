@@ -572,6 +572,9 @@ enum BridgeNotice {
 struct BridgeState {
     task: Option<tokio::task::JoinHandle<()>>,
     command: Option<mpsc::UnboundedSender<BridgeCommand>>,
+    /// Bumped whenever a supervisor starts or is stopped. Notices carry the
+    /// generation of the supervisor that sent them, and older ones are dropped.
+    generation: u64,
     scope: HashSet<String>,
     scope_known: bool,
     core_boot_id: Option<String>,
@@ -619,15 +622,16 @@ impl BridgeState {
     fn start(
         &mut self,
         endpoint: bridge::Endpoint,
-        notices: mpsc::UnboundedSender<BridgeNotice>,
+        notices: mpsc::UnboundedSender<(u64, BridgeNotice)>,
         control: Arc<WatchControl>,
     ) {
         self.stop_task();
         let (command, commands) = mpsc::unbounded_channel();
         self.command = Some(command);
         let scope = self.scope.clone();
+        let generation = self.generation;
         self.task = Some(tokio::spawn(bridge_supervisor(
-            endpoint, scope, commands, notices, control,
+            endpoint, scope, generation, commands, notices, control,
         )));
     }
 
@@ -738,6 +742,7 @@ impl BridgeState {
     }
 
     fn stop_task(&mut self) {
+        self.generation += 1;
         self.command = None;
         if let Some(task) = self.task.take() {
             task.abort();
@@ -914,11 +919,12 @@ fn post_pass_inbox_actions(pass_succeeded: bool, inbox_effects: bool) -> PostPas
 }
 
 fn bridge_notice(
-    notices: &mpsc::UnboundedSender<BridgeNotice>,
+    notices: &mpsc::UnboundedSender<(u64, BridgeNotice)>,
     control: &WatchControl,
+    generation: u64,
     notice: BridgeNotice,
 ) -> bool {
-    let sent = notices.send(notice).is_ok();
+    let sent = notices.send((generation, notice)).is_ok();
     if sent {
         // The resident's wake path debounces (50 ms with a healthy bridge).
         control.wake.notify_one();
@@ -962,21 +968,28 @@ enum BridgeSupervisorOutcome {
 async fn bridge_supervisor(
     endpoint: bridge::Endpoint,
     mut scope: HashSet<String>,
+    generation: u64,
     mut commands: mpsc::UnboundedReceiver<BridgeCommand>,
-    notices: mpsc::UnboundedSender<BridgeNotice>,
+    notices: mpsc::UnboundedSender<(u64, BridgeNotice)>,
     control: Arc<WatchControl>,
 ) {
     loop {
         let watches = match bridge_watches(&endpoint, &scope).await {
             Ok(watches) => watches,
             Err(error) => {
-                bridge_notice(&notices, &control, BridgeNotice::Failed(error.to_string()));
+                bridge_notice(
+                    &notices,
+                    &control,
+                    generation,
+                    BridgeNotice::Failed(error.to_string()),
+                );
                 return;
             }
         };
         if !bridge_notice(
             &notices,
             &control,
+            generation,
             BridgeNotice::Ready {
                 scope: scope.clone(),
             },
@@ -1006,6 +1019,9 @@ async fn bridge_supervisor(
         drop(events);
         let outcome = loop {
             tokio::select! {
+                // A watch task sends its error and returns in one poll. Read the
+                // channel first so the real cause wins over "task ended".
+                biased;
                 command = commands.recv() => match command {
                     Some(BridgeCommand::Resubscribe(scope)) => {
                         break BridgeSupervisorOutcome::Resubscribe(scope);
@@ -1017,7 +1033,7 @@ async fn bridge_supervisor(
                         if matches!(event, Event::ServerExiting) {
                             break BridgeSupervisorOutcome::Failed(bridge::Error::Lost("server exiting".into()));
                         }
-                        if !bridge_notice(&notices, &control, BridgeNotice::Event(event)) {
+                        if !bridge_notice(&notices, &control, generation, BridgeNotice::Event(event)) {
                             break BridgeSupervisorOutcome::Stopped;
                         }
                     }
@@ -1036,7 +1052,12 @@ async fn bridge_supervisor(
         match outcome {
             BridgeSupervisorOutcome::Resubscribe(next) => scope = next,
             BridgeSupervisorOutcome::Failed(error) => {
-                bridge_notice(&notices, &control, BridgeNotice::Failed(error.to_string()));
+                bridge_notice(
+                    &notices,
+                    &control,
+                    generation,
+                    BridgeNotice::Failed(error.to_string()),
+                );
                 return;
             }
             BridgeSupervisorOutcome::Stopped => return,
@@ -1368,6 +1389,9 @@ pub(crate) async fn watch(
                 resident
                     .clear_attention(|args| manager.command_owned(args))
                     .await;
+                // A new resident remembers no marks, so also clear the ones
+                // an earlier resident left on the server.
+                clear_all_marks(|args| manager.command_owned(args)).await;
             }
         }
         let poked = control.poked.swap(false, Ordering::SeqCst);
@@ -1550,7 +1574,14 @@ pub(crate) async fn watch(
             }
             // Over the limit `collect` refuses; looking again every tick
             // would only start processes.
-            let manageable = signature.lines().count() <= super::MAX_PANES;
+            // A linked or grouped window lists its panes once per session, so
+            // count distinct pane ids (the first field), as the CLI does.
+            let manageable = signature
+                .lines()
+                .filter_map(|line| line.split(' ').next())
+                .collect::<HashSet<_>>()
+                .len()
+                <= super::MAX_PANES;
             if !manageable {
                 errors.note(
                     "too_many_panes: agent management supports at most 64 panes per server",
@@ -1743,6 +1774,13 @@ pub(crate) async fn watch(
                 Err(error) => {
                     if error.starts_with(STORE_NEWER) {
                         log(&format!("{error}; a newer masil-agent must take over"));
+                        // The watch ends here, so its marks come off as they
+                        // do on a normal stop.
+                        if let Some(resident) = &manager.resident {
+                            resident
+                                .clear_attention(|args| manager.command_owned(args))
+                                .await;
+                        }
                         stop.notify_one();
                         return;
                     }
@@ -2058,14 +2096,18 @@ struct BridgeNoticeContext<'a, F> {
 
 fn process_bridge_notices<F: Fn(&str)>(
     bridge: &mut BridgeState,
-    notices: &mut mpsc::UnboundedReceiver<BridgeNotice>,
+    notices: &mut mpsc::UnboundedReceiver<(u64, BridgeNotice)>,
     context: BridgeNoticeContext<'_, F>,
     now: u64,
 ) -> bool {
     let mut woken = false;
     let mut invalidated = HashSet::new();
-    while let Ok(notice) = notices.try_recv() {
+    while let Ok((generation, notice)) = notices.try_recv() {
         match notice {
+            // A supervisor that was stopped or replaced reports nothing about
+            // the current one. Events still count: they are real observations.
+            BridgeNotice::Ready { .. } | BridgeNotice::Failed(_)
+                if generation != bridge.generation => {}
             BridgeNotice::Ready { scope } if scope == bridge.scope => {
                 bridge.ready(now);
                 woken = true;
@@ -2989,6 +3031,17 @@ mod tests {
                 notify: true,
             }
         );
+    }
+
+    #[test]
+    fn a_stopped_or_restarted_supervisor_gets_a_new_generation() {
+        let mut bridge = BridgeState::default();
+        let first = bridge.generation;
+        bridge.stop_task();
+        assert!(bridge.generation > first);
+        let stopped = bridge.generation;
+        bridge.observe_boot(Some("boot".into()));
+        assert!(bridge.generation > stopped);
     }
 
     #[test]

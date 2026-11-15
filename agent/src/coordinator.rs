@@ -527,10 +527,22 @@ fn request_with(
 ) -> Result<Value, String> {
     let mut stream = StdUnixStream::connect(listen)
         .map_err(|error| format!("coordinator_unavailable: {error}"))?;
-    stream
+    if let Err(error) = stream
         .set_read_timeout(Some(timeout))
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
-        .map_err(|error| error.to_string())?;
+    {
+        // macOS refuses the setters once the peer has closed. A busy
+        // coordinator closes after a reply that is still buffered, so read it
+        // without blocking before calling the coordinator unavailable.
+        let unavailable = format!("coordinator_unavailable: {error}");
+        if stream.set_nonblocking(true).is_err() {
+            return Err(unavailable);
+        }
+        return match read_reply(&mut stream, frame) {
+            Err(error) if error.starts_with("coordinator_unavailable") => Err(unavailable),
+            reply => reply,
+        };
+    }
     let mut message = json!({"v": 1, "id": "cli", "method": method});
     if !params.is_null() {
         message["params"] = params;
@@ -540,6 +552,11 @@ fn request_with(
         .write_all(&(body.len() as u32).to_be_bytes())
         .and_then(|()| stream.write_all(&body))
         .map_err(|error| format!("coordinator_unavailable: {error}"))?;
+    read_reply(&mut stream, frame)
+}
+
+/// Reads one reply frame and turns it into the request's result.
+fn read_reply(stream: &mut StdUnixStream, frame: usize) -> Result<Value, String> {
     let mut header = [0; 4];
     stream
         .read_exact(&mut header)
@@ -1318,6 +1335,10 @@ fn ensure_server(
                     if let Some(value) = hello(&paths.listen).filter(|v| current(v, server)) {
                         return Ok(value);
                     }
+                    // A coordinator that died during start leaves nothing to wait for.
+                    if !lock_held(&paths.lock)? {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -1474,6 +1495,16 @@ pub(crate) fn reload(socket: &Path) {
 fn sync_boot_setting_warn(socket: &Path, state: &Path) {
     if let Err(error) = sync_boot_setting(socket, state, true, true) {
         eprintln!("masil-agent: could not update {BOOT_OPTION}: {error}");
+    }
+}
+
+/// Coordinator side: stderr is /dev/null here, so a failure goes to the log.
+fn sync_boot_setting_logged(socket: &Path, state: &Path, log_path: &Path) {
+    if let Err(error) = sync_boot_setting(socket, state, true, true) {
+        log(
+            log_path,
+            &format!("could not update {BOOT_OPTION}: {error}"),
+        );
     }
 }
 
@@ -1845,11 +1876,10 @@ fn serve_locked(
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         let mut signals = Signals::new()?;
         watch_parent(server.pid)?;
         let (listener, guard) = bind(&paths.listen)?;
-        write_record(lock, &server, started)?;
         let action_locks = Arc::new(crate::managed::core_action::PaneActionLocks::default());
         let actions = Arc::new(crate::managed::core_action::CoordinatorActions::new(
             options.socket.clone(),
@@ -1895,6 +1925,10 @@ fn serve_locked(
         });
         shared.actions.start().await;
         shared.query.reload().await;
+        // The record carries `boot` only once startup is done. A caller that
+        // sees `boot` assumes the accept loop is about to answer, and does not
+        // wait for a coordinator that is still starting.
+        write_record(lock, &server, started)?;
         let supervisor = tokio::spawn(supervise(
             shared.clone(),
             options.socket.clone(),
@@ -1931,7 +1965,11 @@ fn serve_locked(
             let _ = tokio::time::timeout(DEADLINE, watch).await;
         }
         result
-    })
+    });
+    // Dropping the runtime waits for blocking jobs. The caller holds the lock
+    // until this returns, so cap the wait.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 /// What the accept loop, the clients and the supervisor share.
@@ -2008,8 +2046,9 @@ async fn supervise(
         }
         if features_changed {
             let (socket_for_sync, state_for_sync) = (socket.clone(), state.clone());
+            let sync_log = log_path.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                sync_boot_setting_warn(&socket_for_sync, &state_for_sync)
+                sync_boot_setting_logged(&socket_for_sync, &state_for_sync, &sync_log)
             })
             .await;
         }
@@ -2374,7 +2413,11 @@ async fn accept_loop(
         };
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { continue };
+                let Ok((stream, _)) = accepted else {
+                    // EMFILE leaves the connection queued; back off instead of spinning.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
                 let Ok(std_stream) = stream.into_std() else { continue };
                 if !ipc::peer_is_owner(&std_stream) {
                     continue;
@@ -2416,6 +2459,10 @@ async fn accept_loop(
             _ = signals.rebind.recv() => {
                 if !guard.as_ref().is_some_and(ipc::SocketGuard::still_bound) {
                     // The socket file was removed under a live coordinator.
+                    // The old path is already gone. Drop the old guard first, so
+                    // its Drop cannot unlink the new socket if the filesystem
+                    // reuses the inode number.
+                    guard = None;
                     match bind(path) {
                         Ok((std_listener, new_guard)) => match tokio::net::UnixListener::from_std(std_listener) {
                             Ok(new_listener) => {
@@ -2466,6 +2513,7 @@ async fn serve_client(
         else {
             return active;
         };
+        let was_action = test_request(&body).is_none() && action_request(&body).is_some();
         let (response, stopping, frame) = if let Some(id) = test_request(&body) {
             count(&mut active);
             (notify_test_reply(shared, id).await, false, RESPONSE_FRAME)
@@ -2494,8 +2542,27 @@ async fn serve_client(
             let (response, stopping) = respond(&body, shared, clients, idle_seconds);
             (response, stopping, RESPONSE_FRAME)
         };
-        let written =
+        let mut written =
             tokio::time::timeout(DEADLINE, ipc::write_frame(&mut stream, &response, frame)).await;
+        if matches!(&written, Ok(Err(error)) if error == ipc::RESPONSE_TOO_LARGE) {
+            // Nothing was written. Answer with a small error rather than EOF, which
+            // callers read as a lost reply for a request that already ran.
+            let refusal = if was_action {
+                // The action already ran: keep the reply-lost wording callers match.
+                json!({"v": 1, "id": response["id"].clone(), "ok": false,
+                    "error": {"code": "outcome_unknown",
+                        "message": "outcome_unknown: coordinator action reply lost: the reply exceeds the frame limit"}})
+            } else {
+                json!({"v": 1, "id": response["id"].clone(), "ok": false,
+                    "error": {"code": "response_too_large",
+                        "message": "the reply exceeds the frame limit; the request may have run"}})
+            };
+            written = tokio::time::timeout(
+                DEADLINE,
+                ipc::write_frame(&mut stream, &refusal, RESPONSE_FRAME),
+            )
+            .await;
+        }
         if stopping {
             shared.stop.notify_one();
             return active;
