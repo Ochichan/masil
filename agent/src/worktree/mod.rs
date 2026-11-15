@@ -557,8 +557,6 @@ fn forget(args: &[String]) -> Result<i32, String> {
             "worktree_unavailable: masil still tracks this worktree; use `worktree remove`".into(),
         );
     }
-    std::fs::remove_file(&found.marker)
-        .map_err(|error| format!("{}: {error}", found.marker.display()))?;
     let root = found
         .root
         .to_str()
@@ -571,6 +569,9 @@ fn forget(args: &[String]) -> Result<i32, String> {
     if locked {
         git::query(&found.root, &["worktree", "unlock", "--", root])?;
     }
+    // The marker goes last, so a failed unlock can be retried.
+    std::fs::remove_file(&found.marker)
+        .map_err(|error| format!("{}: {error}", found.marker.display()))?;
     print(&json!({"forgotten": root, "unlocked": locked}))?;
     Ok(0)
 }

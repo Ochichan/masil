@@ -391,6 +391,31 @@ pub(super) fn status_entries(output: &str) -> Vec<String> {
     entries
 }
 
+/// The commit a detached HEAD sits on when no ref reaches it, so removing
+/// the worktree would leave it only in the reflog.
+fn stranded_head(path: &Path) -> Result<Option<String>, String> {
+    // Exit 1 and no message: HEAD is not a symbolic ref.
+    if git::probe(path, &["symbolic-ref", "-q", "HEAD"])?.is_some() {
+        return Ok(None);
+    }
+    let Some(oid) = git::probe(path, &["rev-parse", "--verify", "--quiet", "HEAD"])? else {
+        return Ok(None);
+    };
+    let reached = git::query(
+        path,
+        &[
+            "for-each-ref",
+            "--contains",
+            "HEAD",
+            "--count=1",
+            "refs/heads/",
+            "refs/tags/",
+            "refs/remotes/",
+        ],
+    )?;
+    Ok(reached.trim().is_empty().then(|| oid.trim().to_owned()))
+}
+
 fn files(registry: &Registry, row: &Worktree) -> Result<Files, String> {
     let path = Path::new(&row.path);
     let mut changes = status_entries(&git::query(
@@ -404,6 +429,12 @@ fn files(registry: &Registry, row: &Worktree) -> Result<Files, String> {
             "--ignore-submodules=none",
         ],
     )?);
+    if let Some(oid) = stranded_head(path)? {
+        changes.push(format!(
+            "?? (detached HEAD has commits no branch or tag reaches: {})",
+            oid.get(..12).unwrap_or(&oid)
+        ));
+    }
     changes.sort();
     let setup: std::collections::HashMap<String, String> =
         registry.setup_paths(row.id)?.into_iter().collect();
@@ -559,7 +590,54 @@ pub(super) fn settle(registry: &mut Registry, job: &Job) -> (&'static str, Strin
 
 #[cfg(test)]
 mod tests {
-    use super::status_entries;
+    use super::{status_entries, stranded_head};
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+            ])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn detached_head_is_stranded_only_when_no_ref_reaches_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "masil-stranded-{}",
+            crate::managed::nonce().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        assert_eq!(stranded_head(&dir).unwrap(), None, "on a branch");
+        git(&dir, &["switch", "-q", "--detach"]);
+        assert_eq!(stranded_head(&dir).unwrap(), None, "main reaches it");
+        git(&dir, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        assert!(stranded_head(&dir).unwrap().is_some(), "only HEAD has it");
+        // git worktree remove deletes per-worktree refs such as this one.
+        git(&dir, &["update-ref", "refs/bisect/bad", "HEAD"]);
+        assert!(stranded_head(&dir).unwrap().is_some(), "bisect ref only");
+        git(&dir, &["tag", "keep"]);
+        assert_eq!(stranded_head(&dir).unwrap(), None, "a tag reaches it");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn status_v2_entries_keep_paths_and_rename_sources() {

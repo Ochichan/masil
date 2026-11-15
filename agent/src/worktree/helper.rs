@@ -43,8 +43,8 @@ fn me() -> Result<(i32, u64), String> {
 
 /// Starts the helper of a new job and records it as the owner.
 pub(super) fn spawn(registry: &Registry, id: i64) -> Result<Child, String> {
-    let executable =
-        std::env::current_exe().map_err(|error| format!("locating masil-agent: {error}"))?;
+    let executable = super::git::current_executable()
+        .map_err(|error| format!("locating masil-agent: {error}"))?;
     let log = registry.open_job_log(id)?;
     let mut command = Command::new(executable);
     command
@@ -150,7 +150,7 @@ pub(super) fn notify_ended(id: i64) {
     if crate::notify::job_settings().is_none() {
         return;
     }
-    let Ok(executable) = std::env::current_exe() else {
+    let Ok(executable) = super::git::current_executable() else {
         return;
     };
     let mut command = std::process::Command::new(executable);

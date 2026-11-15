@@ -3,13 +3,14 @@
 
 use std::fs::File;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Variables that move git to another repository, index or object store.
-const SCRUBBED: [&str; 7] = [
+/// Variables that move git to another repository, index or object store,
+/// or change which objects and refs it sees.
+const SCRUBBED: [&str; 14] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -17,7 +18,15 @@ const SCRUBBED: [&str; 7] = [
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_QUARANTINE_PATH",
 ];
+
 /// How long a cancelled git has between SIGTERM and SIGKILL (B-14).
 const GRACE: Duration = Duration::from_secs(2);
 /// Error text kept from a failed query.
@@ -35,6 +44,23 @@ pub(crate) fn command(dir: &Path) -> Command {
         .env("LC_ALL", "C")
         .stdin(Stdio::null());
     command
+}
+
+/// This binary's path. On Linux, after an upgrade replaced the file, the
+/// kernel reports the old path with a ` (deleted)` suffix; the path without
+/// it is the new binary, if one is there.
+pub(crate) fn current_executable() -> std::io::Result<PathBuf> {
+    let path = std::env::current_exe()?;
+    if let Some(stripped) = path
+        .to_str()
+        .and_then(|text| text.strip_suffix(" (deleted)"))
+    {
+        let stripped = PathBuf::from(stripped);
+        if stripped.exists() {
+            return Ok(stripped);
+        }
+    }
+    Ok(path)
 }
 
 pub(crate) fn tail(bytes: &[u8], limit: usize) -> String {
@@ -348,4 +374,29 @@ fn subcommand<'a>(args: &[&'a str]) -> &'a str {
         }
     }
     ""
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SCRUBBED;
+
+    #[test]
+    fn scrub_covers_repository_variables_and_keeps_run_settings() {
+        for name in [
+            "GIT_DIR",
+            "GIT_PREFIX",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_QUARANTINE_PATH",
+        ] {
+            assert!(SCRUBBED.contains(&name), "{name}");
+        }
+        for name in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_LFS_SKIP_SMUDGE",
+            "GIT_SSH_COMMAND",
+        ] {
+            assert!(!SCRUBBED.contains(&name), "{name}");
+        }
+    }
 }

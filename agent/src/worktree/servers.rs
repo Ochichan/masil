@@ -96,9 +96,17 @@ fn list(socket: &Path) -> Result<String, String> {
         .map_err(|error| format!("cannot run masil: {error}"))?;
     let mut stdout = child.stdout.take().ok_or("masil output unavailable")?;
     let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = (&mut stdout).take(OUTPUT_LIMIT).read_to_string(&mut text);
-        text
+        let mut bytes = Vec::new();
+        (&mut stdout)
+            .take(OUTPUT_LIMIT)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("cannot read the pane list: {error}"))?;
+        // A cut-off list would read as "no pane there".
+        if bytes.len() as u64 >= OUTPUT_LIMIT {
+            return Err("output too large".to_owned());
+        }
+        // A pane path that is not UTF-8 must not hide the others.
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     });
     let deadline = Instant::now() + ANSWER;
     let status = loop {
@@ -112,7 +120,9 @@ fn list(socket: &Path) -> Result<String, String> {
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    let output = reader.join().unwrap_or_default();
+    let output = reader
+        .join()
+        .map_err(|_| "the pane list reader failed".to_owned())??;
     if !status.success() {
         return Err(format!("list-panes failed ({status})"));
     }

@@ -99,13 +99,17 @@ pub(super) fn resolve(
     hint: &Path,
 ) -> Result<super::registry::Worktree, String> {
     if spec.contains('/') || spec == "." || spec == ".." {
-        let path = hint
-            .join(spec)
-            .canonicalize()
-            .map_err(|error| format!("invalid_argument: {spec}: {error}"))?;
-        let found = detect(&path)?
-            .ok_or_else(|| format!("worktree_unavailable: {spec} is not in a masil worktree"))?;
-        return known(registry, &found);
+        match hint.join(spec).canonicalize() {
+            Ok(path) => {
+                let found = detect(&path)?.ok_or_else(|| {
+                    format!("worktree_unavailable: {spec} is not in a masil worktree")
+                })?;
+                return known(registry, &found);
+            }
+            // A branch such as `feat/login` has a `/` but is no path.
+            Err(_) if !spec.starts_with(['/', '.']) => {}
+            Err(error) => return Err(format!("invalid_argument: {spec}: {error}")),
+        }
     }
     let key = super::repository(
         hint.to_str()

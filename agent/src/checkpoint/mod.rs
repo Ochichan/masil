@@ -422,6 +422,49 @@ fn numbers(store: &Store, deadline: Instant) -> Result<Vec<(u64, String)>, Strin
     Ok(numbers)
 }
 
+/// A checkpoint's metadata is its commit body, read as JSON; a longer one
+/// than this reads as none, as in [`metadata_of`].
+const METADATA_LIMIT: usize = 64 * 1024;
+
+/// Like [`numbers`], with each checkpoint's metadata from the same git call.
+fn numbers_with_metadata(
+    store: &Store,
+    deadline: Instant,
+) -> Result<Vec<(u64, String, Value)>, String> {
+    let prefix = store.ref_prefix();
+    let output = run(
+        store,
+        false,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(contents:body)%01",
+            &prefix,
+        ],
+        None,
+        deadline,
+        LIST_LIMIT,
+    )?;
+    let mut found: Vec<(u64, String, Value)> = output
+        .stdout
+        .split(|byte| *byte == 1)
+        .filter_map(|record| {
+            let mut fields = record.splitn(3, |byte| *byte == 0);
+            let name = String::from_utf8_lossy(fields.next()?);
+            let oid = String::from_utf8_lossy(fields.next()?).into_owned();
+            let body = fields.next()?.trim_ascii();
+            let id = name.trim_start().strip_prefix(&prefix)?.parse().ok()?;
+            let metadata = if body.len() > METADATA_LIMIT {
+                Value::Null
+            } else {
+                serde_json::from_slice(body).unwrap_or(Value::Null)
+            };
+            Some((id, oid, metadata))
+        })
+        .collect();
+    found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    Ok(found)
+}
+
 /// Makes a checkpoint. The caller holds the store's locks (shared
 /// repository lock and this working tree's lock).
 pub(crate) fn make(
@@ -600,8 +643,20 @@ const LATE_MS: u64 = 1000;
 pub(crate) fn list(store: &Store) -> Result<Value, String> {
     let deadline = Instant::now() + MAKE_TIME;
     let mut entries = Vec::new();
-    for (id, commit) in numbers(store, deadline)? {
-        let mut entry = metadata_of(store, &commit, deadline);
+    let listed = match numbers_with_metadata(store, deadline) {
+        Ok(listed) => listed,
+        // One checkpoint whose commit object is missing fails the combined
+        // call. Each ref is then read on its own, so the others are listed
+        // and that one has no metadata.
+        Err(_) => numbers(store, deadline)?
+            .into_iter()
+            .map(|(id, commit)| {
+                let metadata = metadata_of(store, &commit, deadline);
+                (id, commit, metadata)
+            })
+            .collect(),
+    };
+    for (id, commit, mut entry) in listed {
         if !entry.is_object() {
             entry = json!({});
         }
@@ -914,7 +969,7 @@ pub(crate) fn before_prompt(cwd: &str, name: &str, run: &str) {
     if !settings.before_prompt {
         return;
     }
-    let Ok(executable) = std::env::current_exe() else {
+    let Ok(executable) = crate::worktree::git::current_executable() else {
         return;
     };
     let mut command = std::process::Command::new(executable);
