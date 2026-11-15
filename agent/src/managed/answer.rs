@@ -540,6 +540,8 @@ fn candidates(pid: i32, provider: &str) -> Vec<i32> {
 pub(super) struct Endpoint {
     profile: &'static AnswerProfile,
     client: Client,
+    /// For `/event`: a connect timeout only, since a stream has no total time.
+    stream_client: Client,
     port: u16,
     secret: String,
 }
@@ -604,13 +606,8 @@ impl Endpoint {
     /// `GET /event`: the server's event stream, open until either side
     /// ends it. Only connecting has a time limit.
     pub(super) async fn events(&self) -> Result<reqwest::Response, String> {
-        let client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(HTTP_TIMEOUT)
-            .build()
-            .map_err(|error| error.to_string())?;
-        let response = client
+        let response = self
+            .stream_client
             .get(format!("http://127.0.0.1:{}/event", self.port))
             .basic_auth(self.profile.username, Some(&self.secret))
             .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -735,6 +732,17 @@ async fn read_limited(mut response: reqwest::Response) -> Result<(StatusCode, Ve
     Ok((status, body))
 }
 
+/// The client for `/event`: connecting has a time limit, the stream does not.
+fn stream_client() -> Result<Client, String> {
+    Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(HTTP_TIMEOUT)
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
 fn client() -> Result<Client, String> {
     Client::builder()
         .no_proxy()
@@ -745,6 +753,15 @@ fn client() -> Result<Client, String> {
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|error| error.to_string())
+}
+
+/// The distinct ports, in ascending order. A listener inherited by a launcher
+/// and its child shows up once per process but is one server.
+fn collect_ports(ports: impl IntoIterator<Item = u16>) -> Vec<u16> {
+    let mut ports: Vec<u16> = ports.into_iter().collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// The server of the process group `pid`: exactly one local listener of its
@@ -762,14 +779,12 @@ pub(super) async fn discover(
         ));
     }
     let ports = tokio::task::spawn_blocking(move || {
-        candidates(pid, profile.id)
-            .into_iter()
-            .flat_map(listening)
-            .collect::<Vec<_>>()
+        collect_ports(candidates(pid, profile.id).into_iter().flat_map(listening))
     })
     .await
     .map_err(|error| error.to_string())?;
     let client = client()?;
+    let stream_client = stream_client()?;
     let mut usable = Vec::new();
     let mut unsafe_port = false;
     for port in ports {
@@ -814,6 +829,7 @@ pub(super) async fn discover(
         [port] => Ok(Endpoint {
             profile,
             client,
+            stream_client,
             port: *port,
             secret,
         }),
@@ -921,14 +937,23 @@ impl Manager {
         pane: &str,
         state: &'static str,
     ) -> Result<(), String> {
-        let agent = self.get(pane).await?;
-        let mut evidence = agent
-            .run_evidence
-            .clone()
-            .filter(|evidence| evidence.run == agent.run)
-            .ok_or("identity_mismatch: the run has no evidence")?;
-        if evidence.answer_channel_state.as_deref() != Some(state) {
+        // The write builds on the evidence the pane holds when it is made,
+        // and holds only while that text is unchanged, so a request or a
+        // prompt mark a hook recorded meanwhile is kept. A write another
+        // writer beat is tried again on a fresh read, three times in all.
+        let mut recorded = false;
+        for _ in 0..3 {
+            let agent = self.get(pane).await?;
+            if (agent.run_evidence.as_ref()).is_none_or(|evidence| evidence.run != agent.run) {
+                return Err("identity_mismatch: the run has no evidence".into());
+            }
+            let (mut evidence, raw) = self.evidence_now(&agent.run, &agent.pane_id).await?;
+            if evidence.answer_channel_state.as_deref() == Some(state) {
+                recorded = true;
+                break;
+            }
             evidence.answer_channel_state = Some(state.into());
+            let condition = super::evidence_unchanged(raw.as_deref());
             let outcome = self
                 .guarded_input_outcome(
                     &agent,
@@ -937,12 +962,16 @@ impl Manager {
                         super::EVIDENCE,
                         super::encode(&evidence)?,
                     )],
-                    None,
+                    condition.as_deref(),
                 )
                 .await?;
-            if matches!(outcome, super::Guarded::Rejected) {
-                return Err("identity_mismatch: the pane changed".into());
+            if matches!(outcome, super::Guarded::Applied) {
+                recorded = true;
+                break;
             }
+        }
+        if !recorded {
+            return Err("identity_mismatch: the pane changed".into());
         }
         if state == "ready" {
             self.command(&["set-option", "-gq", "@masil-answers", "on"])
@@ -1380,7 +1409,13 @@ async fn pending(endpoint: &Endpoint) -> Result<Vec<Value>, String> {
     let mut all = Vec::new();
     for (path, kind) in [("/permission", "permission"), ("/question", "question")] {
         let value = endpoint.get_json(path).await?;
-        for mut item in value.as_array().cloned().unwrap_or_default() {
+        let Some(items) = value.as_array() else {
+            return Err(format!(
+                "answer_unavailable: {} sent no list for {path}",
+                endpoint.profile.label
+            ));
+        };
+        for mut item in items.iter().cloned() {
             if item["id"].as_str().is_none() {
                 continue;
             }
@@ -1411,6 +1446,7 @@ fn public_request(request: &Value, root: Option<&str>) -> Value {
     if let Some(root) = root {
         value["root"] = json!(session == Some(root));
     }
+    let mut truncated = false;
     for field in [
         "permission",
         "patterns",
@@ -1420,8 +1456,13 @@ fn public_request(request: &Value, root: Option<&str>) -> Value {
         "tool",
     ] {
         if let Some(field_value) = request.get(field) {
-            value[field] = clip(field_value);
+            let clipped = clip(field_value);
+            truncated |= clipped != *field_value;
+            value[field] = clipped;
         }
+    }
+    if truncated {
+        value["truncated"] = json!(true);
     }
     value
 }
@@ -1541,6 +1582,21 @@ mod tests {
 
     fn args(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn a_port_listened_on_by_two_processes_is_one_candidate() {
+        assert_eq!(collect_ports([4096, 3000, 4096, 3000]), vec![3000, 4096]);
+        assert!(collect_ports([]).is_empty());
+    }
+
+    #[test]
+    fn a_clipped_request_says_so() {
+        let short = json!({"id": "p1", "_kind": "permission", "permission": "edit"});
+        assert!(public_request(&short, None).get("truncated").is_none());
+        let long =
+            json!({"id": "p1", "_kind": "permission", "patterns": ["x".repeat(FIELD_LIMIT + 1)]});
+        assert_eq!(public_request(&long, None)["truncated"], true);
     }
 
     #[test]
@@ -1804,6 +1860,7 @@ mod tests {
         let endpoint = Endpoint {
             profile: opencode(),
             client: client().unwrap(),
+            stream_client: stream_client().unwrap(),
             port,
             secret: "secret".into(),
         };

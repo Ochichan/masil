@@ -55,6 +55,8 @@ const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
 #[derive(Debug)]
 pub struct Engine {
     manifests: HashMap<&'static str, ManifestEntry>,
+    /// Problems with the override directory that do not fail the load.
+    override_warnings: Vec<String>,
 }
 
 impl Engine {
@@ -81,7 +83,12 @@ impl Engine {
     fn load_checked(directory: Option<PathBuf>) -> (String, Result<Self, String>) {
         let candidates = read_candidates(directory.as_deref());
         let fingerprint = fingerprint_candidates(directory.as_deref(), &candidates);
-        (fingerprint, Self::load_candidates(candidates))
+        let warnings = unmatched_override_warnings(directory.as_deref());
+        let engine = Self::load_candidates(candidates).map(|mut engine| {
+            engine.override_warnings = warnings;
+            engine
+        });
+        (fingerprint, engine)
     }
 
     fn load_candidates(candidates: Vec<(PathBuf, Candidate)>) -> Result<Self, String> {
@@ -294,7 +301,16 @@ impl Engine {
         for (id, text) in BUNDLED_MANIFESTS {
             manifests.insert(*id, ManifestEntry::bundled(id, text));
         }
-        Self { manifests }
+        Self {
+            manifests,
+            override_warnings: Vec::new(),
+        }
+    }
+
+    /// Warnings from the last override load, such as a file named for no provider.
+    #[allow(dead_code)]
+    pub(crate) fn override_warnings(&self) -> &[String] {
+        &self.override_warnings
     }
 }
 
@@ -594,7 +610,7 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, Stri
         if rule.region.trim().starts_with("top_non_empty_lines(")
             && manifest
                 .min_engine_version
-                .is_some_and(|version| version < 3)
+                .is_none_or(|version| version < 3)
         {
             return Err(format!(
                 "rule {} uses top_non_empty_lines but min_engine_version is below 3",
@@ -696,6 +712,7 @@ fn validate_gate(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    reject_empty_matchers(context, gate, &regex, false)?;
     let all = gate
         .all
         .iter()
@@ -728,6 +745,39 @@ fn validate_gate(
         regex,
         line_regex,
     })
+}
+
+/// An empty matcher source matches every screen. Anchored patterns such as
+/// `^\s*$` are selective and stay valid, and so does a catch-all positive
+/// regex like letta's `(?s)^.*$`. In a `not` gate a regex that matches both ""
+/// and "x" matches everything, so the `not` could never pass.
+fn reject_empty_matchers(
+    context: &str,
+    gate: &ManifestGate,
+    regex: &[Regex],
+    negated: bool,
+) -> Result<(), String> {
+    let kinds = [
+        ("contains", &gate.contains),
+        ("regex", &gate.regex),
+        ("line_regex", &gate.line_regex),
+    ];
+    for (kind, values) in kinds {
+        if values.iter().any(String::is_empty) {
+            return Err(format!("{context} has an empty {kind} matcher"));
+        }
+    }
+    if negated
+        && let Some(pattern) = regex
+            .iter()
+            .find(|pattern| pattern.is_match("") && pattern.is_match("x"))
+    {
+        return Err(format!(
+            "{context} has regex {:?} that matches everything",
+            pattern.as_str()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_not_gate(
@@ -784,6 +834,7 @@ fn validate_not_gate(
                 .map_err(|error| format!("invalid not line_regex {pattern:?}: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    reject_empty_matchers("not gate", gate, &regex, true)?;
     let all = gate
         .all
         .iter()
@@ -1175,18 +1226,65 @@ fn unavailable_explanation(provider: &str, warning: &str) -> Value {
     explanation
 }
 
+/// An environment path, used only when absolute: the XDG spec says an empty
+/// or relative value is ignored, and a relative one would make a repository's
+/// own `masil/agent-detection` directory an override source.
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
 pub(crate) fn override_directory() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(path).join("masil").join("agent-detection"));
+    if let Some(path) = absolute_env_path("XDG_CONFIG_HOME") {
+        return Some(path.join("masil").join("agent-detection"));
     }
     if cfg!(windows)
-        && let Some(path) = std::env::var_os("APPDATA")
+        && let Some(path) = absolute_env_path("APPDATA")
     {
-        return Some(PathBuf::from(path).join("masil").join("agent-detection"));
+        return Some(path.join("masil").join("agent-detection"));
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|path| path.join(".config").join("masil").join("agent-detection"))
+    absolute_env_path("HOME").map(|path| path.join(".config").join("masil").join("agent-detection"))
+}
+
+/// `*.toml` files in the override directory whose names match no provider
+/// id. They are never read, so each is reported instead of dropped silently.
+fn unmatched_override_warnings(directory: Option<&std::path::Path>) -> Vec<String> {
+    let Some(entries) = directory.and_then(|directory| std::fs::read_dir(directory).ok()) else {
+        return Vec::new();
+    };
+    use std::os::unix::fs::MetadataExt;
+    // An entry counts as read when it is the same file as a candidate path,
+    // which also covers names that differ only in case on a case-insensitive
+    // volume.
+    let candidates: Vec<(u64, u64)> = directory
+        .into_iter()
+        .flat_map(|directory| {
+            BUNDLED_MANIFESTS.iter().filter_map(move |(id, _)| {
+                std::fs::symlink_metadata(directory.join(format!("{id}.toml"))).ok()
+            })
+        })
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+        .collect();
+    let mut names: Vec<String> = entries
+        .take(256)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".toml"))
+        .filter(|entry| {
+            std::fs::symlink_metadata(entry.path())
+                .map(|metadata| !candidates.contains(&(metadata.dev(), metadata.ino())))
+                .unwrap_or(true)
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "override files matching no provider id were not read: {}",
+        names.join(", ")
+    )]
 }
 
 /// What one override candidate file held when it was read.
@@ -1342,7 +1440,81 @@ mod tests {
         let loaded = load_manifest(text, ManifestSource::Bundled).unwrap();
         Engine {
             manifests: HashMap::from([("codex", ManifestEntry::Loaded(loaded))]),
+            override_warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn empty_matchers_and_a_missing_engine_version_are_rejected() {
+        let rule = |extra: &str| {
+            format!("id = \"codex\"\n[[rules]]\nid = \"r\"\nstate = \"idle\"\n{extra}\n")
+        };
+        for extra in [
+            "contains = [\"\"]",
+            "regex = [\"\"]",
+            "line_regex = [\"\"]",
+            "contains = [\"a\"]\nnot = [{ regex = [\"x*\"] }]",
+            "contains = [\"a\"]\nnot = [{ contains = [\"\"] }]",
+            "contains = [\"a\"]\nnot = [{ regex = [\"\"] }]",
+            "contains = [\"a\"]\nnot = [{ any = [{ contains = [\"\"] }] }]",
+            "all = [{ any = [{ regex = [\"\"] }] }]",
+        ] {
+            let error = load_manifest(&rule(extra), ManifestSource::Bundled).unwrap_err();
+            assert!(error.contains("rule r"), "{extra}: {error}");
+        }
+        for extra in [
+            "contains = [\"  \"]",
+            "contains = [\"a\"]\nnot = [{ regex = [\"^\\\\s*$\"] }]",
+            "contains = [\"a\"]\nnot = [{ line_regex = [\"^$\"] }]",
+            "regex = [\"(?s)^.*$\"]",
+        ] {
+            load_manifest(&rule(extra), ManifestSource::Bundled).unwrap();
+        }
+        load_manifest(&rule("contains = [\"a\"]"), ManifestSource::Bundled).unwrap();
+        let error = load_manifest(
+            &rule("region = \"top_non_empty_lines(3)\"\ncontains = [\"a\"]"),
+            ManifestSource::Bundled,
+        )
+        .unwrap_err();
+        assert!(error.contains("min_engine_version"), "{error}");
+    }
+
+    #[test]
+    fn config_paths_from_the_environment_must_be_absolute() {
+        // Distinct variable names keep these tests off the real environment.
+        let name = "MASIL_TEST_ABSOLUTE_ENV_PATH";
+        unsafe {
+            std::env::set_var(name, "");
+            assert_eq!(absolute_env_path(name), None);
+            std::env::set_var(name, "relative/config");
+            assert_eq!(absolute_env_path(name), None);
+            std::env::set_var(name, "/abs/config");
+            assert_eq!(absolute_env_path(name), Some(PathBuf::from("/abs/config")));
+            std::env::remove_var(name);
+        }
+        assert_eq!(absolute_env_path(name), None);
+    }
+
+    #[test]
+    fn unmatched_override_files_are_reported() {
+        let directory = TempDirectory::new();
+        std::fs::write(directory.path().join("claude.toml"), "").unwrap();
+        std::fs::write(directory.path().join("antigravity.toml"), "").unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "").unwrap();
+        let warnings = unmatched_override_warnings(Some(directory.path()));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("antigravity.toml"), "{warnings:?}");
+        assert!(!warnings[0].contains("claude.toml"), "{warnings:?}");
+        // A symlink under another name is a different file, so it is reported.
+        std::os::unix::fs::symlink(
+            directory.path().join("claude.toml"),
+            directory.path().join("link.toml"),
+        )
+        .unwrap();
+        let warnings = unmatched_override_warnings(Some(directory.path()));
+        assert!(warnings[0].contains("link.toml"), "{warnings:?}");
+        assert!(unmatched_override_warnings(None).is_empty());
+        assert!(unmatched_override_warnings(Some(&directory.path().join("missing"))).is_empty());
     }
 
     #[test]
@@ -1394,6 +1566,7 @@ regex = ["("]
 "#,
                 ),
             )]),
+            override_warnings: Vec::new(),
         };
 
         let explanation = engine.explain("codex", "anything", "");

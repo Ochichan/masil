@@ -31,6 +31,8 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a query's `format_digest` waits for the core's answer.
 const QUERY_DIGEST_WAIT: Duration = Duration::from_millis(100);
 const BUSY_ATTEMPTS: usize = 5;
+/// The interrupt sleeps between keys while holding the client locks.
+const MAX_INTERRUPT_KEYS: usize = 4;
 const INTERRUPT_INTER_KEY_PAUSE: Duration = Duration::from_millis(300);
 /// An idle coordinator connection sends a heartbeat this often. The core
 /// treats its summaries as stale after 90 seconds without any request.
@@ -318,20 +320,6 @@ impl LedgerResult {
 
 fn consumes_ticket(result: &LedgerResult) -> bool {
     result.ticket().is_some() || matches!(result, LedgerResult::LedgerFull)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReconcileDecision {
-    Retire,
-    OutcomeUnknown,
-}
-
-fn reconcile_decision(has_sqlite_receipt: bool, _result: &LedgerResult) -> ReconcileDecision {
-    if has_sqlite_receipt {
-        ReconcileDecision::Retire
-    } else {
-        ReconcileDecision::OutcomeUnknown
-    }
 }
 
 /// A retained ledger entry returned by `ledger_list`.
@@ -977,7 +965,10 @@ impl Client {
             let reply = match self.call(kind, fields.clone()).await {
                 Ok(reply) => reply,
                 Err(error) => {
-                    self.broken = true;
+                    // An oversized request never reached the wire.
+                    if !matches!(error, Error::InvalidArgument(_)) {
+                        self.broken = true;
+                    }
                     return Err(error);
                 }
             };
@@ -1197,6 +1188,10 @@ async fn writer_loop(
                         last_write = tokio::time::Instant::now();
                         active = Some(request);
                     }
+                    Err(error @ Error::InvalidArgument(_)) => {
+                        // Nothing was written, so the connection stays usable.
+                        let _ = request.reply.send(Err(error));
+                    }
                     Err(error) => {
                         let _ = request.reply.send(Err(error.clone()));
                         while let Ok(waiting) = requests.try_recv() {
@@ -1330,8 +1325,8 @@ where
     let body = serde_json::to_vec(value)
         .map_err(|error| Error::Protocol(format!("encoding action request: {error}")))?;
     if body.is_empty() || body.len() > REQUEST_FRAME {
-        return Err(Error::Protocol(
-            "action request exceeds core frame limit".into(),
+        return Err(Error::InvalidArgument(
+            "invalid_argument: action request exceeds core frame limit".into(),
         ));
     }
     tokio::time::timeout(FRAME_TIMEOUT, async {
@@ -1479,11 +1474,7 @@ fn response_id(value: &Value) -> Option<String> {
 }
 
 fn valid_staging_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    valid_operation_id(value)
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -2509,7 +2500,7 @@ impl CoordinatorActions {
         };
         if let Err(error) = connected {
             self.unavailable(&error);
-            return Err(format!("bridge_unavailable: {error}"));
+            return Err(bridge_unavailable(&error));
         }
         // The core tracks client views only while this bridge connection
         // exists, and a fresh connection sets a new baseline without bumping
@@ -2527,7 +2518,7 @@ impl CoordinatorActions {
                 self.lock_connected(|| async {
                     let error = self.connect(&manager).await.err()?;
                     self.unavailable(&error);
-                    Some(format!("bridge_unavailable: {error}"))
+                    Some(bridge_unavailable(&error))
                 }),
             )
             .await??;
@@ -2816,15 +2807,10 @@ impl CoordinatorActions {
                 expected.matches(&fresh, false)?;
                 self.send_keys(core, &fresh, keys, KeyDispatch::ephemeral(&fresh, true))
                     .await
-                    .map_err(|error| match error {
-                        Error::InvalidArgument(error) => error,
-                        error => format!("outcome_unknown: {error}"),
-                    })?
+                    .map_err(keys_send_error)?
             }
             Ok(result) => result,
-            Err(Error::InvalidArgument(error)) => return Err(error),
-            Err(Error::Busy(error)) => return Err(format!("bridge_unavailable: {error}")),
-            Err(error) => return Err(format!("outcome_unknown: {error}")),
+            Err(error) => return Err(keys_send_error(error)),
         };
         match result {
             LedgerResult::Applied { .. } => Ok(json!({
@@ -2887,7 +2873,7 @@ impl CoordinatorActions {
         // A lost reader is found here, before anything is sent.
         if let Err(error) = core.drain_launch_events() {
             core.broken = true;
-            return Err(format!("bridge_unavailable: {error}"));
+            return Err(bridge_unavailable(&error.to_string()));
         }
         // Registered before the request goes out so that no phase frame can
         // arrive for a ticket nobody waits on. A rejection or error drops it.
@@ -2895,7 +2881,7 @@ impl CoordinatorActions {
         let (result, reply) = match core.guarded_action_reply(request).await {
             Ok(answer) => answer,
             Err(Error::InvalidArgument(error)) => return Err(error),
-            Err(Error::Busy(error)) => return Err(format!("bridge_unavailable: {error}")),
+            Err(Error::Busy(error)) => return Err(bridge_unavailable(&error)),
             Err(error) => return Err(format!("outcome_unknown: {error}")),
         };
         match result {
@@ -3882,7 +3868,9 @@ impl CoordinatorActions {
                     return Self::reject_launch_before_dispatch(
                         &mut store,
                         &record,
-                        format!("can't find pane: {}", request.target),
+                        // The wording of the native path, where tmux refuses
+                        // the same split and the command fails.
+                        format!("native command failed: can't find pane: {}", request.target),
                     );
                 }
                 let fields: Vec<_> = target.trim_end_matches('\n').split('\t').collect();
@@ -4006,7 +3994,7 @@ impl CoordinatorActions {
             return Self::reject_launch_before_dispatch(
                 &mut store,
                 &record,
-                format!("bridge_unavailable: {error}"),
+                bridge_unavailable(&error.to_string()),
             );
         }
         let mut intent = core_intent(&key, core_ticket);
@@ -4093,7 +4081,7 @@ impl CoordinatorActions {
                 )?;
                 return Err(match error {
                     Error::InvalidArgument(error) => error,
-                    Error::Busy(error) => format!("bridge_unavailable: {error}"),
+                    Error::Busy(error) => bridge_unavailable(&error),
                     error => format!("outcome_unknown: {error}"),
                 });
             }
@@ -4642,6 +4630,7 @@ impl CoordinatorActions {
         keys: &[String],
         tracked_digest: &str,
     ) -> Result<Value, String> {
+        validate_interrupt_keys(keys)?;
         let mut store = manager.operation_store().await?;
         let (ticket, key, recorded) = self
             .admit_durable(
@@ -4864,7 +4853,12 @@ impl CoordinatorActions {
                             &evidence,
                             "the bridge did not consume this interrupt ticket, but its durable receipt could not be committed",
                         )?;
-                        return Err(format!("bridge_unavailable: {error}"));
+                        if index != 0 {
+                            return Err(format!(
+                                "interrupt_partial: an earlier interrupt key reached the pane; {error}"
+                            ));
+                        }
+                        return Err(bridge_unavailable(&error.to_string()));
                     }
                     let evidence = json!({"error": error.to_string(), "path": "core_ledger"});
                     let partial = index != 0;
@@ -4887,10 +4881,10 @@ impl CoordinatorActions {
                         "the interrupt action ended without a durable result",
                     )?;
                     return Err(match error {
-                        Error::InvalidArgument(error) => error,
                         error if partial => format!(
                             "interrupt_partial: an earlier interrupt key reached the pane; {error}"
                         ),
+                        Error::InvalidArgument(error) => error,
                         error => format!("outcome_unknown: {error}"),
                     });
                 }
@@ -5010,7 +5004,7 @@ impl CoordinatorActions {
                         &evidence,
                         "the bridge did not consume this close ticket, but its durable receipt could not be committed",
                     )?;
-                    return Err(format!("bridge_unavailable: {error}"));
+                    return Err(bridge_unavailable(&error.to_string()));
                 }
                 let evidence = json!({"error": error.to_string(), "path": "core_ledger"});
                 if !matches!(&error, Error::InvalidArgument(_)) {
@@ -5262,7 +5256,6 @@ impl CoordinatorActions {
             let has_receipt = (current.state != super::operations::DISPATCHING
                 && current.state != UNKNOWN)
                 || has_ticket_receipt(&current, entry.ticket, &entry.operation_key);
-            let decision = reconcile_decision(has_receipt, &entry.result);
             let mut evidence = ledger_result_evidence(entry);
             launch_reconcile_receipt(&mut evidence, &current, &entry.result);
             let current = if is_two_step(&current) {
@@ -5300,9 +5293,7 @@ impl CoordinatorActions {
                         now_ms(),
                     )?,
                 }
-            } else if decision == ReconcileDecision::OutcomeUnknown
-                && current.state == super::operations::DISPATCHING
-            {
+            } else if !has_receipt && current.state == super::operations::DISPATCHING {
                 let state = prompt_core_state(&current, &entry.result).unwrap_or_else(|| {
                     match &entry.result {
                         LedgerResult::RejectedBeforeEffect { .. } if has_core_effect(&current) => {
@@ -6446,6 +6437,33 @@ fn parse_keys(value: Option<&Value>) -> Result<Vec<String>, String> {
     Ok(keys)
 }
 
+/// Busy means the core reserved no ticket and nothing was sent.
+fn keys_send_error(error: Error) -> String {
+    match error {
+        Error::InvalidArgument(error) => error,
+        Error::Busy(error) => bridge_unavailable(&error),
+        error => format!("outcome_unknown: {error}"),
+    }
+}
+
+/// The error text with the `bridge_unavailable` code once, whether or not
+/// the reason already carries the "bridge unavailable: " display prefix.
+fn bridge_unavailable(reason: &str) -> String {
+    let reason = reason
+        .strip_prefix("bridge unavailable: ")
+        .unwrap_or(reason);
+    format!("bridge_unavailable: {reason}")
+}
+
+fn validate_interrupt_keys(keys: &[String]) -> Result<(), String> {
+    if keys.len() > MAX_INTERRUPT_KEYS {
+        return Err(format!(
+            "invalid_argument: an interrupt takes at most {MAX_INTERRUPT_KEYS} keys"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_keys(keys: &[String]) -> Result<(), String> {
     if keys.len() > 64
         || keys.iter().map(String::len).sum::<usize>() > 8192
@@ -7516,33 +7534,6 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_never_resends_a_retained_ticket() {
-        let ticket = DispatchTicket { epoch: 4, seq: 9 };
-        let applied = LedgerResult::Applied {
-            ticket,
-            result_digest: "b".repeat(64),
-            queued_bytes: None,
-            launch: None,
-        };
-        let not_applied = LedgerResult::NotApplied {
-            ticket,
-            result_digest: "c".repeat(64),
-        };
-        assert_eq!(
-            reconcile_decision(true, &applied),
-            ReconcileDecision::Retire
-        );
-        assert_eq!(
-            reconcile_decision(false, &applied),
-            ReconcileDecision::OutcomeUnknown
-        );
-        assert_eq!(
-            reconcile_decision(false, &not_applied),
-            ReconcileDecision::OutcomeUnknown
-        );
-    }
-
-    #[test]
     fn staging_receipt_does_not_hide_an_applied_retry_with_the_same_ticket() {
         // input_begin failure consumes neither the ticket nor an input_commit
         // slot. A retry therefore gets a fresh operation key but can use the
@@ -7631,14 +7622,82 @@ mod tests {
         assert!(has_ticket_receipt(&record, ticket, &staged_key));
         assert!(!has_ticket_receipt(&record, ticket, &retry_key));
         assert_eq!(recorded_prompt_core_state(&record), None);
-        assert_eq!(
-            reconcile_decision(
-                has_ticket_receipt(&record, ticket, &retry_key),
-                &entry.result
-            ),
-            ReconcileDecision::OutcomeUnknown,
-        );
         assert_eq!(prompt_core_state(&record, &entry.result), Some("delivered"));
+    }
+
+    #[test]
+    fn bridge_unavailable_text_carries_the_code_once() {
+        let busy = Error::Busy("the core bridge stayed busy".into());
+        assert_eq!(
+            bridge_unavailable(&busy.to_string()),
+            "bridge_unavailable: the core bridge stayed busy"
+        );
+        assert_eq!(
+            bridge_unavailable("connecting timed out"),
+            "bridge_unavailable: connecting timed out"
+        );
+        assert_eq!(
+            keys_send_error(Error::Busy("stayed busy".into())),
+            "bridge_unavailable: stayed busy"
+        );
+        assert!(keys_send_error(Error::Lost("gone".into())).starts_with("outcome_unknown:"));
+    }
+
+    #[test]
+    fn an_interrupt_takes_at_most_four_keys() {
+        let keys = |count: usize| vec!["C-c".to_owned(); count];
+        assert!(validate_interrupt_keys(&keys(4)).is_ok());
+        let error = validate_interrupt_keys(&keys(5)).unwrap_err();
+        assert!(error.starts_with("invalid_argument:"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_request_leaves_the_connection_usable() {
+        let HeartbeatWriter {
+            mut far,
+            requests,
+            answers,
+            task: writer,
+        } = heartbeat_writer(None);
+        let (mut client, _frames, _received) = wired_test_client();
+        client.requests = requests;
+        let error = client
+            .format_digest(&"x".repeat(REQUEST_FRAME), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert!(!client.is_broken());
+        let call = client.call("ledger_epochs", json!({}));
+        let peer = async {
+            let frame = next_frame(&mut far).await.expect("the normal request");
+            assert_eq!(frame["kind"], "ledger_epochs");
+            let id = frame["request_id"].as_str().unwrap().to_owned();
+            answers
+                .send(Ok(
+                    json!({"v": 1, "kind": "ledger_epochs", "request_id": id}),
+                ))
+                .unwrap();
+            // The oversized request must never have reached the peer.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), read_value(&mut far, false))
+                    .await
+                    .is_err()
+            );
+            id
+        };
+        let (reply, id) = tokio::join!(call, peer);
+        let reply = reply.unwrap();
+        assert_eq!(reply["request_id"], id.as_str());
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_invalid_argument_and_writes_nothing() {
+        let mut sink = Vec::new();
+        let value = json!({"text": "x".repeat(REQUEST_FRAME)});
+        let error = write_value(&mut sink, &value).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert!(sink.is_empty());
     }
 
     #[test]

@@ -82,6 +82,14 @@ pub(crate) enum Spec {
     },
 }
 
+/// A number made only of ASCII digits: `parse` alone also takes a leading `+`.
+fn number<T: std::str::FromStr>(text: &str) -> Option<T> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
 fn field(text: &str, low: u32, high: u32, name: &str) -> Result<(BTreeSet<u32>, bool), String> {
     let invalid = || {
         format!(
@@ -92,7 +100,7 @@ fn field(text: &str, low: u32, high: u32, name: &str) -> Result<(BTreeSet<u32>, 
     let mut restricted = false;
     for part in text.split(',') {
         let (range, step) = match part.split_once('/') {
-            Some((range, step)) => (range, step.parse::<u32>().map_err(|_| invalid())?),
+            Some((range, step)) => (range, number::<u32>(step).ok_or_else(invalid)?),
             None => (part, 1),
         };
         if step == 0 {
@@ -104,11 +112,11 @@ fn field(text: &str, low: u32, high: u32, name: &str) -> Result<(BTreeSet<u32>, 
             restricted = true;
             match range.split_once('-') {
                 Some((a, b)) => (
-                    a.parse::<u32>().map_err(|_| invalid())?,
-                    b.parse::<u32>().map_err(|_| invalid())?,
+                    number::<u32>(a).ok_or_else(invalid)?,
+                    number::<u32>(b).ok_or_else(invalid)?,
                 ),
                 None => {
-                    let value = range.parse::<u32>().map_err(|_| invalid())?;
+                    let value = number::<u32>(range).ok_or_else(invalid)?;
                     // A single value with a step runs to the end, as in cron.
                     (value, if part.contains('/') { high } else { value })
                 }
@@ -134,9 +142,8 @@ impl Spec {
             return Self::cron(text);
         }
         if let Some(seconds) = stored.strip_prefix("every:") {
-            let seconds = seconds
-                .parse::<u64>()
-                .map_err(|_| format!("schedule_invalid: {stored}"))?;
+            let seconds =
+                number::<u64>(seconds).ok_or_else(|| format!("schedule_invalid: {stored}"))?;
             return Self::every_seconds(seconds);
         }
         Err(format!("schedule_invalid: {stored}"))
@@ -172,7 +179,7 @@ impl Spec {
         let invalid =
             || format!("schedule_invalid: interval {text:?}; use a number with s, m, h or d");
         let (at, unit) = text.char_indices().last().ok_or_else(invalid)?;
-        let number = text[..at].parse::<u64>().map_err(|_| invalid())?;
+        let count = number::<u64>(&text[..at]).ok_or_else(invalid)?;
         let scale = match unit {
             's' => 1,
             'm' => 60,
@@ -180,7 +187,7 @@ impl Spec {
             'd' => 86_400,
             _ => return Err(invalid()),
         };
-        Self::every_seconds(number.checked_mul(scale).ok_or_else(invalid)?)
+        Self::every_seconds(count.checked_mul(scale).ok_or_else(invalid)?)
     }
 
     fn every_seconds(seconds: u64) -> Result<Self, String> {
@@ -221,8 +228,27 @@ impl Spec {
                     let at = local(candidate);
                     let day = cron.day_matches(&at) && cron.months.contains(&at.month);
                     if !day {
-                        // Whole hours, so a zone change inside the day is seen.
-                        candidate += HOUR_MS - i64::from(at.minute) * MINUTE_MS;
+                        // Up to an hour before the next local midnight. A
+                        // clock that jumps forward by more than an hour in
+                        // the day can carry that step past the midnight, so
+                        // a step that lands on another local date is
+                        // replaced by the hourly one.
+                        let to_midnight =
+                            i64::from(24 - at.hour) * HOUR_MS - i64::from(at.minute) * MINUTE_MS;
+                        let hourly = HOUR_MS - i64::from(at.minute) * MINUTE_MS;
+                        let step = if to_midnight > HOUR_MS {
+                            let landed = local(candidate + to_midnight - HOUR_MS);
+                            if (landed.year, landed.month, landed.day)
+                                == (at.year, at.month, at.day)
+                            {
+                                to_midnight - HOUR_MS
+                            } else {
+                                hourly
+                            }
+                        } else {
+                            to_midnight
+                        };
+                        candidate += step;
                         continue;
                     }
                     if !cron.hours.contains(&at.hour) {
@@ -338,6 +364,10 @@ mod tests {
             "*/0 * * * *",
             "a * * * *",
             "5-1 * * * *",
+            "+5 * * * *",
+            "*/+5 * * * *",
+            "1-+5 * * * *",
+            "0 +9 * * *",
         ] {
             assert!(Spec::cron(bad).is_err(), "{bad}");
         }
@@ -346,6 +376,9 @@ mod tests {
         assert!(Spec::every("5x").is_err());
         assert!(Spec::every("30분").is_err());
         assert!(Spec::every("").is_err());
+        assert!(Spec::every("+5m").is_err());
+        assert!(Spec::parse("every:+300").is_err());
+        assert_eq!(Spec::parse("every:300"), Ok(Spec::Every { seconds: 300 }));
         assert!(Spec::every("213503982334602d").is_err());
     }
 
@@ -429,5 +462,73 @@ mod tests {
             spec.next_after(origin + 601_000, origin, &utc_local),
             Some(origin + 1_200_000)
         );
+    }
+
+    #[test]
+    fn a_sparse_expression_skips_whole_days() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let counted = |ms| {
+            calls.set(calls.get() + 1);
+            utc_local(ms)
+        };
+        let leap = Spec::cron("0 0 29 2 *").unwrap();
+        assert_eq!(
+            leap.next_after(utc(2026, 1, 1, 0, 0), 0, &counted),
+            Some(utc(2028, 2, 29, 0, 0))
+        );
+        assert!(calls.get() < 5_000, "{} lookups", calls.get());
+        // Ordinary expressions give the same instants as the hourly walk.
+        let ordinary = [
+            (
+                "0 9 * * 1-5",
+                utc(2026, 10, 2, 10, 0),
+                utc(2026, 10, 5, 9, 0),
+            ),
+            (
+                "30 23 31 * *",
+                utc(2026, 4, 1, 0, 0),
+                utc(2026, 5, 31, 23, 30),
+            ),
+            ("15 0 1 3 *", utc(2026, 3, 1, 0, 15), utc(2027, 3, 1, 0, 15)),
+            (
+                "59 23 * 12 *",
+                utc(2026, 10, 1, 0, 0),
+                utc(2026, 12, 1, 23, 59),
+            ),
+            ("0 0 13 * 5", utc(2026, 2, 1, 0, 0), utc(2026, 2, 6, 0, 0)),
+        ];
+        for (text, after, expected) in ordinary {
+            let spec = Spec::cron(text).unwrap();
+            assert_eq!(
+                spec.next_after(after, 0, &utc_local),
+                Some(expected),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_day_cut_short_by_two_hours_does_not_hide_the_next() {
+        // The clock jumps forward 2 h at 12:00 UTC on 2026-03-30, so that
+        // local day has 22 hours.
+        let jump = utc(2026, 3, 30, 12, 0);
+        let zone = |ms: i64| {
+            let offset = if ms >= jump { 7_200 } else { 0 };
+            fields(ms + offset * 1000, offset)
+        };
+        let spec = Spec::cron("0 0 31 3 *").unwrap();
+        let due = spec.next_after(utc(2026, 3, 29, 23, 59), 0, &zone).unwrap();
+        assert_eq!(zone(due).wall(), (2026, 3, 31, 0, 0));
+    }
+
+    #[test]
+    fn a_day_after_a_short_day_is_not_skipped() {
+        // 2026-03-08 has 23 hours in `shifting`; the 9th at 00:30 must be found.
+        let spec = Spec::cron("30 0 9 3 *").unwrap();
+        let due = spec
+            .next_after(utc(2026, 3, 7, 12, 0), 0, &shifting)
+            .unwrap();
+        assert_eq!(shifting(due).wall(), (2026, 3, 9, 0, 30));
     }
 }

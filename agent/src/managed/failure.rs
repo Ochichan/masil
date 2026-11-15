@@ -56,6 +56,7 @@ const CODES: &[(&str, Class)] = &[
     ("unsupported_action", Class::Refused),
     ("unsupported_kind", Class::Refused),
     ("binding_conflict", Class::Refused),
+    ("name_in_use", Class::Refused),
     ("store_newer", Class::Refused),
     ("store_replaced", Class::Refused),
     ("store_unsupported", Class::Refused),

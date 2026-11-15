@@ -1720,7 +1720,10 @@ impl Store {
 
         if let Some(record) = &existing_slot {
             if record.operation_key == key {
-                if record.digest != new.digest {
+                // As in `admit_in`: a slot masil numbered itself takes new
+                // content after a proven no-op (an edited queue body).
+                let rebind = RETRYABLE.contains(&record.state.as_str()) && !record.explicit;
+                if record.digest != new.digest && !rebind {
                     return Err("prompt operation was already used with different content".into());
                 }
                 if matches!(record.state.as_str(), DISPATCHING | UNKNOWN) {
@@ -2241,7 +2244,8 @@ impl Store {
         let old: bool = self
             .conn
             .query_row(
-                "SELECT EXISTS (SELECT 1 FROM operations WHERE state != ?1 AND updated_ms < ?2)",
+                "SELECT EXISTS (SELECT 1 FROM operations WHERE state != ?1 AND updated_ms < ?2
+                   AND compacted_ms IS NULL)",
                 params![DISPATCHING, now.saturating_sub(RETENTION_MS) as i64],
                 |row| row.get(0),
             )
@@ -3452,7 +3456,11 @@ impl Store {
 
     /// How sending went for claimed rows.
     pub fn notify_outcome(&mut self, rows: &[i64], outcome: &str) -> Result<(), String> {
-        let tx = self.conn.transaction().map_err(sql)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
         for row in rows {
             tx.execute(
                 "UPDATE notify_log SET outcome = ?2 WHERE id = ?1",
@@ -3724,26 +3732,37 @@ impl Store {
         result: &Value,
         now: u64,
     ) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE schedule_runs SET state = ?3, ended_ms = ?4, result = ?5
-                 WHERE schedule_id = ?1 AND due_ms = ?2 AND state = 'running'",
-                params![id, due_ms, state, now as i64, result.to_string()],
-            )
-            .map(drop)
-            .map_err(sql)
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        tx.execute(
+            "UPDATE schedule_runs SET state = ?3, ended_ms = ?4, result = ?5
+             WHERE schedule_id = ?1 AND due_ms = ?2 AND state = 'running'",
+            params![id, due_ms, state, now as i64, result.to_string()],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)
     }
 
     /// Runs a coordinator that ended left `running`: started before
     /// `before_ms`, their outcome is unknown. They are never run again.
     pub fn schedule_settle(&mut self, before_ms: u64, now: u64) -> Result<usize, String> {
-        self.conn
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let settled = tx
             .execute(
                 "UPDATE schedule_runs SET state = 'unknown', ended_ms = ?2
                  WHERE state = 'running' AND started_ms < ?1",
                 params![before_ms as i64, now as i64],
             )
-            .map_err(sql)
+            .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(settled)
     }
 
     /// Notification status read without creating or changing anything;
@@ -5447,6 +5466,181 @@ mod tests {
                 .digest,
             "d9"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_core_prompt_slot_proven_unused_takes_new_content_unless_explicit() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let auto = NewOperation {
+            id: "q5",
+            explicit: false,
+            ..request("d1")
+        };
+        let intent = json!({"slot": 1, "path": "core_ledger"});
+        let (admission, slot) = store
+            .admit_prompt(&auto, intent.clone(), 100, None, None)
+            .unwrap();
+        assert_eq!(slot, 1);
+        let first = dispatch(admission);
+        let record = store
+            .finish(&first, "not_applied", "fence", None, 101)
+            .unwrap();
+        store.note_prompt_result(&record).unwrap();
+        // The edited body has a new digest and rebinds the same key.
+        let edited = NewOperation {
+            digest: "d2",
+            ..auto
+        };
+        let (admission, slot) = store
+            .admit_prompt(&edited, intent.clone(), 102, None, None)
+            .unwrap();
+        assert_eq!(slot, 1);
+        let second = dispatch(admission);
+        let record = store
+            .finish(&second, "delivered", "core_ledger", None, 103)
+            .unwrap();
+        assert_eq!((record.digest.as_str(), record.attempts), ("d2", 2));
+        store.note_prompt_result(&record).unwrap();
+        // A client key keeps its content after a proven no-op.
+        let explicit = NewOperation {
+            id: "7",
+            explicit: true,
+            ..request("d1")
+        };
+        let (admission, slot) = store
+            .admit_prompt(
+                &explicit,
+                json!({"slot": 2, "path": "core_ledger"}),
+                110,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(slot, 2);
+        let record = store
+            .finish(&dispatch(admission), "not_applied", "fence", None, 111)
+            .unwrap();
+        store.note_prompt_result(&record).unwrap();
+        assert!(
+            store
+                .admit_prompt(
+                    &NewOperation {
+                        digest: "d2",
+                        ..explicit
+                    },
+                    json!({"slot": 2, "path": "core_ledger"}),
+                    112,
+                    None,
+                    None,
+                )
+                .unwrap_err()
+                .contains("different content")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_rebound_core_prompt_marks_its_queue_row_in_the_same_transaction() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let item = store
+            .queue_add("r1", "%1", "codex", "hello", &json!([]), 100)
+            .unwrap();
+        let id = format!("q{}", item.id);
+        let intent = json!({"slot": 1, "path": "core_ledger"});
+        let current = QueuedPrompt {
+            item: item.id,
+            revision: 1,
+            run: "r1",
+        };
+        let (admission, slot) = store
+            .admit_prompt(
+                &queued_request(&id, "d1"),
+                intent.clone(),
+                110,
+                None,
+                Some(&current),
+            )
+            .unwrap();
+        assert_eq!(slot, 1);
+        let ticket = dispatch(admission);
+        assert_eq!(
+            store.queue_item(item.id, 110).unwrap().unwrap().state(),
+            "sending"
+        );
+        let record = store
+            .finish(&ticket, "not_applied", "test", None, 120)
+            .unwrap();
+        store.note_prompt_result(&record).unwrap();
+        assert_eq!(
+            store.queue_item(item.id, 120).unwrap().unwrap().state(),
+            "staged"
+        );
+        let edited = store
+            .queue_change(
+                item.id,
+                Some(2),
+                "r1",
+                QueueChange::Body("hello again".into()),
+                130,
+            )
+            .unwrap();
+        // A stale revision admits nothing and leaves the record as it was.
+        let stale = QueuedPrompt {
+            revision: 1,
+            ..current
+        };
+        assert!(
+            store
+                .admit_prompt(
+                    &queued_request(&id, "d2"),
+                    intent.clone(),
+                    135,
+                    None,
+                    Some(&stale)
+                )
+                .unwrap_err()
+                .starts_with("queue_stale")
+        );
+        let again = QueuedPrompt {
+            revision: edited.revision,
+            ..current
+        };
+        let (admission, slot) = store
+            .admit_prompt(&queued_request(&id, "d2"), intent, 140, None, Some(&again))
+            .unwrap();
+        assert_eq!(slot, 1);
+        let ticket = dispatch(admission);
+        let sending = store.queue_item(item.id, 140).unwrap().unwrap();
+        assert_eq!(sending.state(), "sending");
+        assert_eq!(sending.revision, edited.revision + 1);
+        store
+            .finish(&ticket, "delivered", "test", None, 150)
+            .unwrap();
+        assert_eq!(
+            store.queue_item(item.id, 150).unwrap().unwrap().state(),
+            "sent"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_compacted_record_alone_does_not_make_needs_prune_true() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+        let ticket = dispatch(store.admit(&request("d1"), json!({}), 100).unwrap());
+        store
+            .finish(&ticket, "delivered", "test", None, 101)
+            .unwrap();
+        let now = 101 + RETENTION_MS + PRUNE_EVERY_MS;
+        assert!(store.needs_prune(now).unwrap());
+        store
+            .conn
+            .execute("UPDATE operations SET compacted_ms = 102", [])
+            .unwrap();
+        assert!(!store.needs_prune(now).unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 

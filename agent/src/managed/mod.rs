@@ -1018,7 +1018,7 @@ impl Manager {
     /// The inventory and the text of `list-panes` it was parsed from.
     async fn inventory_text(&self) -> Result<(Vec<Vec<String>>, String), String> {
         let output = self.command(&["list-panes", "-a", "-F", FORMAT]).await?;
-        let records = records(&output)?;
+        let records = distinct_panes(records(&output)?);
         if records.len() > MAX_PANES {
             return Err("agent management supports at most 64 panes per server".into());
         }
@@ -1262,7 +1262,7 @@ impl Manager {
         } else {
             (output.as_str(), "")
         };
-        let inventory = records(listing)?;
+        let inventory = distinct_panes(records(listing)?);
         if inventory.len() > MAX_PANES {
             return Err("agent management supports at most 64 panes per server".into());
         }
@@ -1516,10 +1516,7 @@ impl Manager {
             if dead {
                 state = "exited".into();
             }
-            let process_epoch = (foreground_group > 1)
-                .then(|| crate::process::info(foreground_group))
-                .flatten()
-                .map(|info| format!("{foreground_group}:{}", info.started));
+            let process_epoch = process_epoch(foreground_group);
             let previous = decode::<Tracked>(&fields[12]).unwrap_or_default();
             let (synthetic, epoch_record) = unmanaged_run(
                 &format!(
@@ -1660,6 +1657,7 @@ impl Manager {
             };
             let epoch_write = epoch_record.map(|record| Self::option(&agent, EPOCH, record));
             let mut hold_write = Vec::new();
+            let mut hold_guard = None;
             if let (true, Some(mut metadata), Some(mut evidence)) = (
                 hold_ended,
                 agent.metadata.clone(),
@@ -1670,6 +1668,13 @@ impl Manager {
                 })
                 && end_turn_hold(&mut metadata, &mut evidence)
             {
+                // The group below holds only while the evidence is the text
+                // this pass read, so a request a hook recorded meanwhile is
+                // not overwritten. A refused group is tried again next pass.
+                hold_guard = evidence_unchanged(
+                    Some(fields[16].as_str())
+                        .filter(|raw| raw.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                );
                 let encoded = encode(&metadata)?;
                 hold_write.push(Self::option(&agent, META, encoded.clone()));
                 hold_write.push(Self::option(&agent, EVIDENCE, encode(&evidence)?));
@@ -1679,7 +1684,10 @@ impl Manager {
                 let encoded = encode(&agent.tracked)?;
                 tracked_groups.push((
                     agent.pane_id.clone(),
-                    identity_guard(&agent),
+                    match hold_guard {
+                        Some(unchanged) => and(&[identity_guard(&agent), unchanged]),
+                        None => identity_guard(&agent),
+                    },
                     std::iter::once(Self::option(&agent, TRACKED, encoded.clone()))
                         .chain(hold_write)
                         .chain(epoch_write)
@@ -1925,7 +1933,7 @@ impl Manager {
             .native
             .guarded_script(
                 &agent.pane_id,
-                &identity_guard(agent),
+                &run_guard(agent),
                 &[command],
                 "masil-agent-stale",
             )
@@ -1936,6 +1944,26 @@ impl Manager {
             return Err("identity_mismatch: agent run changed before reading".into());
         }
         Ok(text)
+    }
+
+    /// `guarded`, once more against a fresh read when only the tracked state
+    /// moved. `build` makes the commands from the agent it is given.
+    async fn guarded_same_run(
+        &self,
+        agent: &Agent,
+        build: impl Fn(&Agent) -> Result<Vec<Vec<String>>, String>,
+    ) -> Result<(), String> {
+        let error = match self.guarded(agent, build(agent)?).await {
+            Err(error) if error.starts_with("identity_mismatch:") => error,
+            result => return result,
+        };
+        let Ok(fresh) = self.get(&agent.pane_id).await else {
+            return Err(error);
+        };
+        if !same_run(agent, &fresh) {
+            return Err(error);
+        }
+        self.guarded(&fresh, build(&fresh)?).await
     }
 
     async fn guarded(&self, agent: &Agent, commands: Vec<Vec<String>>) -> Result<(), String> {
@@ -2185,7 +2213,7 @@ impl Manager {
         agent
             .session_id
             .as_deref()
-            .ok_or_else(|| "no native session reference was reported".into())
+            .ok_or_else(|| "unsupported_action: no native session reference was reported".into())
     }
 
     fn option(agent: &Agent, key: &str, value: String) -> Vec<String> {
@@ -2202,22 +2230,24 @@ impl Manager {
     pub async fn rename(&self, agent: &Agent, name: &str) -> Result<(), String> {
         let _lock = self.lock()?;
         self.unique_name(name, Some(&agent.pane_id)).await?;
-        let mut metadata = agent.metadata.clone().unwrap_or_else(|| Metadata {
-            provider: agent.provider.clone(),
-            boot: agent.boot.clone(),
-            generation: agent.generation.clone(),
-            run: agent.run.clone(),
-            foreground_group: agent.foreground_group,
-            ..Metadata::default()
-        });
-        metadata.name = name.into();
-        self.guarded(agent, vec![Self::option(agent, META, encode(&metadata)?)])
-            .await
+        self.guarded_same_run(agent, |agent| {
+            let mut metadata = agent.metadata.clone().unwrap_or_else(|| Metadata {
+                provider: agent.provider.clone(),
+                boot: agent.boot.clone(),
+                generation: agent.generation.clone(),
+                run: agent.run.clone(),
+                foreground_group: agent.foreground_group,
+                ..Metadata::default()
+            });
+            metadata.name = name.into();
+            Ok(vec![Self::option(agent, META, encode(&metadata)?)])
+        })
+        .await
     }
 
     async fn unique_name(&self, name: &str, except: Option<&str>) -> Result<(), String> {
         if !valid_name(name) {
-            return Err("name must begin with a lowercase letter and use 1–32 lowercase letters, digits, '-' or '_'".into());
+            return Err("invalid_argument: name must begin with a lowercase letter and use 1–32 lowercase letters, digits, '-' or '_'".into());
         }
         if self
             .list()
@@ -2225,7 +2255,7 @@ impl Manager {
             .iter()
             .any(|a| a.name == name && Some(a.pane_id.as_str()) != except)
         {
-            return Err("agent name already exists".into());
+            return Err("name_in_use: agent name already exists".into());
         }
         Ok(())
     }
@@ -2258,9 +2288,9 @@ impl Manager {
             providers::find(provider).ok_or("unknown_provider: unknown agent provider")?;
         let cwd = cwd
             .canonicalize()
-            .map_err(|e| format!("working directory: {e}"))?;
+            .map_err(|e| format!("invalid_argument: working directory: {e}"))?;
         if !cwd.is_dir() {
-            return Err("working directory is not a directory".into());
+            return Err("invalid_argument: working directory is not a directory".into());
         }
         validate_args(args)?;
         if let Some(target) = split {
@@ -2284,8 +2314,8 @@ impl Manager {
         }
         let cwd_identity = {
             use std::os::unix::fs::MetadataExt;
-            let metadata =
-                std::fs::metadata(&cwd).map_err(|error| format!("working directory: {error}"))?;
+            let metadata = std::fs::metadata(&cwd)
+                .map_err(|error| format!("invalid_argument: working directory: {error}"))?;
             (metadata.dev(), metadata.ino())
         };
         let worktree = crate::worktree::detect(&cwd)?;
@@ -2465,6 +2495,9 @@ impl Manager {
             }
             return launched;
         }
+        // The name, the directory, the environment values and the provider's
+        // arguments are data: none of them may end the command.
+        let command = command.into_iter().map(command_word_os);
         let result = match self.native.tmux(command, None).await {
             Ok(result) => result,
             Err(error) => {
@@ -2682,7 +2715,7 @@ impl Manager {
     /// the agent.
     pub async fn acknowledge(&self, agent: &Agent, through: Through) -> Result<(), String> {
         if agent.state != "blocked" && !agent.returned_idle {
-            return Err("agent has no observed attention request".into());
+            return Err("unsupported_action: agent has no observed attention request".into());
         }
         let mut tracked = agent.tracked.clone();
         tracked.seen = true;
@@ -2851,7 +2884,7 @@ impl Manager {
         origin: ReportOrigin<'_>,
     ) -> Result<ReportResult, String> {
         if !["idle", "working", "blocked", "unknown"].contains(&state) {
-            return Err("invalid agent state".into());
+            return Err("invalid_argument: invalid agent state".into());
         }
         self.report_inner(agent, sequence, Some(state), session, origin)
             .await
@@ -2881,7 +2914,8 @@ impl Manager {
             return Err("identity_mismatch: stale agent report".into());
         }
         // The coordinator numbers its reports by when it writes them; a
-        // callback that started before that still binds its session.
+        // callback that started before that still binds its session. The
+        // META guard proves `agent`'s copy of this pair current at write time.
         let observed = metadata.report.as_ref().is_some_and(|report| {
             agent
                 .run_evidence
@@ -2898,14 +2932,11 @@ impl Manager {
         {
             return Err(REPORT_STALE.into());
         }
-        let mut evidence = agent
-            .run_evidence
-            .clone()
-            .filter(|e| e.run == metadata.run)
-            .unwrap_or_else(|| RunEvidence {
-                run: metadata.run.clone(),
-                ..RunEvidence::default()
-            });
+        // The base of the write is read here, not taken from `agent`: a hook
+        // that recorded a request since `agent` was read must not lose it to
+        // this write, which holds only while the evidence is still the text
+        // read now.
+        let (mut evidence, raw) = self.evidence_now(&metadata.run, &agent.pane_id).await?;
         let now = now_ms();
         let mut binding = None;
         let mut registry_note = false;
@@ -2992,7 +3023,7 @@ impl Manager {
                     Self::option(agent, META, encode(&metadata)?),
                     Self::option(agent, EVIDENCE, encode(&evidence)?),
                 ],
-                None,
+                evidence_unchanged(raw.as_deref()).as_deref(),
             )
             .await?;
         if matches!(outcome, Guarded::Rejected) {
@@ -3078,6 +3109,10 @@ impl Manager {
         {
             return Ok(());
         }
+        // The write is guarded on META and TRACKED only. Both turn events
+        // clear every open request, so a request another hook recorded while
+        // this report was in flight is cleared with the others. Keeping the
+        // requests newer than the turn event is an open design question.
         match report {
             TurnReport::Begin { marker } => {
                 metadata.report = Some(Report {
@@ -3136,6 +3171,32 @@ impl Manager {
         Ok(())
     }
 
+    /// The run's evidence as the pane holds it now, with the encoded text it
+    /// was decoded from. A guard that compares the option with that text
+    /// (`evidence_unchanged`) holds only until another writer changes it.
+    /// Evidence that does not decode reads as a default record. When the text
+    /// is not hex it cannot go into a guard, so no text is returned and the
+    /// writer writes under the identity guard alone, which rewrites the option.
+    async fn evidence_now(
+        &self,
+        run: &str,
+        pane: &str,
+    ) -> Result<(RunEvidence, Option<String>), String> {
+        let raw = self
+            .pane_values(pane, &[EVIDENCE])
+            .await?
+            .pop()
+            .unwrap_or_default();
+        let hex = raw.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let evidence = decode::<RunEvidence>(&raw)
+            .filter(|evidence| evidence.run == run)
+            .unwrap_or_else(|| RunEvidence {
+                run: run.to_owned(),
+                ..RunEvidence::default()
+            });
+        Ok((evidence, hex.then_some(raw)))
+    }
+
     /// Sets the run's open-request list (`RunEvidence::requests`) to what
     /// `next` makes of the list the pane holds now. The write holds only
     /// while the evidence is still the text read here, so two hooks never
@@ -3149,32 +3210,21 @@ impl Manager {
         if agent.metadata.is_none() || agent.process != "running" {
             return Err("identity_mismatch: stale agent report".into());
         }
-        let raw = self
-            .pane_values(&agent.pane_id, &[EVIDENCE])
-            .await?
-            .pop()
-            .unwrap_or_default();
-        // The text goes into a guard format as it is.
-        if !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let (mut evidence, raw) = self.evidence_now(&agent.run, &agent.pane_id).await?;
+        // Without the text there is nothing to compare; this writer needs it.
+        let Some(raw) = raw else {
             return Err("invalid_argument: run evidence is not encoded".into());
-        }
-        let mut evidence = decode::<RunEvidence>(&raw)
-            .filter(|evidence| evidence.run == agent.run)
-            .unwrap_or_else(|| RunEvidence {
-                run: agent.run.clone(),
-                ..RunEvidence::default()
-            });
+        };
         let requests = next(&evidence.requests);
         if requests == evidence.requests {
             return Ok(false);
         }
         evidence.requests = requests;
-        let unchanged = format!("#{{==:#{{{EVIDENCE}}},{raw}}}");
         let outcome = self
             .guarded_input_outcome(
                 agent,
                 vec![Self::option(agent, EVIDENCE, encode(&evidence)?)],
-                Some(&unchanged),
+                Some(&format!("#{{==:#{{{EVIDENCE}}},{raw}}}")),
             )
             .await?;
         if matches!(outcome, Guarded::Rejected) {
@@ -3201,7 +3251,7 @@ impl Manager {
         if metadata.run != agent.run || agent.process != "running" {
             return Err("identity_mismatch: stale agent report".into());
         }
-        let mut evidence = agent
+        let evidence = agent
             .run_evidence
             .clone()
             .filter(|e| e.run == metadata.run)
@@ -3235,6 +3285,10 @@ impl Manager {
         if unchanged {
             return Ok(false);
         }
+        // The copy above only decides whether to write. The write builds on
+        // the evidence the pane holds now, so a request a hook recorded since
+        // is kept, and holds only while that text is unchanged.
+        let (mut evidence, raw) = self.evidence_now(&metadata.run, &agent.pane_id).await?;
         // Callbacks number reports by their start time in nanoseconds.
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3258,7 +3312,7 @@ impl Manager {
                     Self::option(agent, META, encoded.clone()),
                     Self::option(agent, EVIDENCE, encode(&evidence)?),
                 ],
-                None,
+                evidence_unchanged(raw.as_deref()).as_deref(),
             )
             .await?;
         if matches!(outcome, Guarded::Rejected) {
@@ -3273,25 +3327,50 @@ impl Manager {
     }
 
     /// Records once per run that its prompt hook works (capability
-    /// `provider_ack`). Best effort.
+    /// `provider_ack`). Best effort. The write holds only while the evidence
+    /// is the text read here; a write another hook beat is tried again on a
+    /// fresh read, twice.
     pub(super) async fn note_prompt_hook(&self, agent: &Agent) {
-        let mut evidence = agent
+        // Most prompts find the mark already set: no read for those.
+        if agent
             .run_evidence
-            .clone()
+            .as_ref()
             .filter(|e| e.run == agent.run)
-            .unwrap_or_else(|| RunEvidence {
-                run: agent.run.clone(),
-                ..RunEvidence::default()
-            });
-        let seen = evidence.integration.get_or_insert_with(Default::default);
-        if seen.prompt {
+            .and_then(|e| e.integration.as_ref())
+            .is_some_and(|seen| seen.prompt)
+        {
             return;
         }
-        seen.prompt = true;
-        if let Ok(encoded) = encode(&evidence) {
-            let _ = self
-                .guarded_input_outcome(agent, vec![Self::option(agent, EVIDENCE, encoded)], None)
-                .await;
+        let mut agent = agent.clone();
+        for attempt in 0..3 {
+            let Ok((mut evidence, raw)) = self.evidence_now(&agent.run, &agent.pane_id).await
+            else {
+                return;
+            };
+            let seen = evidence.integration.get_or_insert_with(Default::default);
+            if seen.prompt {
+                return;
+            }
+            seen.prompt = true;
+            let Ok(encoded) = encode(&evidence) else {
+                return;
+            };
+            match self
+                .guarded_input_outcome(
+                    &agent,
+                    vec![Self::option(&agent, EVIDENCE, encoded)],
+                    evidence_unchanged(raw.as_deref()).as_deref(),
+                )
+                .await
+            {
+                Ok(Guarded::Rejected) if attempt < 2 => {}
+                _ => return,
+            }
+            // The guard also covers the metadata and tracked state.
+            match self.get(&agent.pane_id).await {
+                Ok(fresh) if fresh.run == agent.run && fresh.process == "running" => agent = fresh,
+                _ => return,
+            }
         }
     }
 
@@ -3559,7 +3638,7 @@ impl Agent {
             (blocked && permissions == 0 && questions == 0) || (!blocked && self.returned_idle),
         );
         let mut projection = json!({"id":self.id,"source_id":self.provider,"session_id":self.session_id.as_deref().unwrap_or("unverified"),"pane_id":self.pane_id,
-            "native":{"exists":self.process=="running","activity":if ["idle","working"].contains(&self.state.as_str()){self.state.as_str()}else{"unknown"},"attention":attention,"permission_count":permissions,"question_count":questions,"pending_count":pending,"freshness":"fresh","observed_at_ms":now_ms()},
+            "native":{"exists":self.process=="running","activity":if ["idle","working","blocked"].contains(&self.state.as_str()){self.state.as_str()}else{"unknown"},"attention":attention,"permission_count":permissions,"question_count":questions,"pending_count":pending,"freshness":"fresh","observed_at_ms":now_ms()},
             "core":{"process":self.process,"pty_generation":self.generation,"freshness":"fresh"},"binding":self.binding_label(),"frontend_verified":false,
             "attention":{"revision":self.revision,"acknowledged":self.seen,"pending":self.state=="blocked"||self.returned_idle,"available":self.state=="blocked"||self.returned_idle},
             "capabilities":{"read":true,"input":false,"approval":false,"completion":false,"child_aggregation":false}});
@@ -3979,6 +4058,20 @@ fn format_literal_path(path: &Path) -> OsString {
     OsString::from_vec(bytes)
 }
 
+/// `session::command_word` for an argument that may not be UTF-8: tmux ends
+/// a command at an argument that ends in ';' and reads a final "\;" as a
+/// literal ';'.
+fn command_word_os(arg: OsString) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    if !arg.as_bytes().ends_with(b";") {
+        return arg;
+    }
+    let mut bytes = arg.into_vec();
+    bytes.pop();
+    bytes.extend_from_slice(b"\\;");
+    OsString::from_vec(bytes)
+}
+
 fn valid_boot(boot: &str) -> Result<&str, String> {
     if boot.len() != 36
         || !boot.bytes().enumerate().all(|(i, b)| {
@@ -4032,6 +4125,38 @@ fn same_run(before: &Agent, after: &Agent) -> bool {
         && before.foreground_group == after.foreground_group
         && before.process_epoch == after.process_epoch
         && after.process == "running"
+}
+
+/// The run alone: boot, pty generation and foreground group, without the
+/// metadata and tracked state that observation rewrites.
+fn run_guard(agent: &Agent) -> String {
+    and(&[
+        format!("#{{==:#{{masil_core_boot_id}},{}}}", agent.boot),
+        format!("#{{==:#{{masil_pty_generation}},{}}}", agent.generation),
+        format!(
+            "#{{==:#{{masil_foreground_pgid}},{}}}",
+            if agent.foreground_group > 0 {
+                agent.foreground_group.to_string()
+            } else {
+                String::new()
+            }
+        ),
+    ])
+}
+
+/// A guard condition: the run evidence option still holds `raw`. `None`
+/// when there is no text to compare (see `Manager::evidence_now`).
+///
+/// The condition carries the whole evidence text a second time. An option
+/// value is at most 16384 hex characters (`encode` refuses more than 8192
+/// bytes), so a write of META and EVIDENCE under the identity guard (META and
+/// TRACKED) plus this condition can in the worst legal case hold five such
+/// values, about 80 KiB, against `MAX_SCRIPT` of 64 KiB. That worst case does
+/// not fit and `source_script` would refuse it. Real records are far smaller:
+/// the largest the tests build (`run_evidence_stays_within_the_option_limit`)
+/// encodes to 9112 characters, so five such values are about 45 KiB and fit.
+fn evidence_unchanged(raw: Option<&str>) -> Option<String> {
+    raw.map(|raw| format!("#{{==:#{{{EVIDENCE}}},{raw}}}"))
 }
 
 fn identity_guard(agent: &Agent) -> String {
@@ -4165,6 +4290,15 @@ fn records(text: &str) -> Result<Vec<Vec<String>>, String> {
         return Err("truncated native inventory".into());
     }
     Ok(rows)
+}
+
+/// One row per pane ID: a linked window lists its panes once per session,
+/// and the pane limit counts panes.
+fn distinct_panes(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let mut seen = HashSet::new();
+    rows.into_iter()
+        .filter(|fields| seen.insert(fields[0].clone()))
+        .collect()
 }
 
 fn validate_inventory(inventory: &[Vec<String>]) -> Result<(), String> {
@@ -4316,6 +4450,14 @@ fn split_store_line(output: &str) -> Result<(&str, &str), String> {
     Ok((listing, recorded))
 }
 
+/// The foreground group and when it started, so a reused group ID differs.
+fn process_epoch(group: i32) -> Option<String> {
+    (group > 1)
+        .then(|| crate::process::info(group))
+        .flatten()
+        .map(|info| format!("{group}:{}", info.started))
+}
+
 /// An agent from its inventory row alone, as `get_identity` returns it. The
 /// run, process and process epoch are judged as `collect_once` judges them;
 /// what only the screen could tell is a placeholder.
@@ -4328,10 +4470,7 @@ fn identity_agent(
     let dead = fields[4] == "1";
     let foreground = identified.is_some_and(|p| p.id == provider.id);
     let foreground_group = fields[13].parse::<i32>().unwrap_or(0);
-    let process_epoch = (foreground_group > 1)
-        .then(|| crate::process::info(foreground_group))
-        .flatten()
-        .map(|info| format!("{foreground_group}:{}", info.started));
+    let process_epoch = process_epoch(foreground_group);
     // The recorded epoch is part of the run of an agent masil did not start.
     let (synthetic, _) = unmanaged_run(
         &format!(
@@ -4475,7 +4614,7 @@ fn run_of(base: &str, run: &str) -> bool {
 /// `versions/2.1.289`).
 fn identify_args(args: &str) -> Option<&'static providers::Provider> {
     providers::identify(args).or_else(|| {
-        providers::split_command(args).and_then(|argv| providers::identify_process(&argv))
+        providers::split_process_args(args).and_then(|argv| providers::identify_process(&argv))
     })
 }
 
@@ -5516,6 +5655,31 @@ mod tests {
     }
 
     #[test]
+    fn the_evidence_guard_compares_the_option_with_the_text_read() {
+        // Writers of the evidence name the text they built on, so a write
+        // another hook got in before is refused (a lost open request).
+        assert_eq!(
+            evidence_unchanged(Some("0a1b")).as_deref(),
+            Some("#{==:#{@masil-agent-run-evidence},0a1b}")
+        );
+        // An empty option reads as the empty text.
+        assert_eq!(
+            evidence_unchanged(Some("")).as_deref(),
+            Some("#{==:#{@masil-agent-run-evidence},}")
+        );
+        // Text that cannot go into a guard leaves the identity guard alone.
+        assert_eq!(evidence_unchanged(None), None);
+        let both = and(&[
+            "#{==:a,b}".into(),
+            evidence_unchanged(Some("0a1b")).unwrap(),
+        ]);
+        assert_eq!(
+            both,
+            "#{&&:#{==:a,b},#{==:#{@masil-agent-run-evidence},0a1b}}"
+        );
+    }
+
+    #[test]
     fn run_evidence_stays_within_the_option_limit() {
         let (mut metadata, mut evidence) = requested(&"s".repeat(512));
         apply_binding(
@@ -5764,6 +5928,18 @@ mod tests {
         assert_eq!(
             format_literal_path(Path::new("/plain")),
             OsString::from("/plain")
+        );
+    }
+
+    #[test]
+    fn launch_words_cannot_end_the_command() {
+        for (given, sent) in [("echo hi;", "echo hi\\;"), (";", "\\;"), ("a;b", "a;b")] {
+            assert_eq!(command_word_os(given.into()), OsString::from(sent));
+        }
+        use std::os::unix::ffi::OsStringExt;
+        assert_eq!(
+            command_word_os(OsString::from_vec(vec![0xff, b';'])),
+            OsString::from_vec(vec![0xff, b'\\', b';'])
         );
     }
 

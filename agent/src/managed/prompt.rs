@@ -882,11 +882,12 @@ impl Manager {
                                    "operation_key": ticket.key, "path": "native_guard"})
                         }))
                 }
+                // The guard failed, so the else branch ran and nothing was sent.
                 Ok(Guarded::Rejected) => {
                     let _ =
                         store.finish(&ticket, "rejected_before_effect", "guard", None, now_ms());
                     Err(format!(
-                        "rejected_before_effect: prompt operation {operation} was rejected or its delivery is unknown: agent foreground or run changed before input delivery; query prompt-receipt before retrying"
+                        "rejected_before_effect: prompt operation {operation} was rejected: the pane or agent state changed before input delivery; nothing was sent"
                     ))
                 }
                 Err(error) => {

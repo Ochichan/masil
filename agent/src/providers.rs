@@ -656,6 +656,14 @@ fn normalize_name(value: &str) -> String {
     basename
 }
 
+/// Splits the `ps -o args=` text of a running process. The shell already
+/// removed any quoting, so quotes and `;|&<>` are ordinary characters here;
+/// arguments that contain spaces cannot be recovered and split into words.
+pub(crate) fn split_process_args(args: &str) -> Option<Vec<String>> {
+    let argv: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+    (!argv.is_empty()).then_some(argv)
+}
+
 pub(crate) fn split_command(command: &str) -> Option<Vec<String>> {
     if command.is_empty() || command.len() > 8192 || command.chars().any(char::is_control) {
         return None;
@@ -726,6 +734,20 @@ mod tests {
         assert!(!is_runtime("claude"));
         assert_eq!(find("qodercn").map(|p| p.id), Some("qodercli"));
         assert_eq!(find("muse-cli").map(|p| p.id), Some("muse"));
+    }
+
+    #[test]
+    fn process_args_split_on_whitespace_only() {
+        let argv =
+            split_process_args("/opt/bin/claude --append-system-prompt don't stop; a>b | c &")
+                .unwrap();
+        assert_eq!(argv[0], "/opt/bin/claude");
+        assert_eq!(argv[2], "don't");
+        assert_eq!(argv.len(), 8);
+        assert_eq!(identify_process(&argv).map(|p| p.id), Some("claude"));
+        assert!(split_command("claude --x don't").is_none());
+        assert!(split_command("claude a;b").is_none());
+        assert!(split_process_args("  ").is_none());
     }
 
     #[test]

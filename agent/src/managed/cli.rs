@@ -70,6 +70,15 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
         command,
         std::env::var_os("MASIL_API_CALL").is_some(),
     ));
+    if endpoint.is_some()
+        && (command == "providers"
+            || (command == "capabilities"
+                && rest.first().map(String::as_str) == Some("--provider")))
+    {
+        return Err(format!(
+            "usage: {command} is not available with --endpoint; see masil-agent agent --help"
+        ));
+    }
     if command == "providers" && rest.is_empty() {
         print(
             &json!({"providers":providers::all().iter().map(|p|json!({"id":p.id,"command":p.command,"aliases":p.aliases,"resume":providers::resume(p.id,"example").is_ok(),"integration":super::integration::target_capability(p.id)})).collect::<Vec<_>>()}),
@@ -492,7 +501,7 @@ pub(super) fn answer_reply(args: &[String]) -> Result<super::answer::Reply, Stri
         i += 2;
     }
     Ok(match (choice, answers.is_empty(), reject) {
-        (Some("once"), true, false) => super::answer::Reply::Once,
+        (Some("once"), true, false) if message.is_none() => super::answer::Reply::Once,
         (Some("always"), true, false) if message.is_none() => super::answer::Reply::Always,
         (Some("reject"), true, false) => super::answer::Reply::Reject { message },
         (None, false, false) if message.is_none() => super::answer::Reply::Answers(answers),
@@ -501,13 +510,13 @@ pub(super) fn answer_reply(args: &[String]) -> Result<super::answer::Reply, Stri
             return Err("invalid_argument: --choice is once, always or reject".into());
         }
         _ => {
-            return Err("usage: answer TARGET REQUEST --choice once|always|reject [--message TEXT] | --answer TEXT... | --reject".into());
+            return Err("usage: answer TARGET REQUEST --choice once|always | --choice reject [--message TEXT] | --answer TEXT... | --reject".into());
         }
     })
 }
 
 fn queue_usage() -> String {
-    "usage: queue TARGET [show ID | add TEXT [--attach PATH]... | add --from ID | edit ID TEXT | attach ID PATH | detach ID N | move ID POSITION | remove ID | send [ID]] [--revision N] | queue --held [remove ID]".to_owned()
+    "usage: queue TARGET [show ID | add TEXT [--attach PATH]... | add --from ID | edit ID TEXT | attach ID PATH | detach ID N | move ID POSITION | remove ID | send [ID]] [--revision N (edit|attach|detach|move|remove|send only)] | queue --held [remove ID]".to_owned()
 }
 
 /// `--revision N` may come anywhere after the target.
@@ -534,6 +543,9 @@ async fn queue_command(manager: &Manager, args: &[String]) -> Result<i32, String
     let number = |text: &str| text.parse::<i64>().map_err(|_| queue_usage());
     if words.first() == Some(&"--held") {
         return match words[1..] {
+            [] if revision.is_some() => {
+                Err("usage: --revision applies to edit|attach|detach|move|remove|send".to_owned())
+            }
             [] => print(&manager.queue_held().await?).map(|()| 0),
             ["remove", id] => {
                 print(&manager.queue_remove(number(id)?, revision).await?).map(|()| 0)
@@ -569,6 +581,14 @@ pub(super) async fn queue_words(
 ) -> Result<(Value, bool), String> {
     let usage = queue_usage;
     let (revision, words) = queue_revision(args)?;
+    if revision.is_some()
+        && !matches!(
+            words.first().copied(),
+            Some("edit" | "attach" | "detach" | "move" | "remove" | "send")
+        )
+    {
+        return Err("usage: --revision applies to edit|attach|detach|move|remove|send".to_owned());
+    }
     let number = |text: &str| text.parse::<i64>().map_err(|_| usage());
     let absolute = |path: &str| {
         if base.is_none() && !std::path::Path::new(path).is_absolute() {
@@ -856,6 +876,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             } else {
                 print(&json!({
                     "pane_id":agent.pane_id,
+                    "run":agent.run,
                     "provider":agent.provider,
                     "state":agent.state,
                     "evidence":agent.evidence,
@@ -926,7 +947,9 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
         "rename" | "attach" if args.len() == 2 => {
             let agent = manager.get(&args[0]).await?;
             manager.rename(&agent, &args[1]).await?;
-            print(&json!({"stage":"registered","pane_id":agent.pane_id,"name":args[1]}))?;
+            print(
+                &json!({"stage":"registered","pane_id":agent.pane_id,"run":agent.run,"name":args[1]}),
+            )?;
         }
         "focus" if args.len() == 1 => {
             let agent = manager.get(&args[0]).await?;
@@ -1114,7 +1137,9 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             manager
                 .acknowledge(&agent, super::Through::Before(read_at))
                 .await?;
-            print(&json!({"stage":"seen","revision":agent.revision}))?;
+            print(
+                &json!({"stage":"seen","pane_id":agent.pane_id,"run":agent.run,"revision":agent.revision}),
+            )?;
         }
         "send-keys" if args.len() >= 2 => {
             let agent = manager.get(&args[0]).await?;
@@ -1274,9 +1299,13 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             manager.reload()?;
             let socket = manager.native.socket.clone();
             let _ = tokio::task::spawn_blocking(move || crate::coordinator::reload(&socket)).await;
-            print(
-                &json!({"stage":"manifests_validated","note":"new commands and views load current overrides"}),
-            )?;
+            let mut receipt = json!({"stage":"manifests_validated","note":"new commands and views load current overrides"});
+            // An override file whose name matches no provider is not read.
+            let warnings = manager.engine.override_warnings();
+            if !warnings.is_empty() {
+                receipt["warnings"] = json!(warnings);
+            }
+            print(&receipt)?;
         }
         _ => {
             return Err(format!(
@@ -2123,6 +2152,16 @@ async fn wait_closed_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_once_rejects_a_message() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert!(answer_reply(&words("--choice once")).is_ok());
+        let Err(error) = answer_reply(&words("--choice once --message hi")) else {
+            panic!("once with a message was accepted");
+        };
+        assert!(error.starts_with("usage:"), "{error}");
+    }
 
     #[test]
     fn only_list_and_get_in_their_plain_forms_go_to_the_coordinator() {

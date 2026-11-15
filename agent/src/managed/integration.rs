@@ -397,7 +397,7 @@ fn artifact(path: &std::path::Path, mode: &str, content: &str) -> Value {
 
 fn shell_bridge(provider: &str, executable: &str) -> String {
     format!(
-        "#!/bin/sh\n# masil generated bridge for {provider}; provider configuration is not installed.\nset -eu\n[ -n \"${{TMUX_PANE:-}}\" ] || exit 64\n[ -n \"${{MASIL_AGENT_RUN:-}}\" ] || exit 64\nexec {binary} agent integration hook {provider} \"${{1:-}}\"\n",
+        "#!/bin/sh\n# masil generated bridge for {provider}; provider configuration is not installed.\n# Outside a masil-managed pane it does nothing and exits 0, so a global hook shows no error.\nset -eu\n[ -n \"${{TMUX_PANE:-}}\" ] || exit 0\n[ -n \"${{MASIL_AGENT_RUN:-}}\" ] || exit 0\nexec {binary} agent integration hook {provider} \"${{1:-}}\"\n",
         provider = posix_quote(provider),
         binary = posix_quote(executable),
     )
@@ -471,6 +471,32 @@ __LISTENERS__
     .replace("__LISTENERS__", listeners)
 }
 
+/// Bus event types the OpenCode and Kilo plugin forwards. These are the
+/// target's events that arrive on the plugin's `event` hook plus the `v2`
+/// request events `map_open_code` also accepts. `chat.message` is sent by the
+/// plugin's own `chat.message` hook, and the plugin defines no
+/// `tool.execute.*` hooks, so those names are left out. Anything else, such as streaming
+/// `message.part.*` events, is dropped before a process is spawned.
+fn open_code_forwarded_events(provider: &str) -> Vec<String> {
+    const V2: [&str; 5] = [
+        "permission.v2.asked",
+        "permission.v2.replied",
+        "question.v2.asked",
+        "question.v2.replied",
+        "question.v2.rejected",
+    ];
+    let Ok(target) = target(provider) else {
+        return Vec::new();
+    };
+    target
+        .events
+        .iter()
+        .filter(|event| **event != "chat.message" && !event.starts_with("tool.execute."))
+        .chain(V2.iter())
+        .map(|event| (*event).to_string())
+        .collect()
+}
+
 fn javascript_plugin(provider: &str, executable: &str) -> String {
     let default_export = if provider == "opencode" {
         r#"
@@ -508,6 +534,7 @@ function send(payload, action) {
   child.on("close", () => clearTimeout(timeout));
   child.stdin.end(body);
 }
+const FORWARDED_EVENTS = new Set(__EVENTS__);
 let rootSessionID;
 const childSessions = new Set();
 export const MasilAgentStatePlugin = async () => ({
@@ -525,6 +552,7 @@ export const MasilAgentStatePlugin = async () => ({
       childSessions.add(properties.info.id);
       return;
     }
+    if (!FORWARDED_EVENTS.has(event?.type)) return;
     if (!rootSessionID || !sessionID || childSessions.has(sessionID) || sessionID !== rootSessionID) return;
     send({ event });
   },
@@ -543,6 +571,10 @@ __DEFAULT__
         &serde_json::to_string(executable).unwrap_or_default(),
     )
     .replace("__PROVIDER__", provider)
+    .replace(
+        "__EVENTS__",
+        &serde_json::to_string(&open_code_forwarded_events(provider)).unwrap_or_default(),
+    )
     .replace("__DEFAULT__", default_export)
 }
 
@@ -554,19 +586,26 @@ import subprocess
 
 MASIL_AGENT = __BINARY__
 INTERACTIVE = {"cli", "tui", "desktop", "acp"}
+last = None
 
 def report(event, **kwargs):
+    global last
     if kwargs.get("platform") not in INTERACTIVE:
         return
     session_id = kwargs.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return
+    if event != "on_session_reset" and session_id == last:
+        return
     payload = json.dumps({"event": event, "session_id": session_id})
     try:
-        subprocess.run([MASIL_AGENT, "agent", "integration", "hook", "hermes", "session"],
-                       input=payload, text=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=1, check=False, env=os.environ.copy())
+        done = subprocess.run([MASIL_AGENT, "agent", "integration", "hook", "hermes", "session"],
+                              input=payload, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=1, check=False, env=os.environ.copy())
+        # The hook exits 0 even when it refuses a report; only its receipt counts.
+        if "native_callback_recorded" in (done.stdout or ""):
+            last = session_id
     except Exception:
         pass
 
@@ -950,7 +989,7 @@ async fn hook(
         origin: source,
     };
     let mut agent = agent;
-    let mut retried = false;
+    let mut retries = 0;
     let result = loop {
         let attempt = if let Some(state) = mapped.state {
             manager
@@ -968,8 +1007,8 @@ async fn hook(
         match attempt {
             // Another writer changed the pane between the read and this
             // write: read again and let the usual checks decide once more.
-            Err(error) if error == super::REPORT_REJECTED && !retried => {
-                retried = true;
+            Err(error) if error == super::REPORT_REJECTED && retries < 2 => {
+                retries += 1;
                 agent = manager.get(&pane).await?;
                 if agent.run != run || agent.provider != target.id || agent.process != "running" {
                     return Err(
@@ -3184,6 +3223,95 @@ mod tests {
                 .unwrap()
                 .contains("event = \"PreToolUse\"\nmatcher = \"^AskUserQuestion$\"")
         );
+    }
+
+    /// The normalized event names in the arms of `map_open_code`'s match,
+    /// read from this file's source so a new arm cannot go unnoticed.
+    fn mapped_open_code_events() -> Vec<String> {
+        let source = include_str!("integration.rs");
+        let start = source
+            .find("let state = match normalized.as_str() {")
+            .unwrap();
+        let body = &source[start..];
+        let end = body.find("\"sessionstatus\" =>").unwrap();
+        let mut names = vec!["sessionstatus".to_string()];
+        for line in body[..end].lines().skip(1) {
+            let line = line.trim();
+            if !(line.starts_with('"') || line.starts_with('|')) {
+                continue;
+            }
+            let patterns = line.split("=>").next().unwrap();
+            let patterns = patterns.split(" if ").next().unwrap();
+            names.extend(patterns.split('"').skip(1).step_by(2).map(str::to_string));
+        }
+        assert!(names.len() > 15, "{names:?}");
+        names
+    }
+
+    #[test]
+    fn open_code_plugin_forwards_exactly_the_mapped_bus_events() {
+        for provider in ["opencode", "kilo"] {
+            let forwarded = open_code_forwarded_events(provider);
+            let probes = forwarded.iter().map(String::as_str).chain([
+                "message.part.delta",
+                "message.part.updated",
+                "message.updated",
+                "session.created",
+                "session.diff",
+                "server.heartbeat",
+            ]);
+            for name in probes {
+                let payload = object(&format!(
+                    r#"{{"event":{{"type":"{name}","properties":{{"sessionID":"s1","status":{{"type":"busy"}}}}}}}}"#
+                ));
+                let mapped = !matches!(
+                    map_callback(target(provider).unwrap(), None, &payload),
+                    Err(error) if error.contains("callback event")
+                );
+                assert_eq!(
+                    mapped,
+                    forwarded.iter().any(|event| event == name),
+                    "{provider} {name}"
+                );
+            }
+            // Every event name `map_open_code` accepts, read from its match
+            // arms, is forwarded unless another hook sends it. `session.created`
+            // maps for kilo only.
+            let normalized: Vec<String> = forwarded.iter().map(|e| normalize_event(e)).collect();
+            for name in mapped_open_code_events() {
+                let other_hook = matches!(
+                    name.as_str(),
+                    "chatmessage"
+                        | "toolexecutebefore"
+                        | "toolexecuteafter"
+                        | "masilsessionselected"
+                );
+                let kilo_only = name == "sessioncreated" && provider != "kilo";
+                assert_eq!(
+                    normalized.contains(&name),
+                    !other_hook && !kilo_only,
+                    "{provider} {name}"
+                );
+            }
+            let plugin = javascript_plugin(provider, "/missing/masil-agent");
+            assert!(plugin.contains("FORWARDED_EVENTS.has(event?.type)"));
+            assert!(plugin.contains("\"session.idle\""));
+            assert!(!plugin.contains("\"message.part.delta\""));
+        }
+        assert!(open_code_forwarded_events("kilo").contains(&"session.created".to_string()));
+        assert!(!open_code_forwarded_events("opencode").contains(&"session.created".to_string()));
+    }
+
+    #[test]
+    fn bridges_are_silent_outside_a_managed_pane_and_hermes_skips_repeats() {
+        let script = shell_bridge("claude", "/bin/masil-agent");
+        assert!(script.contains("|| exit 0\n"));
+        assert!(!script.contains("exit 64"));
+        let hermes = hermes_plugin("/bin/masil-agent");
+        assert!(hermes.contains("last = None"));
+        assert!(hermes.contains("event != \"on_session_reset\" and session_id == last"));
+        assert!(hermes.contains("stdout=subprocess.PIPE"));
+        assert!(hermes.contains("if \"native_callback_recorded\" in (done.stdout or \"\"):"));
     }
 
     fn raised(kind: &'static str, source_ref: &str) -> Effect {

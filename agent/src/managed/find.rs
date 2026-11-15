@@ -50,8 +50,16 @@ fn join(parts: &[&str]) -> String {
 
 fn home_relative(path: &str) -> String {
     match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
-            format!("~{}", &path[home.len()..])
+        Ok(home) => relative_to(&home, path),
+        Err(_) => path.to_owned(),
+    }
+}
+
+/// `path` with `home` as a leading `~`, only at a path boundary.
+fn relative_to(home: &str, path: &str) -> String {
+    match path.strip_prefix(home) {
+        Some(rest) if home.len() > 1 && (rest.is_empty() || rest.starts_with('/')) => {
+            format!("~{rest}")
         }
         _ => path.to_owned(),
     }
@@ -81,10 +89,9 @@ impl Manager {
             .command(&["list-panes", "-a", "-F", PANE_FORMAT])
             .await?;
         let rows = records(&output)?;
-        let truncated = rows.len() > MAX_PANES;
         let mut seen = std::collections::HashSet::new();
         let mut panes = Vec::new();
-        for fields in rows.into_iter().take(MAX_PANES) {
+        for fields in rows {
             if fields.len() != 11 || crate::pane_id(&fields[0]).is_err() {
                 return Err("invalid native pane list".into());
             }
@@ -106,6 +113,9 @@ impl Manager {
                 dead: fields[10] == "1",
             });
         }
+        // The limit counts distinct panes, not rows.
+        let truncated = panes.len() > MAX_PANES;
+        panes.truncate(MAX_PANES);
         panes.sort_by_key(|pane| std::cmp::Reverse(pane.activity));
         Ok((panes, truncated))
     }
@@ -120,12 +130,15 @@ impl Manager {
                     .parse()
                     .ok()
                     .filter(|limit| (1..=200).contains(limit))
-                    .ok_or("--limit must be 1–200")?,
+                    .ok_or("invalid_argument: --limit must be 1–200")?,
             ),
             _ => return Err("usage: find QUERY [--limit N]".into()),
         };
         if query.chars().any(char::is_control) || query.len() > 1024 {
-            return Err("query must be at most 1024 bytes without control characters".into());
+            return Err(
+                "invalid_argument: query must be at most 1024 bytes without control characters"
+                    .into(),
+            );
         }
         let agents = self.list().await?;
         let (panes, truncated) = self.pane_targets().await?;
@@ -158,5 +171,22 @@ impl Manager {
             "panes_truncated": truncated,
             "results": results.into_iter().take(limit).map(|(_, _, row)| row).collect::<Vec<_>>(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_to;
+
+    #[test]
+    fn home_prefix_matches_only_at_a_path_boundary() {
+        assert_eq!(relative_to("/Users/ochi", "/Users/ochi/x"), "~/x");
+        assert_eq!(relative_to("/Users/ochi", "/Users/ochi"), "~");
+        assert_eq!(
+            relative_to("/Users/ochi", "/Users/ochi2/x"),
+            "/Users/ochi2/x"
+        );
+        assert_eq!(relative_to("/", "/x"), "/x");
+        assert_eq!(relative_to("", "/x"), "/x");
     }
 }

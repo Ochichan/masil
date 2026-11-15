@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 pub(super) const OPTION: &str = "@masil-agent-view";
-const USAGE: &str = "view requires get, clear, or set [--provider ID] [--state STATE] [--workspace NAME] [--sort ORDER], and --client-view for one terminal client's view";
+const USAGE: &str = "usage: view requires get, clear, or set [--provider ID] [--state STATE] [--workspace NAME] [--sort ORDER], and --client-view for one terminal client's view";
 const VERSION: u32 = 1;
 const MAX_WORKSPACES: usize = 64;
 const STATES: [&str; 5] = ["idle", "working", "blocked", "unknown", "exited"];
@@ -287,7 +287,7 @@ fn parse_set(args: &[String]) -> Result<SavedView, String> {
     while index < args.len() {
         let value = args
             .get(index + 1)
-            .ok_or_else(|| format!("missing value for {}", args[index]))?;
+            .ok_or_else(|| format!("invalid_argument: missing value for {}", args[index]))?;
         match args[index].as_str() {
             "--provider" => {
                 let provider = providers::find(value)
@@ -296,14 +296,18 @@ fn parse_set(args: &[String]) -> Result<SavedView, String> {
             }
             "--state" => {
                 if !STATES.contains(&value.as_str()) {
-                    return Err(format!("unsupported agent state: {value}"));
+                    return Err(format!(
+                        "invalid_argument: unsupported agent state: {value}"
+                    ));
                 }
                 states.insert(value.clone());
             }
             "--workspace" => {
-                validate_workspace(value)?;
+                validate_workspace(value).map_err(|error| format!("invalid_argument: {error}"))?;
                 if workspaces.len() >= MAX_WORKSPACES && !workspaces.contains(value) {
-                    return Err(format!("view supports at most {MAX_WORKSPACES} workspaces"));
+                    return Err(format!(
+                        "invalid_argument: view supports at most {MAX_WORKSPACES} workspaces"
+                    ));
                 }
                 workspaces.insert(value.clone());
             }
@@ -313,10 +317,18 @@ fn parse_set(args: &[String]) -> Result<SavedView, String> {
                     "name" => SortOrder::Name,
                     "provider" => SortOrder::Provider,
                     "workspace" => SortOrder::Workspace,
-                    _ => return Err(format!("unsupported agent view sort: {value}")),
+                    _ => {
+                        return Err(format!(
+                            "invalid_argument: unsupported agent view sort: {value}"
+                        ));
+                    }
                 });
             }
-            option => return Err(format!("unknown or repeated view option: {option}")),
+            option => {
+                return Err(format!(
+                    "invalid_argument: unknown or repeated view option: {option}"
+                ));
+            }
         }
         index += 2;
     }
@@ -376,7 +388,10 @@ fn validate_unique(values: &[String], label: &str) -> Result<(), String> {
 
 fn validate_workspace(workspace: &str) -> Result<(), String> {
     if workspace.is_empty() || workspace.len() > 128 || workspace.chars().any(char::is_control) {
-        return Err("workspace must contain 1–128 bytes without control characters".into());
+        return Err(
+            "invalid_argument: workspace must contain 1–128 bytes without control characters"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -431,6 +446,15 @@ fn pane_number(pane: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_errors_carry_an_argument_code() {
+        let args = |line: &[&str]| line.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        for line in [&["--state", "bogus"][..], &["--sort", "x"], &["--provider"]] {
+            let error = parse_set(&args(line)).unwrap_err();
+            assert!(error.starts_with("invalid_argument:"), "{error}");
+        }
+    }
 
     #[test]
     fn empty_filters_match_all_and_exact_filters_intersect() {

@@ -289,7 +289,8 @@ fn carriers(nonce: &str) -> Vec<(i32, u64)> {
 /// Ends what a dictation left: its group while the recorded leader runs,
 /// the noted processes that still run, and every process carrying its
 /// nonce. With `wait`, KILL follows TERM 2 s later; without, at once.
-fn sweep(record: &Record, wait: bool) {
+/// Returns whether it found anything to end.
+fn sweep(record: &Record, wait: bool) -> bool {
     let group = record.group.filter(|group| {
         *group > 1
             && record
@@ -307,7 +308,7 @@ fn sweep(record: &Record, wait: bool) {
         }
     }
     if group.is_none() && left.is_empty() {
-        return;
+        return false;
     }
     // SAFETY: the group's recorded leader still runs, and each process is
     // the one noted or carries this run's nonce (start times checked).
@@ -337,13 +338,52 @@ fn sweep(record: &Record, wait: bool) {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
     }
+    true
 }
 
 /// The running command's group, nonce and noted processes, for the panic
-/// hook.
+/// hook and for the sweep when `dictate` ends.
 static GROUP: AtomicI32 = AtomicI32::new(0);
 static NONCE: OnceLock<String> = OnceLock::new();
 static TREE: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
+
+/// `record` with what this process knows of the run added: its nonce and
+/// the processes noted for it.
+fn with_statics(mut record: Record) -> Record {
+    if record.nonce.is_empty()
+        && let Some(nonce) = NONCE.get()
+    {
+        record.nonce.clone_from(nonce);
+    }
+    if let Ok(shared) = TREE.lock() {
+        for noted in shared.iter() {
+            if !record.tree.contains(noted) {
+                record.tree.push(*noted);
+            }
+        }
+    }
+    record
+}
+
+/// Ends a command that `dictate` can no longer follow: its group with the
+/// leader reaped, then what it left outside the group.
+async fn abandon(record: &mut Record, child: &mut tokio::process::Child) {
+    if let Some(group) = record.group {
+        for noted in tree(&[group]) {
+            if !record.tree.contains(&noted) {
+                record.tree.push(noted);
+            }
+        }
+        crate::api::end_group(group, child).await;
+        GROUP.store(0, Ordering::SeqCst);
+    }
+    // For the panic hook and for the sweep in `start`.
+    if let Ok(mut shared) = TREE.lock() {
+        shared.clone_from(&record.tree);
+    }
+    let left = record.clone();
+    let _ = tokio::task::spawn_blocking(move || sweep(&left, true)).await;
+}
 
 /// For the panic hook of a `dictate` process.
 fn sweep_on_panic() {
@@ -541,6 +581,8 @@ fn masil(socket: &Path, args: &[&str]) {
 
 fn tell(socket: &Path, client: Option<&str>, text: &str) {
     let text = format!("masil dictation: {text}").replace('#', "##");
+    // tmux would end the command at a message that ends in ';'.
+    let text = crate::session::command_word(&text);
     match client {
         Some(client) => masil(
             socket,
@@ -774,7 +816,8 @@ async fn start(
         Err(error) => Err(error),
     };
     let left = paths.read();
-    if let Some(record) = left.clone() {
+    let record = with_statics(left.clone().unwrap_or_default());
+    if record.group.is_some() || !record.nonce.is_empty() || !record.tree.is_empty() {
         let _ = tokio::task::spawn_blocking(move || sweep(&record, true)).await;
     }
     paths.clear();
@@ -897,7 +940,8 @@ async fn dictate(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0);
+        .process_group(0)
+        .kill_on_drop(true);
     if let Some(home) = std::env::var_os("HOME") {
         command.current_dir(home);
     }
@@ -916,7 +960,11 @@ async fn dictate(
             .unwrap_or_default();
     }
     record.state = "listening".into();
-    paths.write(&record)?;
+    if let Err(error) = paths.write(&record) {
+        // The file still says "starting"; the command is ended from here.
+        abandon(&mut record, &mut child).await;
+        return Err(error);
+    }
     masil(socket, &["set-option", "-gq", OPTION, &agent.name]);
     tell(
         socket,
@@ -928,18 +976,18 @@ async fn dictate(
     let over = Arc::new(tokio::sync::Notify::new());
     let text = Arc::new(Mutex::new(Vec::new()));
     let errors = Arc::new(Mutex::new(Vec::new()));
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        drop(stdin);
+        abandon(&mut record, &mut child).await;
+        return Err("no pipe".into());
+    };
     let mut out = tokio::spawn(collect(
-        child.stdout.take().ok_or("no pipe")?,
+        stdout,
         text.clone(),
         super::queue::TEXT_BYTES,
         Some(over.clone()),
     ));
-    let mut err = tokio::spawn(collect(
-        child.stderr.take().ok_or("no pipe")?,
-        errors.clone(),
-        STDERR_KEPT,
-        None,
-    ));
+    let mut err = tokio::spawn(collect(stderr, errors.clone(), STDERR_KEPT, None));
     let mut look = tokio::time::interval(Duration::from_millis(500));
     let mut phase = Phase::Listening;
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(config.max_seconds);
@@ -1107,5 +1155,34 @@ mod tests {
         assert_eq!(clean("\u{1b}"), "");
         assert!(blank("\u{FEFF} \u{200B}"));
         assert!(!blank("ok"));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_command_does_not_outlive_dictate() {
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let group = child.id().unwrap() as i32;
+        let mut record = Record {
+            group: Some(group),
+            leader_started: crate::process::info(group).map(|info| info.started),
+            ..Record::default()
+        };
+        assert!(record.leader_started.is_some());
+        abandon(&mut record, &mut child).await;
+        // The leader is reaped and nothing is left in the group.
+        assert!(child.try_wait().unwrap().is_some());
+        // SAFETY: signal 0 only checks.
+        assert_ne!(unsafe { libc::killpg(group, 0) }, 0);
+        assert!(record.tree.iter().any(|(pid, _)| *pid == group));
+        // The panic hook and the sweep in `start` see the noted tree, and
+        // a record without it gains it.
+        let merged = with_statics(Record::default());
+        assert!(merged.tree.iter().any(|(pid, _)| *pid == group));
+        assert!(merged.group.is_none());
     }
 }

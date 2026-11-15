@@ -55,11 +55,7 @@ pub(super) async fn command(manager: &Manager, args: &[String]) -> Result<Value,
                 .iter()
                 .map(|row| {
                     let next = Spec::parse(&row.spec).ok().and_then(|spec| {
-                        let lower = row
-                            .last_due
-                            .unwrap_or(i64::MIN)
-                            .max(row.changed_ms)
-                            .max(now);
+                        let lower = settled_until(row.last_due, row.changed_ms, now).max(now);
                         spec.next_after(lower, row.created_ms, &local)
                     });
                     json!({
@@ -355,6 +351,20 @@ pub(crate) fn serve(
     });
 }
 
+/// The time after which due times are settled for a schedule. After the
+/// clock was set back, the last due time is ahead of `now` and would hide
+/// everything that comes due until the clock catches up; the look then
+/// reaches back over one sleep and the grace instead. A due time that was
+/// settled already keeps its row and is not run again.
+fn settled_until(last_due: Option<i64>, changed_ms: i64, now: i64) -> i64 {
+    let lower = last_due.unwrap_or(i64::MIN).max(changed_ms);
+    if last_due.is_some_and(|due| due > now) {
+        let window = LOOK_EVERY.as_millis() as i64 + schedule::GRACE_MS;
+        return (now - window).max(changed_ms);
+    }
+    lower
+}
+
 /// One look: settles what is due and starts what runs now. Returns how long
 /// to sleep: until the nearest next time, at most a minute.
 async fn look(
@@ -382,7 +392,7 @@ async fn look(
             }
         };
         let now = now_ms() as i64;
-        let lower = row.last_due.unwrap_or(i64::MIN).max(row.changed_ms);
+        let lower = settled_until(row.last_due, row.changed_ms, now);
         let due = schedule::due(&spec, row.created_ms, lower, now, &local);
         if due.run.is_some() || due.missed.is_some() {
             // One schedule's failure leaves the others to run; it is looked
@@ -496,5 +506,30 @@ async fn perform(socket: &Path, row: &ScheduleRow, due_ms: i64) -> Result<Value,
             Ok(json!({"agent": agent.name, "run": agent.run, "queued": added}))
         }
         _ => Err("schedule_invalid: unknown stored action".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_last_due_time_ahead_of_now_does_not_hide_what_comes_due() {
+        let now = 1_000_000_000;
+        // The normal case is unchanged.
+        assert_eq!(settled_until(Some(now - 5), 0, now), now - 5);
+        assert_eq!(settled_until(None, 7, now), 7);
+        // Clock set back an hour: look over the last sleep and the grace.
+        let window = 60_000 + schedule::GRACE_MS;
+        assert_eq!(settled_until(Some(now + 3_600_000), 0, now), now - window);
+        // A change after that point still wins.
+        assert_eq!(
+            settled_until(Some(now + 3_600_000), now - 10, now),
+            now - 10
+        );
+        let every = Spec::Every { seconds: 60 };
+        let local = |ms| schedule::cron::system_local(ms);
+        let lower = settled_until(Some(now + 3_600_000), 0, now);
+        assert!(schedule::due(&every, 0, lower, now, &local).run.is_some());
     }
 }

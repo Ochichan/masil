@@ -481,11 +481,17 @@ impl View {
             .map(|(session, _)| session.clone())
             .collect();
         let mut requests = Vec::new();
-        for (kind, list) in [
-            ("permission.asked", permissions),
-            ("question.asked", questions),
+        for (kind, path, list) in [
+            ("permission.asked", "/permission", permissions),
+            ("question.asked", "/question", questions),
         ] {
-            for request in list.as_array().cloned().unwrap_or_default() {
+            let Some(list) = list.as_array() else {
+                return Err(format!(
+                    "answer_unavailable: {} sent no list for {path}",
+                    endpoint.profile().label
+                ));
+            };
+            for request in list.iter().cloned() {
                 if request["id"].is_string() {
                     requests.push((kind, request));
                 }
@@ -539,8 +545,10 @@ impl View {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let properties = frame.get("properties").cloned().unwrap_or(Value::Null);
+        // Some events carry the id only on their `info` object.
         let session = properties["sessionID"]
             .as_str()
+            .or_else(|| properties["info"]["sessionID"].as_str())
             .unwrap_or_default()
             .to_owned();
         let mut effects = Vec::new();
@@ -601,6 +609,9 @@ impl View {
             // OpenCode publishes a turn's user message again as it
             // summarizes; only a new message starts a turn.
             "message.updated" if properties["info"]["role"] == "user" => {
+                if session.is_empty() {
+                    return Ok(effects);
+                }
                 if let Some(id) = properties["info"]["id"].as_str()
                     && memory
                         .turns
@@ -622,6 +633,9 @@ impl View {
             // full context that is not compacted shows; a compacted one
             // leaves the message without an error.
             "message.updated" if properties["info"]["role"] == "assistant" => {
+                if session.is_empty() {
+                    return Ok(effects);
+                }
                 let error = &properties["info"]["error"];
                 if !error.is_null()
                     && let Some(turn) = memory.turns.get_mut(&session)
@@ -684,18 +698,20 @@ async fn read_prompt(endpoint: &answer::Endpoint, memory: &mut Memory, session: 
         return;
     };
     turn.read = true;
-    memory.prompted.push(Prompted {
-        session: session.to_owned(),
-        message: turn.message.clone(),
-        digest: prompt_digest(endpoint.profile().id, &message["parts"]),
-        created_ms: message["info"]["time"]["created"].as_u64().unwrap_or(0),
-    });
+    if let Some(digest) = prompt_digest(endpoint.profile().id, &message["parts"]) {
+        memory.prompted.push(Prompted {
+            session: session.to_owned(),
+            message: turn.message.clone(),
+            digest,
+            created_ms: message["info"]["time"]["created"].as_u64().unwrap_or(0),
+        });
+    }
 }
 
 /// The accept digest of a user message's own text: its text parts, without
-/// what the server added (editor context, file reads). Empty for a provider
+/// what the server added (editor context, file reads). None for a provider
 /// whose prompts have no digest (Kilo's, until measured).
-fn prompt_digest(provider: &str, parts: &Value) -> String {
+fn prompt_digest(provider: &str, parts: &Value) -> Option<String> {
     let text = parts
         .as_array()
         .into_iter()
@@ -704,7 +720,7 @@ fn prompt_digest(provider: &str, parts: &Value) -> String {
         .filter_map(|part| part["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    super::prompt::accept_digest(provider, &text).unwrap_or_default()
+    super::prompt::accept_digest(provider, &text)
 }
 
 /// A root session that went idle ended its turn; one that failed or was
@@ -839,11 +855,12 @@ async fn catch_up(
             if info["role"] == "user"
                 && created >= since.max(recent)
                 && let Some(message_id) = info["id"].as_str()
+                && let Some(digest) = prompt_digest(target.profile.id, &message["parts"])
             {
                 memory.prompted.push(Prompted {
                     session: id.to_owned(),
                     message: message_id.to_owned(),
-                    digest: prompt_digest(target.profile.id, &message["parts"]),
+                    digest,
                     created_ms: created,
                 });
             }

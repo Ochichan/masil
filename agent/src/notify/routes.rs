@@ -71,6 +71,7 @@ pub(crate) async fn tmux(
             "-c",
             name,
             "-l",
+            "--",
             message,
         ])
         .await
@@ -224,7 +225,7 @@ pub(crate) async fn hook(
         Err(_) => {
             drop((stdout, stderr));
             if let Some(group) = group {
-                stop_group(group).await;
+                stop_group(group, &mut child).await;
             }
             guard.0 = None;
             let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
@@ -240,16 +241,32 @@ struct Group(Option<i32>);
 impl Drop for Group {
     fn drop(&mut self) {
         if let Some(group) = self.0 {
-            // SAFETY: the leader is not reaped, so the group ID is the hook's.
+            // SAFETY: cleared once the leader is reaped, except when the
+            // future is dropped inside `stop_group` after it reaped the
+            // leader; then the group's other members, if any, still hold
+            // the ID.
             unsafe { libc::killpg(group, libc::SIGKILL) };
         }
     }
 }
 
-async fn stop_group(group: i32) {
-    // SAFETY: signals to the hook's own group.
-    unsafe { libc::killpg(group, libc::SIGTERM) };
-    tokio::time::sleep(Duration::from_secs(2)).await;
+/// TERM, then KILL at 2 s if the group is still there. The leader is
+/// reaped here when it ends, so a group that died at once ends the wait at
+/// once.
+async fn stop_group(group: i32, child: &mut tokio::process::Child) {
+    // SAFETY: signals to the hook's own group; its leader is not reaped yet.
+    if unsafe { libc::killpg(group, libc::SIGTERM) } != 0 {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let _ = tokio::time::timeout_at(deadline, child.wait()).await;
+    while tokio::time::Instant::now() < deadline {
+        // SAFETY: signal 0 only checks.
+        if unsafe { libc::killpg(group, 0) } != 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     // SAFETY: as above; a group already gone is fine.
     unsafe { libc::killpg(group, libc::SIGKILL) };
 }
@@ -263,5 +280,18 @@ mod tests {
         assert_eq!(tmux_text("a#[fg=red]b"), "a##[fg=red]b");
         assert_eq!(tmux_text("line\nnext\x1b[2J"), "line next [2J");
         assert_eq!(tmux_text("ends;"), "ends; ");
+    }
+
+    #[tokio::test]
+    async fn a_group_that_dies_on_term_ends_the_stop_at_once() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let group = child.id().unwrap() as i32;
+        let started = std::time::Instant::now();
+        stop_group(group, &mut child).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // SAFETY: signal 0 only checks.
+        assert_ne!(unsafe { libc::killpg(group, 0) }, 0);
     }
 }

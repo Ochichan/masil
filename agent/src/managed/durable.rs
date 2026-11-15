@@ -118,6 +118,22 @@ fn recorded_start_refusal(error: &str, key: &str, state: &str) -> String {
     format!("{state}: {detail} (operation {key} is {state})")
 }
 
+/// The error of a launch the coordinator refused as busy before it wrote or
+/// sent anything. The store has no transient state, so the record stays
+/// `rejected_before_effect` and the same key can be admitted again. The caller
+/// still gets the transient `coordinator_busy` code (exit 4), not a final
+/// failure. The exact busy text is kept as it is: the endpoint's caller sends
+/// the call again only on that exact text.
+fn busy_start_refusal(error: &str, key: &str, state: &str) -> String {
+    if !error.starts_with("coordinator_busy:") {
+        return recorded_start_refusal(error, key, state);
+    }
+    if error == super::core_action::COORDINATOR_BUSY {
+        return error.to_owned();
+    }
+    format!("{error} (operation {key} is {state}; the same start can be run again)")
+}
+
 /// The public receipt of a run-bound effect, rebuilt identically on retry.
 fn effect_receipt(record: &Record) -> Value {
     let path = record
@@ -210,7 +226,16 @@ impl Manager {
     }
 
     /// Delete resolved records whose namespace ended, when the store has grown.
+    /// Best effort: a failure is logged and skipped, so housekeeping never
+    /// fails the operation that triggered it. Always returns `Ok`.
     pub(super) async fn maintain(&self, store: &mut Store) -> Result<(), String> {
+        if let Err(error) = self.try_maintain(store).await {
+            super::inbox::log("operations.log", &json!({"error": error}));
+        }
+        Ok(())
+    }
+
+    async fn try_maintain(&self, store: &mut Store) -> Result<(), String> {
         let now = now_ms();
         if store.needs_prune(now)? {
             let (runs, boot) = self.live_runs().await?;
@@ -1129,7 +1154,6 @@ impl Manager {
 
     /// Start with an optional client key pinned to the server boot.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn start_with_operation(
         &self,
         name: &str,
@@ -1199,7 +1223,7 @@ impl Manager {
             .id;
         let canonical = cwd
             .canonicalize()
-            .map_err(|e| format!("working directory: {e}"))?;
+            .map_err(|e| format!("invalid_argument: working directory: {e}"))?;
         let mut digest = launch_digest(name, provider_id, &canonical, args, session, split);
         if answers {
             digest = super::prompt::sha256(&format!("{digest}\nanswers"));
@@ -1416,7 +1440,7 @@ impl Manager {
                                 ticket.key
                             )))
                         })?;
-                    return Err(recorded_start_refusal(&error, &ticket.key, &record.state));
+                    return Err(busy_start_refusal(&error, &ticket.key, &record.state));
                 }
                 if transport_rejected(&error) && !error.contains("was launched") {
                     let _ = store.finish(
@@ -1501,19 +1525,28 @@ impl Manager {
                 };
                 let agent = match self.get(&record.target).await {
                     Ok(agent) if Some(&agent.run) == record.run.as_ref() => agent,
-                    _ => {
+                    got => {
+                        // A lookup that failed for any reason but an absent
+                        // target proves nothing, as in `settle_effect`: no
+                        // fence was written, so the group may still apply.
+                        let lookup_error = match &got {
+                            Err(error) if super::failure::classify(error).1 != "target_absent" => {
+                                Some(error.clone())
+                            }
+                            _ => None,
+                        };
+                        // A gone pane was closed whatever `get` said.
                         let state = match (effect, self.pane_exists(&record.target).await) {
                             (Effect::Close, Ok(false)) => "target_absent",
+                            _ if lookup_error.is_some() => "outcome_unknown",
                             (Effect::Close, Ok(true)) => "not_applied",
                             _ => "outcome_unknown",
                         };
-                        return store.resolve(
-                            record,
-                            state,
-                            "reconcile",
-                            Some(&json!({"reason": "run_not_live"})),
-                            now,
-                        );
+                        let evidence = match lookup_error {
+                            Some(error) => json!({"reason": "lookup_failed", "error": error}),
+                            None => json!({"reason": "run_not_live"}),
+                        };
+                        return store.resolve(record, state, "reconcile", Some(&evidence), now);
                     }
                 };
                 let intent = record.intent().cloned().unwrap_or_default();
@@ -1605,7 +1638,8 @@ impl Manager {
                         }
                     });
                 }
-                self.maintain(&mut store).await?;
+                // Best effort: the resolved results are returned regardless.
+                let _ = self.maintain(&mut store).await;
                 Ok(json!({"stage": "reconciled", "operations": results}))
             }
 
@@ -1687,6 +1721,42 @@ mod tests {
         assert!(!lost_core_launch_reply(
             "bridge_unavailable: coordinator action request was not sent: connection refused"
         ));
+    }
+
+    #[test]
+    fn a_busy_launch_refusal_stays_transient() {
+        let key = "boot:boot/start/busy";
+        let exact = super::super::core_action::COORDINATOR_BUSY;
+        // The exact text is passed on so a remote caller can send it again.
+        assert_eq!(
+            busy_start_refusal(exact, key, "rejected_before_effect"),
+            exact
+        );
+        assert_eq!(
+            crate::managed::failure::classify(exact).0,
+            crate::managed::failure::Class::Transient
+        );
+        let waited = "coordinator_busy: another action held the coordinator for 10 s; the request was not delivered and had no effect";
+        let text = busy_start_refusal(waited, key, "rejected_before_effect");
+        assert!(text.starts_with("coordinator_busy:"), "{text}");
+        assert!(text.contains("can be run again"), "{text}");
+        assert_eq!(
+            crate::managed::failure::classify(&text).0,
+            crate::managed::failure::Class::Transient
+        );
+        // Any other refusal keeps its recorded wording.
+        assert_eq!(
+            busy_start_refusal(
+                "bridge_unavailable: no bridge",
+                key,
+                "rejected_before_effect"
+            ),
+            recorded_start_refusal(
+                "bridge_unavailable: no bridge",
+                key,
+                "rejected_before_effect"
+            )
+        );
     }
 
     #[test]
