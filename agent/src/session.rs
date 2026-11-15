@@ -166,11 +166,15 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
                 Kind::Manual
             };
             let result = save(server, &options.socket, kind);
-            if kind == Kind::Manual && matches!(&result, Ok(Some(_))) {
+            if kind == Kind::Manual && matches!(&result, Ok((Some(_), _))) {
                 after_manual_save(server, &options.socket);
             }
-            let message = match &result {
-                Ok(Some((_, snapshot))) => {
+            let skipped = match &result {
+                Ok((_, skipped)) => *skipped,
+                Err(_) => 0,
+            };
+            let mut message = match &result {
+                Ok((Some((_, snapshot)), _)) => {
                     let (sessions, panes) = counts(snapshot);
                     text(
                         &format!(
@@ -181,32 +185,41 @@ fn execute(server: &Server, options: &Options) -> Result<(i32, Option<String>), 
                         &format!("세션 {sessions}개, pane {panes}개를 저장했습니다"),
                     )
                 }
-                Ok(None) if options.auto => text(
+                Ok((None, _)) if options.auto => text(
                     "Sessions unchanged since the last snapshot",
                     "마지막 저장 뒤 바뀐 세션이 없습니다",
                 ),
-                Ok(None) => text("Nothing to save", "저장할 세션이 없습니다"),
+                Ok((None, _)) => text("Nothing to save", "저장할 세션이 없습니다"),
                 Err(error) => text(
                     &format!("Could not save sessions: {error}"),
                     &format!("세션을 저장하지 못했습니다: {error}"),
                 ),
             };
+            if skipped > 0 {
+                message.push_str(&text(
+                    &format!("; skipped {skipped} whose name contains ':' or starts with '$'"),
+                    &format!(
+                        "; 이름에 ':'가 있거나 '$'로 시작하는 세션 {skipped}개는 건너뛰었습니다"
+                    ),
+                ));
+            }
             tell(server, options.client.as_deref(), &message);
             let name = result
                 .as_ref()
                 .ok()
-                .and_then(Option::as_ref)
+                .and_then(|(saved, _)| saved.as_ref())
                 .map(|(name, _)| name.clone());
             let stage = match &result {
-                Ok(Some(_)) => "saved",
-                Ok(None) => "unchanged",
+                Ok((Some(_), _)) => "saved",
+                Ok((None, _)) => "unchanged",
                 Err(_) => "failed",
             };
             Ok((
                 i32::from(result.is_err()),
                 Some(
-                    serde_json::json!({"stage": stage, "snapshot": name, "message": message})
-                        .to_string(),
+                    serde_json::json!({"stage": stage, "snapshot": name, "message": message,
+                        "skipped": skipped})
+                    .to_string(),
                 ),
             ))
         }
@@ -389,8 +402,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         Some(socket) => socket,
         None => std::env::var("TMUX")
             .ok()
-            .and_then(|value| value.split(',').next().map(str::to_owned))
-            .filter(|path| !path.is_empty())
+            .and_then(|value| socket_from_tmux_env(&value))
             .ok_or("run this inside masil or pass --socket PATH")?,
     };
     if let Some(client) = &client
@@ -407,15 +419,32 @@ fn parse(args: &[String]) -> Result<Options, String> {
     })
 }
 
-/// Runs a masil command. A value ending in ';' would end the command, so
-/// that ';' is escaped.
+/// The socket path in `$TMUX`, which is `path,pid,session`. The path may
+/// itself contain commas, so the last two fields are cut off from the right.
+fn socket_from_tmux_env(value: &str) -> Option<String> {
+    value
+        .rsplitn(3, ',')
+        .last()
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+}
+
+/// Makes one argument safe to pass as a tmux command word. tmux ends a
+/// command at any argument that ends in ';' and turns a final "\;" into a
+/// literal ';', so a trailing ';' is escaped. A separator that should end a
+/// command must not go through this function.
+pub(crate) fn command_word(arg: &str) -> std::borrow::Cow<'_, str> {
+    match arg.strip_suffix(';') {
+        Some(rest) => std::borrow::Cow::Owned(format!("{rest}\\;")),
+        None => std::borrow::Cow::Borrowed(arg),
+    }
+}
+
+/// Runs a masil command. Every argument goes through `command_word`.
 fn masil(server: &Server, args: &[&str]) -> Result<String, String> {
     let args: Vec<String> = args
         .iter()
-        .map(|arg| match arg.strip_suffix(';') {
-            Some(rest) => format!("{rest}\\;"),
-            None => (*arg).to_owned(),
-        })
+        .map(|arg| command_word(arg).into_owned())
         .collect();
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     server.run(&refs)
@@ -459,7 +488,11 @@ fn fields(line: &str, count: usize) -> Option<Vec<&str>> {
 
 /// The sessions, windows and panes of the server, with the commands a restore
 /// would run again.
-fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
+///
+/// A session whose name contains ':' or starts with '$' is left out and
+/// counted. A `=NAME:` target cannot name the first unambiguously, and
+/// `=$3:` resolves by session id, not by name.
+fn capture(server: &Server, socket: &str) -> Result<(Vec<SavedSession>, usize), String> {
     let format = |parts: &[&str]| parts.join(&SEP.to_string());
     let sessions = masil(
         server,
@@ -513,9 +546,14 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
     let allowed = allowed_commands(server);
     let agents = resumable_agents(socket);
     let mut saved = Vec::new();
+    let mut skipped = 0;
     for line in sessions.lines() {
         let Some(f) = fields(line, 3) else { continue };
         if f[0].is_empty() || plain(f[0]).is_none() {
+            continue;
+        }
+        if f[0].contains(':') || f[0].starts_with('$') {
+            skipped += 1;
             continue;
         }
         saved.push(SavedSession {
@@ -590,7 +628,7 @@ fn capture(server: &Server, socket: &str) -> Result<Vec<SavedSession>, String> {
         session.windows.sort_by_key(|window| window.index);
     }
     saved.retain(|session| !session.windows.is_empty());
-    Ok(saved)
+    Ok((saved, skipped))
 }
 
 /// Text without control characters and within the size limit.
@@ -769,7 +807,7 @@ fn validate(snapshot: &Snapshot) -> Result<(), String> {
     }
     let mut panes = 0;
     for session in &snapshot.sessions {
-        if session.name.is_empty() || bad_text(&session.name) || session.name.contains([':', '.']) {
+        if session.name.is_empty() || bad_text(&session.name) || session.name.contains(':') {
             return Err("invalid session name".into());
         }
         for window in &session.windows {
@@ -865,7 +903,18 @@ fn local_time(ms: u64) -> String {
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = path.parent().ok_or("snapshot path has no directory")?;
-    let temporary = dir.join(format!(".snapshot.{}.tmp", std::process::id()));
+    // The time and a counter keep a name from a crashed run, or from a reused
+    // process id, from colliding with this one.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temporary = dir.join(format!(
+        ".snapshot.{}.{nanos}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let result = (|| -> Result<(), String> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -888,12 +937,16 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 const EXISTS: &str = "snapshot exists";
 
+/// The snapshot name and content, or None if nothing was saved, and how many
+/// sessions were left out because their names cannot be restored.
+type Saved = (Option<(String, Snapshot)>, usize);
+
 /// Saves a snapshot. An automatic save is skipped when nothing changed since
-/// the latest snapshot. Returns the snapshot name, or None if not saved.
-fn save(server: &Server, socket: &str, kind: Kind) -> Result<Option<(String, Snapshot)>, String> {
-    let sessions = capture(server, socket)?;
+/// the latest snapshot.
+fn save(server: &Server, socket: &str, kind: Kind) -> Result<Saved, String> {
+    let (sessions, skipped) = capture(server, socket)?;
     if sessions.is_empty() {
-        return Ok(None);
+        return Ok((None, skipped));
     }
     let dir = snapshot_dir()?;
     let names = list_snapshots(&dir)?;
@@ -902,7 +955,7 @@ fn save(server: &Server, socket: &str, kind: Kind) -> Result<Option<(String, Sna
         && let Ok(previous) = load(&dir.join(format!("{latest}.json")))
         && previous.sessions == sessions
     {
-        return Ok(None);
+        return Ok((None, skipped));
     }
     let created_at_ms = now_ms();
     let snapshot = Snapshot {
@@ -926,10 +979,34 @@ fn save(server: &Server, socket: &str, kind: Kind) -> Result<Option<(String, Sna
         }
     }
     prune(&dir, kind)?;
-    Ok(Some((name, snapshot)))
+    Ok((Some((name, snapshot)), skipped))
+}
+
+/// Removes temporary snapshot files that a crashed save left behind.
+fn remove_stale_temporaries(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !(name.starts_with(".snapshot.") && name.ends_with(".tmp")) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= Duration::from_secs(60));
+        if old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn prune(dir: &Path, kind: Kind) -> Result<(), String> {
+    remove_stale_temporaries(dir);
     let suffix = format!("-{}", kind.as_str());
     let names: Vec<_> = list_snapshots(dir)?
         .into_iter()
@@ -1045,7 +1122,7 @@ fn pristine(server: &Server, name: &str) -> bool {
             "list-panes",
             "-s",
             "-t",
-            &format!("={name}"),
+            &format!("={name}:"),
             "-F",
             "#{pane_pid} #{masil_foreground_pgid} #{session_windows} #{history_size} \
              #{cursor_y} #{session_created} #{pane_current_command} #{b:default-shell} \
@@ -1270,23 +1347,17 @@ fn execute_restore(
                     "-c",
                     client,
                     "-t",
-                    &format!("={}", session.target_name),
+                    &format!("={}:", session.target_name),
                 ],
             );
         }
         if session.target_name != session.name {
             // Replace the just-started session if it is still untouched and
             // no client uses it; otherwise both stay.
-            let old = format!("={}", session.name);
+            let old = format!("={}:", session.name);
             let attached = masil(
                 server,
-                &[
-                    "display-message",
-                    "-p",
-                    "-t",
-                    &format!("{old}:"),
-                    "#{session_attached}",
-                ],
+                &["display-message", "-p", "-t", &old, "#{session_attached}"],
             )
             .unwrap_or_default();
             if attached.trim() == "0" && pristine(server, &session.name) {
@@ -1296,7 +1367,7 @@ fn execute_restore(
                     &[
                         "rename-session",
                         "-t",
-                        &format!("={}", session.target_name),
+                        &format!("={}:", session.target_name),
                         "--",
                         &literal(&session.name),
                     ],
@@ -2106,6 +2177,9 @@ fn after_manual_save(server: &Server, socket: &str) {
     if let Err(error) = masil(server, &["set-option", "-gq", "@masil-autosave-used", "on"]) {
         eprintln!("masil-agent: could not set @masil-autosave-used: {error}");
     }
+    if autosave_running(Path::new(socket)) {
+        return;
+    }
     if let Err(error) = start_autosave(socket) {
         eprintln!("masil-agent: could not start session autosave: {error}");
     }
@@ -2249,7 +2323,7 @@ fn autosave(raw_socket: &str, boot: bool) -> Result<i32, String> {
             "" => AUTOSAVE_MINUTES,
             value => value.parse::<u64>().unwrap_or(0),
         };
-        if minutes > 0 && last.elapsed() >= Duration::from_secs(minutes * 60) {
+        if minutes > 0 && last.elapsed() >= Duration::from_secs(minutes.saturating_mul(60)) {
             let _ = save(&server, socket_text, Kind::Auto);
             last = std::time::Instant::now();
         }
@@ -2482,6 +2556,10 @@ mod tests {
         assert!(validate(&snapshot).is_ok());
         snapshot.sessions[0].name = "a:b".into();
         assert!(validate(&snapshot).is_err());
+        for name in ["my.app", "v1.2", ".hidden"] {
+            snapshot.sessions[0].name = name.into();
+            assert!(validate(&snapshot).is_ok(), "{name}");
+        }
         snapshot.sessions[0].name = "work".into();
         snapshot.sessions[0].windows[0].panes[0].command = Some(Vec::new());
         assert!(validate(&snapshot).is_err());
@@ -2583,5 +2661,60 @@ mod tests {
         let mut without = listed.clone();
         without.as_object_mut().unwrap().remove("columns_skipped");
         assert_eq!(without, plain);
+    }
+
+    #[test]
+    fn command_word_escapes_only_a_trailing_semicolon() {
+        assert_eq!(command_word("make;"), "make\\;");
+        assert_eq!(command_word(";"), "\\;");
+        assert_eq!(command_word("a;b"), "a;b");
+        assert_eq!(command_word("plain"), "plain");
+    }
+
+    #[test]
+    fn tmux_env_keeps_commas_in_the_socket_path() {
+        assert_eq!(
+            socket_from_tmux_env("/tmp/a,b/sock,123,0").as_deref(),
+            Some("/tmp/a,b/sock")
+        );
+        assert_eq!(
+            socket_from_tmux_env("/tmp/sock,1,0").as_deref(),
+            Some("/tmp/sock")
+        );
+        assert_eq!(socket_from_tmux_env(",1,0"), None);
+    }
+
+    #[test]
+    fn autosave_interval_does_not_overflow() {
+        assert_eq!(
+            Duration::from_secs(u64::MAX.saturating_mul(60)),
+            Duration::from_secs(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn temporary_snapshot_files_do_not_collide_and_stale_ones_are_pruned() {
+        let dir = std::env::temp_dir().join(format!(
+            "masil-session-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        // A leftover with this process id must not block a save.
+        let stale = dir.join(format!(".snapshot.{}.tmp", std::process::id()));
+        fs::write(&stale, b"old").unwrap();
+        write_private(&dir.join("a.json"), b"{}").unwrap();
+        write_private(&dir.join("b.json"), b"{}").unwrap();
+        assert!(stale.exists());
+        // A fresh temporary file stays; one older than a minute goes.
+        let file = File::options().write(true).open(&stale).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        let fresh = dir.join(".snapshot.fresh.tmp");
+        fs::write(&fresh, b"new").unwrap();
+        remove_stale_temporaries(&dir);
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

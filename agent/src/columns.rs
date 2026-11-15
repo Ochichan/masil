@@ -8,6 +8,7 @@
 //! commands read the window, build, and write the result in one guarded
 //! tmux command so that a change made meanwhile is never overwritten.
 
+use crate::session::command_word;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -909,6 +910,16 @@ pub(crate) fn guarded(window: &str, signature: &str, list: &[String]) -> Vec<Str
     ]
 }
 
+/// `guarded` for a window read in column mode: the list also runs only while
+/// the window still carries the column mark. A write that was decided before
+/// `off` or a restore cleanup took the mark away then does not put the count,
+/// dirty and fit options back on a window that is no longer in column mode.
+fn guarded_on(window: &str, signature: &str, list: &[String]) -> Vec<String> {
+    let mut command = guarded(window, signature, list);
+    command[4] = format!("#{{&&:#{{==:{SIGNATURE},{signature}}},#{{==:#{{{MARK}}},1}}}}");
+    command
+}
+
 /// Quotes a value for a tmux command list in single quotes.
 pub(crate) fn single_quoted(value: &str) -> Result<String, String> {
     if value.contains('\'') || value.chars().any(char::is_control) {
@@ -1279,6 +1290,32 @@ impl Server {
         String::from_utf8(output.stdout).map_err(|_| "native response is not UTF-8".into())
     }
 
+    /// `run`, but a failure also returns what the command printed first.
+    async fn run_keeping_stdout<S: AsRef<str>>(
+        &self,
+        args: &[S],
+    ) -> Result<String, (String, Vec<u8>)> {
+        let output = self
+            .native
+            .tmux_keeping_stdout(
+                args.iter()
+                    .map(|arg| std::ffi::OsString::from(arg.as_ref())),
+            )
+            .await
+            .map_err(|(error, printed)| {
+                let error = if error.starts_with("native command failed")
+                    || error.starts_with("native command exited")
+                {
+                    error
+                } else {
+                    format!("server_unreachable: {error}")
+                };
+                (error, printed)
+            })?;
+        String::from_utf8(output.stdout)
+            .map_err(|_| ("native response is not UTF-8".to_owned(), Vec::new()))
+    }
+
     async fn clients(&self) -> Result<Vec<Client>, String> {
         Ok(parse_clients(
             &self.run(&["list-clients", "-F", CLIENT_FORMAT]).await?,
@@ -1578,7 +1615,12 @@ async fn write(server: &Server, state: &State, change: &Change) -> Result<Writte
         }
         Change::Leave => return Ok(Written::Nothing),
     };
-    match server.run(&guarded(window, &state.signature, &list)).await {
+    let command = if state.on {
+        guarded_on(window, &state.signature, &list)
+    } else {
+        guarded(window, &state.signature, &list)
+    };
+    match server.run(&command).await {
         Ok(output) if output.trim() == "columns_applied" => Ok(Written::Applied),
         Ok(output) if output.trim() == "columns_stale" => Ok(Written::Stale),
         Ok(output) => Err(format!("columns: unexpected answer {}", output.trim())),
@@ -1701,21 +1743,61 @@ where
                 }
             }
             Written::Failed(error) => {
+                // A user's hook after `select-layout` or `resize-window` can
+                // fail without stopping the list. When the built layout is in
+                // place the change happened and the error is a warning.
+                if let Change::Layout { built, .. } = &change
+                    && built.changed
+                    && check(server, &state, built).await?
+                {
+                    warnings.push(format!(
+                        "columns_hook_failed: {}",
+                        crate::managed::failure::human(&error)
+                    ));
+                    return Ok(Settled {
+                        changed: true,
+                        widths: built.widths.clone(),
+                        warnings,
+                    });
+                }
+                // The change did not happen. Put back the layout read before
+                // the write, as well as it can be done; a window turned off
+                // meanwhile is left alone.
+                if state.on {
+                    let (width, height) = state.layout.size();
+                    let _ = server
+                        .run(&[
+                            "resize-window".to_owned(),
+                            "-t".into(),
+                            state.window.clone(),
+                            "-x".into(),
+                            width.to_string(),
+                            "-y".into(),
+                            height.to_string(),
+                            ";".into(),
+                            "select-layout".into(),
+                            "-t".into(),
+                            state.window.clone(),
+                            state.text.clone(),
+                        ])
+                        .await;
+                }
                 // The list stopped at `select-layout`; `resize-window`
                 // before it changed the panes, so the guard reads again.
-                let state = State::read(server, Some(window)).await?;
-                let count = state.layout.tiled();
-                let list = option_commands(&state.window, count, None)?;
-                server
-                    .run(&guarded(&state.window, &state.signature, &list))
-                    .await?;
+                let now = State::read(server, Some(window)).await?;
+                if now.on {
+                    let list = option_commands(&now.window, now.layout.tiled(), None)?;
+                    server
+                        .run(&guarded_on(&now.window, &now.signature, &list))
+                        .await?;
+                }
                 warnings.push(format!(
                     "columns_apply_failed: {}",
                     crate::managed::failure::human(&error)
                 ));
                 return Ok(Settled {
                     changed: true,
-                    widths: state.layout.widths(),
+                    widths: now.layout.widths(),
                     warnings,
                 });
             }
@@ -1902,6 +1984,20 @@ async fn install(server: &Server) -> Result<(), String> {
     Ok(())
 }
 
+/// The `columns_apply_failed` warning of a settled change, if there is one.
+/// A command that was asked for a change reports it as an error, since the
+/// layout the change describes was not applied.
+fn apply_failure(settled: &Settled) -> Result<(), String> {
+    match settled
+        .warnings
+        .iter()
+        .find(|warning| warning.starts_with("columns_apply_failed"))
+    {
+        Some(failed) => Err(failed.clone()),
+        None => Ok(()),
+    }
+}
+
 /// Removes every hook of ours, the monitor and the global options. A slot
 /// holding a hook that is not ours (the reason `on` refuses) keeps it.
 async fn uninstall(server: &Server) -> Result<(), String> {
@@ -2022,17 +2118,30 @@ async fn on(server: &Server, options: &Options) -> Result<Value, String> {
     .await
     .and_then(|settled| {
         // The list stopped at select-layout, before the mark.
-        match settled
-            .warnings
-            .iter()
-            .find(|warning| warning.starts_with("columns_apply_failed"))
-        {
-            Some(failed) => Err(failed.clone()),
-            None => Ok(settled),
-        }
+        apply_failure(&settled).map(|()| settled)
     });
+    // A window turned on just now goes back to its own size and options when
+    // the layout or the hooks cannot be set up.
     let settled = match result {
-        Ok(settled) => settled,
+        Ok(settled) => match install(server).await {
+            Ok(()) => settled,
+            Err(error) => {
+                if fresh {
+                    let _ = restore_size(server, &window, &own_size).await;
+                    // The layout was already made columnar; put the original
+                    // back before the saved copy is cleared.
+                    let _ = server
+                        .run(&["select-layout", "-t", &window, &first.text])
+                        .await;
+                    let _ = clear_window(server, &window).await;
+                    // A partly applied install may have left hooks behind.
+                    if server.column_windows().await.is_ok_and(|w| w.is_empty()) {
+                        let _ = uninstall(server).await;
+                    }
+                }
+                return Err(error);
+            }
+        },
         Err(error) => {
             if fresh {
                 let _ = restore_size(server, &window, &own_size).await;
@@ -2042,8 +2151,14 @@ async fn on(server: &Server, options: &Options) -> Result<Value, String> {
         }
     };
     warnings.extend(settled.warnings);
-    install(server).await?;
-    pan(server).await?;
+    // The window is already in column mode; a failed pan only leaves the view
+    // where it was.
+    if let Err(error) = pan(server).await {
+        warnings.push(format!(
+            "columns_pan_failed: {}",
+            crate::managed::failure::human(&error)
+        ));
+    }
     Ok(json!({
         "stage": "columns_on",
         "window": window,
@@ -2108,6 +2223,21 @@ async fn off(server: &Server, options: &Options) -> Result<Value, String> {
             None => None,
         };
         let mut list = Vec::new();
+        // The global value is read just before the guarded list. A change of
+        // it in between is not caught by the guard, which only compares the
+        // panes.
+        let global = if layout.is_some() && saved["window_size"].is_null() {
+            server
+                .run(&["show-options", "-gwqv", "window-size"])
+                .await?
+        } else {
+            String::new()
+        };
+        if layout.is_some()
+            && let Some(resize) = off_resize(&saved, &global, &window)
+        {
+            list.push(resize);
+        }
         if let Some(layout) = &layout {
             list.push(format!(
                 "select-layout -t {window} {}",
@@ -2154,6 +2284,21 @@ async fn off(server: &Server, options: &Options) -> Result<Value, String> {
         "changed": true,
         "warnings": warnings,
     }))
+}
+
+/// The `resize-window` that gives a window back the size it had before `on`,
+/// when its `window-size` is `manual` once `off` has put the option back: the
+/// window's own saved value, or the global one when it had none. `on` made
+/// the window wide, and a manual window does not follow the client, so the
+/// saved layout alone would leave it wide. Any other value sizes the window
+/// again once the option is put back.
+fn off_resize(saved: &Value, global: &str, window: &str) -> Option<String> {
+    let effective = saved["window_size"].as_str().unwrap_or(global.trim());
+    if effective != "manual" {
+        return None;
+    }
+    let (width, height) = Layout::parse(saved["layout"].as_str()?).ok()?.size();
+    Some(format!("resize-window -t {window} -x {width} -y {height}"))
 }
 
 /// The layout `off` puts back: the saved one's tiled part when the tiled
@@ -2343,7 +2488,7 @@ async fn add(server: &Server, options: &Options) -> Result<Value, String> {
         split.push("-d".into());
     }
     if let Some(cwd) = &options.cwd {
-        split.extend(["-c".into(), cwd.clone()]);
+        split.extend(["-c".into(), command_word(cwd).into_owned()]);
     }
     append_command(&mut split, options.command.as_deref());
     // Wider first, so the split has room; then a column at the right end.
@@ -2369,33 +2514,53 @@ async fn add(server: &Server, options: &Options) -> Result<Value, String> {
         ],
         split,
     ]);
-    let created = match server.run(&list).await {
+    let created = match server.run_keeping_stdout(&list).await {
         Ok(output) => output.trim().to_owned(),
-        Err(error) => {
-            let mut undo = vec![vec![
-                "resize-window".to_owned(),
-                "-t".into(),
-                window.clone(),
-                "-x".into(),
-                first.width.to_string(),
-            ]];
-            if !first.dirty {
-                undo.push(vec![
-                    "set".into(),
-                    "-wu".into(),
-                    "-t".into(),
-                    window.clone(),
-                    "@masil-columns-dirty".into(),
-                ]);
+        Err((error, printed)) => {
+            // A hook of the user's (`after-split-window`) can fail after the
+            // pane was made; the command still printed that pane's id before
+            // the hook ran. A split that failed prints nothing. The pane is
+            // laid out like any other, and the failure is a warning.
+            match printed_pane(&printed) {
+                Some(pane) if !error.starts_with("server_unreachable") => {
+                    warnings.push(format!(
+                        "columns_split_hook_failed: {}",
+                        crate::managed::failure::human(&error)
+                    ));
+                    pane
+                }
+                _ => {
+                    let mut undo = vec![vec![
+                        "resize-window".to_owned(),
+                        "-t".into(),
+                        window.clone(),
+                        "-x".into(),
+                        first.width.to_string(),
+                    ]];
+                    if !first.dirty {
+                        undo.push(vec![
+                            "set".into(),
+                            "-wu".into(),
+                            "-t".into(),
+                            window.clone(),
+                            "@masil-columns-dirty".into(),
+                        ]);
+                    }
+                    let _ = server.run(&joined(undo)).await;
+                    return Err(error);
+                }
             }
-            let _ = server.run(&joined(undo)).await;
-            return Err(error);
         }
     };
     if crate::pane_id(&created).is_err() {
         return Err("columns: split-window returned no pane id".into());
     }
     let settled = settle(server, &window, |state, clients, warnings| {
+        // A window turned off meanwhile keeps the layout the split made.
+        if !state.on {
+            warnings.push("columns_off".into());
+            return Ok(Change::Leave);
+        }
         let base = base_client(clients, &state.window, None);
         let mut request = Request {
             default_width: default_width(None, state, base),
@@ -2428,6 +2593,12 @@ async fn add(server: &Server, options: &Options) -> Result<Value, String> {
     }))
 }
 
+/// The pane id a failed `split-window -P` printed, if it printed one.
+fn printed_pane(printed: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(printed).ok()?.trim();
+    crate::pane_id(text).ok().map(|_| text.to_owned())
+}
+
 /// A command for `split-window` or `new-pane`, as `layout` passes one: a
 /// single word runs without a shell.
 fn append_command(args: &mut Vec<String>, command: Option<&[String]>) {
@@ -2436,9 +2607,17 @@ fn append_command(args: &mut Vec<String>, command: Option<&[String]>) {
     };
     args.push("--".into());
     if command.len() == 1 {
-        args.extend(["/usr/bin/env".into(), "--".into(), command[0].clone()]);
+        args.extend([
+            "/usr/bin/env".into(),
+            "--".into(),
+            command_word(&command[0]).into_owned(),
+        ]);
     } else {
-        args.extend(command.iter().cloned());
+        args.extend(
+            command
+                .iter()
+                .map(|element| command_word(element).into_owned()),
+        );
     }
 }
 
@@ -2462,6 +2641,10 @@ async fn close(server: &Server, options: &Options) -> Result<Value, String> {
         );
     }
     let settled = settle(server, &window, |state, clients, warnings| {
+        if !state.on {
+            warnings.push("columns_off".into());
+            return Ok(Change::Leave);
+        }
         let fit = state.fit(warnings);
         usual(
             state,
@@ -2509,6 +2692,7 @@ async fn width(server: &Server, change: WidthChange, options: &Options) -> Resul
     // `+N` must not apply twice.
     let mut decided: Option<u32> = None;
     let settled = settle_with(server, &window, |state, clients, warnings, applied| {
+        state.require_on()?;
         let prev = state.prev(warnings);
         let next = match decided.filter(|_| applied) {
             Some(next) => next,
@@ -2539,6 +2723,7 @@ async fn width(server: &Server, change: WidthChange, options: &Options) -> Resul
         asked(state, clients, Some(&prev), widths, fit, Vec::new())
     })
     .await?;
+    apply_failure(&settled)?;
     pan(server).await?;
     Ok(json!({
         "stage": "column_width",
@@ -2559,6 +2744,7 @@ async fn fit(server: &Server, options: &Options) -> Result<Value, String> {
     // the width its fit entry keeps for later.
     let mut decided: Option<(bool, u32, u32)> = None;
     let settled = settle_with(server, &window, |state, clients, warnings, applied| {
+        state.require_on()?;
         // A named client must exist even when nothing needs its width.
         base(clients, &state.window, options.client.as_deref())?;
         let prev = state.prev(warnings);
@@ -2590,6 +2776,7 @@ async fn fit(server: &Server, options: &Options) -> Result<Value, String> {
         asked(state, clients, Some(&prev), widths, fit, Vec::new())
     })
     .await?;
+    apply_failure(&settled)?;
     let fitted = decided.is_some_and(|(fitted, ..)| fitted);
     pan(server).await?;
     Ok(json!({
@@ -2636,7 +2823,7 @@ async fn float(server: &Server, options: &Options) -> Result<Value, String> {
         "#{pane_id}".into(),
     ];
     if let Some(cwd) = &options.cwd {
-        args.extend(["-c".into(), cwd.clone()]);
+        args.extend(["-c".into(), command_word(cwd).into_owned()]);
     }
     append_command(&mut args, options.command.as_deref());
     let pane = server.run(&args).await?.trim().to_owned();
@@ -2964,6 +3151,22 @@ mod tests {
     }
 
     #[test]
+    fn append_command_escapes_data_but_not_separators() {
+        let mut args = vec!["split-window".to_owned()];
+        append_command(
+            &mut args,
+            Some(&["sh".into(), "-c".into(), "make;".into(), ";".into()]),
+        );
+        assert_eq!(args, ["split-window", "--", "sh", "-c", "make\\;", "\\;"]);
+        let mut single = Vec::new();
+        append_command(&mut single, Some(&["tool;".into()]));
+        assert_eq!(single, ["--", "/usr/bin/env", "--", "tool\\;"]);
+        // The separator `joined` adds stays a bare ";".
+        let list = joined(vec![vec!["a".into(), "x\\;".into()], vec!["b".into()]]);
+        assert_eq!(list, ["a", "x\\;", ";", "b"]);
+    }
+
+    #[test]
     fn joined_and_parted_columns_keep_one_old_width() {
         let prev = parse(&layout(
             &[(50, &[("%1", 40)]), (80, &[("%2", 40)])],
@@ -3226,6 +3429,58 @@ mod tests {
         assert!(Layout::parse_prev("0000,").is_err());
         assert!(Layout::parse_prev("a1b2,10x10,0,0").is_err());
         assert!(Layout::parse_prev("a1b2,10x10,0,0,1,").is_err());
+    }
+
+    #[test]
+    fn a_write_to_a_column_window_also_needs_the_mark() {
+        let command = guarded_on("@3", "%1.0.0.80.40:", &["set -w -t @3 x 1".into()]);
+        assert_eq!(
+            command[4],
+            format!("#{{&&:#{{==:{SIGNATURE},%1.0.0.80.40:}},#{{==:#{{@masil-columns}},1}}}}")
+        );
+        assert_eq!(command[6], "display-message -p columns_stale");
+    }
+
+    #[test]
+    fn off_resizes_a_window_whose_size_is_manual_once_restored() {
+        let layout = layout(&[(60, &[("%1", 20)]), (60, &[("%2", 20)])], 24, &[]);
+        let own = json!({"window_size": "manual", "layout": layout});
+        let resize = off_resize(&own, "latest", "@3").unwrap();
+        assert!(
+            resize.starts_with("resize-window -t @3 -x 121 -y 24"),
+            "{resize}"
+        );
+        // No own value: the global one decides.
+        let none = json!({"window_size": null, "layout": layout});
+        assert!(off_resize(&none, "manual\n", "@3").is_some());
+        assert_eq!(off_resize(&none, "latest\n", "@3"), None);
+        // An own value hides the global one.
+        let largest = json!({"window_size": "largest", "layout": layout});
+        assert_eq!(off_resize(&largest, "manual", "@3"), None);
+        let unreadable = json!({"window_size": "manual", "layout": null});
+        assert_eq!(off_resize(&unreadable, "manual", "@3"), None);
+    }
+
+    #[test]
+    fn a_split_the_hook_failed_on_still_names_its_pane() {
+        assert_eq!(printed_pane(b"%5\n").as_deref(), Some("%5"));
+        assert_eq!(printed_pane(b""), None);
+        assert_eq!(printed_pane(b"no pane here\n"), None);
+    }
+
+    #[test]
+    fn a_failed_apply_is_an_error_for_a_command_that_asked() {
+        let mut settled = Settled::default();
+        assert!(apply_failure(&settled).is_ok());
+        settled.warnings = vec!["columns_too_short: x".into()];
+        assert!(apply_failure(&settled).is_ok());
+        settled
+            .warnings
+            .push("columns_apply_failed: no space".into());
+        assert_eq!(
+            apply_failure(&settled),
+            Err("columns_apply_failed: no space".into())
+        );
     }
 
     #[test]

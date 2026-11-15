@@ -3,6 +3,7 @@
 use crate::columns::{Columns, MAX_WINDOW, MIN_WIDTH};
 use crate::managed::Manager;
 use crate::providers;
+use crate::session::command_word;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -24,6 +25,8 @@ const MAX_PATH_BYTES: usize = 4096;
 const MAX_DRAFTS: usize = 64;
 const MAX_DRAFT_BYTES: usize = 32 * 1024;
 const DIRECT_EXEC: &str = "/usr/bin/env";
+const NEW_SESSION_WIDTH: &str = "250";
+const NEW_SESSION_HEIGHT: &str = "80";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -749,7 +752,10 @@ fn resolve_path(
             "{field} exceeds bounds or contains control characters"
         ));
     }
-    let expanded = if let Some(suffix) = value.strip_prefix("~/") {
+    let expanded = if value == "~" {
+        home.ok_or_else(|| format!("HOME is required to expand {field}"))?
+            .to_path_buf()
+    } else if let Some(suffix) = value.strip_prefix("~/") {
         home.ok_or_else(|| format!("HOME is required to expand {field}"))?
             .join(suffix)
     } else {
@@ -1185,6 +1191,8 @@ async fn apply_prepared(
     let mut window_ids = Vec::<Option<String>>::with_capacity(prepared.template.windows.len());
     // The column width of each column window that got one.
     let mut column_widths = Vec::<Option<u32>>::with_capacity(prepared.template.windows.len());
+    // What turning column mode on warned about, one object per warning.
+    let mut warnings = Vec::<serde_json::Value>::new();
     let mut focused = None;
     let mut session_created = false;
 
@@ -1280,8 +1288,8 @@ async fn apply_prepared(
                     results.push(failed_result(label.clone(), pane_index, "agent", error));
                     continue;
                 }
-                match manager
-                    .start(
+                let start = || {
+                    manager.start(
                         &agent.name,
                         &agent.provider,
                         Path::new(&pane.cwd),
@@ -1289,8 +1297,18 @@ async fn apply_prepared(
                         agent.session.as_deref(),
                         Some(target),
                     )
-                    .await
+                };
+                let mut started = start().await;
+                // `start` splits the target itself. Its error carries the
+                // core's text when the split fails, so the same tile-and-retry
+                // applies; an error wrapped in other text is not retried.
+                if let Err(error) = &started
+                    && no_space(error)
+                    && tile(&manager, target).await
                 {
+                    started = start().await;
+                }
+                match started {
                     Ok(value) => {
                         let Some(pane_id) = value
                             .get("pane_id")
@@ -1389,6 +1407,20 @@ async fn apply_prepared(
         }
     }
 
+    // The first window's size set the session's `default-size`; later windows
+    // of the session, made after this, use the global default again.
+    if session_created && prepared.template.windows[0].columns.is_none() {
+        let _ = manager
+            .command(&[
+                "set-option",
+                "-u",
+                "-t",
+                &format!("={session}:"),
+                "default-size",
+            ])
+            .await;
+    }
+
     for (window_index, window) in prepared.template.windows.iter().enumerate() {
         let Some(layout) = window.layout.as_deref() else {
             continue;
@@ -1441,11 +1473,19 @@ async fn apply_prepared(
             results.push(failed_result(label, 0, "columns", error));
             continue;
         }
-        if let Err(error) = Columns::new(manager.native.socket.clone())
+        match Columns::new(manager.native.socket.clone())
             .turn_on(window_id, Some(width))
             .await
         {
-            results.push(failed_result(label, 0, "columns", error));
+            Ok(turned_on) => warnings.extend(
+                turned_on["warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|warning| warning.as_str())
+                    .map(|warning| json!({"window": label, "warning": warning})),
+            ),
+            Err(error) => results.push(failed_result(label, 0, "columns", error)),
         }
     }
 
@@ -1470,7 +1510,13 @@ async fn apply_prepared(
     } else {
         "failed"
     };
-    Ok(json!({"stage":stage,"session":session,"results":results}))
+    let mut output = json!({"stage":stage,"session":session,"results":results});
+    // Present only when column mode had something to warn about, so other
+    // output stays as it was.
+    if !warnings.is_empty() {
+        output["warnings"] = json!(warnings);
+    }
+    Ok(output)
 }
 
 fn window_label(window: &Window, index: usize) -> String {
@@ -1535,10 +1581,18 @@ async fn create_first_window(
         OsString::from("-s"),
         OsString::from(session),
     ];
+    // A detached session has the default size (80x24). A larger window helps
+    // the splits, but each split halves the previous pane, so `create_split`
+    // also tiles the window when it runs out of space. The size also sets the
+    // session's `default-size`, which `apply_prepared` unsets afterwards. A
+    // column window grows from its own width, so it keeps the default.
+    if window.columns.is_none() {
+        args.extend(["-x", NEW_SESSION_WIDTH, "-y", NEW_SESSION_HEIGHT].map(OsString::from));
+    }
     if let Some(name) = &window.name {
         args.extend([OsString::from("-n"), OsString::from(name)]);
     }
-    args.extend([OsString::from("-c"), OsString::from(&pane.cwd)]);
+    args.extend([OsString::from("-c"), word(&pane.cwd)]);
     append_command(&mut args, pane.command.as_deref());
     created_window(manager, args).await
 }
@@ -1561,12 +1615,43 @@ async fn create_window(
     if let Some(name) = &window.name {
         args.extend([OsString::from("-n"), OsString::from(name)]);
     }
-    args.extend([OsString::from("-c"), OsString::from(&pane.cwd)]);
+    args.extend([OsString::from("-c"), word(&pane.cwd)]);
     append_command(&mut args, pane.command.as_deref());
     created_window(manager, args).await
 }
 
+/// Whether an error says a split had no room. The core words every such
+/// failure (core/layout.c) as "no space for a new pane", possibly after a
+/// "create pane failed: " prefix.
+fn no_space(error: &str) -> bool {
+    error.contains("no space for a new pane")
+}
+
+/// Tiles a window so the next split has room.
+async fn tile(manager: &Manager, target: &str) -> bool {
+    manager
+        .command(&["select-layout", "-t", target, "tiled"])
+        .await
+        .is_ok()
+}
+
+/// Each split halves the previous pane, so a window fills up before 16 panes
+/// exist. When a split has no space, the window is tiled once and the split is
+/// tried again.
 async fn create_split(manager: &Manager, target: &str, pane: &Pane) -> Result<String, String> {
+    let args = split_args(target, pane);
+    match created_pane(manager, args.clone()).await {
+        Err(error) if no_space(&error) => {
+            if !tile(manager, target).await {
+                return Err(error);
+            }
+            created_pane(manager, args).await
+        }
+        result => result,
+    }
+}
+
+fn split_args(target: &str, pane: &Pane) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("split-window"),
         OsString::from("-d"),
@@ -1576,10 +1661,10 @@ async fn create_split(manager: &Manager, target: &str, pane: &Pane) -> Result<St
         OsString::from("-t"),
         OsString::from(target),
         OsString::from("-c"),
-        OsString::from(&pane.cwd),
+        word(&pane.cwd),
     ];
     append_command(&mut args, pane.command.as_deref());
-    created_pane(manager, args).await
+    args
 }
 
 /// A full-height column of WIDTH cells at the window's right edge.
@@ -1597,7 +1682,7 @@ fn column_split_args(target: &str, pane: &Pane, width: u32) -> Vec<OsString> {
         OsString::from("-t"),
         OsString::from(target),
         OsString::from("-c"),
-        OsString::from(&pane.cwd),
+        word(&pane.cwd),
     ];
     append_command(&mut args, pane.command.as_deref());
     args
@@ -1647,6 +1732,11 @@ async fn widen_for_column(
         .map(drop)
 }
 
+/// A user-supplied value as one tmux command word.
+fn word(value: &str) -> OsString {
+    OsString::from(command_word(value).as_ref())
+}
+
 fn append_command(args: &mut Vec<OsString>, command: Option<&[String]>) {
     let Some(command) = command else {
         return;
@@ -1656,10 +1746,10 @@ fn append_command(args: &mut Vec<OsString>, command: Option<&[String]>) {
         args.extend([
             OsString::from(DIRECT_EXEC),
             OsString::from("--"),
-            OsString::from(&command[0]),
+            word(&command[0]),
         ]);
     } else {
-        args.extend(command.iter().map(OsString::from));
+        args.extend(command.iter().map(|element| word(element)));
     }
 }
 
@@ -1838,6 +1928,61 @@ agent = { provider = "codex", name = "review" }
                 .map(OsString::from)
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn a_trailing_semicolon_reaches_the_pane_as_data() {
+        let mut args = Vec::new();
+        append_command(
+            &mut args,
+            Some(&["sh".into(), "-c".into(), "make;".into(), ";".into()]),
+        );
+        assert_eq!(
+            args,
+            ["--", "sh", "-c", "make\\;", "\\;"]
+                .map(OsString::from)
+                .to_vec()
+        );
+        let mut single = Vec::new();
+        append_command(&mut single, Some(&["tool;".into()]));
+        assert_eq!(
+            single,
+            ["--", DIRECT_EXEC, "--", "tool\\;"]
+                .map(OsString::from)
+                .to_vec()
+        );
+        let pane = Pane {
+            cwd: "/tmp/dir;".into(),
+            command: None,
+            focus: false,
+            agent: None,
+            worktree: None,
+            queue: Vec::new(),
+        };
+        let args = column_split_args("%1", &pane, 40);
+        assert!(args.contains(&OsString::from("/tmp/dir\\;")));
+    }
+
+    #[test]
+    fn no_space_matches_the_cores_split_failure() {
+        assert!(no_space("create pane failed: no space for a new pane"));
+        assert!(no_space("no space for a new pane"));
+        assert!(!no_space("no space for new pane"));
+        assert!(!no_space("can't find pane: %9"));
+    }
+
+    #[test]
+    fn a_lone_tilde_root_is_the_home_directory() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            resolve_path("~", Path::new("/work"), Some(home), "root").unwrap(),
+            home
+        );
+        assert_eq!(
+            resolve_path("~/x", Path::new("/work"), Some(home), "root").unwrap(),
+            home.join("x")
+        );
+        assert!(resolve_path("~", Path::new("/work"), None, "root").is_err());
     }
 
     #[test]

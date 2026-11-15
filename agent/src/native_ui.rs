@@ -1052,6 +1052,64 @@ impl Context {
         run_process(executable.as_os_str(), all, input).await
     }
 
+    /// Runs a native command like `tmux` does, and when it fails also returns
+    /// what it printed on stdout. A command list can print a result and then
+    /// fail in a later step, such as a user's hook after `split-window -P`.
+    pub(crate) async fn tmux_keeping_stdout<I>(
+        &self,
+        args: I,
+    ) -> Result<ProcessOutput, (String, Vec<u8>)>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let executable = native_executable().map_err(|error| (error, Vec::new()))?;
+        let mut all = vec![
+            OsString::from("-u"),
+            OsString::from("-S"),
+            self.socket.as_os_str().to_owned(),
+        ];
+        all.extend(args);
+        let mut child = Command::new(executable.as_os_str())
+            .args(all)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| (format!("starting native command: {error}"), Vec::new()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ("native command has no stdout".to_owned(), Vec::new()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ("native command has no stderr".to_owned(), Vec::new()))?;
+        let joined = timeout(COMMAND_DEADLINE, async move {
+            tokio::join!(read_limited(stdout), read_limited(stderr), child.wait())
+        })
+        .await
+        .map_err(|_| ("native command timed out".to_owned(), Vec::new()))?;
+        let stdout = joined.0.map_err(|error| (error, Vec::new()))?;
+        let stderr = joined.1.map_err(|error| (error, Vec::new()))?;
+        let status = joined.2.map_err(|error| {
+            (
+                format!("waiting for native command: {error}"),
+                stdout.clone(),
+            )
+        })?;
+        if !status.success() || !stderr.is_empty() {
+            let message = String::from_utf8_lossy(&stderr);
+            let error = if message.trim().is_empty() {
+                format!("native command exited with {status}")
+            } else {
+                format!("native command failed: {}", message.trim())
+            };
+            return Err((error, stdout));
+        }
+        Ok(ProcessOutput { stdout, stderr })
+    }
+
     fn native_lock(&self, window_id: &str) -> Result<NativeLock, String> {
         require_window(window_id)?;
         let directory = private_parent(&self.socket)?;
