@@ -51,7 +51,9 @@ class Masil < Formula
   end
 
   test do
-    socket_dir = Pathname(Dir.mktmpdir("m", "/tmp"))
+    # The test sandbox lets a client connect only to sockets under testpath.
+    socket_dir = testpath/"sock"
+    socket_dir.mkpath
     socket_dir.chmod 0700
     socket = socket_dir/"s"
     home = testpath/"home"
@@ -63,34 +65,30 @@ class Masil < Formula
     [home, cache_home, config_home, data_home, runtime_dir, state_home].each(&:mkpath)
     runtime_dir.chmod 0700
 
-    begin
-      with_env(HOME:                home,
-               MASIL_AGENT_SOCKET:  nil,
-               MASIL_BRIDGE_SOCKET: "off",
-               TMUX:                nil,
-               TMUX_PANE:           nil,
-               TMUX_TMPDIR:         socket_dir,
-               XDG_CACHE_HOME:      cache_home,
-               XDG_CONFIG_HOME:     config_home,
-               XDG_DATA_HOME:       data_home,
-               XDG_RUNTIME_DIR:     runtime_dir,
-               XDG_STATE_HOME:      state_home) do
-        assert_match "tmux next-3.9", shell_output("#{bin}/masil -V")
-        agent_version = shell_output("#{bin}/masil-agent --version").strip
-        assert_match(/\Amasil-agent \d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\z/, agent_version)
+    with_env(HOME:                home,
+             MASIL_AGENT_SOCKET:  nil,
+             MASIL_BRIDGE_SOCKET: "off",
+             TMUX:                nil,
+             TMUX_PANE:           nil,
+             TMUX_TMPDIR:         socket_dir,
+             XDG_CACHE_HOME:      cache_home,
+             XDG_CONFIG_HOME:     config_home,
+             XDG_DATA_HOME:       data_home,
+             XDG_RUNTIME_DIR:     runtime_dir,
+             XDG_STATE_HOME:      state_home) do
+      assert_match "tmux next-3.9", shell_output("#{bin}/masil -V")
+      agent_version = shell_output("#{bin}/masil-agent --version").strip
+      assert_match(/\Amasil-agent \d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\z/, agent_version)
 
-        system bin/"masil", "-f", File::NULL, "-S", socket,
-               "new-session", "-d", "-s", "brewtest"
-        sessions = shell_output("#{bin}/masil -f #{File::NULL} -S #{socket} list-sessions -F '\#{session_name}'")
-        assert_equal "brewtest\n", sessions
+      system bin/"masil", "-f", File::NULL, "-S", socket,
+             "new-session", "-d", "-s", "brewtest"
+      sessions = shell_output("#{bin}/masil -f #{File::NULL} -S #{socket} list-sessions -F '\#{session_name}'")
+      assert_equal "brewtest\n", sessions
 
-        providers = JSON.parse(shell_output("#{bin}/masil-agent agent providers")).fetch("providers")
-        assert providers.any? { |provider| provider["id"] == "codex" }
-      ensure
-        quiet_system bin/"masil", "-f", File::NULL, "-S", socket, "kill-server"
-      end
+      providers = JSON.parse(shell_output("#{bin}/masil-agent agent providers")).fetch("providers")
+      assert providers.any? { |provider| provider["id"] == "codex" }
     ensure
-      remove_entry socket_dir if socket_dir.exist?
+      quiet_system bin/"masil", "-f", File::NULL, "-S", socket, "kill-server"
     end
   end
 end
