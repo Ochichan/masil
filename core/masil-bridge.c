@@ -651,6 +651,14 @@ masil_bridge_client_deadline(struct masil_bridge_client *client)
 
 	active = !client->hello_done || client->rx_len != 0 ||
 	    client->tx != NULL;
+	/*
+	 * masil: the handshake deadline is total. It starts at accept, and
+	 * bytes or rejected requests before hello do not extend it, so a
+	 * connection holds a pending-hello slot for at most the timeout.
+	 */
+	if (!client->hello_done && event_initialized(&client->timeout_event) &&
+	    evtimer_pending(&client->timeout_event, NULL))
+		return;
 	if (event_initialized(&client->timeout_event))
 		event_del(&client->timeout_event);
 	if (!active)
@@ -2324,7 +2332,13 @@ masil_bridge_watch_unsubscribe(struct masil_bridge_client *client)
 	}
 	client->watch_count = 0;
 	memset(client->watch_bits, 0, sizeof client->watch_bits);
-	if (masil_bridge_watch_clients == 0) {
+	/*
+	 * masil: another connection that is the coordinator reads launch and
+	 * focus records from this journal without a watch, and it may not have
+	 * read the newest ones yet. Keep the journal while it is connected.
+	 */
+	if (masil_bridge_watch_clients == 0 &&
+	    (!masil_bridge_coordinator_connected || client->coordinator)) {
 		masil_bridge_journal_head = 0;
 		masil_bridge_journal_count = 0;
 	}
@@ -3463,6 +3477,32 @@ masil_bridge_client_stop_flush(struct masil_bridge_client *client)
 	}
 }
 
+static void masil_bridge_accept(int, short, void *);
+
+/*
+ * masil: listen for bridge connections, or with a timeout stop listening for
+ * that many seconds first. This follows server_add_accept in server.c.
+ */
+static void
+masil_bridge_add_accept(int timeout)
+{
+	struct timeval tv = { timeout, 0 };
+
+	if (masil_bridge_fd == -1)
+		return;
+	if (event_initialized(&masil_bridge_event))
+		event_del(&masil_bridge_event);
+	if (timeout == 0) {
+		event_set(&masil_bridge_event, masil_bridge_fd,
+		    EV_READ|EV_PERSIST, masil_bridge_accept, NULL);
+		event_add(&masil_bridge_event, NULL);
+	} else {
+		event_set(&masil_bridge_event, masil_bridge_fd, EV_TIMEOUT,
+		    masil_bridge_accept, NULL);
+		event_add(&masil_bridge_event, &tv);
+	}
+}
+
 static void
 masil_bridge_accept(__unused int fd, short events, __unused void *data)
 {
@@ -3473,11 +3513,23 @@ masil_bridge_accept(__unused int fd, short events, __unused void *data)
 	gid_t			 gid;
 	int			 client_fd;
 
-	if (!(events & EV_READ))
+	if (!(events & EV_READ)) {
+		/* masil: the pause after a failed accept is over. */
+		masil_bridge_add_accept(0);
 		return;
+	}
 	client_fd = accept(masil_bridge_fd, (struct sockaddr *)&address, &length);
-	if (client_fd == -1)
+	if (client_fd == -1) {
+		/*
+		 * masil: without a free descriptor the connection can stay
+		 * queued (Linux and the BSDs), and the read event would then
+		 * fire again at once. Like server_accept, do not try again for
+		 * one second.
+		 */
+		if (errno == ENFILE || errno == EMFILE)
+			masil_bridge_add_accept(1);
 		return;
+	}
 	if (fcntl(client_fd, F_SETFD, FD_CLOEXEC) == -1) {
 		close(client_fd);
 		return;
@@ -3858,7 +3910,10 @@ masil_bridge_start(void)
 	if ((!derived && masil_bridge_private_parent(path) != 0) ||
 	    (!derived && strlcpy(masil_bridge_path, path,
 	    sizeof masil_bridge_path) >= sizeof masil_bridge_path)) {
-		log_debug("masil bridge: socket path must be in a private owner directory");
+		/* masil: show-messages tells the user why the bridge is off. */
+		server_add_message("masil bridge is off: socket path %s is too "
+		    "long or is not in a directory that only its owner can "
+		    "access", path);
 		masil_bridge_path[0] = '\0';
 		return;
 	}
@@ -3866,8 +3921,8 @@ masil_bridge_start(void)
 	if ((derived && masil_bridge_reclaim_stale(masil_bridge_path) != 0) ||
 	    (!derived && (lstat(masil_bridge_path, &sb) == 0 ||
 	    errno != ENOENT))) {
-		log_debug("masil bridge: refusing existing socket path %s",
-		    masil_bridge_path);
+		server_add_message("masil bridge is off: refusing existing "
+		    "socket path %s", masil_bridge_path);
 		masil_bridge_path_derived = 0;
 		masil_bridge_path[0] = '\0';
 		return;
@@ -3932,6 +3987,17 @@ masil_bridge_start(void)
 	event_set(&masil_bridge_event, masil_bridge_fd, EV_READ|EV_PERSIST,
 	    masil_bridge_accept, NULL);
 	event_add(&masil_bridge_event, NULL);
+	/*
+	 * masil: the configured path has been used. Panes must not inherit it,
+	 * because a masil server started inside one would be told to use the
+	 * same path and refuse it as existing. The variable stays when it turns
+	 * the bridge off or when the start failed, so that doctor can read it.
+	 */
+	if (!derived) {
+		environ_unset(global_environ, "MASIL_BRIDGE_SOCKET");
+		/* Children forked without the global environment (pipe-pane). */
+		unsetenv("MASIL_BRIDGE_SOCKET");
+	}
 	log_debug("masil bridge: listening on %s", masil_bridge_path);
 	return;
 
@@ -3943,7 +4009,7 @@ fail_bound:
 		unlink(masil_bridge_path);
 	errno = saved_errno;
 fail:
-	log_debug("masil bridge: failed to listen on %s: %s",
+	server_add_message("masil bridge is off: cannot listen on %s: %s",
 	    masil_bridge_path, strerror(errno));
 	if (masil_bridge_fd != -1) {
 		close(masil_bridge_fd);

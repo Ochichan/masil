@@ -6302,6 +6302,7 @@ static void *
 window_copy_pipe_run(struct window_mode_entry *wme, struct session *s,
     const char *cmd, size_t *len, struct window_copy_pipe_job **pj)
 {
+	struct window_copy_mode_data	*wdata = wme->data; /* masil: */
 	void				*buf;
 	struct job			*job;
 	struct window_copy_pipe_job	*data = NULL;
@@ -6309,6 +6310,13 @@ window_copy_pipe_run(struct window_mode_entry *wme, struct session *s,
 	if (pj != NULL)
 		*pj = NULL;
 	buf = window_copy_get_selection(wme, len);
+	/*
+	 * masil: an invalidated selection copies nothing, so the helper is not
+	 * started either. With empty input a helper such as pbcopy would empty
+	 * the system clipboard after the "nothing copied" message.
+	 */
+	if (buf == NULL && wdata->selection_invalidated)
+		return (NULL);
 	if (cmd == NULL || *cmd == '\0')
 		cmd = options_get_string(global_options, "copy-command");
 	if (cmd != NULL && *cmd != '\0') {
