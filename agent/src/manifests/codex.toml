@@ -1,10 +1,17 @@
 # Modified by masil after the import from Herdr. See NOTICE.
 id = "codex"
-version = "2026.10.04.1"
-min_engine_version = 4
-updated_at = "2026-10-04T12:00:00Z"
+version = "2026.11.17.1"
+min_engine_version = 6
+updated_at = "2026-11-17T12:00:00Z"
 # Measured 2026-10-04 on 0.160.0: Esc ends the turn; C-c opens a menu or exits.
 interrupt_keys = ["Escape"]
+
+# Measured 2026-11-17 on 0.169.0: the placeholder after › is faint, a draft
+# is not. With a draft in the composer Codex adds a sent prompt to it.
+[composer]
+region = "bottom_non_empty_lines(4)"
+line = '^›(?: |$)'
+empty = ['^›\s*$']
 
 [[rules]]
 id = "osc_title_blocked"

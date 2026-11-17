@@ -332,6 +332,12 @@ const SCREEN_MOVED_PAUSE: std::time::Duration = std::time::Duration::from_millis
 /// refusal and is not followed by a late delivery.
 const SCREEN_MOVED_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 
+fn composer_refusal(name: &str, draft: &str) -> String {
+    format!(
+        "composer_not_empty: the composer of {name} holds a draft ({draft:?}), and a prompt would be added to it; nothing was sent. Clear the draft in the pane and send again"
+    )
+}
+
 /// Whether `error` is the core's refusal of a prompt whose pane output,
 /// title or progress moved after the read that judged it. The core checks
 /// these with the paste in one step, so nothing was sent.
@@ -704,8 +710,9 @@ impl Manager {
                 );
             }
             if current.state != "idle" || current.process != "running" {
-                return Err("prompt requires an idle, verified foreground agent; blocked, working and unknown states cannot receive a prompt".into());
+                return Err("prompt_not_idle: prompt requires an idle, verified foreground agent; blocked, working and unknown states cannot receive a prompt".into());
             }
+            self.composer_is_empty(&current).await?;
             // A bare newline is a submit key when bracketed paste is not enabled.
             let needs_bracket = text.contains('\n') || text.contains('\t');
             if needs_bracket
@@ -1054,9 +1061,10 @@ impl Manager {
             }
             if current.state != "idle" || current.process != "running" {
                 return Err(again(
-                    "prompt requires an idle, verified foreground agent; blocked, working and unknown states cannot receive a prompt",
+                    "prompt_not_idle: prompt requires an idle, verified foreground agent; blocked, working and unknown states cannot receive a prompt",
                 ));
             }
+            self.composer_is_empty(&current).await?;
             // The second read is the one that established this call's idle
             // judgment. Use all of its screen guards, not the caller's older
             // snapshot, exactly as the native guarded path does.
@@ -1109,6 +1117,25 @@ impl Manager {
                 }
                 result => return result,
             }
+        }
+    }
+
+    /// Refuses a prompt when the composer already holds a draft: the
+    /// provider would add the prompt to it and submit both. The pane is read
+    /// after the idle judgment; the output guard of the send covers what a
+    /// person types after this read.
+    async fn composer_is_empty(&self, agent: &Agent) -> Result<(), String> {
+        // Without a `[composer]` section there is nothing to read, and the
+        // prompt costs no extra command.
+        if !self.engine.reads_composer(&agent.provider) {
+            return Ok(());
+        }
+        let styled = self
+            .command(&["capture-pane", "-p", "-e", "-t", &agent.pane_id])
+            .await?;
+        match self.engine.composer_draft(&agent.provider, &styled) {
+            Some(draft) => Err(composer_refusal(&agent.name, &draft)),
+            None => Ok(()),
         }
     }
 

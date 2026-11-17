@@ -1,8 +1,8 @@
 # Modified by masil after the import from Herdr. See NOTICE.
 id = "opencode"
-version = "2026.06.10.1"
+version = "2026.11.17.1"
 min_engine_version = 4
-updated_at = "2026-06-10T00:00:00Z"
+updated_at = "2026-11-17T12:00:00Z"
 # Measured 2026-10-04 on 1.18.34: the first Esc arms ("esc again to
 # interrupt"), the second ends the turn; C-c exits OpenCode.
 interrupt_keys = ["Escape", "Escape"]
@@ -23,7 +23,10 @@ any = [
 id = "interrupt_hint_working"
 state = "working"
 priority = 110
-region = "whole_recent"
+# Measured 2026-11-17 on 1.19.5: the hint and the progress bar are on the
+# footer, the last line of the screen. An answer or a draft that quotes
+# them is at least five lines up.
+region = "bottom_non_empty_lines(4)"
 visible_working = true
 interruptible = true
 any = [
@@ -37,7 +40,7 @@ any = [
 id = "progress_bar_working"
 state = "working"
 priority = 100
-region = "whole_recent"
+region = "bottom_non_empty_lines(4)"
 visible_working = true
 interruptible = true
 regex = ['(■|⬝){4,}']

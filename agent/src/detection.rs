@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::providers;
 
-const ENGINE_VERSION: u32 = 5;
+const ENGINE_VERSION: u32 = 6;
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 const MAX_SCREEN_BYTES: usize = 1024 * 1024;
 const MAX_REGION_CACHE_BYTES: usize = MAX_SCREEN_BYTES;
@@ -158,6 +158,42 @@ impl Engine {
                     .iter()
                     .any(|candidate| candidate.id == rule && candidate.interruptible)
             })
+    }
+
+    /// Whether this provider's manifest says where its composer is.
+    pub fn reads_composer(&self, provider: &str) -> bool {
+        providers::find(provider)
+            .and_then(|provider| self.manifests.get(provider.id))
+            .and_then(|manifest| manifest.loaded().ok())
+            .is_some_and(|loaded| loaded.composer.is_some())
+    }
+
+    /// The draft in this provider's composer, cut to 40 characters. `styled`
+    /// is the pane as `capture-pane -e` prints it. None when the manifest
+    /// has no `[composer]`, when the screen shows no composer line, and when
+    /// that line holds nothing.
+    pub fn composer_draft(&self, provider: &str, styled: &str) -> Option<String> {
+        let loaded = providers::find(provider)
+            .and_then(|provider| self.manifests.get(provider.id))
+            .and_then(|manifest| manifest.loaded().ok())?;
+        let composer = loaded.composer.as_ref()?;
+        if styled.len() > MAX_SCREEN_BYTES {
+            return None;
+        }
+        let screen = without_hint_text(styled);
+        let input = DetectionInput {
+            screen: &screen,
+            osc_title: "",
+            osc_progress: "",
+        };
+        let line = region(input, &composer.region)
+            .lines()
+            .rfind(|line| composer.line.is_match(line))?;
+        if composer.empty.iter().any(|empty| empty.is_match(line)) {
+            return None;
+        }
+        let draft = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        Some(draft.chars().take(40).collect())
     }
 
     /// Whether screen detection has rules for this provider.
@@ -368,6 +404,7 @@ fn load_bundled_manifest(id: &str, text: &str) -> Result<LoadedManifest, String>
 struct LoadedManifest {
     manifest: AgentManifest,
     compiled_rules: Vec<CompiledRule>,
+    composer: Option<CompiledComposer>,
     source: ManifestSource,
 }
 
@@ -400,8 +437,34 @@ struct AgentManifest {
     /// means masil does not know how to interrupt this provider.
     #[serde(default)]
     interrupt_keys: Vec<String>,
+    /// Where the composer is and how it looks with nothing in it (engine 6).
+    #[serde(default)]
+    composer: Option<ManifestComposer>,
     #[serde(default)]
     rules: Vec<ManifestRule>,
+}
+
+/// A prompt sent while the composer holds a draft is added to that draft,
+/// so masil reads the composer before it sends one.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestComposer {
+    #[serde(default = "default_region")]
+    region: String,
+    /// Matches the composer's first line; the last such line in the region
+    /// is the composer.
+    line: String,
+    /// The forms of that line that hold no draft. They are matched after
+    /// faint and italic text became spaces: a placeholder or a key hint is
+    /// drawn that way, what a person typed is not.
+    empty: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CompiledComposer {
+    region: String,
+    line: Regex,
+    empty: Vec<Regex>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -523,9 +586,11 @@ fn load_manifest(text: &str, source: ManifestSource) -> Result<LoadedManifest, S
     }
     let manifest: AgentManifest = toml::from_str(text).map_err(|error| error.to_string())?;
     let compiled_rules = validate_manifest(&manifest)?;
+    let composer = validate_composer(&manifest)?;
     Ok(LoadedManifest {
         manifest,
         compiled_rules,
+        composer,
         source,
     })
 }
@@ -623,6 +688,137 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, Stri
         compiled_rules.push(CompiledRule { gate });
     }
     Ok(compiled_rules)
+}
+
+fn validate_composer(manifest: &AgentManifest) -> Result<Option<CompiledComposer>, String> {
+    let Some(composer) = &manifest.composer else {
+        return Ok(None);
+    };
+    if manifest
+        .min_engine_version
+        .is_none_or(|version| version < 6)
+    {
+        return Err("composer needs min_engine_version = 6".into());
+    }
+    validate_region(&composer.region)
+        .map_err(|error| format!("composer uses invalid region: {error}"))?;
+    if matches!(composer.region.trim(), "osc_title" | "osc_progress") {
+        return Err("composer region must be a part of the screen".into());
+    }
+    if composer.empty.is_empty() || composer.empty.len() > MAX_MATCHERS_PER_GATE {
+        return Err(format!(
+            "composer needs 1 to {MAX_MATCHERS_PER_GATE} empty patterns"
+        ));
+    }
+    let compile = |pattern: &String| {
+        if pattern.is_empty() || pattern.chars().count() > MAX_MATCHER_CHARS {
+            return Err(format!(
+                "composer pattern must have 1 to {MAX_MATCHER_CHARS} characters"
+            ));
+        }
+        Regex::new(pattern)
+            .map_err(|error| format!("composer contains invalid regex {pattern:?}: {error}"))
+    };
+    let line = compile(&composer.line)?;
+    if line.is_match("") {
+        return Err("composer line pattern matches an empty line".into());
+    }
+    Ok(Some(CompiledComposer {
+        region: composer.region.clone(),
+        line,
+        empty: composer
+            .empty
+            .iter()
+            .map(compile)
+            .collect::<Result<_, _>>()?,
+    }))
+}
+
+/// The text of a `capture-pane -e` screen: escape sequences are removed,
+/// and characters drawn faint, italic or in reverse video become spaces.
+/// Reverse video is a cursor the provider paints itself, on the first
+/// character of a placeholder or on a character of a draft; only a draft
+/// of one character under that cursor is lost.
+fn without_hint_text(styled: &str) -> String {
+    let mut text = String::with_capacity(styled.len());
+    let mut hint = HintStyle::default();
+    let mut chars = styled.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    let mut parameters = String::new();
+                    let mut last = None;
+                    for next in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&next) {
+                            last = Some(next);
+                            break;
+                        }
+                        parameters.push(next);
+                    }
+                    if last == Some('m') {
+                        hint.apply_sgr(&parameters);
+                    }
+                }
+                // An OSC string ends at BEL or at ESC and one more byte.
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\x07' {
+                            break;
+                        }
+                        if next == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some('(' | ')' | '*' | '+') => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\n' => text.push('\n'),
+            '\x0e' | '\x0f' => {}
+            _ if hint.faint || hint.italic || hint.reverse => text.push(' '),
+            _ => text.push(character),
+        }
+    }
+    text
+}
+
+#[derive(Default)]
+struct HintStyle {
+    faint: bool,
+    italic: bool,
+    reverse: bool,
+}
+
+impl HintStyle {
+    fn apply_sgr(&mut self, parameters: &str) {
+        let mut items = parameters.split(';');
+        while let Some(item) = items.next() {
+            match item {
+                "" | "0" => *self = Self::default(),
+                "2" => self.faint = true,
+                "22" => self.faint = false,
+                "3" => self.italic = true,
+                "23" => self.italic = false,
+                "7" => self.reverse = true,
+                "27" => self.reverse = false,
+                // A colour's own numbers are not attributes.
+                "38" | "48" | "58" => match items.next() {
+                    Some("5") => {
+                        items.next();
+                    }
+                    Some("2") => {
+                        items.nth(2);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
 }
 
 fn validate_version(version: &str) -> Result<(), String> {
@@ -1829,7 +2025,7 @@ contains = ["running"]
 
         let unsupported = r#"
 id = "codex"
-min_engine_version = 6
+min_engine_version = 7
 [[rules]]
 id = "future"
 state = "idle"
@@ -1887,6 +2083,22 @@ contains = ["x"]
         // The title spinner can turn under the box; the box still wins.
         let spinning = engine.explain("omp", approval, "π ⠋ Reply with word PINEAPPLE");
         assert_eq!(spinning["state"], "blocked", "{spinning}");
+        assert_eq!(spinning["interruptible"], false, "{spinning}");
+        // Without the box the `Working…` line is back above the composer:
+        // a turn that Escape ends, at 80 columns too.
+        let turn = "  Working…\n──────────── Reply with word PINEAPPLE ─\n❯\n────────────\n ⠧ 8s · DeepSeek · masil-t2-live/omp · $0.00\n";
+        for title in ["π ⠧ Reply with word PINEAPPLE", ""] {
+            let explained = engine.explain("omp", turn, title);
+            assert_eq!(explained["state"], "working", "{explained}");
+            assert_eq!(explained["matched_rule"]["id"], "working_line");
+            assert_eq!(explained["interruptible"], true, "{explained}");
+        }
+        // A spinning title over a screen masil has no rule for, such as a
+        // question, is a turn but not one masil sends Escape to.
+        let question = "  Which file?\n  1. a.rs\n  2. b.rs\n────────────\n❯\n────────────\n ⠧ 8s · DeepSeek · masil-t2-live/omp · $0.00\n";
+        let explained = engine.explain("omp", question, "π ⠧ Reply with word PINEAPPLE");
+        assert_eq!(explained["state"], "working", "{explained}");
+        assert_eq!(explained["interruptible"], false, "{explained}");
         // After Escape the box is replaced by the denied call's output.
         let denied = "├─── Output ────────────────┤\n│ Tool call denied by user: bash │\n╰───────────────────────────╯\n Tool call denied; command not executed.\n──────────── Reply with word PINEAPPLE ─\n❯\n────────────\n · DeepSeek · masil-t2-live/omp · $0.00\n";
         assert_eq!(engine.explain("omp", denied, "")["state"], "unknown");
@@ -1917,6 +2129,161 @@ contains = ["x"]
             let explained = engine.explain("cursor", composer, "");
             assert_eq!(explained["state"], "idle", "{explained}");
             assert_eq!(explained["matched_rule"]["id"], "composer_idle");
+        }
+
+        // Kilo 7.8.17 at 80 columns: the footer is the last line, during a
+        // turn and after the first Escape armed the interrupt.
+        let kilo_box = "  ┃\n  ┃\n  ┃\n  ┃  Code  · Auto Free Kilo Gateway\n  ╹▀▀▀▀▀▀▀▀▀▀▀▀\n";
+        for footer in [
+            "   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                 tab agents  ctrl+p commands",
+            "   ■■■■■■⬝⬝  esc again to interrupt        tab agents  ctrl+p commands",
+        ] {
+            let explained = engine.explain("kilo", &format!("{kilo_box}{footer}\n"), "");
+            assert_eq!(explained["state"], "working", "{explained}");
+            assert_eq!(explained["matched_rule"]["id"], "esc_interrupt_working");
+            assert_eq!(explained["interruptible"], true, "{explained}");
+        }
+        assert_eq!(engine.interrupt_keys("kilo"), vec!["Escape", "Escape"]);
+        // OpenCode 1.19.5 at 150 columns has the same footer.
+        let opencode = "  ┃\n  ┃\n  ┃  Build · DeepSeek Flash Latest OpenRouter · max      /private/tmp/project\n  ╹▀▀▀▀▀▀▀▀▀▀▀▀\n   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt       19.4K (2%) · $0.00  ctrl+p commands    • OpenCode 1.19.5\n";
+        let explained = engine.explain("opencode", opencode, "");
+        assert_eq!(explained["state"], "working", "{explained}");
+        assert_eq!(explained["interruptible"], true, "{explained}");
+        // An answer and a draft that quote the hint are above the footer,
+        // so no turn is running and masil has nothing to interrupt.
+        for provider in ["kilo", "opencode"] {
+            let quoted = "     Press esc to interrupt, shown as ■■■■⬝⬝⬝⬝  esc interrupt.\n     ▣  Code · Auto Free\n  ┃\n  ┃  what does esc interrupt mean\n  ┃\n  ┃  Code  · Auto Free Kilo Gateway\n  ╹▀▀▀▀▀▀▀▀▀▀▀▀\n                             tab agents  ctrl+p commands\n";
+            let explained = engine.explain(provider, quoted, "");
+            assert_ne!(explained["state"], "working", "{provider}: {explained}");
+        }
+    }
+
+    /// Composers captured with `capture-pane -e` on 2026-11-17, cut to the
+    /// lines the composer section reads.
+    #[test]
+    fn composer_drafts_measured_2026_11_17() {
+        let engine = Engine::load_bundled();
+        let rule = "\x1b[38;5;244m────────────\n\x1b[39m";
+        let claude = |composer: &str| {
+            format!("  Hi!\n{rule}{composer}\n{rule}  \x1b[38;5;220m⏵⏵\x1b[39m auto mode on\n")
+        };
+        // Claude 2.1.326: the placeholder is faint.
+        let empty = claude("❯ \x1b[2mTry \"fix lint errors\"\x1b[0m");
+        assert_eq!(engine.composer_draft("claude", &empty), None);
+        assert_eq!(engine.composer_draft("claude", &claude("❯ ")), None);
+        // Claude puts a no-break space after the marker.
+        assert_eq!(
+            engine
+                .composer_draft("claude", &claude("❯\u{a0}zz  draft"))
+                .as_deref(),
+            Some("❯ zz draft")
+        );
+        // A draft after the placeholder's style ended is still a draft, and
+        // a long one is cut.
+        let long = claude(&format!("❯ \x1b[2m\x1b[22m{}", "word ".repeat(30)));
+        assert_eq!(
+            engine
+                .composer_draft("claude", &long)
+                .map(|draft| draft.chars().count()),
+            Some(40)
+        );
+        // Claude can paint its own cursor: the placeholder's first
+        // character is then in reverse video and the rest faint.
+        for cursor in [
+            "❯ \x1b[7mT\x1b[0;2mry \"fix lint errors\"\x1b[0m",
+            "❯ \x1b[7mT\x1b[27m\x1b[2mry \"fix lint errors\"\x1b[0m",
+            "❯ \x1b[7m \x1b[27m",
+        ] {
+            assert_eq!(engine.composer_draft("claude", &claude(cursor)), None);
+        }
+        // The same cursor after or inside a draft leaves the draft.
+        for cursor in ["❯ zz\x1b[7m \x1b[27m", "❯ z\x1b[7mz\x1b[27m draft"] {
+            assert!(
+                engine.composer_draft("claude", &claude(cursor)).is_some(),
+                "{cursor}"
+            );
+        }
+        // A menu in place of the composer has no composer line.
+        let menu = format!("{rule}  1. Yes\n  2. No\n{rule}  esc to cancel\n");
+        assert_eq!(engine.composer_draft("claude", &menu), None);
+
+        // Codex 0.169.0: a bold marker, a faint placeholder and a footer in
+        // 24-bit colours whose numbers include 2 and 3.
+        let codex = |composer: &str| {
+            format!(
+                "• Done.\n\n\x1b[1m›\x1b[0m {composer}\n\n  \x1b[38;2;246;226;183mGPT-6.1-Sol xhigh\x1b[39m · \x1b[38;2;242;181;144mContext 0% used\x1b[39m\n"
+            )
+        };
+        let empty = codex("\x1b[2mAsk Codex to do anything\x1b[0m");
+        assert_eq!(engine.composer_draft("codex", &empty), None);
+        assert_eq!(
+            engine
+                .composer_draft("codex", &codex("zz draft"))
+                .as_deref(),
+            Some("› zz draft")
+        );
+        // A draft drawn in a colour is not faint or italic text.
+        let coloured = codex("\x1b[38;2;2;3;2mzz\x1b[48;5;3m draft\x1b[0m");
+        assert_eq!(
+            engine.composer_draft("codex", &coloured).as_deref(),
+            Some("› zz draft")
+        );
+        // An earlier prompt in the transcript is not the composer.
+        let history = "› Reply with OK\n\n• OK\n\n\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n  Context 1% used\n";
+        assert_eq!(engine.composer_draft("codex", history), None);
+
+        // omp 18.12.2: two key icons and an italic hint at the right edge;
+        // the italic lasts until the reset on the next line.
+        let omp_rule = "\x1b[38;2;212;192;144m────────────\n\x1b[39m";
+        let empty = format!(
+            "{omp_rule}❯ \x1b[38;2;229;229;231m          \x1b[38;2;0;180;255m\u{f0636} \u{f0312}\x1b[38;2;229;229;231m \x1b[3m\x1b[38;2;107;114;128mto change thinking effort\n\x1b[0m{omp_rule} \u{f0d57} · DeepSeek\n"
+        );
+        assert_eq!(engine.composer_draft("omp", &empty), None);
+        let draft = format!(
+            "{omp_rule}❯ \x1b[4m\x1b[38;2;229;229;231mzz\x1b[0m\x1b[38;2;229;229;231m draft\x1b[39m\n{omp_rule} \u{f0d57} · DeepSeek\n"
+        );
+        assert_eq!(
+            engine.composer_draft("omp", &draft).as_deref(),
+            Some("❯ zz draft")
+        );
+
+        // A provider without the section is not read.
+        assert!(engine.reads_composer("claude") && engine.reads_composer("omp"));
+        assert!(!engine.reads_composer("kilo") && !engine.reads_composer("nothing"));
+        assert_eq!(engine.composer_draft("kilo", "  ┃  zz draft\n"), None);
+        assert_eq!(engine.composer_draft("nothing", "❯ zz draft\n"), None);
+    }
+
+    #[test]
+    fn the_composer_section_is_validated() {
+        let manifest = |engine: u32, composer: &str| {
+            format!(
+                "id = \"codex\"\nmin_engine_version = {engine}\n[composer]\n{composer}\n[[rules]]\nid = \"idle\"\nstate = \"idle\"\ncontains = [\"x\"]\n"
+            )
+        };
+        let good = "line = '^›'\nempty = ['^›\\s*$']";
+        assert!(load_manifest(&manifest(6, good), ManifestSource::Bundled).is_ok());
+        for (engine, composer, problem) in [
+            (5, good, "composer needs min_engine_version = 6"),
+            (6, "line = '^›'\nempty = []", "empty patterns"),
+            (6, "line = '^›'", "missing field"),
+            (6, "line = '›?'\nempty = ['^$']", "matches an empty line"),
+            (6, "line = '^›('\nempty = ['^$']", "invalid regex"),
+            (
+                6,
+                "region = \"osc_title\"\nline = '^›'\nempty = ['^$']",
+                "part of the screen",
+            ),
+            (
+                6,
+                "region = \"nowhere\"\nline = '^›'\nempty = ['^$']",
+                "invalid region",
+            ),
+            (6, "line = '^›'\nempty = ['^$']\nhint = 1", "unknown field"),
+        ] {
+            let error =
+                load_manifest(&manifest(engine, composer), ManifestSource::Bundled).unwrap_err();
+            assert!(error.contains(problem), "{composer}: {error}");
         }
     }
 
@@ -2118,7 +2485,8 @@ contains = ["x"]
                 format!(" Write the numbers.\n  󱊷 Working…\n{rule}\n❯\n{rule}\n ⠴ 1s ·  GLM 5.3 Flash ·  project ·  0.7%/1M\n"),
                 "π ⠼ omp",
                 "working",
-                "osc_title_working",
+                // Since 2026-11-17 the line outranks the title.
+                "working_line",
             ),
             (
                 "omp",
@@ -2180,10 +2548,11 @@ contains = ["x"]
         assert_eq!(explained["matched_rule"]["id"], "model_picker_menu");
         assert!(explained["ends_turn"].is_null());
 
-        // Measured keys; omp screens do not yet allow an interrupt (cursor:
-        // `live_screens_measured_2026_10_26`).
+        // Measured keys. Only omp's `Working…` line allows an interrupt
+        // (`live_screens_measured_2026_11_17`).
         assert_eq!(engine.interrupt_keys("omp"), vec!["Escape"]);
         assert!(!engine.interruptible_rule("omp", "osc_title_working"));
+        assert!(engine.interruptible_rule("omp", "working_line"));
         assert_eq!(engine.interrupt_keys("agy"), vec!["Escape"]);
         // A model's answer quoting a dialog line is not a dialog.
         let quoted = engine.explain(

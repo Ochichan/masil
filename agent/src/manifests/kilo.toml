@@ -1,8 +1,11 @@
 # Modified by masil after the import from Herdr. See NOTICE.
 id = "kilo"
-version = "2026.10.26.1"
-min_engine_version = 1
-updated_at = "2026-10-26T12:00:00Z"
+version = "2026.11.17.1"
+min_engine_version = 4
+updated_at = "2026-11-17T12:00:00Z"
+# Measured 2026-11-17 on 7.8.17: the first Esc arms ("esc again to
+# interrupt"), the second ends the turn ("· interrupted").
+interrupt_keys = ["Escape", "Escape"]
 aliases = ["kilo-code", "kilo code", "herdr:kilo"]
 
 [[rules]]
@@ -20,9 +23,15 @@ any = [
 id = "esc_interrupt_working"
 state = "working"
 priority = 100
-region = "whole_recent"
+# The hint is on the footer, the last line of the screen at 80 and 150
+# columns. An answer or a draft that quotes it is at least five lines up.
+region = "bottom_non_empty_lines(4)"
 visible_working = true
-contains = ["esc interrupt"]
+interruptible = true
+any = [
+  { contains = ["esc interrupt"] },
+  { contains = ["esc again to interrupt"] },
+]
 
 [[rules]]
 id = "reject_instruction"

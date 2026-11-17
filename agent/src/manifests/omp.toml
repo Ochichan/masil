@@ -1,9 +1,17 @@
 id = "omp"
-version = "2026.11.17.1"
-min_engine_version = 4
+version = "2026.11.17.3"
+min_engine_version = 6
 updated_at = "2026-11-17T12:00:00Z"
 # Measured 2026-10-04 on 18.4.4: Escape stops the turn and keeps the session.
 interrupt_keys = ["Escape"]
+
+# Measured 2026-11-17 on 18.12.2: an empty composer shows two key icons
+# (private-use glyphs) and an italic hint at the right edge; a draft
+# replaces them.
+[composer]
+region = "prompt_box_body"
+line = '^❯'
+empty = ['^❯[\s\x{E000}-\x{F8FF}\x{F0000}-\x{FFFFD}]*$']
 
 [[rules]]
 id = "tool_approval"
@@ -30,14 +38,21 @@ state = "working"
 priority = 1100
 region = "osc_title"
 visible_working = true
-# The title starts with π and a braille spinner while a turn runs. A title
-# spinner can also turn under an approval, so it does not allow an interrupt.
+# The title starts with π and a braille spinner while a turn runs. The
+# spinner also turns under an approval box or a question, so this rule does
+# not allow an interrupt.
 regex = ['^π [\x{2800}-\x{28FF}] ']
 
 [[rules]]
 id = "working_line"
 state = "working"
-priority = 1000
+# Above the title rule: with both on screen this one decides.
+priority = 1150
 region = "bottom_non_empty_lines(6)"
 visible_working = true
+# Measured 2026-11-17 on 18.12.2: `Working…` sits right above the composer
+# while a turn runs and one Escape ends that turn. A box that asks
+# something takes its place, so this line is the screen an interrupt is
+# sent to.
+interruptible = true
 line_regex = ['Working…\s*$', '^\s*[\x{2800}-\x{28FF}] [0-9]+[smh] ·']

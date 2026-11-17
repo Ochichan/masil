@@ -1,11 +1,18 @@
 # Modified by masil after the import from Herdr. See NOTICE.
 id = "claude"
-version = "2026.10.04.1"
-min_engine_version = 5
-updated_at = "2026-10-04T12:00:00Z"
+version = "2026.11.17.1"
+min_engine_version = 6
+updated_at = "2026-11-17T12:00:00Z"
 # Measured 2026-10-04 on 2.1.288: Esc ends the turn and keeps the session.
 interrupt_keys = ["Escape"]
 aliases = ["claude-code"]
+
+# Measured 2026-11-17 on 2.1.326: the placeholder after ❯ is faint, a draft
+# is not.
+[composer]
+region = "prompt_box_body"
+line = '^\s*❯'
+empty = ['^\s*❯\s*$']
 
 [[rules]]
 id = "osc_title_working"
