@@ -1874,6 +1874,52 @@ contains = ["x"]
         );
     }
 
+    /// Screens measured on 2026-11-17, cut to the lines the rules read.
+    #[test]
+    fn live_screens_measured_2026_11_17() {
+        let engine = Engine::load_bundled();
+        // omp 18.12.2 with --approval-mode=always-ask: the approval box
+        // shows above the composer while the status line still spins.
+        let approval = "  Echoing PINEAPPLE\n╭─ Allow tool: bash ───────╮\n│ Command: echo PINEAPPLE   │\n│  Approve                  │\n│   Approve bash for this session │\n│   Deny                    │\n├───────────────────────────┤\n│ ↑/↓ choose · select · approve · deny · details · type to deny and steer │\n╰───────────────────────────╯\n──────────── Reply with word PINEAPPLE ─\n❯\n────────────\n ⠼ 12s · DeepSeek · masil-t2-live/omp · $0.00\n";
+        let explained = engine.explain("omp", approval, "π ! Reply with word PINEAPPLE");
+        assert_eq!(explained["state"], "blocked", "{explained}");
+        assert_eq!(explained["matched_rule"]["id"], "tool_approval");
+        // The title spinner can turn under the box; the box still wins.
+        let spinning = engine.explain("omp", approval, "π ⠋ Reply with word PINEAPPLE");
+        assert_eq!(spinning["state"], "blocked", "{spinning}");
+        // After Escape the box is replaced by the denied call's output.
+        let denied = "├─── Output ────────────────┤\n│ Tool call denied by user: bash │\n╰───────────────────────────╯\n Tool call denied; command not executed.\n──────────── Reply with word PINEAPPLE ─\n❯\n────────────\n · DeepSeek · masil-t2-live/omp · $0.00\n";
+        assert_eq!(engine.explain("omp", denied, "")["state"], "unknown");
+        // A narrow pane cuts the key hints and a typed reply changes the
+        // last choice; the box still waits.
+        let typed = "╭─ Allow tool: bash ─────╮\n│ Command: echo PINEAPPLE │\n│   Approve               │\n│   Approve bash for this session │\n│  Deny and send message │\n├─────────────────────────┤\n│ ↑/↓ choose · select · approve · deny and send │\n╰─────────────────────────╯\n────────────\n❯ no, use printf\n────────────\n";
+        let explained = engine.explain("omp", typed, "");
+        assert_eq!(
+            explained["matched_rule"]["id"], "tool_approval",
+            "{explained}"
+        );
+        // The same box printed inside an answer or a tool's output is
+        // indented, so it is not the dialog.
+        let quoted = " ╭─ Allow tool: bash ───────╮\n │ Command: echo PINEAPPLE   │\n │   Approve                 │\n │   Deny                    │\n ╰───────────────────────────╯\n────────────\n❯\n────────────\n";
+        assert_eq!(engine.explain("omp", quoted, "")["state"], "unknown");
+
+        // cursor-agent 2026.10.22 signed out: the whole screen is three lines.
+        let login = "\n\n      Cursor Agent\n      v2026.10.22-27dcf5f\n      Press any key to log in...\n\n\n";
+        let explained = engine.explain("cursor", login, "");
+        assert_eq!(explained["state"], "blocked", "{explained}");
+        assert_eq!(explained["matched_rule"]["id"], "login_required");
+        // The same line alone in an answer, or as the last line of a
+        // draft, leaves the composer idle.
+        for composer in [
+            "  Cursor Agent\n  Press any key to log in...\n\n\n  → Add a follow-up\n\n\n  Auto\n  /private/tmp/project\n",
+            "  → what does this mean:\n    Press any key to log in...\n  Auto\n  /private/tmp/project\n",
+        ] {
+            let explained = engine.explain("cursor", composer, "");
+            assert_eq!(explained["state"], "idle", "{explained}");
+            assert_eq!(explained["matched_rule"]["id"], "composer_idle");
+        }
+    }
+
     /// Screens measured on 2026-10-26 (C5), cut to the lines the rules read.
     /// Each case is (provider, screen, state, rule).
     #[test]

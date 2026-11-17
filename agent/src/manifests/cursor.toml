@@ -1,8 +1,8 @@
 # Modified by masil after the import from Herdr. See NOTICE.
 id = "cursor"
-version = "2026.10.26.1"
+version = "2026.11.17.1"
 min_engine_version = 4
-updated_at = "2026-10-26T12:00:00Z"
+updated_at = "2026-11-17T12:00:00Z"
 aliases = ["cursor-agent"]
 # Measured 2026-10-26 on 2026.10.22: one C-c while working ends the turn at
 # once, keeps the process, and puts the prompt back in the composer. One C-c
@@ -76,6 +76,16 @@ visible_blocker = true
 # answer, so only the live dialog with its key hint counts.
 contains = ["workspace trust required", "trust this workspace", "use arrow keys to navigate"]
 not = [{ contains = ["trusting workspace"] }]
+
+[[rules]]
+id = "login_required"
+state = "blocked"
+priority = 950
+region = "bottom_non_empty_lines(3)"
+visible_blocker = true
+# Measured 2026-11-17 on 2026.10.22: a signed-out cursor-agent shows its
+# name, its version and this line, and any key opens the browser sign-in.
+line_regex = ['^\s*Cursor Agent\s*$', '^\s*Press any key to log in\.\.\.\s*$']
 
 [[rules]]
 id = "instruction_input"

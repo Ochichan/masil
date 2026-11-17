@@ -1,9 +1,28 @@
 id = "omp"
-version = "2026.10.04.1"
+version = "2026.11.17.1"
 min_engine_version = 4
-updated_at = "2026-10-04T12:00:00Z"
+updated_at = "2026-11-17T12:00:00Z"
 # Measured 2026-10-04 on 18.4.4: Escape stops the turn and keeps the session.
 interrupt_keys = ["Escape"]
+
+[[rules]]
+id = "tool_approval"
+state = "blocked"
+priority = 1200
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+# Measured 2026-11-17 on 18.12.2 with --approval-mode=always-ask, 150
+# columns: the box asks before a tool runs while the status line still
+# spins. Escape denies the call and the turn goes on without it. The
+# extension reports blocked, and that report lasts 30 s; after it this rule
+# keeps the state. The choice rows are matched and not the key hints under
+# them, which a narrow pane cuts and a typed reply changes. The selected row
+# has a marker before its text.
+line_regex = [
+  '^╭─ Allow tool: \S',
+  '^│\s+(?:\S\s+)?Approve\s*│$',
+  '^│\s+(?:\S\s+)?Deny\b[^│]*│$',
+]
 
 [[rules]]
 id = "osc_title_working"
