@@ -323,6 +323,33 @@ fn public_record_at_path(run: &str, operation: u64, record: &Record, path: &str)
     )
 }
 
+/// How many more times a prompt is sent after the core refused it because
+/// the pane printed between the idle judgment and the paste.
+const SCREEN_MOVED_RETRIES: u32 = 4;
+const SCREEN_MOVED_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+/// No further attempt starts this long after the first one began. A slow
+/// attempt (a busy coordinator, a remote caller's deadline) ends with its
+/// refusal and is not followed by a late delivery.
+const SCREEN_MOVED_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether `error` is the core's refusal of a prompt whose pane output,
+/// title or progress moved after the read that judged it. The core checks
+/// these with the paste in one step, so nothing was sent.
+fn screen_moved_refusal(error: &str) -> bool {
+    error
+        .strip_prefix("rejected_before_effect: prompt operation ")
+        .and_then(|rest| rest.split_once(" was rejected or its delivery is unknown: "))
+        .and_then(|(slot, rest)| {
+            slot.bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then_some(rest)
+        })
+        .and_then(|rest| rest.split_once(';'))
+        .is_some_and(|(reason, _)| {
+            ["output_changed", "title_changed", "progress_changed"].contains(&reason)
+        })
+}
+
 impl Manager {
     pub async fn prompt(&self, agent: &Agent, text: &str) -> Result<Value, String> {
         self.prompt_with_operation(agent, text, None).await
@@ -997,61 +1024,92 @@ impl Manager {
         }
         drop(store);
 
-        let current = self.get(&agent.pane_id).await?;
-        if current.run != agent.run
-            || current.boot != agent.boot
-            || current.generation != agent.generation
-            || current.session_id != agent.session_id
-            || current.revision != agent.revision
-        {
-            return Err(
-                "identity_mismatch: agent changed while preparing the prompt; inspect it again"
-                    .into(),
-            );
-        }
-        if current.state != "idle" || current.process != "running" {
-            return Err("prompt requires an idle, verified foreground agent; blocked, working and unknown states cannot receive a prompt".into());
-        }
-        // The second read is the one that established this call's idle
-        // judgment. Use all of its screen guards, not the caller's older
-        // snapshot, exactly as the native guarded path does.
-        let current_expected = super::core_action::prompt_expected(&current);
         let needs_bracket = text.contains('\n') || text.contains('\t');
-        if needs_bracket
-            && self
-                .command(&[
-                    "display-message",
-                    "-p",
-                    "-t",
-                    &current.pane_id,
-                    "#{masil_bracketed_paste}",
-                ])
-                .await?
-                .trim()
-                != "1"
-        {
-            return Err(
-                "multiline prompt requires native bracketed paste; prepare a draft instead".into(),
-            );
+        // The core refuses the paste when the pane printed after the read
+        // that judged it idle. A status block that redraws while the
+        // provider waits makes that likely, so such a refusal, which sent
+        // nothing, is tried again from a new read. A queued prompt is not:
+        // its admission moved the item's revision, and the person sends the
+        // item again.
+        let mut refused: Option<String> = None;
+        let started = std::time::Instant::now();
+        let mut attempt = 0;
+        loop {
+            if attempt > 0 {
+                tokio::time::sleep(SCREEN_MOVED_PAUSE).await;
+            }
+            let current = self.get(&agent.pane_id).await?;
+            // After a refusal, an agent that is no longer the one judged, or
+            // no longer idle, ends with that refusal.
+            let again = |error: &str| refused.clone().unwrap_or_else(|| error.into());
+            if current.run != agent.run
+                || current.boot != agent.boot
+                || current.generation != agent.generation
+                || current.session_id != agent.session_id
+                || current.revision != agent.revision
+            {
+                return Err(again(
+                    "identity_mismatch: agent changed while preparing the prompt; inspect it again",
+                ));
+            }
+            if current.state != "idle" || current.process != "running" {
+                return Err(again(
+                    "prompt requires an idle, verified foreground agent; blocked, working and unknown states cannot receive a prompt",
+                ));
+            }
+            // The second read is the one that established this call's idle
+            // judgment. Use all of its screen guards, not the caller's older
+            // snapshot, exactly as the native guarded path does.
+            let current_expected = super::core_action::prompt_expected(&current);
+            if needs_bracket
+                && self
+                    .command(&[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &current.pane_id,
+                        "#{masil_bracketed_paste}",
+                    ])
+                    .await?
+                    .trim()
+                    != "1"
+            {
+                return Err(again(
+                    "multiline prompt requires native bracketed paste; prepare a draft instead",
+                ));
+            }
+            let socket = self.native.socket.clone();
+            let server = context.server()?;
+            let params = json!({
+                "operation": "prompt",
+                "pane_id": current.pane_id,
+                "expected": current_expected,
+                "text": text,
+                "operation_id": operation,
+                "queued": queued.map(|(item, revision)| json!({"item": item, "revision": revision})),
+                "needs_bracket": needs_bracket,
+                "submit": plan.wire(),
+                // Taken once, before the first attempt.
+                "checkpoint": checkpoint && attempt == 0,
+            });
+            let result = tokio::task::spawn_blocking(move || {
+                crate::coordinator::action_known(&socket, params, server)
+            })
+            .await
+            .map_err(|error| format!("coordinator_unavailable: {error}"))?;
+            match result {
+                Err(error)
+                    if queued.is_none()
+                        && attempt < SCREEN_MOVED_RETRIES
+                        && started.elapsed() < SCREEN_MOVED_BUDGET
+                        && screen_moved_refusal(&error) =>
+                {
+                    refused = Some(error);
+                    attempt += 1;
+                }
+                result => return result,
+            }
         }
-        let socket = self.native.socket.clone();
-        let server = context.server()?;
-        let params = json!({
-            "operation": "prompt",
-            "pane_id": current.pane_id,
-            "expected": current_expected,
-            "text": text,
-            "operation_id": operation,
-            "queued": queued.map(|(item, revision)| json!({"item": item, "revision": revision})),
-            "needs_bracket": needs_bracket,
-            "submit": plan.wire(),
-            "checkpoint": checkpoint,
-        });
-        tokio::task::spawn_blocking(move || {
-            crate::coordinator::action_known(&socket, params, server)
-        })
-        .await
-        .map_err(|error| format!("coordinator_unavailable: {error}"))?
     }
 
     async fn ensure_core_coordinator(&self) -> Result<(), String> {
@@ -1264,6 +1322,36 @@ fn format_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refusal_for_a_moved_screen_is_sent_again() {
+        // The text the coordinator builds for the core's refusal.
+        let refusal = |reason: &str| super::super::core_action::prompt_rejection(2, reason);
+        // Measured 2026-11-17: Claude Code's status block redrew between the
+        // idle judgment and the paste.
+        assert!(screen_moved_refusal(&refusal("output_changed")));
+        assert!(screen_moved_refusal(&refusal("title_changed")));
+        assert!(screen_moved_refusal(&refusal("progress_changed")));
+        // Another guard means the agent is not the one judged.
+        for reason in [
+            "meta_changed",
+            "tracked_changed",
+            "foreground_pgid_changed",
+            "mode_active",
+            "bridge rejected invalid_action: output_changed",
+            "output_changed and more",
+        ] {
+            assert!(!screen_moved_refusal(&refusal(reason)), "{reason}");
+        }
+        // Only the core's own refusal, never an unknown outcome.
+        assert!(!screen_moved_refusal("outcome_unknown: output_changed; x"));
+        assert!(!screen_moved_refusal(
+            "rejected_before_effect: prompt operation x was rejected or its delivery is unknown: output_changed; x"
+        ));
+        assert!(!screen_moved_refusal(
+            "rejected_before_effect: prompt operation 2 was rejected: the pane or agent state changed before input delivery; nothing was sent"
+        ));
+    }
 
     #[test]
     fn only_cursor_gets_the_two_step_plan() {

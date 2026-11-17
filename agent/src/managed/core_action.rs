@@ -6705,7 +6705,7 @@ fn input_result_evidence(
     evidence
 }
 
-fn prompt_rejection(slot: u64, reason: &str) -> String {
+pub(super) fn prompt_rejection(slot: u64, reason: &str) -> String {
     format!(
         "rejected_before_effect: prompt operation {slot} was rejected or its delivery is unknown: {reason}; query prompt-receipt before retrying"
     )
