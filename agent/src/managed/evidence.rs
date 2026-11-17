@@ -12,6 +12,8 @@ pub(crate) struct Evidence {
     ends_turn: Option<Box<str>>,
     /// The digest of any turn-end marker on screen, whichever rule won.
     turn_end_marker: Option<Box<str>>,
+    /// No rule of the provider's manifest matched the screen.
+    unmatched: bool,
 }
 
 fn digest(value: &Value, key: &str) -> Option<Box<str>> {
@@ -34,6 +36,8 @@ impl Evidence {
         let visible_idle = matches!(value.get("visible_idle"), Some(Value::Bool(true)));
         let ends_turn = digest(&value, "ends_turn");
         let turn_end_marker = digest(&value, "turn_end_marker");
+        let unmatched =
+            value.get("fallback_reason").and_then(Value::as_str) == Some("no_matching_rule");
         let raw = serde_json::value::to_raw_value(&value)
             .expect("serializing a serde_json::Value cannot fail");
         Self {
@@ -44,6 +48,7 @@ impl Evidence {
             visible_idle,
             ends_turn,
             turn_end_marker,
+            unmatched,
         }
     }
 
@@ -79,6 +84,7 @@ impl Evidence {
             ends_turn: None,
             // What the screen under the report shows.
             turn_end_marker: original.turn_end_marker.clone(),
+            unmatched: false,
         }
     }
 
@@ -104,6 +110,11 @@ impl Evidence {
 
     pub(crate) fn turn_end_marker(&self) -> Option<&str> {
         self.turn_end_marker.as_deref()
+    }
+
+    /// Whether the screen matched no rule, so it says nothing of the state.
+    pub(crate) fn unmatched(&self) -> bool {
+        self.unmatched
     }
 }
 

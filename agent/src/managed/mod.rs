@@ -59,6 +59,17 @@ const TURN_HOLD_MAX_MS: u64 = 2 * 60 * 60 * 1000;
 /// A held turn whose idle-looking screen printed nothing for this long has
 /// ended without telling masil (an interrupt or a lost `Stop`).
 const TURN_QUIET_SECONDS: u64 = 20;
+/// The bottom non-empty lines of a held turn's screen that may redraw while
+/// the provider waits: the composer, its footer and a status block above it.
+const HELD_CHROME_LINES: usize = 16;
+/// How often a waiting provider may redraw such lines, in output events a
+/// second. A spinner or streamed text prints more often than this.
+const HELD_REDRAWS_PER_SECOND: u64 = 5;
+/// A held turn's screen is not recorded as idle-looking this soon after the
+/// turn began: the provider has not drawn its spinner yet.
+const HELD_LOOK_AFTER_MS: u64 = 2_000;
+/// Output this soon after an idle report still belongs to the turn it ended.
+const IDLE_SETTLE_MS: u64 = 3_000;
 /// Panes per server that agent management handles.
 const MAX_PANES: usize = 64;
 const TRACKED_LOST: &str = "identity_mismatch: agent run changed before the action";
@@ -492,17 +503,40 @@ struct ReportSource {
 /// A turn a provider hook said began (Claude's `UserPromptSubmit`). The
 /// provider's screen may look idle while it streams, so the report holds
 /// until `TurnReport::End`, a turn-end marker other than the one on screen
-/// when the turn began, a quiet idle-looking screen, or `TURN_HOLD_MAX_MS`.
-/// A visible blocker still wins while it shows.
+/// when the turn began, a quiet or settled idle-looking screen, or
+/// `TURN_HOLD_MAX_MS`. A visible blocker still wins while it shows.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct TurnHold {
     /// The digest of the turn-end marker on screen when the turn began.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     marker: Option<String>,
+    /// The last look that found the screen idle-looking but not quiet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idle: Option<IdleLook>,
+}
+
+/// A held turn's idle-looking screen as one look read it. A status block
+/// that redraws every second keeps the pane printing, so its output time
+/// never shows the screen quiet. Two looks that read the same `stable_part`
+/// one to two times `TURN_QUIET_SECONDS` apart, with few output events
+/// between them, show that the provider waits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IdleLook {
+    stable: String,
+    /// The pane's output generation at the look.
+    generation: u64,
+    at: u64,
 }
 
 impl TurnHold {
-    fn holds(&self, report: &Report, screen: &Evidence, last_output: Option<u64>) -> bool {
+    /// `settled`: `TurnHold::settled` of this look's screen.
+    fn holds(
+        &self,
+        report: &Report,
+        screen: &Evidence,
+        last_output: Option<u64>,
+        settled: bool,
+    ) -> bool {
         let now = now_ms();
         if report.state != "working" || now.saturating_sub(report.at) > TURN_HOLD_MAX_MS {
             return false;
@@ -517,8 +551,94 @@ impl TurnHold {
         let quiet = last_output
             .is_some_and(|at| (now / 1000).saturating_sub(at) >= TURN_QUIET_SECONDS)
             && now.saturating_sub(report.at) >= TURN_QUIET_SECONDS * 1000;
-        !(screen.visible_idle() && quiet)
+        !(screen.visible_idle() && (quiet || settled))
     }
+}
+
+impl TurnHold {
+    /// Whether the idle-looking screen read now (`stable`, at the pane's
+    /// output `generation`) is the one recorded one to two quiet times ago,
+    /// and the pane printed no faster since than a waiting provider redraws
+    /// its status. An older look proves nothing of the time between: the
+    /// rate is an average, and a spinner may have run and gone.
+    fn settled(&self, stable: Option<&str>, generation: u64, now: u64) -> bool {
+        let (Some(look), Some(stable)) = (&self.idle, stable) else {
+            return false;
+        };
+        let elapsed = now.saturating_sub(look.at);
+        look.stable == stable
+            && (TURN_QUIET_SECONDS * 1000..=TURN_QUIET_SECONDS * 2000).contains(&elapsed)
+            && generation >= look.generation
+            && (generation - look.generation).saturating_mul(1000)
+                <= HELD_REDRAWS_PER_SECOND.saturating_mul(elapsed)
+    }
+
+    /// The look to record in place of the one kept, if this one should be.
+    /// A look that reads another screen replaces the kept one only after
+    /// half the quiet time, so text that streams under an idle-looking
+    /// screen costs one write in that time and not one a look.
+    fn next_look(
+        &self,
+        report: &Report,
+        stable: Option<&str>,
+        generation: u64,
+        now: u64,
+    ) -> Option<IdleLook> {
+        let stable = stable?;
+        if now.saturating_sub(report.at) < HELD_LOOK_AFTER_MS {
+            return None;
+        }
+        let wait = match &self.idle {
+            None => 0,
+            Some(look) if look.stable != stable || generation < look.generation => {
+                TURN_QUIET_SECONDS * 500
+            }
+            // The same screen, which printed too fast to have settled or
+            // was read too long ago.
+            Some(_) => TURN_QUIET_SECONDS * 1000,
+        };
+        let waited = self
+            .idle
+            .as_ref()
+            .is_none_or(|look| now.saturating_sub(look.at) >= wait);
+        waited.then(|| IdleLook {
+            stable: stable.to_owned(),
+            generation,
+            at: now,
+        })
+    }
+}
+
+/// How many non-empty lines the screen has and what they read without the
+/// last `HELD_CHROME_LINES`, as a digest. Streamed text adds a line or
+/// scrolls the screen, which changes it; a status block that redraws in
+/// place near the composer does not. The count covers a screen too short to
+/// have lines above the left-out ones.
+fn stable_part(screen: &str) -> String {
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let kept = lines.len().saturating_sub(HELD_CHROME_LINES);
+    let mut digest = core_action::digest(&format!("{}\n{}", lines.len(), lines[..kept].join("\n")));
+    digest.truncate(16);
+    digest
+}
+
+/// Whether a report with no hold and no observing coordinator still decides
+/// the state. It does for `REPORT_FRESH_MS`. An idle one goes on doing so
+/// while the pane has printed nothing since the turn ended and the screen
+/// matches no rule: omp, pi and kimi have no rule for their waiting screen,
+/// and a provider that started to work again would draw.
+fn plain_report_holds(report: &Report, screen: &Evidence, last_output: Option<u64>) -> bool {
+    if now_ms().saturating_sub(report.at) <= REPORT_FRESH_MS {
+        return true;
+    }
+    report.state == "idle"
+        && screen.unmatched()
+        && last_output
+            .is_some_and(|at| at.saturating_mul(1000) <= report.at.saturating_add(IDLE_SETTLE_MS))
 }
 
 /// Drops a held turn report; true when there was one.
@@ -1422,6 +1542,10 @@ impl Manager {
                 continue;
             };
             let foreground = identified.is_some_and(|p| p.id == provider.id);
+            // The screen this pass captured, kept for a held turn's look.
+            let mut fresh_screen = None;
+            // A held turn's idle-looking screen to record (`TurnHold::next_look`).
+            let mut idle_look = None;
             let mut evidence = if foreground {
                 let key = observation_key(&fields, provider.id);
                 match prepared
@@ -1447,6 +1571,7 @@ impl Manager {
                         {
                             captured.insert(fields[0].clone(), std::time::Instant::now());
                         }
+                        fresh_screen = Some(screen);
                         evidence
                     }
                 }
@@ -1492,11 +1617,28 @@ impl Manager {
                         .and_then(|source| source.hold.as_ref())
                     {
                         Some(hold) => {
-                            let holds = hold.holds(report, &evidence, fields[18].parse().ok());
+                            // Only a screen captured in this pass is read: an
+                            // unchanged pane is quiet by its output time.
+                            let stable = fresh_screen
+                                .as_deref()
+                                .filter(|_| evidence.visible_idle())
+                                .map(stable_part);
+                            let now = now_ms();
+                            let settled = hold.settled(stable.as_deref(), output_generation, now);
+                            let holds =
+                                hold.holds(report, &evidence, fields[18].parse().ok(), settled);
                             hold_ended = !holds;
+                            if holds {
+                                idle_look = hold.next_look(
+                                    report,
+                                    stable.as_deref(),
+                                    output_generation,
+                                    now,
+                                );
+                            }
                             holds
                         }
-                        None => now_ms().saturating_sub(report.at) <= REPORT_FRESH_MS,
+                        None => plain_report_holds(report, &evidence, fields[18].parse().ok()),
                     },
                 }
             {
@@ -1679,6 +1821,24 @@ impl Manager {
                 hold_write.push(Self::option(&agent, META, encoded.clone()));
                 hold_write.push(Self::option(&agent, EVIDENCE, encode(&evidence)?));
                 dropped_holds.push((agents.len(), metadata, encoded, evidence));
+            } else if let (Some(look), Some(mut evidence)) = (idle_look, agent.run_evidence.clone())
+                && !read_only
+                && self.resident.as_ref().is_none_or(|resident| {
+                    resident.may_write(&fields[0], &fields[14], &fields[12], now_ms())
+                })
+                && let Some(hold) = evidence
+                    .report
+                    .as_mut()
+                    .and_then(|source| source.hold.as_mut())
+            {
+                // Guarded like the write above. The returned agent keeps the
+                // evidence this pass read; the next pass reads the look.
+                hold.idle = Some(look);
+                hold_guard = evidence_unchanged(
+                    Some(fields[16].as_str())
+                        .filter(|raw| raw.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                );
+                hold_write.push(Self::option(&agent, EVIDENCE, encode(&evidence)?));
             }
             if write_tracked || !hold_write.is_empty() {
                 let encoded = encode(&agent.tracked)?;
@@ -3131,6 +3291,7 @@ impl Manager {
                     event: Some("UserPromptSubmit".into()),
                     hold: Some(TurnHold {
                         marker: marker.clone(),
+                        idle: None,
                     }),
                 });
                 integration::clear_open_requests(&mut evidence.requests);
@@ -4154,7 +4315,7 @@ fn run_guard(agent: &Agent) -> String {
 /// values, about 80 KiB, against `MAX_SCRIPT` of 64 KiB. That worst case does
 /// not fit and `source_script` would refuse it. Real records are far smaller:
 /// the largest the tests build (`run_evidence_stays_within_the_option_limit`)
-/// encodes to 9112 characters, so five such values are about 45 KiB and fit.
+/// encodes to about 9300 characters, so five such values are about 45 KiB and fit.
 fn evidence_unchanged(raw: Option<&str>) -> Option<String> {
     raw.map(|raw| format!("#{{==:#{{{EVIDENCE}}},{raw}}}"))
 }
@@ -5713,6 +5874,11 @@ mod tests {
             event: Some("e".repeat(64)),
             hold: Some(TurnHold {
                 marker: Some("0123456789abcdef".into()),
+                idle: Some(IdleLook {
+                    stable: "0123456789abcdef".into(),
+                    generation: u64::MAX,
+                    at: u64::MAX,
+                }),
             }),
         });
         // The most requests, with the longest keys `integration` keeps.
@@ -5833,29 +5999,208 @@ mod tests {
         };
         let hold = TurnHold {
             marker: Some("old".into()),
+            idle: None,
         };
         let fresh = Some(now / 1000);
         // Streaming: the screen looks idle and still shows the old marker.
-        assert!(hold.holds(&report("working", now), &screen(true, Some("old")), fresh));
-        assert!(hold.holds(&report("working", now), &screen(true, None), fresh));
+        assert!(hold.holds(
+            &report("working", now),
+            &screen(true, Some("old")),
+            fresh,
+            false
+        ));
+        assert!(hold.holds(&report("working", now), &screen(true, None), fresh, false));
         // The turn's own end marker.
-        assert!(!hold.holds(&report("working", now), &screen(true, Some("new")), fresh));
+        assert!(!hold.holds(
+            &report("working", now),
+            &screen(true, Some("new")),
+            fresh,
+            false
+        ));
         // A marker under a working screen does not end it.
-        assert!(hold.holds(&report("working", now), &screen(false, Some("new")), fresh));
+        assert!(hold.holds(
+            &report("working", now),
+            &screen(false, Some("new")),
+            fresh,
+            false
+        ));
         // An idle-looking screen that printed nothing for the quiet time.
         let quiet = Some(now / 1000 - TURN_QUIET_SECONDS - 1);
         let begun = now - TURN_QUIET_SECONDS * 1000 - 1000;
-        assert!(!hold.holds(&report("working", begun), &screen(true, None), quiet));
+        assert!(!hold.holds(&report("working", begun), &screen(true, None), quiet, false));
         // ... but not right after the turn began, nor under a working screen.
-        assert!(hold.holds(&report("working", now), &screen(true, None), quiet));
-        assert!(hold.holds(&report("working", begun), &screen(false, None), quiet));
+        assert!(hold.holds(&report("working", now), &screen(true, None), quiet, false));
+        assert!(hold.holds(
+            &report("working", begun),
+            &screen(false, None),
+            quiet,
+            false
+        ));
         // The cap, and a report that is not a running turn.
         let old = now - TURN_HOLD_MAX_MS - 1;
-        assert!(!hold.holds(&report("working", old), &screen(false, None), fresh));
-        assert!(!hold.holds(&report("idle", now), &screen(true, None), fresh));
+        assert!(!hold.holds(&report("working", old), &screen(false, None), fresh, false));
+        assert!(!hold.holds(&report("idle", now), &screen(true, None), fresh, false));
         // No marker when the turn began: any marker ends it.
         let unmarked = TurnHold::default();
-        assert!(!unmarked.holds(&report("working", now), &screen(true, Some("old")), fresh));
+        assert!(!unmarked.holds(
+            &report("working", now),
+            &screen(true, Some("old")),
+            fresh,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_held_turn_ends_on_a_screen_that_settled_under_a_redrawing_status_line() {
+        let now = now_ms();
+        let report = Report {
+            sequence: 7,
+            state: "working".into(),
+            at: now - 60_000,
+        };
+        let screen = |idle: bool| {
+            Evidence::from_value(json!({
+                "state": if idle { "idle" } else { "working" },
+                "visible_idle": idle,
+            }))
+        };
+        let hold = TurnHold::default();
+        // The pane printed this second, so the output time shows no quiet.
+        let printing = Some(now / 1000);
+        assert!(hold.holds(&report, &screen(true), printing, false));
+        assert!(!hold.holds(&report, &screen(true), printing, true));
+        assert!(hold.holds(&report, &screen(false), printing, true));
+
+        // Measured 2026-11-17 on Claude Code 2.1.326: a status block above
+        // the composer redraws about twice a second while Claude waits.
+        let body: String = (0..30).map(|n| format!("  line {n}\n")).collect();
+        let frame = |art: &str| {
+            format!("{body}   {art}     HP ?????\n  status\n────\n❯\n────\n  auto mode on\n")
+        };
+        let quiet = TURN_QUIET_SECONDS * 1000;
+        let at = report.at + HELD_LOOK_AFTER_MS;
+        let first = stable_part(&frame("z Z"));
+        assert_eq!(first, stable_part(&frame("z Z z")));
+        // Nothing is recorded before the provider had time to draw.
+        assert_eq!(hold.next_look(&report, Some(&first), 100, at - 1), None);
+        let look = hold.next_look(&report, Some(&first), 100, at).unwrap();
+        let held = TurnHold {
+            marker: None,
+            idle: Some(look.clone()),
+        };
+        // Two redraws a second for the quiet time: the provider waits.
+        let redraws = 100 + 2 * TURN_QUIET_SECONDS;
+        assert!(!held.settled(Some(&first), redraws, at + quiet - 1));
+        assert!(held.settled(Some(&first), redraws, at + quiet));
+        assert_eq!(
+            held.next_look(&report, Some(&first), redraws, at + quiet - 1),
+            None
+        );
+        // A spinner or streamed text prints faster: not settled, and the
+        // time starts over.
+        let busy = 100 + (HELD_REDRAWS_PER_SECOND + 1) * TURN_QUIET_SECONDS;
+        assert!(!held.settled(Some(&first), busy, at + quiet));
+        let again = held
+            .next_look(&report, Some(&first), busy, at + quiet)
+            .unwrap();
+        assert_eq!((again.generation, again.at), (busy, at + quiet));
+        // Streamed text adds a line above the status block, or scrolls a
+        // full screen by one line.
+        let grown = stable_part(&frame("z Z").replace("  line 29\n", "  line 29\n  line 30\n"));
+        assert_ne!(grown, first);
+        let scrolled = frame("z Z")
+            .replace("  line 0\n", "")
+            .replace("  line 29\n", "  line 29\n  line 30\n");
+        assert_ne!(stable_part(&scrolled), first);
+        // A screen shorter than the lines left out still shows a new line,
+        // and a redraw in place still reads the same.
+        let short = |art: &str, more: &str| format!("  ❯ hello\n{more}   {art}\n────\n❯\n────\n");
+        assert_eq!(
+            stable_part(&short("z Z", "")),
+            stable_part(&short("Z z", ""))
+        );
+        assert_ne!(
+            stable_part(&short("z Z", "")),
+            stable_part(&short("z Z", "  one\n"))
+        );
+        assert!(!held.settled(Some(&grown), redraws, at + quiet));
+        // The other screen replaces the kept look after half the quiet time.
+        assert_eq!(
+            held.next_look(&report, Some(&grown), 110, at + quiet / 2 - 1),
+            None
+        );
+        let moved = held
+            .next_look(&report, Some(&grown), 110, at + quiet / 2)
+            .unwrap();
+        assert_eq!(moved.stable, grown);
+        // A look older than twice the quiet time proves nothing of the time
+        // between; the next look starts over.
+        let late = at + 2 * quiet + 1;
+        assert!(held.settled(Some(&first), redraws, late - 1));
+        assert!(!held.settled(Some(&first), redraws, late));
+        assert_eq!(
+            held.next_look(&report, Some(&first), redraws, late)
+                .unwrap()
+                .at,
+            late
+        );
+        // A pane that started over, a screen not read, and no kept look.
+        assert!(!held.settled(Some(&first), 99, at + quiet));
+        assert!(!held.settled(None, redraws, at + quiet));
+        assert!(!hold.settled(Some(&first), redraws, at + quiet));
+        // The kept look survives the evidence's encoding.
+        let encoded = serde_json::to_string(&held).unwrap();
+        assert_eq!(serde_json::from_str::<TurnHold>(&encoded).unwrap(), held);
+        assert_eq!(serde_json::to_string(&hold).unwrap(), "{}");
+    }
+
+    #[test]
+    fn an_idle_report_holds_past_its_fresh_time_on_a_silent_unmatched_screen() {
+        let now = now_ms();
+        let at = now - REPORT_FRESH_MS - 60_000;
+        let report = |state: &str, at: u64| Report {
+            sequence: 1,
+            state: state.into(),
+            at,
+        };
+        // What the engine says of omp's waiting screen, which no rule reads.
+        let waiting = "────────\n❯\n────────\n · DeepSeek · masil-t2-live/omp · $0.00\n";
+        let unmatched = Evidence::from_value(Engine::load_bundled().explain("omp", waiting, ""));
+        assert_eq!(unmatched.state(), "unknown");
+        assert!(unmatched.unmatched());
+        let silent = Some(at / 1000);
+        // Measured 2026-11-17 on omp 18.12.2: nothing prints after the turn
+        // ends, and no rule reads its waiting screen.
+        assert!(plain_report_holds(&report("idle", at), &unmatched, silent));
+        // The turn's last drawing may land just after the report.
+        let settling = Some((at + IDLE_SETTLE_MS) / 1000);
+        assert!(plain_report_holds(
+            &report("idle", at),
+            &unmatched,
+            settling
+        ));
+        // Later output (a typed draft, a menu, a new turn) ends it.
+        let later = Some((at + IDLE_SETTLE_MS) / 1000 + 1);
+        assert!(!plain_report_holds(&report("idle", at), &unmatched, later));
+        assert!(!plain_report_holds(&report("idle", at), &unmatched, None));
+        // Only idle outlives the fresh time, and only where no rule matched.
+        assert!(!plain_report_holds(
+            &report("working", at),
+            &unmatched,
+            silent
+        ));
+        assert!(!plain_report_holds(
+            &report("blocked", at),
+            &unmatched,
+            silent
+        ));
+        let menu = Evidence::from_value(json!({
+            "state": "unknown",
+            "matched_rule": {"id": "model_picker_menu"},
+        }));
+        assert!(!plain_report_holds(&report("idle", at), &menu, silent));
+        // Any fresh report holds, as before.
+        assert!(plain_report_holds(&report("working", now), &menu, None));
     }
 
     #[test]

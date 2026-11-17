@@ -276,7 +276,8 @@ impl Snapshot {
 
 /// The earliest wall-clock time after `now` at which an agent's judgement
 /// changes with time alone: a report going stale, a held turn's quiet check
-/// or cap, a resume deadline.
+/// or cap, a resume deadline. A held turn that ends on a settled screen
+/// needs none: the pane prints, which starts a pass.
 fn earliest_transition_ms(agents: &[Agent], now: u64) -> Option<u64> {
     let mut earliest: Option<u64> = None;
     let mut note = |at: u64| {

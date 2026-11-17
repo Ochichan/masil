@@ -296,7 +296,7 @@ impl Engine {
         })
     }
 
-    fn load_bundled() -> Self {
+    pub(crate) fn load_bundled() -> Self {
         let mut manifests = HashMap::with_capacity(BUNDLED_MANIFESTS.len());
         for (id, text) in BUNDLED_MANIFESTS {
             manifests.insert(*id, ManifestEntry::bundled(id, text));

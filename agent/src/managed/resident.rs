@@ -2457,9 +2457,11 @@ impl Badge {
 }
 
 /// When the earliest report that still overrides a screen stops doing so.
-/// `collect` lets a report win for REPORT_FRESH_MS without any output; a
-/// held turn ends on a quiet screen, which no output announces, so it is
-/// looked at again every TURN_QUIET_SECONDS.
+/// `collect` lets a report win for REPORT_FRESH_MS without any output (an
+/// idle one longer on a silent screen no rule reads, which this look then
+/// leaves as it is); a held turn ends on a quiet screen, which no output
+/// announces, or on one that read the same at two looks, so it is looked at
+/// again every TURN_QUIET_SECONDS.
 fn report_expiry(agents: &[Agent], now: u64) -> Option<u64> {
     agents
         .iter()
