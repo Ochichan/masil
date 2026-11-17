@@ -6343,7 +6343,7 @@ mod tests {
         let command = "node".to_owned();
         let expected = vec![(&pane, &tty, &command, 42)];
         let names = HashMap::from([("16/66".to_owned(), "ttys066".to_owned())]);
-        let args = "node /opt/codex.js";
+        let args = "node /opt/bin/codex.js";
         let parsed = parse_ps_inventory(
             &format!("16/66 7 {args}\n16/66 42 {args}\n"),
             &expected,

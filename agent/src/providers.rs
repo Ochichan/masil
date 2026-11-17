@@ -42,7 +42,9 @@ const PROVIDERS: [Provider; 24] = [
             "cursor-agent"
         },
         aliases: &["cursor"],
-        executables: &["cursor", "cursor-agent"],
+        // `cursor` is the IDE's launcher; the agent runs as `cursor-agent`
+        // (measured 2026-11-17 on 2026.10.22).
+        executables: &["cursor-agent"],
     },
     Provider {
         id: "devin",
@@ -54,7 +56,8 @@ const PROVIDERS: [Provider; 24] = [
         id: "agy",
         command: "agy",
         aliases: &["antigravity", "antigravity-cli"],
-        executables: &["agy", "antigravity", "antigravity-cli"],
+        // `antigravity` is the IDE's launcher.
+        executables: &["agy", "antigravity-cli"],
     },
     Provider {
         id: "cline",
@@ -96,7 +99,8 @@ const PROVIDERS: [Provider; 24] = [
         id: "kiro",
         command: "kiro-cli",
         aliases: &["kiro"],
-        executables: &["kiro", "kiro-cli"],
+        // `kiro` opens the IDE unless the person set it to the CLI.
+        executables: &["kiro-cli"],
     },
     Provider {
         id: "droid",
@@ -496,7 +500,7 @@ fn identify_executable(value: &str) -> Option<&'static Provider> {
 }
 
 fn identify_script(path: &str) -> Option<&'static Provider> {
-    if let Some(provider) = identify_executable(path) {
+    if let Some(provider) = identify_executable(path).or_else(|| packaged_js(path)) {
         return Some(provider);
     }
 
@@ -568,6 +572,21 @@ fn identify_script(path: &str) -> Option<&'static Provider> {
         return find("letta");
     }
     None
+}
+
+/// A script named after a provider with `.js` added, as npm packages name
+/// their entry (`@openai/codex/bin/codex.js`). The name counts only inside
+/// `node_modules` or a `bin` directory: `node /app/pi.js` is someone's own
+/// script.
+fn packaged_js(path: &str) -> Option<&'static Provider> {
+    let lower = path.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".js")?;
+    let mut components = stem.rsplit(['/', '\\']).filter(|part| !part.is_empty());
+    components.next()?;
+    let in_bin = components.next() == Some("bin");
+    (in_bin || components.any(|part| part == "node_modules"))
+        .then(|| identify_executable(stem))
+        .flatten()
 }
 
 fn runtime_script<'a>(argv: &'a [String], eval: &[&str], modules: &[&str]) -> Option<&'a str> {
@@ -648,7 +667,7 @@ fn normalize_name(value: &str) -> String {
         .find(|component| !component.is_empty())
         .unwrap_or(value)
         .to_ascii_lowercase();
-    for suffix in [".exe", ".cmd", ".bat", ".ps1", ".js"] {
+    for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
         if let Some(stripped) = basename.strip_suffix(suffix) {
             return stripped.to_string();
         }
@@ -797,6 +816,36 @@ mod tests {
                 .map(|p| p.id),
             Some("cursor")
         );
+        // An npm entry script is named after the provider only inside a
+        // package or a `bin` directory.
+        for command in [
+            "node /opt/lib/node_modules/@openai/codex/bin/codex.js",
+            "node @openai/codex/bin/codex.js --no-daemon",
+            r#"node C:\Users\me\node_modules\x\Codex.JS"#,
+        ] {
+            assert_eq!(identify(command).map(|p| p.id), Some("codex"), "{command}");
+        }
+        for command in [
+            "node /app/pi.js",
+            "node pi.js",
+            "bun /work/src/codex.js",
+            "codex.js",
+        ] {
+            assert_eq!(identify(command), None, "{command}");
+        }
+        // The IDE launchers are not the agents; the agents' own names are.
+        for command in ["cursor", "kiro", "antigravity", "/usr/local/bin/cursor"] {
+            assert_eq!(identify(command), None, "{command}");
+        }
+        for (command, id) in [
+            ("cursor-agent", "cursor"),
+            ("kiro-cli", "kiro"),
+            ("agy", "agy"),
+        ] {
+            assert_eq!(identify(command).map(|p| p.id), Some(id));
+            assert_eq!(find(id).map(|p| p.id), Some(id));
+        }
+        assert_eq!(find("antigravity").map(|p| p.id), Some("agy"));
         assert_eq!(identify("bash -c codex"), None);
         assert_eq!(identify("node -e codex /tmp/codex"), None);
         assert_eq!(identify("notes about codex"), None);
