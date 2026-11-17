@@ -1,5 +1,5 @@
 use super::{Agent, Manager, commands, failure, validate_args};
-use crate::{bridge, providers};
+use crate::{bridge, provider_support, providers};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -80,9 +80,22 @@ fn run_inner(args: &[String]) -> Result<i32, String> {
         ));
     }
     if command == "providers" && rest.is_empty() {
-        print(
-            &json!({"providers":providers::all().iter().map(|p|json!({"id":p.id,"command":p.command,"aliases":p.aliases,"resume":providers::resume(p.id,"example").is_ok(),"integration":super::integration::target_capability(p.id)})).collect::<Vec<_>>()}),
-        )?;
+        let engine = crate::detection::Engine::load().ok();
+        let entries = providers::all()
+            .iter()
+            .map(|provider| {
+                let declarations = super::provider_declarations(engine.as_ref(), provider.id);
+                json!({
+                    "id": provider.id,
+                    "command": provider.command,
+                    "aliases": provider.aliases,
+                    "resume": declarations.resume,
+                    "integration": declarations.integration,
+                    "support": provider_support::report(provider.id, declarations, None),
+                })
+            })
+            .collect::<Vec<_>>();
+        print(&json!({"providers": entries}))?;
         return Ok(0);
     }
     if command == "capabilities" && rest.len() == 2 && rest[0] == "--provider" {

@@ -1,6 +1,6 @@
 //! On-demand diagnostics for the local agent, masil server, and saved configuration.
 
-use crate::{detection::Engine, managed::endpoints, native_ui, providers};
+use crate::{detection::Engine, managed::endpoints, native_ui, provider_support, providers};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -982,6 +982,7 @@ fn limits_check(server: Option<&ServerInfo>) -> Check {
 }
 
 async fn providers_check(include_versions: bool) -> Check {
+    let engine = Engine::load().ok();
     let executables: Vec<_> = providers::all()
         .iter()
         .map(|provider| resolve_provider(provider.executables))
@@ -1002,13 +1003,14 @@ async fn providers_check(include_versions: bool) -> Check {
     for ((provider, executable), (version, version_error)) in
         providers::all().iter().zip(&executables).zip(versions)
     {
-        entries.push(json!({
-            "id": provider.id,
-            "found": executable.is_some(),
-            "executable": executable.as_ref().map(|path| path.to_string_lossy()),
-            "version": version,
-            "version_error": version_error,
-        }));
+        entries.push(provider_entry(
+            provider,
+            executable.as_deref(),
+            version.as_deref(),
+            version_error.as_deref(),
+            include_versions,
+            engine.as_ref(),
+        ));
     }
     Check {
         id: "providers",
@@ -1024,6 +1026,34 @@ async fn providers_check(include_versions: bool) -> Check {
         },
         detail: json!({"versions_requested": include_versions, "providers": entries}),
     }
+}
+
+fn provider_entry(
+    provider: &providers::Provider,
+    executable: Option<&Path>,
+    version: Option<&str>,
+    version_error: Option<&str>,
+    versions_requested: bool,
+    engine: Option<&Engine>,
+) -> Value {
+    let declarations = crate::managed::provider_declarations(engine, provider.id);
+    json!({
+        "id": provider.id,
+        "found": executable.is_some(),
+        "executable": executable.map(|path| path.to_string_lossy()),
+        "version": version,
+        "version_error": version_error,
+        "support": provider_support::report(
+            provider.id,
+            declarations,
+            Some(provider_support::RuntimeProbe {
+                found: executable.is_some(),
+                versions_requested,
+                version_output: version,
+                version_error,
+            }),
+        ),
+    })
 }
 
 fn resolve_provider(executables: &[&str]) -> Option<PathBuf> {
@@ -1904,6 +1934,31 @@ mod tests {
                 fail: 1,
                 skip: 1,
             }
+        );
+    }
+
+    #[test]
+    fn provider_diagnostics_keep_version_and_integration_readiness_unverified() {
+        let provider = providers::find("claude").unwrap();
+        let entry = provider_entry(
+            provider,
+            Some(Path::new("/usr/local/bin/claude")),
+            Some("2.1.327 (Claude Code)"),
+            None,
+            true,
+            None,
+        );
+        let support = &entry["support"];
+        assert_eq!(support["verification"]["status"], "unverified");
+        assert_eq!(support["verification"]["version_evidence"], "not_observed");
+        assert_eq!(
+            support["integration_readiness"]["installation"],
+            "unverified"
+        );
+        assert!(
+            support["integration_readiness"]["guidance"]
+                .as_array()
+                .is_some_and(|guidance| !guidance.is_empty())
         );
     }
 

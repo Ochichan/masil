@@ -21,6 +21,7 @@ mod observation;
 mod open_link;
 mod opencode;
 mod process;
+mod provider_support;
 mod providers;
 mod schedule;
 mod session;

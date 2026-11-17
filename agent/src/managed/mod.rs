@@ -29,7 +29,7 @@ pub(crate) mod tokens;
 pub(crate) mod transfer;
 mod view;
 
-use crate::{detection::Engine, native_ui, observation::now_ms, providers};
+use crate::{detection::Engine, native_ui, observation::now_ms, provider_support, providers};
 pub(crate) use cli::run;
 use evidence::Evidence;
 pub(crate) use operations::{NotifyEvent, Through, private_directory};
@@ -3821,8 +3821,9 @@ impl Agent {
 /// Static contract for a provider before any run supplies evidence.
 fn provider_contract(engine: &Engine, id: &str) -> Result<Value, String> {
     let provider = providers::find(id).ok_or("unknown_provider: unknown agent provider")?;
-    let integration = integration::target_capability(provider.id);
-    let resume = providers::resume(provider.id, "example").is_ok();
+    let declarations = provider_declarations(Some(engine), provider.id);
+    let integration = declarations.integration;
+    let resume = declarations.resume;
     Ok(json!({
         "provider": provider.id,
         "command": provider.command,
@@ -3848,7 +3849,34 @@ fn provider_contract(engine: &Engine, id: &str) -> Result<Value, String> {
         "approval_response": false,
         "question_response": false,
         "turn_identity": false,
+        "support": provider_support::report(provider.id, declarations, None),
     }))
+}
+
+/// Static declarations for provider inventory and diagnostics. The integration
+/// value comes from the same target table that accepts and exports callbacks.
+pub(crate) fn provider_declarations<'a>(
+    engine: Option<&'a Engine>,
+    provider: &'a str,
+) -> provider_support::Declarations<'a> {
+    provider_support::Declarations {
+        detection: match engine {
+            Some(engine) if engine.has_manifest(provider) => "screen_manifest",
+            Some(_) => "none",
+            None => "unknown",
+        },
+        prompt: engine
+            .map(|engine| prompt_submit_mode(engine, provider))
+            .unwrap_or("unknown"),
+        interrupt: match engine {
+            Some(engine) if !engine.interrupt_keys(provider).is_empty() => "measured_keys",
+            Some(_) => "unverified",
+            None => "unknown",
+        },
+        resume: providers::resume(provider, "example").is_ok(),
+        answers: answer::profile(provider).is_some(),
+        integration: integration::target_capability(provider),
+    }
 }
 
 /// `exec-managed` reads the directory it must run in from this variable

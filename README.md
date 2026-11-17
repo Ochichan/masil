@@ -1,10 +1,17 @@
 # masil
 
-masil is a terminal multiplexer built from the tmux source. It keeps the tmux commands, options and default key bindings. It adds tools that run coding agents such as Claude Code, Codex and OpenCode in their own TUIs inside panes and manage them from the shell or a side panel.
+masil keeps your tmux commands, configuration and default key bindings while adding coding-agent management. Run Claude Code, Codex or OpenCode in their own terminal panes, inspect which agent needs attention, and track whether a management command was delivered or its outcome is still unknown.
 
 The repository has two programs. `core/` is tmux at commit `94796f6b1182507efac8a272fc309a79e22e58a5`, on the `next-3.9` development line, with masil's changes. `make core` builds it into `bin/masil`. `agent/` is a Rust program, `masil-agent`, that finds and controls agents and provides the agent UI, layout templates, saved sessions and diagnostics.
 
 masil is still in development. The tests run on macOS arm64 and Debian 13.7 x86_64.
+
+Start with [installation and updates](docs/public/install.md),
+[provider support and setup](docs/public/providers.md), or
+[verification and performance](docs/public/validation.md).
+The [architecture and compatibility guide](docs/public/architecture.md)
+explains the tmux boundary and operational limits. Windows is not a supported
+masil host. Provider recognition does not mean every operation has been tested.
 
 ## Install with Homebrew
 
@@ -61,6 +68,13 @@ make core       # bin/masil only
 ./bin/masil -L main new-session -s work
 ```
 
+For a source installation, `make install` builds and installs both programs
+under `~/.local`. Add `~/.local/bin` to `PATH`. Use
+`make install PREFIX=/path/to/prefix` to choose another directory. Updates
+prepare a complete versioned bundle and switch one link; unrelated existing
+files are refused. Existing servers keep their old core until you save your
+work and restart them. See the [install guide](docs/public/install.md).
+
 ## CI and releases
 
 GitHub Actions runs on pull requests, pushes to `main`, and manual CI dispatches.
@@ -70,17 +84,23 @@ server and its agent bridge, then package and smoke-test the extracted binaries.
 The Homebrew job builds a formula from the same checkout, runs its test and
 checks dynamic linkage. Successful builds retain archives for 14 days.
 
-The `tests/` directory and upstream comparison checkout are local development
-tools excluded from Git. CI therefore does not run `make test`. Before the Rust
-tests, CI runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
-For the tracked runtime check locally, run:
+Selected regression tests and their fixtures are tracked in `tests/`. CI runs
+`make test-ci` for compatibility contracts, prompt replay protection, restore,
+endpoint disconnect and local installation. This gate needs no separate tmux
+checkout, provider account or model call. The broader local `make test` still
+uses unpublished development suites and a pinned upstream checkout. Before
+the Rust tests, CI runs `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings`. To run the public checks locally:
 
 ```sh
 make all
 cargo test --locked --manifest-path agent/Cargo.toml
+make test-ci
 python3 scripts/ci_smoke.py bin
-python3 scripts/release.py package
 ```
+
+Release packaging additionally checks that the binaries were built from the
+current clean commit. Run it after committing and rebuilding with `make all`.
 
 To prepare a release:
 
@@ -214,14 +234,21 @@ The tmux C core owns the PTY, the VT parser, the grid and history, key handling 
 
 ## Performance
 
-A run on 2026-09-28 compared the masil core with stock tmux, built from the same source with the same compiler flags, and with Herdr 0.8.2. The machine was a macOS arm64 Mac with 64 GiB of memory. The agent management layer was not part of this run.
+A bounded run on 2026-11-18 compared the masil terminal core with the official
+Herdr 0.9.5 macOS arm64 binary. Two rounds reversed product order and checked
+identical 93×39 inner grids. The ranges below are the two round results, not
+confidence intervals. No agent management or real provider ran in this comparison.
 
-| Measure | masil | tmux | Herdr 0.8.2 |
-| --- | --- | --- | --- |
-| Idle server RSS, 50 panes | 4.44 MiB | 4.39 MiB | 48.61 MiB |
-| Input to screen, median | 2.67 ms | 2.65 ms | 16.68 ms |
+| Measure | masil core | Herdr 0.9.5 |
+| --- | --- | --- |
+| Idle server RSS, 50 panes | 4.69–4.73 MiB | 27.63–27.92 MiB |
+| Input to reconstructed screen, median | 2.44–2.47 ms | 3.03–3.11 ms |
 
-Herdr used less CPU than masil for output in a single pane, 1.87% against 3.16%, and finished writing a 1 MiB burst sooner. Each program ran once in a fixed order, so this run cannot settle differences of a few percent.
+Herdr used less CPU for single-pane scrolling output. These short synthetic
+measurements do not pass the full performance gate or establish full-product
+superiority. A separate masil-only probe enables inbox, coordinator and the
+agent desk with synthetic providers. See the [recorded results and limits](docs/public/performance-2026-11-18.md)
+and [reproduction commands](docs/public/validation.md).
 
 ## License
 

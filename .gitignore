@@ -11,13 +11,47 @@ core/config.h.in
 core/config.h.in~
 core/Makefile.in
 core/etc/
-# Notes, docs and review records stay local.
+# Notes and review records stay local. Public documentation is allowlisted.
 *.md
 !/README.md
 /docs/
+!/docs/
+/docs/*
+!/docs/public/
+/docs/public/*
+!/docs/public/**/
+!/docs/public/*.md
+!/docs/public/**/*.md
+!/docs/public/performance-2026-11-18.json
 /.impeccable/
-# Test, smoke, benchmark and capture tools stay local.
+# Test, smoke, benchmark and capture tools stay local unless explicitly
+# selected for the fresh-clone regression and performance gates.
 /tests/
+!/tests/
+/tests/*
+!/tests/faults/
+/tests/faults/*
+!/tests/faults/agent.c
+!/tests/faults/raw_reader.c
+!/tests/performance/
+/tests/performance/*
+!/tests/performance/benchmark.py
+!/tests/performance/compare.py
+!/tests/performance/management.py
+!/tests/performance/fixture.py
+!/tests/performance/requirements.txt
+!/tests/test_agent_endpoints.py
+!/tests/test_benchmark_harness.py
+!/tests/test_compatibility.py
+!/tests/test_core_ledger.py
+!/tests/test_core_prompt.py
+!/tests/test_install.py
+!/tests/test_managed_agents.py
+!/tests/test_managed_restore.py
+!/tests/test_performance_compare.py
+!/tests/test_management_probe.py
+!/tests/test_remote_links.py
+!/tests/test_restore.py
 /core/regress/
 /core/fuzz/
 /scripts/test_*.py

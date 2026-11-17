@@ -1,0 +1,1225 @@
+{
+  "schema_version": 1,
+  "kind": "selected_metrics_not_raw_process_logs",
+  "terminal_raw_sha256": "3c7e455e123f24149594837d10afe8ece1a1e2bba67caa9c27c7607e9ed6d0a2",
+  "management_raw_sha256": "358eefde2fccfbbcb4fe571815c949633f15d82ae2410b8e4c501c32b81cd79f",
+  "terminal_scope": "Repeated terminal PTY workloads with alternating product order. No agent management, provider account, model request, or full-product comparison.",
+  "terminal_started_at_utc": "2026-11-17T15:35:30.094430+00:00",
+  "terminal_completed_at_utc": "2026-11-17T15:40:18.963577+00:00",
+  "orders": [
+    [
+      "masil",
+      "herdr"
+    ],
+    [
+      "herdr",
+      "masil"
+    ]
+  ],
+  "performance_budget_pass": null,
+  "runs": [
+    {
+      "round": 1,
+      "product": "masil",
+      "binary": {
+        "sha256": "cb3ec7f34821b84eb67b505771d31b22584e64ce2e451b344d3492a1e75f5b54",
+        "version_output": "tmux next-3.9"
+      },
+      "harness": {
+        "agent_management": "not exercised",
+        "benchmark_sha256": "ce26c7b1d49b26105da059d3770db1ceaab646e2197ca3c5cab5036fbefe732f",
+        "fixture_scope": "deterministic local PTY traffic; no provider, account, model, or network request",
+        "fixture_sha256": "78765abecae6574d8dbeb3faaaae584c9f13628d7c04742b6e2813cc076e7bab"
+      },
+      "host": {
+        "logical_cpus": 18,
+        "machine": "arm64",
+        "platform": "macOS-27.3-arm64-arm-64bit",
+        "python": "3.11.15 (main, Mar 10 2026, 18:01:34) [Clang 21.1.4 ]"
+      },
+      "methodology": {
+        "aggregate_burst_bytes": 1048576,
+        "aggregate_offered_rate_bytes_per_second": 1048576,
+        "cpu": "process CPU time delta and ps point samples; percentages are of one logical core",
+        "host_pty": {
+          "columns": 120,
+          "rows": 40
+        },
+        "idle_seconds": 5.0,
+        "input_rtt": "attached client PTY round trip to a unique marker in a pyte 0.8.2 reconstructed screen; timestamp at read before parser/log work",
+        "memory": "per-process RSS from ps; shared pages may be double-counted when summed",
+        "output_style": "scroll",
+        "pane_counts": [
+          1,
+          15,
+          50
+        ],
+        "required_inner_geometry": {
+          "active": {
+            "columns": 93,
+            "rows": 39
+          },
+          "hidden": {
+            "columns": 93,
+            "rows": 39
+          }
+        },
+        "scrollback": "product defaults; inplace workload overwrites the first row without scrolling",
+        "startup": "CLI/server readiness and fixture-child readiness are separate",
+        "startup_samples": 10,
+        "throughput": "headless PTY acceptance; offered and fixture-completed byte counts are equal by sidechannel evidence",
+        "throughput_repeats": 2,
+        "throughput_seconds": 5.0
+      },
+      "rtt": {
+        "max": 3.419333,
+        "mean": 1.83459754,
+        "median": 2.473313,
+        "min": 0.532084,
+        "p95": 2.617708,
+        "p99": 2.838291,
+        "samples": 100,
+        "stdev": 0.9524615133351453
+      },
+      "idle": [
+        {
+          "pane_count": 1,
+          "server": {
+            "average_percent_of_one_core": 0.0,
+            "cpu_seconds_delta": 0.0,
+            "rss_kib_end_sum": 4400,
+            "rss_kib_sample_max_sum": 4400
+          }
+        },
+        {
+          "pane_count": 15,
+          "server": {
+            "average_percent_of_one_core": 0.0,
+            "cpu_seconds_delta": 0.0,
+            "rss_kib_end_sum": 4560,
+            "rss_kib_sample_max_sum": 4560
+          }
+        },
+        {
+          "pane_count": 50,
+          "server": {
+            "average_percent_of_one_core": 0.0,
+            "cpu_seconds_delta": 0.0,
+            "rss_kib_end_sum": 4800,
+            "rss_kib_sample_max_sum": 4800
+          }
+        }
+      ],
+      "output": [
+        {
+          "pane_count": 1,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048576,
+              "completed_bytes": 1048576,
+              "fixture_write_seconds": 0.0169635,
+              "server": {
+                "average_percent_of_one_core": 1.2882637838475055,
+                "cpu_seconds_delta": 0.01,
+                "rss_kib_end_sum": 5840,
+                "rss_kib_sample_max_sum": 5840
+              }
+            },
+            {
+              "offered_bytes": 1048576,
+              "completed_bytes": 1048576,
+              "fixture_write_seconds": 0.019001167,
+              "server": {
+                "average_percent_of_one_core": 2.5379390157937536,
+                "cpu_seconds_delta": 0.019999999999999997,
+                "rss_kib_end_sum": 5856,
+                "rss_kib_sample_max_sum": 5856
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 15,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048575,
+              "completed_bytes": 1048575,
+              "fixture_write_seconds": 0.018594958,
+              "server": {
+                "average_percent_of_one_core": 2.5364703502822366,
+                "cpu_seconds_delta": 0.020000000000000004,
+                "rss_kib_end_sum": 14512,
+                "rss_kib_sample_max_sum": 14512
+              }
+            },
+            {
+              "offered_bytes": 1048575,
+              "completed_bytes": 1048575,
+              "fixture_write_seconds": 0.017467084,
+              "server": {
+                "average_percent_of_one_core": 2.5674186782154766,
+                "cpu_seconds_delta": 0.020000000000000004,
+                "rss_kib_end_sum": 14368,
+                "rss_kib_sample_max_sum": 14368
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 50,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048550,
+              "completed_bytes": 1048550,
+              "fixture_write_seconds": 0.018154125,
+              "server": {
+                "average_percent_of_one_core": 1.307414780185927,
+                "cpu_seconds_delta": 0.010000000000000009,
+                "rss_kib_end_sum": 13792,
+                "rss_kib_sample_max_sum": 13792
+              }
+            },
+            {
+              "offered_bytes": 1048550,
+              "completed_bytes": 1048550,
+              "fixture_write_seconds": 0.017985958,
+              "server": {
+                "average_percent_of_one_core": 2.5838111635163945,
+                "cpu_seconds_delta": 0.020000000000000004,
+                "rss_kib_end_sum": 14048,
+                "rss_kib_sample_max_sum": 14048
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 1,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242880,
+              "completed_bytes": 5242880,
+              "fixture_write_seconds": 5.00075,
+              "server": {
+                "average_percent_of_one_core": 4.6285849504083165,
+                "cpu_seconds_delta": 0.27,
+                "rss_kib_end_sum": 5744,
+                "rss_kib_sample_max_sum": 5920
+              }
+            },
+            {
+              "offered_bytes": 5242880,
+              "completed_bytes": 5242880,
+              "fixture_write_seconds": 5.000863458,
+              "server": {
+                "average_percent_of_one_core": 4.979274235424427,
+                "cpu_seconds_delta": 0.29,
+                "rss_kib_end_sum": 5680,
+                "rss_kib_sample_max_sum": 5728
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 15,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242875,
+              "completed_bytes": 5242875,
+              "fixture_write_seconds": 5.005126334,
+              "server": {
+                "average_percent_of_one_core": 4.468452222989534,
+                "cpu_seconds_delta": 0.26,
+                "rss_kib_end_sum": 22192,
+                "rss_kib_sample_max_sum": 22192
+              }
+            },
+            {
+              "offered_bytes": 5242875,
+              "completed_bytes": 5242875,
+              "fixture_write_seconds": 5.004501208,
+              "server": {
+                "average_percent_of_one_core": 4.669476677717393,
+                "cpu_seconds_delta": 0.27,
+                "rss_kib_end_sum": 22256,
+                "rss_kib_sample_max_sum": 22256
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 50,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242750,
+              "completed_bytes": 5242750,
+              "fixture_write_seconds": 5.001113334,
+              "server": {
+                "average_percent_of_one_core": 4.435627906858118,
+                "cpu_seconds_delta": 0.26,
+                "rss_kib_end_sum": 42720,
+                "rss_kib_sample_max_sum": 42720
+              }
+            },
+            {
+              "offered_bytes": 5242750,
+              "completed_bytes": 5242750,
+              "fixture_write_seconds": 5.002042708,
+              "server": {
+                "average_percent_of_one_core": 4.321580190972922,
+                "cpu_seconds_delta": 0.25,
+                "rss_kib_end_sum": 42592,
+                "rss_kib_sample_max_sum": 42640
+              }
+            }
+          ]
+        }
+      ],
+      "geometry_matched": true
+    },
+    {
+      "round": 1,
+      "product": "herdr",
+      "binary": {
+        "sha256": "fb77c2232a05a8035421382c894392f4174e4e38a18e48af3dd0290157c3a7e2",
+        "version_output": "herdr 0.9.5",
+        "version": "0.9.5",
+        "api_protocol": 22
+      },
+      "harness": {
+        "agent_management": "not exercised",
+        "benchmark_sha256": "ce26c7b1d49b26105da059d3770db1ceaab646e2197ca3c5cab5036fbefe732f",
+        "fixture_scope": "deterministic local PTY traffic; no provider, account, model, or network request",
+        "fixture_sha256": "78765abecae6574d8dbeb3faaaae584c9f13628d7c04742b6e2813cc076e7bab"
+      },
+      "host": {
+        "logical_cpus": 18,
+        "machine": "arm64",
+        "platform": "macOS-27.3-arm64-arm-64bit",
+        "python": "3.11.15 (main, Mar 10 2026, 18:01:34) [Clang 21.1.4 ]"
+      },
+      "methodology": {
+        "aggregate_burst_bytes": 1048576,
+        "aggregate_offered_rate_bytes_per_second": 1048576,
+        "cpu": "process CPU time delta and ps point samples; percentages are of one logical core",
+        "host_pty": {
+          "columns": 120,
+          "rows": 40
+        },
+        "idle_seconds": 5.0,
+        "input_rtt": "attached client PTY round trip to a unique marker in a pyte 0.8.2 reconstructed screen; timestamp at read before parser/log work",
+        "memory": "per-process RSS from ps; shared pages may be double-counted when summed",
+        "output_style": "scroll",
+        "pane_counts": [
+          1,
+          15,
+          50
+        ],
+        "required_inner_geometry": {
+          "active": {
+            "columns": 93,
+            "rows": 39
+          },
+          "hidden": {
+            "columns": 93,
+            "rows": 39
+          }
+        },
+        "scrollback": "product defaults; inplace workload overwrites the first row without scrolling",
+        "startup": "CLI/server readiness and fixture-child readiness are separate",
+        "startup_samples": 10,
+        "throughput": "headless PTY acceptance; offered and fixture-completed byte counts are equal by sidechannel evidence",
+        "throughput_repeats": 2,
+        "throughput_seconds": 5.0
+      },
+      "rtt": {
+        "max": 3.468375,
+        "mean": 2.25011373,
+        "median": 3.0326874999999998,
+        "min": 0.532417,
+        "p95": 3.181917,
+        "p99": 3.317875,
+        "samples": 100,
+        "stdev": 1.1733229026897842
+      },
+      "idle": [
+        {
+          "pane_count": 1,
+          "server": {
+            "average_percent_of_one_core": 0.0,
+            "cpu_seconds_delta": 0.0,
+            "rss_kib_end_sum": 20800,
+            "rss_kib_sample_max_sum": 20800
+          }
+        },
+        {
+          "pane_count": 15,
+          "server": {
+            "average_percent_of_one_core": 0.7911149680118822,
+            "cpu_seconds_delta": 0.039999999999999994,
+            "rss_kib_end_sum": 22960,
+            "rss_kib_sample_max_sum": 22960
+          }
+        },
+        {
+          "pane_count": 50,
+          "server": {
+            "average_percent_of_one_core": 0.7880446015143686,
+            "cpu_seconds_delta": 0.03999999999999998,
+            "rss_kib_end_sum": 28592,
+            "rss_kib_sample_max_sum": 28592
+          }
+        }
+      ],
+      "output": [
+        {
+          "pane_count": 1,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048576,
+              "completed_bytes": 1048576,
+              "fixture_write_seconds": 0.007379709,
+              "server": {
+                "average_percent_of_one_core": 2.5694126837247424,
+                "cpu_seconds_delta": 0.020000000000000004,
+                "rss_kib_end_sum": 30064,
+                "rss_kib_sample_max_sum": 30064
+              }
+            },
+            {
+              "offered_bytes": 1048576,
+              "completed_bytes": 1048576,
+              "fixture_write_seconds": 0.007551292,
+              "server": {
+                "average_percent_of_one_core": 2.613890618756429,
+                "cpu_seconds_delta": 0.02,
+                "rss_kib_end_sum": 30096,
+                "rss_kib_sample_max_sum": 30096
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 15,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048575,
+              "completed_bytes": 1048575,
+              "fixture_write_seconds": 0.008681458,
+              "server": {
+                "average_percent_of_one_core": 10.338293731725013,
+                "cpu_seconds_delta": 0.07999999999999999,
+                "rss_kib_end_sum": 32160,
+                "rss_kib_sample_max_sum": 32160
+              }
+            },
+            {
+              "offered_bytes": 1048575,
+              "completed_bytes": 1048575,
+              "fixture_write_seconds": 0.010026917,
+              "server": {
+                "average_percent_of_one_core": 8.922449569729228,
+                "cpu_seconds_delta": 0.06999999999999999,
+                "rss_kib_end_sum": 32288,
+                "rss_kib_sample_max_sum": 32288
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 50,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048550,
+              "completed_bytes": 1048550,
+              "fixture_write_seconds": 0.010325208,
+              "server": {
+                "average_percent_of_one_core": 9.03514785422592,
+                "cpu_seconds_delta": 0.06999999999999998,
+                "rss_kib_end_sum": 36064,
+                "rss_kib_sample_max_sum": 36048
+              }
+            },
+            {
+              "offered_bytes": 1048550,
+              "completed_bytes": 1048550,
+              "fixture_write_seconds": 0.010159167,
+              "server": {
+                "average_percent_of_one_core": 11.473566018859724,
+                "cpu_seconds_delta": 0.09,
+                "rss_kib_end_sum": 36032,
+                "rss_kib_sample_max_sum": 36032
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 1,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242880,
+              "completed_bytes": 5242880,
+              "fixture_write_seconds": 5.00076475,
+              "server": {
+                "average_percent_of_one_core": 2.7796331186942513,
+                "cpu_seconds_delta": 0.16,
+                "rss_kib_end_sum": 30640,
+                "rss_kib_sample_max_sum": 30640
+              }
+            },
+            {
+              "offered_bytes": 5242880,
+              "completed_bytes": 5242880,
+              "fixture_write_seconds": 5.000711625,
+              "server": {
+                "average_percent_of_one_core": 2.5861518293544368,
+                "cpu_seconds_delta": 0.15000000000000002,
+                "rss_kib_end_sum": 30672,
+                "rss_kib_sample_max_sum": 30672
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 15,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242875,
+              "completed_bytes": 5242875,
+              "fixture_write_seconds": 5.004322333,
+              "server": {
+                "average_percent_of_one_core": 5.502584383407201,
+                "cpu_seconds_delta": 0.32,
+                "rss_kib_end_sum": 74688,
+                "rss_kib_sample_max_sum": 74688
+              }
+            },
+            {
+              "offered_bytes": 5242875,
+              "completed_bytes": 5242875,
+              "fixture_write_seconds": 5.004711042,
+              "server": {
+                "average_percent_of_one_core": 5.162632976636941,
+                "cpu_seconds_delta": 0.3,
+                "rss_kib_end_sum": 74672,
+                "rss_kib_sample_max_sum": 74672
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 50,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242750,
+              "completed_bytes": 5242750,
+              "fixture_write_seconds": 5.002435208,
+              "server": {
+                "average_percent_of_one_core": 9.796441405980836,
+                "cpu_seconds_delta": 0.5700000000000001,
+                "rss_kib_end_sum": 79216,
+                "rss_kib_sample_max_sum": 79216
+              }
+            },
+            {
+              "offered_bytes": 5242750,
+              "completed_bytes": 5242750,
+              "fixture_write_seconds": 5.000751334,
+              "server": {
+                "average_percent_of_one_core": 10.619113439937077,
+                "cpu_seconds_delta": 0.62,
+                "rss_kib_end_sum": 79232,
+                "rss_kib_sample_max_sum": 79232
+              }
+            }
+          ]
+        }
+      ],
+      "geometry_matched": true
+    },
+    {
+      "round": 2,
+      "product": "herdr",
+      "binary": {
+        "sha256": "fb77c2232a05a8035421382c894392f4174e4e38a18e48af3dd0290157c3a7e2",
+        "version_output": "herdr 0.9.5",
+        "version": "0.9.5",
+        "api_protocol": 22
+      },
+      "harness": {
+        "agent_management": "not exercised",
+        "benchmark_sha256": "ce26c7b1d49b26105da059d3770db1ceaab646e2197ca3c5cab5036fbefe732f",
+        "fixture_scope": "deterministic local PTY traffic; no provider, account, model, or network request",
+        "fixture_sha256": "78765abecae6574d8dbeb3faaaae584c9f13628d7c04742b6e2813cc076e7bab"
+      },
+      "host": {
+        "logical_cpus": 18,
+        "machine": "arm64",
+        "platform": "macOS-27.3-arm64-arm-64bit",
+        "python": "3.11.15 (main, Mar 10 2026, 18:01:34) [Clang 21.1.4 ]"
+      },
+      "methodology": {
+        "aggregate_burst_bytes": 1048576,
+        "aggregate_offered_rate_bytes_per_second": 1048576,
+        "cpu": "process CPU time delta and ps point samples; percentages are of one logical core",
+        "host_pty": {
+          "columns": 120,
+          "rows": 40
+        },
+        "idle_seconds": 5.0,
+        "input_rtt": "attached client PTY round trip to a unique marker in a pyte 0.8.2 reconstructed screen; timestamp at read before parser/log work",
+        "memory": "per-process RSS from ps; shared pages may be double-counted when summed",
+        "output_style": "scroll",
+        "pane_counts": [
+          1,
+          15,
+          50
+        ],
+        "required_inner_geometry": {
+          "active": {
+            "columns": 93,
+            "rows": 39
+          },
+          "hidden": {
+            "columns": 93,
+            "rows": 39
+          }
+        },
+        "scrollback": "product defaults; inplace workload overwrites the first row without scrolling",
+        "startup": "CLI/server readiness and fixture-child readiness are separate",
+        "startup_samples": 10,
+        "throughput": "headless PTY acceptance; offered and fixture-completed byte counts are equal by sidechannel evidence",
+        "throughput_repeats": 2,
+        "throughput_seconds": 5.0
+      },
+      "rtt": {
+        "max": 3.466792,
+        "mean": 2.29064083,
+        "median": 3.1147915,
+        "min": 0.547042,
+        "p95": 3.192584,
+        "p99": 3.242708,
+        "samples": 100,
+        "stdev": 1.1978398507698955
+      },
+      "idle": [
+        {
+          "pane_count": 1,
+          "server": {
+            "average_percent_of_one_core": 0.19551392165119394,
+            "cpu_seconds_delta": 0.010000000000000002,
+            "rss_kib_end_sum": 20784,
+            "rss_kib_sample_max_sum": 20784
+          }
+        },
+        {
+          "pane_count": 15,
+          "server": {
+            "average_percent_of_one_core": 0.799630790468569,
+            "cpu_seconds_delta": 0.039999999999999994,
+            "rss_kib_end_sum": 22912,
+            "rss_kib_sample_max_sum": 22896
+          }
+        },
+        {
+          "pane_count": 50,
+          "server": {
+            "average_percent_of_one_core": 0.7993984459485145,
+            "cpu_seconds_delta": 0.04000000000000001,
+            "rss_kib_end_sum": 28288,
+            "rss_kib_sample_max_sum": 28288
+          }
+        }
+      ],
+      "output": [
+        {
+          "pane_count": 1,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048576,
+              "completed_bytes": 1048576,
+              "fixture_write_seconds": 0.0075015,
+              "server": {
+                "average_percent_of_one_core": 1.3067203034377095,
+                "cpu_seconds_delta": 0.010000000000000002,
+                "rss_kib_end_sum": 30144,
+                "rss_kib_sample_max_sum": 30144
+              }
+            },
+            {
+              "offered_bytes": 1048576,
+              "completed_bytes": 1048576,
+              "fixture_write_seconds": 0.007339417,
+              "server": {
+                "average_percent_of_one_core": 2.5057050456327965,
+                "cpu_seconds_delta": 0.020000000000000004,
+                "rss_kib_end_sum": 30176,
+                "rss_kib_sample_max_sum": 30176
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 15,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048575,
+              "completed_bytes": 1048575,
+              "fixture_write_seconds": 0.010268792,
+              "server": {
+                "average_percent_of_one_core": 10.029067572957398,
+                "cpu_seconds_delta": 0.07999999999999999,
+                "rss_kib_end_sum": 32224,
+                "rss_kib_sample_max_sum": 32224
+              }
+            },
+            {
+              "offered_bytes": 1048575,
+              "completed_bytes": 1048575,
+              "fixture_write_seconds": 0.009093875,
+              "server": {
+                "average_percent_of_one_core": 8.88874262825141,
+                "cpu_seconds_delta": 0.07,
+                "rss_kib_end_sum": 32240,
+                "rss_kib_sample_max_sum": 32240
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 50,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048550,
+              "completed_bytes": 1048550,
+              "fixture_write_seconds": 0.0098045,
+              "server": {
+                "average_percent_of_one_core": 9.976263762637755,
+                "cpu_seconds_delta": 0.08000000000000002,
+                "rss_kib_end_sum": 35952,
+                "rss_kib_sample_max_sum": 35936
+              }
+            },
+            {
+              "offered_bytes": 1048550,
+              "completed_bytes": 1048550,
+              "fixture_write_seconds": 0.009511291,
+              "server": {
+                "average_percent_of_one_core": 10.026404435994769,
+                "cpu_seconds_delta": 0.08000000000000002,
+                "rss_kib_end_sum": 35920,
+                "rss_kib_sample_max_sum": 35920
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 1,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242880,
+              "completed_bytes": 5242880,
+              "fixture_write_seconds": 5.000746583,
+              "server": {
+                "average_percent_of_one_core": 2.590776713982581,
+                "cpu_seconds_delta": 0.15,
+                "rss_kib_end_sum": 30448,
+                "rss_kib_sample_max_sum": 30448
+              }
+            },
+            {
+              "offered_bytes": 5242880,
+              "completed_bytes": 5242880,
+              "fixture_write_seconds": 5.000748,
+              "server": {
+                "average_percent_of_one_core": 2.5817032896525802,
+                "cpu_seconds_delta": 0.15,
+                "rss_kib_end_sum": 30464,
+                "rss_kib_sample_max_sum": 30464
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 15,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242875,
+              "completed_bytes": 5242875,
+              "fixture_write_seconds": 5.004348958,
+              "server": {
+                "average_percent_of_one_core": 5.493885734369326,
+                "cpu_seconds_delta": 0.32,
+                "rss_kib_end_sum": 74688,
+                "rss_kib_sample_max_sum": 74688
+              }
+            },
+            {
+              "offered_bytes": 5242875,
+              "completed_bytes": 5242875,
+              "fixture_write_seconds": 5.004731125,
+              "server": {
+                "average_percent_of_one_core": 5.313276950092645,
+                "cpu_seconds_delta": 0.31,
+                "rss_kib_end_sum": 74656,
+                "rss_kib_sample_max_sum": 74656
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 50,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242750,
+              "completed_bytes": 5242750,
+              "fixture_write_seconds": 5.001684333,
+              "server": {
+                "average_percent_of_one_core": 9.956481448697472,
+                "cpu_seconds_delta": 0.5800000000000001,
+                "rss_kib_end_sum": 79328,
+                "rss_kib_sample_max_sum": 79328
+              }
+            },
+            {
+              "offered_bytes": 5242750,
+              "completed_bytes": 5242750,
+              "fixture_write_seconds": 5.002012542,
+              "server": {
+                "average_percent_of_one_core": 10.308536355525694,
+                "cpu_seconds_delta": 0.6000000000000001,
+                "rss_kib_end_sum": 79344,
+                "rss_kib_sample_max_sum": 79344
+              }
+            }
+          ]
+        }
+      ],
+      "geometry_matched": true
+    },
+    {
+      "round": 2,
+      "product": "masil",
+      "binary": {
+        "sha256": "cb3ec7f34821b84eb67b505771d31b22584e64ce2e451b344d3492a1e75f5b54",
+        "version_output": "tmux next-3.9"
+      },
+      "harness": {
+        "agent_management": "not exercised",
+        "benchmark_sha256": "ce26c7b1d49b26105da059d3770db1ceaab646e2197ca3c5cab5036fbefe732f",
+        "fixture_scope": "deterministic local PTY traffic; no provider, account, model, or network request",
+        "fixture_sha256": "78765abecae6574d8dbeb3faaaae584c9f13628d7c04742b6e2813cc076e7bab"
+      },
+      "host": {
+        "logical_cpus": 18,
+        "machine": "arm64",
+        "platform": "macOS-27.3-arm64-arm-64bit",
+        "python": "3.11.15 (main, Mar 10 2026, 18:01:34) [Clang 21.1.4 ]"
+      },
+      "methodology": {
+        "aggregate_burst_bytes": 1048576,
+        "aggregate_offered_rate_bytes_per_second": 1048576,
+        "cpu": "process CPU time delta and ps point samples; percentages are of one logical core",
+        "host_pty": {
+          "columns": 120,
+          "rows": 40
+        },
+        "idle_seconds": 5.0,
+        "input_rtt": "attached client PTY round trip to a unique marker in a pyte 0.8.2 reconstructed screen; timestamp at read before parser/log work",
+        "memory": "per-process RSS from ps; shared pages may be double-counted when summed",
+        "output_style": "scroll",
+        "pane_counts": [
+          1,
+          15,
+          50
+        ],
+        "required_inner_geometry": {
+          "active": {
+            "columns": 93,
+            "rows": 39
+          },
+          "hidden": {
+            "columns": 93,
+            "rows": 39
+          }
+        },
+        "scrollback": "product defaults; inplace workload overwrites the first row without scrolling",
+        "startup": "CLI/server readiness and fixture-child readiness are separate",
+        "startup_samples": 10,
+        "throughput": "headless PTY acceptance; offered and fixture-completed byte counts are equal by sidechannel evidence",
+        "throughput_repeats": 2,
+        "throughput_seconds": 5.0
+      },
+      "rtt": {
+        "max": 3.241958,
+        "mean": 1.80222747,
+        "median": 2.440354,
+        "min": 0.52725,
+        "p95": 2.533958,
+        "p99": 2.591958,
+        "samples": 100,
+        "stdev": 0.9281192800724001
+      },
+      "idle": [
+        {
+          "pane_count": 1,
+          "server": {
+            "average_percent_of_one_core": 0.0,
+            "cpu_seconds_delta": 0.0,
+            "rss_kib_end_sum": 4416,
+            "rss_kib_sample_max_sum": 4416
+          }
+        },
+        {
+          "pane_count": 15,
+          "server": {
+            "average_percent_of_one_core": 0.0,
+            "cpu_seconds_delta": 0.0,
+            "rss_kib_end_sum": 4544,
+            "rss_kib_sample_max_sum": 4544
+          }
+        },
+        {
+          "pane_count": 50,
+          "server": {
+            "average_percent_of_one_core": 0.0,
+            "cpu_seconds_delta": 0.0,
+            "rss_kib_end_sum": 4848,
+            "rss_kib_sample_max_sum": 4848
+          }
+        }
+      ],
+      "output": [
+        {
+          "pane_count": 1,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048576,
+              "completed_bytes": 1048576,
+              "fixture_write_seconds": 0.01807075,
+              "server": {
+                "average_percent_of_one_core": 1.3118435139211169,
+                "cpu_seconds_delta": 0.01,
+                "rss_kib_end_sum": 5856,
+                "rss_kib_sample_max_sum": 5856
+              }
+            },
+            {
+              "offered_bytes": 1048576,
+              "completed_bytes": 1048576,
+              "fixture_write_seconds": 0.016837917,
+              "server": {
+                "average_percent_of_one_core": 1.3111446867583065,
+                "cpu_seconds_delta": 0.01,
+                "rss_kib_end_sum": 5840,
+                "rss_kib_sample_max_sum": 5840
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 15,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048575,
+              "completed_bytes": 1048575,
+              "fixture_write_seconds": 0.018826708,
+              "server": {
+                "average_percent_of_one_core": 2.5619658123504174,
+                "cpu_seconds_delta": 0.020000000000000004,
+                "rss_kib_end_sum": 14160,
+                "rss_kib_sample_max_sum": 14160
+              }
+            },
+            {
+              "offered_bytes": 1048575,
+              "completed_bytes": 1048575,
+              "fixture_write_seconds": 0.017732958,
+              "server": {
+                "average_percent_of_one_core": 2.521692599031846,
+                "cpu_seconds_delta": 0.020000000000000004,
+                "rss_kib_end_sum": 13968,
+                "rss_kib_sample_max_sum": 13968
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 50,
+          "pattern": "burst",
+          "repeats": [
+            {
+              "offered_bytes": 1048550,
+              "completed_bytes": 1048550,
+              "fixture_write_seconds": 0.018661583,
+              "server": {
+                "average_percent_of_one_core": 2.560144187464822,
+                "cpu_seconds_delta": 0.01999999999999999,
+                "rss_kib_end_sum": 13984,
+                "rss_kib_sample_max_sum": 13984
+              }
+            },
+            {
+              "offered_bytes": 1048550,
+              "completed_bytes": 1048550,
+              "fixture_write_seconds": 0.018378958,
+              "server": {
+                "average_percent_of_one_core": 2.5538150017449865,
+                "cpu_seconds_delta": 0.020000000000000004,
+                "rss_kib_end_sum": 13872,
+                "rss_kib_sample_max_sum": 13872
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 1,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242880,
+              "completed_bytes": 5242880,
+              "fixture_write_seconds": 5.00068275,
+              "server": {
+                "average_percent_of_one_core": 5.1579331182034736,
+                "cpu_seconds_delta": 0.3,
+                "rss_kib_end_sum": 5744,
+                "rss_kib_sample_max_sum": 5904
+              }
+            },
+            {
+              "offered_bytes": 5242880,
+              "completed_bytes": 5242880,
+              "fixture_write_seconds": 5.000767166,
+              "server": {
+                "average_percent_of_one_core": 5.003132564824893,
+                "cpu_seconds_delta": 0.29,
+                "rss_kib_end_sum": 5696,
+                "rss_kib_sample_max_sum": 5744
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 15,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242875,
+              "completed_bytes": 5242875,
+              "fixture_write_seconds": 5.005190709,
+              "server": {
+                "average_percent_of_one_core": 4.677620793414803,
+                "cpu_seconds_delta": 0.27,
+                "rss_kib_end_sum": 22256,
+                "rss_kib_sample_max_sum": 22288
+              }
+            },
+            {
+              "offered_bytes": 5242875,
+              "completed_bytes": 5242875,
+              "fixture_write_seconds": 5.004751333,
+              "server": {
+                "average_percent_of_one_core": 4.489511562076686,
+                "cpu_seconds_delta": 0.26,
+                "rss_kib_end_sum": 22256,
+                "rss_kib_sample_max_sum": 22288
+              }
+            }
+          ]
+        },
+        {
+          "pane_count": 50,
+          "pattern": "paced",
+          "repeats": [
+            {
+              "offered_bytes": 5242750,
+              "completed_bytes": 5242750,
+              "fixture_write_seconds": 5.002175,
+              "server": {
+                "average_percent_of_one_core": 4.651137418163914,
+                "cpu_seconds_delta": 0.27,
+                "rss_kib_end_sum": 42512,
+                "rss_kib_sample_max_sum": 42576
+              }
+            },
+            {
+              "offered_bytes": 5242750,
+              "completed_bytes": 5242750,
+              "fixture_write_seconds": 5.00070475,
+              "server": {
+                "average_percent_of_one_core": 4.836960458135246,
+                "cpu_seconds_delta": 0.28,
+                "rss_kib_end_sum": 42656,
+                "rss_kib_sample_max_sum": 42656
+              }
+            }
+          ]
+        }
+      ],
+      "geometry_matched": true
+    }
+  ],
+  "management": {
+    "schema_version": 1,
+    "status": "measured",
+    "scope": "masil only: synthetic provider, custom detection rules, inbox, coordinator, full-screen desk and list; no native provider, model calls, SSH or Herdr comparison",
+    "started_at_utc": "2026-11-17T15:40:34.359572+00:00",
+    "binary_sha256": {
+      "masil": "cb3ec7f34821b84eb67b505771d31b22584e64ce2e451b344d3492a1e75f5b54",
+      "masil-agent": "c47c045cdca8793d7da1d890b59ac6a86e2e86f69b77c43af8ac8808b5e8b1a9"
+    },
+    "harness_sha256": "970d7f31debd9d4212aadcc7583868dd494e850c241880128505d1a573fd210e",
+    "fixture_sha256": "d5ef7cb866ae138693158d9be074f94a1efafc86c28484071a7a4fde316679c6",
+    "fixture_setup_sha256": "5f72c5276821495a40118b803a866a5699239343cf51230d3b2f7b342f57147d",
+    "parameters": {
+      "counts": [
+        1,
+        15,
+        50
+      ],
+      "seconds": 5.0,
+      "samples": 10
+    },
+    "measurements": [
+      {
+        "agents": 1,
+        "status": "measured",
+        "list_ms": [
+          6.864042021334171,
+          4.063166968990117,
+          3.575958020519465,
+          3.3915829844772816,
+          3.4952500136569142,
+          3.342916024848819,
+          3.395750012714416,
+          3.282249963376671,
+          3.3642080379649997,
+          3.509416012093425
+        ],
+        "list_median_ms": 3.445500013185665,
+        "wall_seconds": 5.01191000000108,
+        "roles": {
+          "core": {
+            "rss_kib_end": 5264,
+            "rss_kib_sample_peak": 5344,
+            "cpu_seconds": 0.0,
+            "percent_of_one_core": 0.0
+          },
+          "coordinator": {
+            "rss_kib_end": 9472,
+            "rss_kib_sample_peak": 9472,
+            "cpu_seconds": 0.0,
+            "percent_of_one_core": 0.0
+          },
+          "desk": {
+            "rss_kib_end": 8784,
+            "rss_kib_sample_peak": 8784,
+            "cpu_seconds": 0.02,
+            "percent_of_one_core": 0.399049464176246
+          }
+        },
+        "desk_output_bytes": 0
+      },
+      {
+        "agents": 15,
+        "status": "measured",
+        "list_ms": [
+          9.512040996924043,
+          5.163250025361776,
+          4.591000033542514,
+          4.578957974445075,
+          4.768332990352064,
+          4.580832959618419,
+          4.6034580445848405,
+          4.556791973300278,
+          4.506458004470915,
+          4.555166990030557
+        ],
+        "list_median_ms": 4.585916496580467,
+        "wall_seconds": 5.023978959012311,
+        "roles": {
+          "core": {
+            "rss_kib_end": 5904,
+            "rss_kib_sample_peak": 5904,
+            "cpu_seconds": 0.010000000000000009,
+            "percent_of_one_core": 0.19904541960832495
+          },
+          "coordinator": {
+            "rss_kib_end": 10896,
+            "rss_kib_sample_peak": 10896,
+            "cpu_seconds": 0.0,
+            "percent_of_one_core": 0.0
+          },
+          "desk": {
+            "rss_kib_end": 9504,
+            "rss_kib_sample_peak": 9504,
+            "cpu_seconds": 0.02,
+            "percent_of_one_core": 0.39809083921664956
+          }
+        },
+        "desk_output_bytes": 0
+      },
+      {
+        "agents": 50,
+        "status": "measured",
+        "list_ms": [
+          6.5467089880257845,
+          6.575833016540855,
+          6.3914579804986715,
+          19.924083026126027,
+          6.8445829674601555,
+          6.200375035405159,
+          6.269834004342556,
+          6.132708978839219,
+          6.740375014487654,
+          6.594833044800907
+        ],
+        "list_median_ms": 6.56127100228332,
+        "wall_seconds": 5.022111958009191,
+        "roles": {
+          "core": {
+            "rss_kib_end": 6464,
+            "rss_kib_sample_peak": 6688,
+            "cpu_seconds": 0.030000000000000027,
+            "percent_of_one_core": 0.5973582479011935
+          },
+          "coordinator": {
+            "rss_kib_end": 13552,
+            "rss_kib_sample_peak": 13552,
+            "cpu_seconds": 0.010000000000000009,
+            "percent_of_one_core": 0.1991194159670645
+          },
+          "desk": {
+            "rss_kib_end": 11552,
+            "rss_kib_sample_peak": 11552,
+            "cpu_seconds": 0.020000000000000004,
+            "percent_of_one_core": 0.3982388319341288
+          }
+        },
+        "desk_output_bytes": 0
+      }
+    ],
+    "performance_budget_pass": null,
+    "completed_at_utc": "2026-11-17T15:41:03.285189+00:00"
+  }
+}
