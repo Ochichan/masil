@@ -16,6 +16,7 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 use serde_json::Value;
@@ -55,7 +56,7 @@ enum Mode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Hit {
+pub(super) enum Hit {
     Row(usize),
     Key(KeyCode),
 }
@@ -93,6 +94,7 @@ pub(super) struct ChangesWindow {
     quiet_until: Option<std::time::Instant>,
     notice: Option<String>,
     hits: Vec<(Rect, Hit)>,
+    hover: Option<Hit>,
     pressed: Option<Hit>,
 }
 
@@ -124,8 +126,13 @@ impl ChangesWindow {
             quiet_until: None,
             notice: None,
             hits: Vec::new(),
+            hover: None,
             pressed: None,
         }
+    }
+
+    pub(super) fn hover(&self) -> Option<Hit> {
+        self.hover
     }
 
     fn word(&self, english: &'static str, korean: &'static str) -> &'static str {
@@ -383,14 +390,18 @@ impl ChangesWindow {
                             && mouse.row < rect.bottom()
                     })
                     .map(|(_, hit)| *hit);
-                if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                    self.pressed = target;
-                    return ChangesOutcome::None;
-                }
-                if !matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
-                    || self.pressed.take() != target
-                {
-                    return ChangesOutcome::None;
+                match mouse.kind {
+                    MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                        self.hover = target;
+                        return ChangesOutcome::None;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.pressed = target;
+                        return ChangesOutcome::None;
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if self.pressed.take() == target => {}
+                    MouseEventKind::Up(MouseButton::Left) => return ChangesOutcome::None,
+                    _ => return ChangesOutcome::None,
                 }
                 match target {
                     // The list under a restore preview is not a choice.
@@ -771,7 +782,9 @@ impl ChangesWindow {
             height,
         );
         let text_width = width.saturating_sub(4) as usize;
-        let (panel, text, muted, accent, accent_text) = dialog_colors(theme);
+        let palette = super::view::Palette::for_theme(theme);
+        let (panel, text, _, accent, accent_text) = dialog_colors(theme);
+        let muted_style = palette.muted_style().bg(panel);
         frame.render_widget(Clear, modal);
         let title = format!(" {} · {} ", self.word("Changes", "변경"), self.agent.name);
         frame.render_widget(
@@ -796,12 +809,7 @@ impl ChangesWindow {
                 Rect::new(inner.x, y, inner.width, 1),
             );
         };
-        line(
-            frame,
-            y,
-            &self.header(),
-            Style::default().fg(muted).bg(panel),
-        );
+        line(frame, y, &self.header(), muted_style);
         y += 1;
         let bottom = modal.bottom().saturating_sub(3);
         // The list, or the agents to ask.
@@ -831,13 +839,19 @@ impl ChangesWindow {
                 frame,
                 y,
                 self.word("Nothing here.", "없습니다."),
-                Style::default().fg(muted).bg(panel),
+                muted_style,
             );
             y += 1;
         }
         for (index, row) in rows.iter().enumerate().skip(first).take(shown) {
+            let hovered = self.hover == Some(Hit::Row(index));
             let style = if index == selected {
-                Style::default().fg(accent_text).bg(accent)
+                Style::default()
+                    .fg(accent_text)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD)
+            } else if hovered {
+                Style::default().fg(text).bg(palette.raised_fill())
             } else {
                 Style::default().fg(text).bg(panel)
             };
@@ -846,8 +860,18 @@ impl ChangesWindow {
                 Paragraph::new(ellipsize(row, text_width)).style(style),
                 rect,
             );
+            if index != selected && hovered {
+                palette.raise(frame, rect);
+            }
             hits.push((rect, Hit::Row(index)));
             y += 1;
+        }
+        if y < bottom && self.diff.is_some() {
+            frame.render_widget(
+                Paragraph::new("─".repeat(text_width))
+                    .style(Style::default().fg(palette.track).bg(panel)),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
         }
         y += 1;
         // The diff, then the notice.
@@ -865,28 +889,54 @@ impl ChangesWindow {
                 } else {
                     ""
                 };
-                line(
-                    frame,
-                    y,
-                    &format!("{}{mark}", plain(path)),
-                    Style::default().fg(muted).bg(panel),
-                );
+                let pos = if lines.is_empty() {
+                    String::new()
+                } else {
+                    format!(" L{}/{}", skip + 1, lines.len())
+                };
+                let pos_width = cell_width(&pos);
+                let header_text = format!("{}{mark}", plain(path));
+                if pos_width > 0 && text_width > pos_width + 4 {
+                    let left = ellipsize(&header_text, text_width - pos_width);
+                    let gap = text_width.saturating_sub(cell_width(&left) + pos_width);
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(left, muted_style.add_modifier(Modifier::BOLD)),
+                            Span::styled(" ".repeat(gap), muted_style),
+                            Span::styled(pos, Style::default().fg(accent).bg(panel)),
+                        ])),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                } else {
+                    line(
+                        frame,
+                        y,
+                        &header_text,
+                        muted_style.add_modifier(Modifier::BOLD),
+                    );
+                }
                 y += 1;
             }
             for diff_line in lines.iter().skip(skip).take(room.saturating_sub(1)) {
-                let color = if diff_line.starts_with('+') && !diff_line.starts_with("+++") {
-                    accent
+                let style = if diff_line.starts_with('+') && !diff_line.starts_with("+++") {
+                    Style::default().fg(palette.success).bg(panel)
                 } else if diff_line.starts_with('-') && !diff_line.starts_with("---") {
-                    muted
+                    Style::default().fg(palette.danger).bg(panel)
+                } else if diff_line.starts_with("@@") {
+                    Style::default()
+                        .fg(accent)
+                        .bg(panel)
+                        .add_modifier(Modifier::BOLD)
+                } else if diff_line.starts_with("diff ")
+                    || diff_line.starts_with("index ")
+                    || diff_line.starts_with("--- ")
+                    || diff_line.starts_with("+++ ")
+                {
+                    muted_style.add_modifier(Modifier::BOLD)
                 } else {
-                    text
+                    Style::default().fg(text).bg(panel)
                 };
-                line(
-                    frame,
-                    y,
-                    &plain(diff_line),
-                    Style::default().fg(color).bg(panel),
-                );
+                line(frame, y, &plain(diff_line), style);
                 y += 1;
             }
         }
@@ -909,16 +959,33 @@ impl ChangesWindow {
                 break;
             }
             let rect = Rect::new(right - label_width, button_y, label_width, 1);
-            let style = if index == last {
-                Style::default()
-                    .bg(accent)
-                    .fg(accent_text)
-                    .add_modifier(Modifier::BOLD)
+            let hit = Hit::Key(code);
+            let is_pressed = self.pressed == Some(hit);
+            let is_hovered = self.hover == Some(hit);
+            let (style, raised) = if is_pressed {
+                (
+                    Style::default()
+                        .bg(palette.warning)
+                        .fg(accent_text)
+                        .add_modifier(Modifier::BOLD),
+                    false,
+                )
+            } else if index == last || is_hovered {
+                (
+                    Style::default()
+                        .bg(accent)
+                        .fg(accent_text)
+                        .add_modifier(Modifier::BOLD),
+                    false,
+                )
             } else {
-                Style::default().fg(text).bg(panel)
+                (Style::default().fg(text).bg(palette.raised_fill()), true)
             };
             frame.render_widget(Paragraph::new(label).style(style), rect);
-            hits.push((rect, Hit::Key(code)));
+            if raised {
+                palette.raise(frame, rect);
+            }
+            hits.push((rect, hit));
             right = rect.x.saturating_sub(1);
         }
         self.hits = hits;
@@ -1224,5 +1291,48 @@ mod tests {
             ChangesOutcome::Op(ChangesOp::Handoff { reviewer }) => assert_eq!(reviewer, "qa"),
             _ => panic!("expected a handoff"),
         }
+    }
+
+    #[test]
+    fn diff_uses_semantic_colors_and_shows_line_position() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut window = ChangesWindow::new(1, Language::English, agent(), vec![], files());
+        window.diff = Some((
+            "src/app.rs".into(),
+            "@@ -1,2 +1,2 @@\n-old line\n+new line\n context\n".into(),
+            false,
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| window.draw(frame, Theme::Dark))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let palette = crate::ui::view::Palette::for_theme(Theme::Dark);
+        let mut saw_add = false;
+        let mut saw_del = false;
+        let mut saw_hunk = false;
+        let mut all_text = String::new();
+        for y in 0..24 {
+            let mut row = String::new();
+            for x in 0..80 {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            if row.contains("+new line") {
+                let x = row.find('+').unwrap() as u16;
+                saw_add = buffer[(x, y)].fg == palette.success;
+            }
+            if row.contains("-old line") {
+                let x = row.find('-').unwrap() as u16;
+                saw_del = buffer[(x, y)].fg == palette.danger;
+            }
+            if row.contains("@@ -1,2") {
+                let x = row.find('@').unwrap() as u16;
+                saw_hunk = buffer[(x, y)].fg == palette.accent;
+            }
+            all_text.push_str(&row);
+            all_text.push('\n');
+        }
+        assert!(saw_add && saw_del && saw_hunk, "{all_text}");
+        assert!(all_text.contains("L1/4"), "{all_text}");
     }
 }

@@ -4,11 +4,220 @@
 
 #[cfg(not(target_os = "macos"))]
 use std::fs;
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::process::{Child, ExitStatus};
+use std::time::{Duration, Instant};
 
 const MAX_ARGS: usize = 256;
 /// Largest pid list buffer the macOS listing calls grow to.
 #[cfg(target_os = "macos")]
 const MAX_PIDS: usize = 1_048_576;
+
+/// Output captured from a child process on the calling thread via `poll(2)`.
+#[derive(Debug)]
+pub(crate) struct CapturedOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_truncated: bool,
+    #[allow(dead_code)]
+    pub(crate) stderr_truncated: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum CaptureError {
+    Timeout,
+    Io(std::io::Error),
+}
+
+/// Converts UTF-8 bytes without copying when valid, falling back to lossy conversion.
+pub(crate) fn into_string_lossy(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
+}
+
+fn set_nonblocking(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: fcntl(F_GETFL/F_SETFL) on a valid pipe descriptor owned by this process.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Maximum bytes drained from one pipe per `poll(2)` turn so a continuous
+/// producer on one stream cannot starve the other stream or deadline checks.
+const DRAIN_BUDGET: usize = 64 * 1024;
+
+fn kill_and_wait(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn drain_nonblocking<R: Read>(
+    pipe: &mut R,
+    dst: &mut Vec<u8>,
+    limit: usize,
+    truncated: &mut bool,
+    budget: usize,
+) -> bool {
+    let mut chunk = [0u8; 4096];
+    let mut read_this_turn = 0usize;
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => return true,
+            Ok(count) => {
+                let remaining = limit.saturating_sub(dst.len());
+                let keep = count.min(remaining);
+                dst.extend_from_slice(&chunk[..keep]);
+                if count > keep {
+                    *truncated = true;
+                }
+                read_this_turn = read_this_turn.saturating_add(count);
+                if read_this_turn >= budget {
+                    return false;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// Drains a spawned child's piped stdout/stderr and waits for exit on the
+/// calling thread using `poll(2)`, avoiding extra reader threads and fixed
+/// sleep polling while pipes remain open. Kills and reaps the child if
+/// initialization fails or `timeout` elapses.
+pub(crate) fn capture_child(
+    mut child: Child,
+    timeout: Option<Duration>,
+    limit: usize,
+) -> Result<CapturedOutput, CaptureError> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    if let Some(ref pipe) = stdout
+        && let Err(error) = set_nonblocking(pipe.as_raw_fd())
+    {
+        kill_and_wait(&mut child);
+        return Err(CaptureError::Io(error));
+    }
+    if let Some(ref pipe) = stderr
+        && let Err(error) = set_nonblocking(pipe.as_raw_fd())
+    {
+        kill_and_wait(&mut child);
+        return Err(CaptureError::Io(error));
+    }
+    let deadline = timeout.map(|limit| Instant::now() + limit);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
+
+    while stdout.is_some() || stderr.is_some() {
+        let poll_timeout_ms: libc::c_int = match deadline {
+            Some(deadline) => {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    kill_and_wait(&mut child);
+                    return Err(CaptureError::Timeout);
+                };
+                left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int
+            }
+            None => -1,
+        };
+
+        let mut fds = [libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        }; 2];
+        let mut nfds: libc::nfds_t = 0;
+        let mut out_idx = None;
+        let mut err_idx = None;
+        if let Some(ref pipe) = stdout {
+            out_idx = Some(nfds as usize);
+            fds[nfds as usize] = libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            nfds += 1;
+        }
+        if let Some(ref pipe) = stderr {
+            err_idx = Some(nfds as usize);
+            fds[nfds as usize] = libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            nfds += 1;
+        }
+
+        // SAFETY: `fds` contains `nfds` initialized entries pointing to live pipes.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), nfds, poll_timeout_ms) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            kill_and_wait(&mut child);
+            return Err(CaptureError::Io(error));
+        }
+        if ready == 0 {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                kill_and_wait(&mut child);
+                return Err(CaptureError::Timeout);
+            }
+            continue;
+        }
+        if let Some(idx) = out_idx
+            && fds[idx].revents != 0
+            && let Some(ref mut pipe) = stdout
+            && drain_nonblocking(pipe, &mut out, limit, &mut stdout_truncated, DRAIN_BUDGET)
+        {
+            stdout = None;
+        }
+        if let Some(idx) = err_idx
+            && fds[idx].revents != 0
+            && let Some(ref mut pipe) = stderr
+            && drain_nonblocking(pipe, &mut err, limit, &mut stderr_truncated, DRAIN_BUDGET)
+        {
+            stderr = None;
+        }
+    }
+
+    let status = match deadline {
+        None => child.wait().map_err(CaptureError::Io)?,
+        Some(deadline) => {
+            let mut step = Duration::from_millis(1);
+            loop {
+                if let Some(status) = child.try_wait().map_err(CaptureError::Io)? {
+                    break status;
+                }
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    kill_and_wait(&mut child);
+                    return Err(CaptureError::Timeout);
+                };
+                std::thread::sleep(step.min(left));
+                step = (step * 2).min(Duration::from_millis(10));
+            }
+        }
+    };
+
+    Ok(CapturedOutput {
+        status,
+        stdout: out,
+        stderr: err,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
 
 /// The exact argv of a process.
 #[cfg(target_os = "macos")]
@@ -16,31 +225,37 @@ pub(crate) fn argv(pid: i32) -> Option<Vec<String>> {
     parse_procargs(&procargs(pid)?)
 }
 
+/// Cached kernel `KERN_ARGMAX` value (constant for the lifetime of the boot).
+#[cfg(target_os = "macos")]
+fn argmax() -> Option<usize> {
+    static ARGMAX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ARGMAX.get_or_init(|| {
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        let mut value: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: the buffers match the sizes passed to sysctl.
+        let ok = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (ok == 0 && value > 0).then_some(value as usize)
+    })
+}
+
 /// The kernel's argument area of a process: argc, the executable path,
 /// argv and the environment.
 #[cfg(target_os = "macos")]
 fn procargs(pid: i32) -> Option<Vec<u8>> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    let mut argmax: libc::c_int = 0;
-    let mut size = std::mem::size_of::<libc::c_int>();
-    // SAFETY: the buffers match the sizes passed to sysctl.
-    let ok = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            2,
-            (&mut argmax as *mut libc::c_int).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if ok != 0 || argmax <= 0 {
-        return None;
-    }
-    let mut buffer = vec![0u8; argmax as usize];
+    let mut buffer = vec![0u8; argmax()?];
     let mut size = buffer.len();
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-    // SAFETY: as above; the kernel writes at most size bytes.
+    // SAFETY: the buffer matches `size`; the kernel writes at most size bytes.
     let ok = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -467,5 +682,79 @@ mod tests {
         let parent = info(me.parent).unwrap();
         assert!(parent.started <= me.started);
         assert_eq!(info(-1), None);
+    }
+
+    #[test]
+    fn capture_child_drains_stdout_and_stderr_and_enforces_limit() {
+        let child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 200 ]; do printf 'out-line-%04d\\n' $i; printf 'err-line-%04d\\n' $i >&2; i=$((i+1)); done",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let captured = capture_child(child, Some(Duration::from_secs(3)), 256).unwrap();
+        assert!(captured.status.success());
+        assert_eq!(captured.stdout.len(), 256);
+        assert_eq!(captured.stderr.len(), 256);
+        assert!(captured.stdout_truncated);
+        assert!(captured.stderr_truncated);
+        assert!(captured.stdout.starts_with(b"out-line-0000\n"));
+        assert!(captured.stderr.starts_with(b"err-line-0000\n"));
+    }
+
+    #[test]
+    fn capture_child_kills_timed_out_process_promptly() {
+        let started = Instant::now();
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = capture_child(child, Some(Duration::from_millis(80)), 1024);
+        assert!(matches!(result, Err(CaptureError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn drain_nonblocking_yields_after_turn_budget_on_infinite_stream() {
+        struct EndlessReader {
+            calls: usize,
+        }
+        impl Read for EndlessReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                buf.fill(b'a');
+                Ok(buf.len())
+            }
+        }
+        let mut reader = EndlessReader { calls: 0 };
+        let mut dst = Vec::new();
+        let mut truncated = false;
+        let eof = drain_nonblocking(&mut reader, &mut dst, 1024, &mut truncated, 8192);
+        assert!(!eof);
+        assert_eq!(dst.len(), 1024);
+        assert!(truncated);
+        assert_eq!(reader.calls, 2);
+    }
+
+    #[test]
+    fn capture_child_times_out_under_continuous_stdout_flood() {
+        let started = Instant::now();
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "while true; do printf '%04096d' 0; done"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = capture_child(child, Some(Duration::from_millis(100)), 256);
+        assert!(matches!(result, Err(CaptureError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

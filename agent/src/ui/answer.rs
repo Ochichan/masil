@@ -46,6 +46,7 @@ pub(super) struct AnswerDialog {
     stage: Stage,
     notice: Option<&'static str>,
     hits: Vec<(Rect, Hit)>,
+    hover: Option<Hit>,
     pressed: Option<Hit>,
 }
 
@@ -64,7 +65,7 @@ enum Stage {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Hit {
+pub(super) enum Hit {
     Request(usize),
     Choice(usize),
     Key(KeyCode),
@@ -109,8 +110,13 @@ impl AnswerDialog {
             stage: Stage::List,
             notice: None,
             hits: Vec::new(),
+            hover: None,
             pressed: None,
         }
+    }
+
+    pub(super) fn hover(&self) -> Option<Hit> {
+        self.hover
     }
 
     fn word<'a>(&self, english: &'a str, korean: &'a str) -> &'a str {
@@ -192,14 +198,18 @@ impl AnswerDialog {
                             && mouse.row < rect.bottom()
                     })
                     .map(|(_, hit)| *hit);
-                if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                    self.pressed = target;
-                    return Outcome::None;
-                }
-                if !matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
-                    || self.pressed.take() != target
-                {
-                    return Outcome::None;
+                match mouse.kind {
+                    MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                        self.hover = target;
+                        return Outcome::None;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.pressed = target;
+                        return Outcome::None;
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if self.pressed.take() == target => {}
+                    MouseEventKind::Up(MouseButton::Left) => return Outcome::None,
+                    _ => return Outcome::None,
                 }
                 match target {
                     Some(Hit::Request(index)) if matches!(self.stage, Stage::List) => {
@@ -756,11 +766,16 @@ impl AnswerDialog {
             width,
             height,
         );
-        let (panel, text, muted, accent, accent_text) = dialog_colors(theme);
+        let palette = super::view::Palette::for_theme(theme);
+        let (panel, text, _, accent, accent_text) = dialog_colors(theme);
+        let muted_style = palette.muted_style().bg(panel);
         let style = |tone: Tone| match tone {
             Tone::Text => Style::default().fg(text).bg(panel),
-            Tone::Muted => Style::default().fg(muted).bg(panel),
-            Tone::Selected => Style::default().fg(accent_text).bg(accent),
+            Tone::Muted => muted_style,
+            Tone::Selected => Style::default()
+                .fg(accent_text)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD),
         };
         frame.render_widget(Clear, modal);
         let title = format!(
@@ -843,16 +858,33 @@ impl AnswerDialog {
                 break;
             }
             let rect = Rect::new(right - label_width, button_y, label_width, 1);
-            let button_style = if index == last {
-                Style::default()
-                    .bg(accent)
-                    .fg(accent_text)
-                    .add_modifier(Modifier::BOLD)
+            let hit = Hit::Key(code);
+            let is_pressed = self.pressed == Some(hit);
+            let is_hovered = self.hover == Some(hit);
+            let (button_style, raised) = if is_pressed {
+                (
+                    Style::default()
+                        .bg(palette.warning)
+                        .fg(accent_text)
+                        .add_modifier(Modifier::BOLD),
+                    false,
+                )
+            } else if index == last || is_hovered {
+                (
+                    Style::default()
+                        .bg(accent)
+                        .fg(accent_text)
+                        .add_modifier(Modifier::BOLD),
+                    false,
+                )
             } else {
-                Style::default().fg(text).bg(panel)
+                (Style::default().fg(text).bg(palette.raised_fill()), true)
             };
             frame.render_widget(Paragraph::new(label).style(button_style), rect);
-            self.hits.push((rect, Hit::Key(code)));
+            if raised {
+                palette.raise(frame, rect);
+            }
+            self.hits.push((rect, hit));
             right = rect.x.saturating_sub(1);
         }
     }

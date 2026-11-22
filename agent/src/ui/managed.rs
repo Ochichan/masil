@@ -3,7 +3,7 @@
 use super::{
     answer::{AnswerDialog, Outcome},
     i18n::action_label,
-    model::{Action, App, Effect, Language, Overlay, Theme},
+    model::{Action, App, Effect, Language, Observation, Overlay, Theme},
     palette::{self, Palette, PaletteResult},
     preferences,
     queue::{QueueOutcome, QueueWindow},
@@ -144,6 +144,52 @@ struct Field {
     label: &'static str,
     value: String,
     limit: usize,
+    /// Grapheme index of the editing cursor within `value`.
+    cursor: usize,
+    /// First visible grapheme index when horizontally windowed.
+    view_start: usize,
+}
+
+impl Field {
+    fn new(label: &'static str, value: String, limit: usize) -> Self {
+        let cursor = value.graphemes(true).count();
+        Self {
+            label,
+            value,
+            limit,
+            cursor,
+            view_start: 0,
+        }
+    }
+
+    fn grapheme_count(&self) -> usize {
+        self.value.graphemes(true).count()
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.cursor = self.cursor.min(self.grapheme_count());
+    }
+
+    fn byte_offset(&self, grapheme_index: usize) -> usize {
+        self.value
+            .grapheme_indices(true)
+            .nth(grapheme_index)
+            .map_or(self.value.len(), |(offset, _)| offset)
+    }
+
+    fn move_cursor_to_column(&mut self, relative_col: usize) {
+        let mut cells = 0usize;
+        let mut index = self.view_start;
+        for grapheme in self.value.graphemes(true).skip(self.view_start) {
+            let width = cell_width(grapheme);
+            if cells + width > relative_col {
+                break;
+            }
+            cells += width;
+            index += 1;
+        }
+        self.cursor = index.min(self.grapheme_count());
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -164,6 +210,7 @@ struct Dialog {
     fields: Vec<Field>,
     focus: usize,
     hits: Vec<(Rect, DialogHit)>,
+    hover: Option<DialogHit>,
     pressed: Option<DialogHit>,
 }
 
@@ -184,39 +231,35 @@ impl Dialog {
         let endpoint_field = endpoints.len() > 1;
         let mut fields = Vec::new();
         if endpoint_field {
-            fields.push(Field {
-                label: word(language, "Server", "서버"),
-                value: default_endpoint.clone(),
-                limit: 64,
-            });
+            fields.push(Field::new(
+                word(language, "Server", "서버"),
+                default_endpoint.clone(),
+                64,
+            ));
         }
         let local_cwd = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .to_string_lossy()
             .into_owned();
         fields.extend([
-            Field {
-                label: word(language, "Name", "이름"),
-                value: String::new(),
-                limit: 32,
-            },
-            Field {
-                label: word(language, "Provider", "제공자"),
-                value: crate::providers::all()
+            Field::new(word(language, "Name", "이름"), String::new(), 32),
+            Field::new(
+                word(language, "Provider", "제공자"),
+                crate::providers::all()
                     .first()
                     .map_or("codex", |p| p.id)
                     .into(),
-                limit: 64,
-            },
-            Field {
-                label: word(language, "Working directory", "작업 디렉터리"),
-                value: if default_endpoint == "local" {
+                64,
+            ),
+            Field::new(
+                word(language, "Working directory", "작업 디렉터리"),
+                if default_endpoint == "local" {
                     local_cwd
                 } else {
                     String::new()
                 },
-                limit: 4096,
-            },
+                4096,
+            ),
         ]);
         Self {
             language,
@@ -240,6 +283,7 @@ impl Dialog {
             fields,
             focus: 0,
             hits: Vec::new(),
+            hover: None,
             pressed: None,
         }
     }
@@ -260,13 +304,14 @@ impl Dialog {
             ),
             notice: None,
             submit: word(language, "Resume", "재개"),
-            fields: vec![Field {
-                label: word(language, "New name", "새 이름"),
-                value: format!("{}-resume", agent.name.chars().take(25).collect::<String>()),
-                limit: 32,
-            }],
+            fields: vec![Field::new(
+                word(language, "New name", "새 이름"),
+                format!("{}-resume", agent.name.chars().take(25).collect::<String>()),
+                32,
+            )],
             focus: 0,
             hits: Vec::new(),
+            hover: None,
             pressed: None,
         }
     }
@@ -291,13 +336,14 @@ impl Dialog {
             ),
             notice: None,
             submit: word(language, "Rename", "이름 변경"),
-            fields: vec![Field {
-                label: word(language, "Name", "이름"),
-                value: agent.name.clone(),
-                limit: 32,
-            }],
+            fields: vec![Field::new(
+                word(language, "Name", "이름"),
+                agent.name.clone(),
+                32,
+            )],
             focus: 0,
             hits: Vec::new(),
+            hover: None,
             pressed: None,
         }
     }
@@ -315,13 +361,14 @@ impl Dialog {
             .to_owned(),
             notice: None,
             submit: word(language, "Prepare", "준비"),
-            fields: vec![Field {
-                label: word(language, "Draft text", "초안 텍스트"),
-                value: String::new(),
-                limit: 32_768,
-            }],
+            fields: vec![Field::new(
+                word(language, "Draft text", "초안 텍스트"),
+                String::new(),
+                32_768,
+            )],
             focus: 0,
             hits: Vec::new(),
+            hover: None,
             pressed: None,
         }
     }
@@ -343,13 +390,14 @@ impl Dialog {
             .to_owned(),
             notice: None,
             submit: word(language, "Send", "전송"),
-            fields: vec![Field {
-                label: word(language, "Prompt text", "프롬프트 텍스트"),
-                value: String::new(),
-                limit: 32_768,
-            }],
+            fields: vec![Field::new(
+                word(language, "Prompt text", "프롬프트 텍스트"),
+                String::new(),
+                32_768,
+            )],
             focus: 0,
             hits: Vec::new(),
+            hover: None,
             pressed: None,
         }
     }
@@ -409,8 +457,13 @@ impl Dialog {
             fields: Vec::new(),
             focus: 0,
             hits: Vec::new(),
+            hover: None,
             pressed: None,
         }
+    }
+
+    fn hover(&self) -> Option<DialogHit> {
+        self.hover
     }
 
     /// The field and the reason this dialog cannot be submitted as it
@@ -471,21 +524,29 @@ impl Dialog {
                 DialogResult::None
             }
             Event::Mouse(mouse) => {
-                let target = self
+                let hit = self
                     .hits
                     .iter()
                     .rev()
                     .find(|(rect, _)| contains(*rect, mouse.column, mouse.row))
-                    .map(|(_, hit)| *hit);
+                    .copied();
+                let target = hit.map(|(_, hit)| hit);
                 match mouse.kind {
+                    MouseEventKind::Moved | MouseEventKind::Drag(_) => self.hover = target,
                     MouseEventKind::Down(MouseButton::Left) => self.pressed = target,
                     MouseEventKind::Up(MouseButton::Left) => {
                         let pressed = self.pressed.take();
                         if pressed == target {
-                            match target {
-                                Some(DialogHit::Field(index)) => self.focus = index,
-                                Some(DialogHit::Cancel) => return DialogResult::Cancel,
-                                Some(DialogHit::Submit) => return DialogResult::Submit,
+                            match hit {
+                                Some((rect, DialogHit::Field(index))) => {
+                                    self.focus = index;
+                                    if let Some(field) = self.fields.get_mut(index) {
+                                        let rel = mouse.column.saturating_sub(rect.x) as usize;
+                                        field.move_cursor_to_column(rel);
+                                    }
+                                }
+                                Some((_, DialogHit::Cancel)) => return DialogResult::Cancel,
+                                Some((_, DialogHit::Submit)) => return DialogResult::Submit,
                                 None => {}
                             }
                         }
@@ -499,6 +560,7 @@ impl Dialog {
     }
 
     fn key(&mut self, key: KeyEvent) -> DialogResult {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => DialogResult::Cancel,
             KeyCode::Enter => DialogResult::Submit,
@@ -514,17 +576,92 @@ impl Dialog {
                 }
                 DialogResult::None
             }
-            KeyCode::Backspace => {
-                if let Some(field) = self.fields.get_mut(self.focus)
-                    && let Some((index, _)) = field.value.grapheme_indices(true).next_back()
-                {
-                    field.value.truncate(index);
+            KeyCode::Left => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    field.clamp_cursor();
+                    field.cursor = field.cursor.saturating_sub(1);
                 }
                 DialogResult::None
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Right => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    field.cursor = (field.cursor + 1).min(field.grapheme_count());
+                }
+                DialogResult::None
+            }
+            KeyCode::Home => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    field.cursor = 0;
+                }
+                DialogResult::None
+            }
+            KeyCode::End => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    field.cursor = field.grapheme_count();
+                }
+                DialogResult::None
+            }
+            KeyCode::Char('a') if control => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    field.cursor = 0;
+                }
+                DialogResult::None
+            }
+            KeyCode::Char('e') if control => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    field.cursor = field.grapheme_count();
+                }
+                DialogResult::None
+            }
+            KeyCode::Backspace => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    field.clamp_cursor();
+                    if field.cursor > 0 {
+                        let start = field.byte_offset(field.cursor - 1);
+                        let end = field.byte_offset(field.cursor);
+                        field.value.replace_range(start..end, "");
+                        field.cursor -= 1;
+                    }
+                }
+                DialogResult::None
+            }
+            KeyCode::Delete => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    field.clamp_cursor();
+                    if field.cursor < field.grapheme_count() {
+                        let start = field.byte_offset(field.cursor);
+                        let end = field.byte_offset(field.cursor + 1);
+                        field.value.replace_range(start..end, "");
+                    }
+                }
+                DialogResult::None
+            }
+            KeyCode::Char('w') if control => {
+                if let Some(field) = self.fields.get_mut(self.focus) {
+                    field.clamp_cursor();
+                    if field.cursor > 0 {
+                        let graphemes: Vec<&str> = field.value.graphemes(true).collect();
+                        let mut target = field.cursor;
+                        while target > 0 && graphemes[target - 1].chars().all(char::is_whitespace) {
+                            target -= 1;
+                        }
+                        while target > 0 && !graphemes[target - 1].chars().all(char::is_whitespace)
+                        {
+                            target -= 1;
+                        }
+                        let start = field.byte_offset(target);
+                        let end = field.byte_offset(field.cursor);
+                        field.value.replace_range(start..end, "");
+                        field.cursor = target;
+                    }
+                }
+                DialogResult::None
+            }
+            KeyCode::Char('u') if control => {
                 if let Some(field) = self.fields.get_mut(self.focus) {
                     field.value.clear();
+                    field.cursor = 0;
+                    field.view_start = 0;
                 }
                 DialogResult::None
             }
@@ -547,11 +684,13 @@ impl Dialog {
         let Some(field) = self.fields.get_mut(self.focus) else {
             return;
         };
+        field.clamp_cursor();
         // A field is one line: a line break or tab between words becomes
         // one space, so pasted lines do not run together. One at either end
         // of the text is dropped, so a copied path or name gains no space.
         let text = text.trim_matches(['\r', '\n', '\t']);
         let mut cut = false;
+        let mut clean = String::new();
         let mut characters = text.chars().peekable();
         while let Some(character) = characters.next() {
             let character = match character {
@@ -563,11 +702,17 @@ impl Dialog {
                 other if other.is_control() => continue,
                 other => other,
             };
-            if field.value.len() + character.len_utf8() > field.limit {
+            if field.value.len() + clean.len() + character.len_utf8() > field.limit {
                 cut = true;
                 break;
             }
-            field.value.push(character);
+            clean.push(character);
+        }
+        if !clean.is_empty() {
+            let at = field.byte_offset(field.cursor);
+            let added = clean.graphemes(true).count();
+            field.value.insert_str(at, &clean);
+            field.cursor += added;
         }
         if cut {
             let limit = field.limit;
@@ -644,9 +789,10 @@ impl Dialog {
             modal.height.saturating_sub(2),
         );
         let mut y = inner.y;
+        let focus = self.focus;
         for (index, field) in self
             .fields
-            .iter()
+            .iter_mut()
             .enumerate()
             .skip(first)
             .take(shown as usize)
@@ -655,23 +801,43 @@ impl Dialog {
                 Paragraph::new(ellipsize(field.label, text_width)).style(muted),
                 Rect::new(inner.x, y, inner.width, 1),
             );
-            let selected = self.focus == index;
-            // Typing appends, so a long value keeps its end in view. The
-            // focused field keeps one cell after the text for the cursor.
-            let value = if field.value.is_empty() {
-                String::new()
-            } else {
-                tail(
-                    &field.value,
-                    text_width.saturating_sub(usize::from(selected)),
-                )
-            };
+            let selected = focus == index;
+            field.clamp_cursor();
             let rect = Rect::new(inner.x, y + 1, inner.width, 1);
-            if selected && rect.width > 0 {
-                // An IME draws its preedit at the terminal cursor.
-                let column = (cell_width(&value) as u16).min(rect.width - 1);
-                frame.set_cursor_position((rect.x + column, rect.y));
-            }
+            let value = if field.value.is_empty() {
+                field.view_start = 0;
+                if selected && rect.width > 0 {
+                    frame.set_cursor_position((rect.x, rect.y));
+                }
+                String::new()
+            } else if selected {
+                let count = field.grapheme_count();
+                if field.cursor == count {
+                    let shown = tail(&field.value, text_width.saturating_sub(1));
+                    let shown_graphemes = shown.graphemes(true).count();
+                    let hidden_ellipsis =
+                        usize::from(shown.starts_with('…') && !field.value.starts_with('…'));
+                    field.view_start =
+                        count.saturating_sub(shown_graphemes.saturating_sub(hidden_ellipsis));
+                    if rect.width > 0 {
+                        let column = (cell_width(&shown) as u16).min(rect.width - 1);
+                        frame.set_cursor_position((rect.x + column, rect.y));
+                    }
+                    shown
+                } else {
+                    let (shown, cursor_x, start) =
+                        super::view::search_window(&field.value, field.cursor, text_width);
+                    field.view_start = start;
+                    if rect.width > 0 {
+                        let column = (cursor_x as u16).min(rect.width - 1);
+                        frame.set_cursor_position((rect.x + column, rect.y));
+                    }
+                    shown
+                }
+            } else {
+                field.view_start = 0;
+                tail(&field.value, text_width)
+            };
             frame.render_widget(
                 Paragraph::new(value).style(
                     Style::default()
@@ -719,20 +885,42 @@ impl Dialog {
             cancel_width,
             1,
         );
-        frame.render_widget(
-            Paragraph::new(submit_label).style(
-                Style::default()
-                    .bg(accent)
-                    .fg(accent_text)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            submit,
-        );
+        let submit_style = if self.pressed == Some(DialogHit::Submit) {
+            Style::default()
+                .bg(palette.warning)
+                .fg(accent_text)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(accent)
+                .fg(accent_text)
+                .add_modifier(Modifier::BOLD)
+        };
+        frame.render_widget(Paragraph::new(submit_label).style(submit_style), submit);
         if cancel.width > 0 {
-            frame.render_widget(
-                Paragraph::new(cancel_label).style(Style::default().fg(text)),
-                cancel,
-            );
+            let (cancel_style, raised) = if self.pressed == Some(DialogHit::Cancel) {
+                (
+                    Style::default()
+                        .bg(palette.warning)
+                        .fg(accent_text)
+                        .add_modifier(Modifier::BOLD),
+                    false,
+                )
+            } else if self.hover == Some(DialogHit::Cancel) {
+                (
+                    Style::default()
+                        .bg(accent)
+                        .fg(accent_text)
+                        .add_modifier(Modifier::BOLD),
+                    false,
+                )
+            } else {
+                (Style::default().fg(text).bg(palette.raised_fill()), true)
+            };
+            frame.render_widget(Paragraph::new(cancel_label).style(cancel_style), cancel);
+            if raised {
+                palette.raise(frame, cancel);
+            }
             self.hits.push((cancel, DialogHit::Cancel));
         }
         self.hits.push((submit, DialogHit::Submit));
@@ -1203,6 +1391,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     }
     client_view.restore_filter(&mut app);
     let fleet = Arc::new(Fleet::new(manager)?.with_local_view(local_view));
+    let mut fleet_updates = fleet.take_updates();
     // An inbox in another state directory is not the one the server writes.
     {
         let socket = socket.clone();
@@ -1223,7 +1412,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
         .then(|| std::env::var("TMUX_PANE").ok())
         .flatten();
     let mut agents = HashMap::<String, Agent>::new();
-    let mut last_projection: Option<Vec<Value>> = None;
+    let mut last_projection: Option<Vec<ManagedProjectionRow>> = None;
     let mut revision = 0_u64;
     let mut tasks = JoinSet::<Work>::new();
     let mut poll_pending = false;
@@ -1254,7 +1443,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
             if app.dirty {
                 // The search cursor stays out from under a window drawn above the desk.
                 app.modal_open = dialog.is_some() || answering.is_some() || queueing.is_some() || changing.is_some() || palette.is_some();
-                terminal.terminal().draw(|frame| {
+                terminal.draw(|frame| {
                     app.draw(frame);
                     if let Some(dialog) = &mut dialog { dialog.draw(frame, app.theme); }
                     if let Some(answering) = &mut answering { answering.draw(frame, app.theme); }
@@ -1264,6 +1453,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 }).map_err(|error| error.to_string())?;
                 app.dirty = false;
             }
+            let mut poll_result: Option<Result<FleetSnapshot, String>> = None;
             let effects = tokio::select! {
                 _ = poll.tick(), if !poll_pending => {
                     poll_pending = true;
@@ -1273,21 +1463,49 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                     });
                     Vec::new()
                 }
+                Some(done) = async {
+                    match &mut fleet_updates {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Deliver completed endpoint polls to the UI immediately instead of
+                    // waiting for the next 1 s interval tick.
+                    let mut latest = fleet.finish_poll(done);
+                    if let Some(rx) = &mut fleet_updates {
+                        while let Ok(more) = rx.try_recv() {
+                            latest = fleet.finish_poll(more);
+                        }
+                    }
+                    poll_result = Some(latest);
+                    Vec::new()
+                }
                 event = events.next() => match event {
                     Some(Ok(event)) => {
+                        let mut effects = Vec::new();
                         client_view.input(&app, &event);
+                        let is_mouse_move = matches!(
+                            &event,
+                            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved
+                        );
                         if let Some(active) = &mut palette {
                             if matches!(event, Event::Resize(_, _)) {
                                 app.handle(event.clone(), Instant::now());
                             }
+                            let prev_hover = active.hover();
                             let outcome = active.handle(event, Instant::now());
-                            app.dirty = true;
+                            if !is_mouse_move
+                                || active.hover() != prev_hover
+                                || !matches!(outcome, PaletteResult::None)
+                            {
+                                app.dirty = true;
+                            }
                             match outcome {
-                                PaletteResult::None => Vec::new(),
-                                PaletteResult::Close => { palette = None; Vec::new() },
+                                PaletteResult::None => {}
+                                PaletteResult::Close => palette = None,
                                 PaletteResult::Activate(target) => {
                                     palette = None;
-                                    activate_palette(target, &mut app, &agents, fleet.clone(), &mut tasks, owned_pane.as_deref(), &current_epoch)
+                                    effects.extend(activate_palette(target, &mut app, &agents, fleet.clone(), &mut tasks, owned_pane.as_deref(), &current_epoch));
                                 }
                             }
                         } else if matches!(&event, Event::Key(key) if key.code == KeyCode::Char(':') && key.modifiers.difference(KeyModifiers::SHIFT).is_empty())
@@ -1303,11 +1521,13 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             let fleet = fleet.clone();
                             tasks.spawn(async move { Work::Panes(fleet.local.pane_targets().await) });
                             app.dirty = true;
-                            Vec::new()
                         } else if let Some(active) = &mut changing {
                             use super::changes::ChangesOutcome;
+                            let prev_hover = active.hover();
                             let outcome = active.handle(event);
-                            app.dirty = true;
+                            if !is_mouse_move || active.hover() != prev_hover || !matches!(outcome, ChangesOutcome::None) {
+                                app.dirty = true;
+                            }
                             match outcome {
                                 ChangesOutcome::None => {}
                                 ChangesOutcome::Close => changing = None,
@@ -1319,10 +1539,12 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     tasks.spawn(async move { Work::Pager(fleet.local.open_pager(text).await) });
                                 }
                             }
-                            Vec::new()
                         } else if let Some(active) = &mut queueing {
+                            let prev_hover = active.hover();
                             let outcome = active.handle(event);
-                            app.dirty = true;
+                            if !is_mouse_move || active.hover() != prev_hover || !matches!(outcome, QueueOutcome::None) {
+                                app.dirty = true;
+                            }
                             match outcome {
                                 QueueOutcome::None => {}
                                 QueueOutcome::Close => queueing = None,
@@ -1331,10 +1553,12 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     queue_task(&mut tasks, fleet.clone(), agent, Some(op), None);
                                 }
                             }
-                            Vec::new()
                         } else if let Some(active) = &mut answering {
+                            let prev_hover = active.hover();
                             let outcome = active.handle(event);
-                            app.dirty = true;
+                            if !is_mouse_move || active.hover() != prev_hover || !matches!(outcome, Outcome::None) {
+                                app.dirty = true;
+                            }
                             match outcome {
                                 Outcome::None => {}
                                 Outcome::Cancel => answering = None,
@@ -1343,13 +1567,15 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                     submit_answer(agent, answering_listed, request, reply, fleet.clone(), &mut tasks, app.language, &current_epoch);
                                 }
                             }
-                            Vec::new()
                         } else if let Some(active) = &mut dialog {
+                            let prev_hover = active.hover();
                             let outcome = active.handle(event);
-                            app.dirty = true;
+                            if !is_mouse_move || active.hover() != prev_hover || !matches!(outcome, DialogResult::None) {
+                                app.dirty = true;
+                            }
                             match outcome {
-                                DialogResult::None => Vec::new(),
-                                DialogResult::Cancel => { dialog = None; Vec::new() },
+                                DialogResult::None => {}
+                                DialogResult::Cancel => dialog = None,
                                 DialogResult::Submit => {
                                     // Refused while open: the typed fields stay.
                                     if let Some((field, reason)) = active.refusal() {
@@ -1359,7 +1585,6 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         let submitted = dialog.take().expect("active dialog");
                                         submit_dialog(submitted, fleet.clone(), &mut tasks, &mut app, &current_epoch);
                                     }
-                                    Vec::new()
                                 }
                             }
                         } else if !app.inbox.open && matches!(&event, Event::Key(key) if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
@@ -1367,8 +1592,10 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 dialog = Some(Dialog::interrupt(agent, app.language));
                                 app.dirty = true;
                             }
-                            Vec::new()
-                        } else { app.handle(event, Instant::now()) }
+                        } else {
+                            effects.extend(app.handle(event, Instant::now()));
+                        }
+                        effects
                     },
                     Some(Err(error)) => return Err(error.to_string()),
                     None => break,
@@ -1377,123 +1604,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                     match completed {
                         Ok(Work::Poll(result)) => {
                             poll_pending = false;
-                            match result {
-                                Ok(FleetSnapshot { epoch, agents: list, endpoints }) => {
-                                    let previous_selected_identity = selected_identity(&app, &agents);
-                                    let local_ready = endpoints.iter().any(|status| status.id == "local" && status.connected);
-                                    let connecting = endpoints.iter().any(|status| status.error.as_deref() == Some("connecting"));
-                                    // Before the guards below: they and the epoch must see
-                                    // the restored agent.
-                                    client_view.restore_selection(&mut app, |id| list.iter().any(|agent| agent.id == id), local_ready, connecting);
-                                    let projection = list.iter().map(Agent::projection).collect::<Vec<_>>();
-                                    let mut stable_projection = projection.clone();
-                                    for (row, agent) in stable_projection.iter_mut().zip(&list) {
-                                        row["native"]["observed_at_ms"] = json!(0);
-                                        row["_run"] = json!(agent.run);
-                                        row["_endpoint_key"] = json!(agent.endpoint_key);
-                                    }
-                                    let next_selected_identity = app
-                                        .selected_id
-                                        .as_ref()
-                                        .and_then(|id| list.iter().find(|agent| &agent.id == id))
-                                        .or_else(|| list.first())
-                                        .map(agent_identity);
-                                    let next_agents = list.into_iter().map(|agent| (agent.id.clone(), agent)).collect::<HashMap<_, _>>();
-                                    let identity_changed = previous_selected_identity != next_selected_identity;
-                                    let app_epoch = next_selected_identity
-                                        .clone()
-                                        .unwrap_or_else(|| "managed-fleet-empty".into());
-                                    agents = next_agents;
-                                    if let Some(window) = &mut changing
-                                        && let Some(agent) = agents.values().find(|agent| agent.pane_id == window.pane())
-                                    {
-                                        window.seen_run(&agent.run);
-                                    }
-                                    last_poll_ms = crate::observation::now_ms();
-                                    inbox_due = true;
-                                    let mut names = agents
-                                        .values()
-                                        .filter(|agent| agent.endpoint_id.is_empty() || agent.endpoint_id == "local")
-                                        .map(|agent| (agent.pane_id.clone(), agent.run.clone(), agent.name.clone()))
-                                        .collect::<Vec<_>>();
-                                    names.sort();
-                                    if app.inbox.set_names(names) && app.inbox.open {
-                                        app.dirty = true;
-                                    }
-                                    let next_endpoint_line = endpoint_status_line(&endpoints, app.language);
-                                    if app.endpoint_line.as_ref() != Some(&next_endpoint_line) {
-                                        app.endpoint_line = Some(next_endpoint_line);
-                                        app.dirty = true;
-                                    }
-                                    // A dialog about an agent closes when that run of it is
-                                    // no longer listed, whichever row is selected. The start
-                                    // dialog is about no agent and stays.
-                                    let mut dropped = None;
-                                    if let Some(agent) = dialog.as_ref().and_then(|dialog| dialog.kind.agent())
-                                        && !listed(agent, &agents)
-                                    {
-                                        dropped = Some(crate::managed::find::agent_label(agent));
-                                        dialog = None;
-                                    }
-                                    if let Some(active) = &answering {
-                                        // An agent the saved view hides can be answered from
-                                        // the inbox without ever being listed.
-                                        answering_listed |= listed(&active.agent, &agents);
-                                        if left(&active.agent, answering_listed, &agents) {
-                                            dropped = Some(crate::managed::find::agent_label(&active.agent));
-                                            answering = None;
-                                        }
-                                    }
-                                    // The queue window stays: it shows the agent's new run
-                                    // and keeps typed text from reaching the desk's keys.
-                                    // A first run after an empty selection is a new run too.
-                                    if identity_changed && let Some(window) = &queueing {
-                                        let agent = window.agent.clone();
-                                        queue_task(&mut tasks, fleet.clone(), agent, None, None);
-                                    }
-                                    // The first agent of an empty or new desk replaces no
-                                    // identity: notices and open windows stay as they are.
-                                    if identity_changed && previous_selected_identity.is_some() {
-                                        palette = None;
-                                        app.cancel_interactions();
-                                        // Help is not about the agent and stays open.
-                                        if app.overlay == Some(Overlay::Context) {
-                                            app.overlay = None;
-                                        }
-                                        app.ack_in_flight = None;
-                                        app.prompt_in_flight = false;
-                                        app.toast = None;
-                                        app.dirty = true;
-                                    }
-                                    if let Some(name) = dropped {
-                                        app.notify(message(
-                                            app.language,
-                                            format!("{name}: its run changed or it left the list, so its dialog was closed"),
-                                            format!("{name}: 실행이 바뀌었거나 목록에서 빠져 대화 상자를 닫았습니다"),
-                                        ));
-                                    }
-                                    if epoch != current_epoch || last_projection.as_ref() != Some(&stable_projection) {
-                                        revision = revision.wrapping_add(1);
-                                        // The selection's identity is not a daemon epoch: the block
-                                        // above made the resets a new identity needs, so the
-                                        // snapshot must not read a moved selection as a restart.
-                                        app.epoch.clone_from(&app_epoch);
-                                        app.apply_snapshot(json!({"epoch":app_epoch,"revision":revision.to_string(),"observations":projection}));
-                                        last_projection = Some(stable_projection);
-                                    }
-                                    client_view.rows_shown(&mut app, local_ready);
-                                    current_epoch = epoch;
-                                    if !app.connected || app.connection_message.is_some() { app.set_connection(true, None); }
-                                }
-                                Err(error) => {
-                                    let message = self::message(
-                                        app.language,
-                                        format!("Native inventory unavailable: {error}"),
-                                        format!("네이티브 목록을 읽을 수 없습니다: {error}"),
-                                    );
-                                    if app.connected || app.connection_message.as_deref() != Some(&message) { app.set_connection(false, Some(message)); }
-                                }
-                            }
+                            poll_result = Some(result);
                         }
                         Ok(Work::Inbox(result)) => {
                             inbox_pending = false;
@@ -1657,6 +1768,124 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 _ = hangup.recv() => break,
             };
 
+            if let Some(result) = poll_result {
+                match result {
+                    Ok(FleetSnapshot { epoch, agents: list, endpoints }) => {
+                        let previous_selected_identity = selected_identity(&app, &agents);
+                        let local_ready = endpoints.iter().any(|status| status.id == "local" && status.connected);
+                        let connecting = endpoints.iter().any(|status| status.error.as_deref() == Some("connecting"));
+                        // Before the guards below: they and the epoch must see
+                        // the restored agent.
+                        client_view.restore_selection(&mut app, |id| list.iter().any(|agent| agent.id == id), local_ready, connecting);
+                        let stable_projection = build_managed_projection(&list);
+                        let next_selected_identity = app
+                            .selected_id
+                            .as_ref()
+                            .and_then(|id| list.iter().find(|agent| &agent.id == id))
+                            .or_else(|| list.first())
+                            .map(agent_identity);
+                        let next_agents = list.into_iter().map(|agent| (agent.id.clone(), agent)).collect::<HashMap<_, _>>();
+                        let identity_changed = previous_selected_identity != next_selected_identity;
+                        let app_epoch = next_selected_identity
+                            .clone()
+                            .unwrap_or_else(|| "managed-fleet-empty".into());
+                        agents = next_agents;
+                        if let Some(window) = &mut changing
+                            && let Some(agent) = agents.values().find(|agent| agent.pane_id == window.pane())
+                        {
+                            window.seen_run(&agent.run);
+                        }
+                        last_poll_ms = crate::observation::now_ms();
+                        inbox_due = true;
+                        let mut names = agents
+                            .values()
+                            .filter(|agent| agent.endpoint_id.is_empty() || agent.endpoint_id == "local")
+                            .map(|agent| (agent.pane_id.clone(), agent.run.clone(), agent.name.clone()))
+                            .collect::<Vec<_>>();
+                        names.sort();
+                        if app.inbox.set_names(names) && app.inbox.open {
+                            app.dirty = true;
+                        }
+                        let next_endpoint_line = endpoint_status_line(&endpoints, app.language);
+                        if app.endpoint_line.as_ref() != Some(&next_endpoint_line) {
+                            app.endpoint_line = Some(next_endpoint_line);
+                            app.dirty = true;
+                        }
+                        // A dialog about an agent closes when that run of it is
+                        // no longer listed, whichever row is selected. The start
+                        // dialog is about no agent and stays.
+                        let mut dropped = None;
+                        if let Some(agent) = dialog.as_ref().and_then(|dialog| dialog.kind.agent())
+                            && !listed(agent, &agents)
+                        {
+                            dropped = Some(crate::managed::find::agent_label(agent));
+                            dialog = None;
+                        }
+                        if let Some(active) = &answering {
+                            // An agent the saved view hides can be answered from
+                            // the inbox without ever being listed.
+                            answering_listed |= listed(&active.agent, &agents);
+                            if left(&active.agent, answering_listed, &agents) {
+                                dropped = Some(crate::managed::find::agent_label(&active.agent));
+                                answering = None;
+                            }
+                        }
+                        // The queue window stays: it shows the agent's new run
+                        // and keeps typed text from reaching the desk's keys.
+                        // A first run after an empty selection is a new run too.
+                        if identity_changed && let Some(window) = &queueing {
+                            let agent = window.agent.clone();
+                            queue_task(&mut tasks, fleet.clone(), agent, None, None);
+                        }
+                        // The first agent of an empty or new desk replaces no
+                        // identity: notices and open windows stay as they are.
+                        if identity_changed && previous_selected_identity.is_some() {
+                            palette = None;
+                            app.cancel_interactions();
+                            // Help is not about the agent and stays open.
+                            if app.overlay == Some(Overlay::Context) {
+                                app.overlay = None;
+                            }
+                            app.ack_in_flight = None;
+                            app.prompt_in_flight = false;
+                            app.toast = None;
+                            app.dirty = true;
+                        }
+                        if let Some(name) = dropped {
+                            app.notify(message(
+                                app.language,
+                                format!("{name}: its run changed or it left the list, so its dialog was closed"),
+                                format!("{name}: 실행이 바뀌었거나 목록에서 빠져 대화 상자를 닫았습니다"),
+                            ));
+                        }
+                        if epoch != current_epoch || last_projection.as_ref() != Some(&stable_projection) {
+                            revision = revision.wrapping_add(1);
+                            // The selection's identity is not a daemon epoch: the block
+                            // above made the resets a new identity needs, so the
+                            // snapshot must not read a moved selection as a restart.
+                            app.epoch.clone_from(&app_epoch);
+                            let observations = stable_projection
+                                .iter()
+                                .map(|row| row.observation.clone())
+                                .collect();
+                            app.apply_observations(app_epoch, revision.to_string(), observations);
+                            last_projection = Some(stable_projection);
+                        }
+                        client_view.rows_shown(&mut app, local_ready);
+                        current_epoch = epoch;
+                        if !app.connected || app.connection_message.is_some() { app.set_connection(true, None); }
+                    }
+                    Err(error) => {
+                        let message = self::message(
+                            app.language,
+                            format!("Native inventory unavailable: {error}"),
+                            format!("네이티브 목록을 읽을 수 없습니다: {error}"),
+                        );
+                        if app.connected || app.connection_message.as_deref() != Some(&message) { app.set_connection(false, Some(message)); }
+                    }
+                }
+            }
+
             // The inbox is read after each poll while it is on, and its switch
             // checked every 5 s while it is off; the store is not opened then.
             if !inbox_pending && !app.inbox.mismatch && (app.inbox.refresh || inbox_due) {
@@ -1698,6 +1927,25 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     // desk on screen.
     client_view.finish(&app).await;
     result
+}
+
+/// Direct managed-agent projection row without intermediate JSON DOM allocation.
+#[derive(PartialEq, Eq)]
+struct ManagedProjectionRow {
+    observation: Observation,
+    run: String,
+    endpoint_key: String,
+}
+
+fn build_managed_projection(agents: &[Agent]) -> Vec<ManagedProjectionRow> {
+    agents
+        .iter()
+        .map(|agent| ManagedProjectionRow {
+            observation: Observation::from_agent(agent),
+            run: agent.run.clone(),
+            endpoint_key: agent.endpoint_key.clone(),
+        })
+        .collect()
 }
 
 /// Agents in desk order, then the desk actions for the current selection.
@@ -2978,11 +3226,99 @@ mod tests {
     }
 
     #[test]
+    fn direct_observation_matches_json_projection_across_states() {
+        for (state, returned_idle, stale, permissions, questions, columns, endpoint_label) in [
+            ("idle", false, false, 0, 0, false, ""),
+            ("working", false, false, 0, 0, true, ""),
+            ("blocked", false, false, 2, 0, false, "edge"),
+            ("blocked", false, false, 0, 1, false, ""),
+            ("blocked", false, false, 0, 0, false, ""),
+            ("idle", true, false, 0, 0, false, ""),
+            ("exited", false, true, 0, 0, false, "remote"),
+        ] {
+            let mut item = agent("builder", state);
+            item.returned_idle = returned_idle;
+            item.stale = stale;
+            item.permission_count = permissions;
+            item.question_count = questions;
+            item.columns = columns;
+            item.endpoint_label = endpoint_label.into();
+            let mut via_json = Observation::parse(&item.projection()).unwrap();
+            via_json.observed_at_ms = 0;
+            let direct = Observation::from_agent(&item);
+            assert_eq!(direct, via_json, "state={state} stale={stale}");
+        }
+    }
+
+    #[test]
+    fn dialog_inline_cursor_supports_navigation_insertion_and_word_kill() {
+        let mut dialog = Dialog::rename(&agent("alpha-gamma", "idle"), Language::English);
+        // Move cursor left past "gamma" (5 chars) and insert "beta-".
+        for _ in 0..5 {
+            dialog.handle(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        }
+        dialog.handle(Event::Paste("beta-".into()));
+        assert_eq!(dialog.fields[0].value, "alpha-beta-gamma");
+        // Home + Delete removes 'a'.
+        dialog.handle(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+        dialog.handle(Event::Key(KeyEvent::new(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(dialog.fields[0].value, "lpha-beta-gamma");
+        // End + Backspace removes 'a'.
+        dialog.handle(Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)));
+        dialog.handle(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(dialog.fields[0].value, "lpha-beta-gamm");
+    }
+
+    #[test]
     fn the_server_theme_names_map_to_desk_themes() {
         assert_eq!(server_theme("light"), Some(Theme::Light));
         assert_eq!(server_theme("tmux"), Some(Theme::Terminal));
         assert_eq!(server_theme("terminal"), Some(Theme::Terminal));
         assert_eq!(server_theme("dark"), Some(Theme::Dark));
         assert_eq!(server_theme("solarized"), None);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_managed_projection_50_agents() {
+        let list: Vec<Agent> = (0..50)
+            .map(|index| {
+                let mut a = agent(
+                    &format!("agent-{index:02}"),
+                    if index % 4 == 0 { "blocked" } else { "working" },
+                );
+                a.pane_id = format!("%{index}");
+                a.run = format!("run-{index}");
+                a
+            })
+            .collect();
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        app.set_managed();
+        let iters = 1000usize;
+        let mut last_projection: Option<Vec<ManagedProjectionRow>> = None;
+        let start = std::time::Instant::now();
+        for index in 0..iters {
+            let stable_projection = build_managed_projection(&list);
+            if index == 0 || last_projection.as_ref() != Some(&stable_projection) {
+                let observations = stable_projection
+                    .iter()
+                    .map(|row| row.observation.clone())
+                    .collect();
+                app.apply_observations("e1".into(), index.to_string(), observations);
+                last_projection = Some(stable_projection);
+            }
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "BENCH_MANAGED_PROJ_50_UNCHANGED: total_ms={:.2} us_per_poll={:.2}",
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1_000_000.0 / iters as f64
+        );
     }
 }

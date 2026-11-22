@@ -140,7 +140,7 @@ impl App {
                 Vec::new()
             }
             KeyCode::End if self.focus == Focus::List => {
-                self.select_position(self.filtered_ids().len().saturating_sub(1));
+                self.select_position(self.filtered_count().saturating_sub(1));
                 Vec::new()
             }
             KeyCode::PageUp if self.focus == Focus::List => {
@@ -385,6 +385,34 @@ impl App {
                     self.search_changed();
                 }
             }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_cursor = 0;
+                self.dirty = true;
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_cursor = grapheme_count(&self.search);
+                self.dirty = true;
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.search_cursor > 0 {
+                    let graphemes: Vec<&str> = self.search.graphemes(true).collect();
+                    let mut target = self.search_cursor.min(graphemes.len());
+                    while target > 0 && graphemes[target - 1].chars().all(char::is_whitespace) {
+                        target -= 1;
+                    }
+                    while target > 0 && !graphemes[target - 1].chars().all(char::is_whitespace) {
+                        target -= 1;
+                    }
+                    let start_byte: usize = graphemes[..target].iter().map(|g| g.len()).sum();
+                    let end_byte: usize = graphemes[..self.search_cursor.min(graphemes.len())]
+                        .iter()
+                        .map(|g| g.len())
+                        .sum();
+                    self.search.replace_range(start_byte..end_byte, "");
+                    self.search_cursor = target;
+                    self.search_changed();
+                }
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.search.clear();
                 self.search_cursor = 0;
@@ -558,9 +586,11 @@ impl App {
                 self.start_thumb_drag(HitTarget::InspectorThumb, row, hit.rect)
             }
             HitTarget::HelpThumb => self.start_thumb_drag(HitTarget::HelpThumb, row, hit.rect),
+            HitTarget::InboxThumb => self.start_thumb_drag(HitTarget::InboxThumb, row, hit.rect),
             HitTarget::ListTrack => self.page_track(HitTarget::ListTrack, row),
             HitTarget::InspectorTrack => self.page_track(HitTarget::InspectorTrack, row),
             HitTarget::HelpTrack => self.page_track(HitTarget::HelpTrack, row),
+            HitTarget::InboxTrack => self.page_track(HitTarget::InboxTrack, row),
             HitTarget::InspectorBody => {
                 self.focus = Focus::Inspector;
                 self.dirty = true;
@@ -729,6 +759,9 @@ impl App {
             Drag::HelpThumb { grab } => {
                 self.drag_scroll(row.saturating_sub(grab), HitTarget::HelpTrack)
             }
+            Drag::InboxThumb { grab } => {
+                self.drag_scroll(row.saturating_sub(grab), HitTarget::InboxTrack)
+            }
         }
     }
 
@@ -737,6 +770,7 @@ impl App {
         self.drag = Some(match target {
             HitTarget::ListThumb => Drag::ListThumb { grab },
             HitTarget::InspectorThumb => Drag::InspectorThumb { grab },
+            HitTarget::InboxThumb => Drag::InboxThumb { grab },
             _ => Drag::HelpThumb { grab },
         });
         self.dirty = true;
@@ -752,8 +786,9 @@ impl App {
             return;
         };
         let (total, page) = match track_target {
-            HitTarget::ListTrack => (self.filtered_ids().len(), self.list_page),
+            HitTarget::ListTrack => (self.filtered_count(), self.list_page),
             HitTarget::InspectorTrack => (self.inspector_lines, self.inspector_page),
+            HitTarget::InboxTrack => (self.inbox.view.events.len(), self.inbox.page),
             _ => (self.help_lines, self.help_page),
         };
         let thumb_height =
@@ -763,10 +798,7 @@ impl App {
         let track_span = travel.max(1);
         match track_target {
             HitTarget::ListTrack => {
-                let max = self
-                    .filtered_ids()
-                    .len()
-                    .saturating_sub(self.list_page.max(1));
+                let max = total.saturating_sub(self.list_page.max(1));
                 self.list_scroll = position.saturating_mul(max) / track_span;
             }
             HitTarget::InspectorTrack => {
@@ -774,6 +806,24 @@ impl App {
                     .inspector_lines
                     .saturating_sub(self.inspector_page.max(1));
                 self.inspector_scroll = position.saturating_mul(max) / track_span;
+            }
+            HitTarget::InboxTrack => {
+                let page = self.inbox.page.max(1);
+                let max = total.saturating_sub(page);
+                let next_scroll = position.saturating_mul(max) / track_span;
+                self.inbox.scroll = next_scroll;
+                let selected = self
+                    .inbox
+                    .selected
+                    .and_then(|id| self.inbox.view.events.iter().position(|e| e.id == id))
+                    .unwrap_or(0);
+                let clamped = selected.clamp(
+                    next_scroll,
+                    (next_scroll + page - 1).min(total.saturating_sub(1)),
+                );
+                if let Some(event) = self.inbox.view.events.get(clamped) {
+                    self.inbox.selected = Some(event.id);
+                }
             }
             _ => {
                 let max = self.help_lines.saturating_sub(self.help_page.max(1));
@@ -787,6 +837,7 @@ impl App {
         let thumb_target = match target {
             HitTarget::ListTrack => HitTarget::ListThumb,
             HitTarget::InspectorTrack => HitTarget::InspectorThumb,
+            HitTarget::InboxTrack => HitTarget::InboxThumb,
             _ => HitTarget::HelpThumb,
         };
         let thumb = self
@@ -804,6 +855,7 @@ impl App {
             HitTarget::InspectorTrack => {
                 self.scroll_inspector(direction * self.inspector_page.max(1) as isize)
             }
+            HitTarget::InboxTrack => self.scroll_inbox(direction * self.inbox.page.max(1) as isize),
             _ => self.scroll_help(direction * self.help_page.max(1) as isize),
         }
     }
@@ -834,34 +886,34 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let ids = self.filtered_ids();
-        if ids.is_empty() {
+        let indices = self.filtered_indices();
+        if indices.is_empty() {
             return;
         }
         let current = self
             .selected_id
             .as_ref()
-            .and_then(|id| ids.iter().position(|candidate| candidate == id))
+            .and_then(|id| indices.iter().position(|&index| self.rows[index].id == *id))
             .unwrap_or(0);
         let next = current
             .saturating_add_signed(delta)
-            .min(ids.len().saturating_sub(1));
-        self.selected_id = ids.get(next).cloned();
+            .min(indices.len().saturating_sub(1));
+        self.selected_id = indices.get(next).map(|&index| self.rows[index].id.clone());
         self.reveal_selection();
         self.dirty = true;
     }
 
     fn select_position(&mut self, position: usize) {
-        self.selected_id = self.filtered_ids().get(position).cloned();
+        let indices = self.filtered_indices();
+        self.selected_id = indices
+            .get(position)
+            .map(|&index| self.rows[index].id.clone());
         self.reveal_selection();
         self.dirty = true;
     }
 
     fn scroll_list(&mut self, amount: isize) {
-        let max = self
-            .filtered_ids()
-            .len()
-            .saturating_sub(self.list_page.max(1));
+        let max = self.filtered_count().saturating_sub(self.list_page.max(1));
         self.list_scroll = self.list_scroll.saturating_add_signed(amount).min(max);
         self.dirty = true;
     }

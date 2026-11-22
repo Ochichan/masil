@@ -108,6 +108,118 @@ fn word_score(word: &[char], text: &[char]) -> Option<u32> {
     best
 }
 
+/// Lowercase and compose conjoining Hangul jamo into syllables, tracking the
+/// original `char` index span `(start, end)` of each folded character.
+fn fold_with_spans(text: &str) -> (Vec<char>, Vec<(usize, usize)>, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut folded = Vec::with_capacity(chars.len());
+    let mut spans = Vec::with_capacity(chars.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let start = index;
+        let ch = chars[index];
+        let code = ch as u32;
+        if (0x1100..=0x1112).contains(&code)
+            && index + 1 < chars.len()
+            && (0x1161..=0x1175).contains(&(chars[index + 1] as u32))
+        {
+            let vowel = chars[index + 1] as u32;
+            index += 2;
+            let mut syllable = SYLLABLE_BASE + ((code - 0x1100) * 21 + (vowel - 0x1161)) * 28;
+            if index < chars.len() && (0x11A8..=0x11C2).contains(&(chars[index] as u32)) {
+                syllable += chars[index] as u32 - 0x11A7;
+                index += 1;
+            }
+            if let Some(composed) = char::from_u32(syllable) {
+                folded.push(composed);
+                spans.push((start, index));
+            }
+            continue;
+        }
+        index += 1;
+        for lower in ch.to_lowercase() {
+            folded.push(lower);
+            spans.push((start, index));
+        }
+    }
+    (folded, spans, chars.len())
+}
+
+/// Score one folded word against folded text and return its best matched indices.
+fn word_match(word: &[char], text: &[char]) -> Option<(u32, Vec<usize>)> {
+    if word.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    let mut best: Option<(u32, Vec<usize>)> = None;
+    for start in (0..text.len()).filter(|&i| matches(word[0], text[i])) {
+        let mut score: u32 = 16 + if boundary(text, start) { 24 } else { 0 };
+        let mut previous = start;
+        let mut positions = Vec::with_capacity(word.len());
+        positions.push(start);
+        let mut matched = true;
+        let mut one_token = true;
+        let mut acronym = true;
+        for &query in &word[1..] {
+            let Some(offset) = text[previous + 1..].iter().position(|&c| matches(query, c)) else {
+                matched = false;
+                break;
+            };
+            let index = previous + 1 + offset;
+            if offset > 0 {
+                one_token &= !(previous + 1..=index).any(|i| boundary(text, i));
+                acronym &= boundary(text, index);
+            }
+            score += if offset == 0 {
+                12
+            } else if boundary(text, index) {
+                8
+            } else {
+                2
+            };
+            score = score.saturating_sub((offset as u32).min(8));
+            previous = index;
+            positions.push(index);
+        }
+        if !matched {
+            break;
+        }
+        if !one_token && !acronym {
+            continue;
+        }
+        let score = score.saturating_sub((start as u32).min(16));
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, positions));
+        }
+    }
+    best
+}
+
+/// Per-`char` highlight mask for `text` under `query`. Marks the best matching
+/// characters for every query word that matches `text`.
+pub(crate) fn match_mask(query: &str, text: &str) -> Vec<bool> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let (folded, spans, char_len) = fold_with_spans(text);
+    let mut mask = vec![false; char_len];
+    for word in query.split_whitespace() {
+        let word = fold(word);
+        if let Some((_, positions)) = word_match(&word, &folded) {
+            for pos in positions {
+                let (start, end) = spans[pos];
+                for flag in &mut mask[start..end] {
+                    *flag = true;
+                }
+            }
+        }
+    }
+    mask
+}
+
 /// Match `query` against each field; the first field (the label) counts
 /// double. `None` means some query word matched no field.
 pub(crate) fn score(query: &str, fields: &[&str]) -> Option<u32> {
@@ -177,5 +289,20 @@ mod tests {
         let query = "a".repeat(64);
         assert!(score(&query, &[&text]).is_some());
         assert!(score(&format!("{query}b"), &[&text]).is_none());
+    }
+
+    #[test]
+    fn match_mask_marks_matched_characters_and_korean_initials() {
+        assert_eq!(
+            match_mask("gtp", "Go to pane"),
+            vec![
+                true, false, false, true, false, false, true, false, false, false
+            ]
+        );
+        assert_eq!(
+            match_mask("ㄱㅅ", "개발 서버"),
+            vec![true, false, false, true, false]
+        );
+        assert!(match_mask("", "anything").is_empty());
     }
 }

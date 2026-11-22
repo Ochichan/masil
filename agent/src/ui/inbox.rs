@@ -4,7 +4,7 @@
 //! agent.
 
 use super::model::{App, Effect, HitRegion, HitTarget, Language, Overlay};
-use super::view::{Palette, clip_line, inset_x, pad};
+use super::view::{Palette, cell_width, clip_line, inset_x, pad};
 use crate::managed::inbox::{InboxItem, InboxView};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -420,14 +420,22 @@ impl App {
                 "이 서버의 안 읽은 사건"
             },
         );
+        let muted_style = palette.muted_style();
+        let scope_width = cell_width(scope);
+        let rule_len = (inner.width as usize).saturating_sub(scope_width + 1);
+        let mut header_spans = vec![Span::styled(
+            scope.to_owned(),
+            muted_style.add_modifier(Modifier::BOLD),
+        )];
+        if rule_len >= 3 {
+            header_spans.push(Span::raw(" "));
+            header_spans.push(Span::styled(
+                "─".repeat(rule_len),
+                Style::default().fg(palette.track),
+            ));
+        }
         frame.render_widget(
-            Paragraph::new(clip_line(
-                vec![Span::styled(
-                    scope.to_owned(),
-                    Style::default().fg(palette.muted),
-                )],
-                inner.width as usize,
-            )),
+            Paragraph::new(clip_line(header_spans, inner.width as usize)),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
         let list = Rect::new(
@@ -474,14 +482,22 @@ impl App {
         let mut hits = Vec::new();
         let page = (list.height / row_height).max(1) as usize;
         self.inbox.page = page;
+        let total = self.inbox.view.events.len();
+        let has_scroll = total > page && list.width > 4;
+        let content_width = list.width.saturating_sub(u16::from(has_scroll));
         let selected = self.inbox.selected_index().unwrap_or(0);
         if selected < self.inbox.scroll {
             self.inbox.scroll = selected;
         } else if selected >= self.inbox.scroll + page {
             self.inbox.scroll = selected + 1 - page;
         }
+        self.inbox.scroll = self.inbox.scroll.min(total.saturating_sub(page));
         let names = &self.inbox.names;
         let language = self.language;
+        let hover_id = match self.hover {
+            Some(HitTarget::InboxRow(id)) => Some(id),
+            _ => None,
+        };
         for (offset, event) in self
             .inbox
             .view
@@ -492,15 +508,40 @@ impl App {
             .enumerate()
         {
             let y = list.y + offset as u16 * row_height;
-            let rect = Rect::new(list.x, y, list.width, row_height);
+            let rect = Rect::new(list.x, y, content_width, row_height);
             let is_selected = self.inbox.selected == Some(event.id);
-            let base = if is_selected {
-                Style::default().bg(palette.raised).fg(palette.text)
+            let is_hovered = hover_id == Some(event.id);
+            let raised = is_selected || is_hovered;
+            let base = if raised {
+                Style::default().bg(palette.raised_fill()).fg(palette.text)
             } else {
                 Style::default().fg(palette.text)
             };
             let dim = event.read || event.resolution.is_some();
-            let text_style = if dim { base.fg(palette.muted) } else { base };
+            let row_muted = if raised {
+                muted_style.bg(palette.raised_fill())
+            } else {
+                muted_style
+            };
+            let text_style = if dim {
+                row_muted
+            } else if is_selected {
+                base.add_modifier(Modifier::BOLD)
+            } else {
+                base
+            };
+            let cue = if is_selected {
+                Span::styled(
+                    "›",
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if is_hovered {
+                Span::styled("·", Style::default().fg(palette.accent))
+            } else {
+                Span::raw(" ")
+            };
             let mark = if waiting(event) { "● " } else { "  " };
             let time = local_stamp(event.observed_ms);
             let kind = kind_label(language, &event.kind);
@@ -527,6 +568,7 @@ impl App {
                 vec![
                     clip_line(
                         vec![
+                            cue,
                             Span::styled(mark.to_owned(), kind_style),
                             Span::styled(format!("{kind}  "), kind_style),
                             Span::styled(agent, text_style),
@@ -535,8 +577,8 @@ impl App {
                     ),
                     clip_line(
                         vec![Span::styled(
-                            format!("  {}  {detail}", event.source),
-                            text_style.fg(palette.muted),
+                            format!("   {}  {detail}", event.source),
+                            row_muted,
                         )],
                         rect.width as usize,
                     ),
@@ -545,20 +587,21 @@ impl App {
                 let kind_width = 16.min(rect.width as usize);
                 vec![clip_line(
                     vec![
+                        cue,
                         Span::styled(mark.to_owned(), kind_style),
-                        Span::styled(format!("{time}  "), text_style.fg(palette.muted)),
+                        Span::styled(format!("{time}  "), row_muted),
                         Span::styled(pad(kind, kind_width), kind_style),
                         Span::styled(format!(" {} ", pad(&agent, 16)), text_style),
-                        Span::styled(
-                            format!("{} ", pad(&event.source, 14)),
-                            text_style.fg(palette.muted),
-                        ),
+                        Span::styled(format!("{} ", pad(&event.source, 14)), row_muted),
                         Span::styled(detail, text_style),
                     ],
                     rect.width as usize,
                 )]
             };
             frame.render_widget(Paragraph::new(lines).style(base), rect);
+            if raised {
+                palette.raise(frame, rect);
+            }
             hits.push(HitRegion {
                 rect,
                 target: HitTarget::InboxRow(event.id),
@@ -566,6 +609,19 @@ impl App {
             });
         }
         self.hits.extend(hits);
+        if has_scroll {
+            self.draw_scrollbar(
+                frame,
+                Rect::new(list.right() - 1, list.y, 1, list.height),
+                self.inbox.scroll,
+                page,
+                total,
+                HitTarget::InboxTrack,
+                HitTarget::InboxThumb,
+                palette,
+                2,
+            );
+        }
     }
 
     /// The key line for the inbox view.
@@ -723,5 +779,48 @@ mod tests {
         assert!(app.handle_inbox_key(key(KeyCode::Char('p'))).is_empty());
         app.handle_inbox_key(key(KeyCode::Esc));
         assert!(!app.inbox.open);
+    }
+
+    #[test]
+    fn inbox_renders_scrollbar_on_overflow_and_raises_selected_row_in_terminal_theme() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new(
+            false,
+            Language::English,
+            super::super::model::Theme::Terminal,
+        );
+        app.managed = true;
+        let events = (1..=12)
+            .map(|id| item(id, id, &format!("r{id}"), "blocked"))
+            .collect();
+        app.inbox.apply(view(events));
+        app.toggle_inbox();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(
+            app.hits
+                .iter()
+                .any(|hit| hit.target == HitTarget::InboxTrack),
+            "expected scrollbar track when inbox overflows"
+        );
+        assert!(
+            app.hits
+                .iter()
+                .any(|hit| hit.target == HitTarget::InboxThumb),
+            "expected scrollbar thumb when inbox overflows"
+        );
+        let buffer = terminal.backend().buffer();
+        let selected_row = app
+            .hits
+            .iter()
+            .find(|hit| hit.target == HitTarget::InboxRow(1))
+            .expect("selected row hit")
+            .rect;
+        assert!(
+            buffer[(selected_row.x, selected_row.y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "expected REVERSED highlight for selected inbox row under Theme::Terminal"
+        );
     }
 }

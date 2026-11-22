@@ -162,7 +162,7 @@ pub(crate) struct ServerInfo {
 /// Runs one native command with a time limit and returns standard output.
 pub(crate) fn masil(socket: &Path, args: &[&str]) -> Result<String, String> {
     let binary = crate::native_ui::native_executable()?;
-    let mut child = Command::new(binary)
+    let child = Command::new(binary)
         .arg("-u")
         .arg("-S")
         .arg(socket)
@@ -172,33 +172,17 @@ pub(crate) fn masil(socket: &Path, args: &[&str]) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("server_unreachable: cannot run masil: {error}"))?;
-    let mut stdout = child.stdout.take().ok_or("masil output unavailable")?;
-    let mut stderr = child.stderr.take().ok_or("masil output unavailable")?;
-    let out = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = (&mut stdout).take(OUTPUT_LIMIT).read_to_string(&mut text);
-        text
-    });
-    let err = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = (&mut stderr).take(OUTPUT_LIMIT).read_to_string(&mut text);
-        text
-    });
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("server_unreachable: masil did not answer".into());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let out = out.join().unwrap_or_default();
-    let err = err.join().unwrap_or_default();
-    if status.success() {
+    let captured =
+        crate::process::capture_child(child, Some(COMMAND_TIMEOUT), OUTPUT_LIMIT as usize)
+            .map_err(|error| match error {
+                crate::process::CaptureError::Timeout => {
+                    "server_unreachable: masil did not answer".to_owned()
+                }
+                crate::process::CaptureError::Io(error) => error.to_string(),
+            })?;
+    let out = crate::process::into_string_lossy(captured.stdout);
+    let err = crate::process::into_string_lossy(captured.stderr);
+    if captured.status.success() {
         Ok(out)
     } else {
         Err(format!(

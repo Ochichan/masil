@@ -235,6 +235,8 @@ pub(crate) enum HitTarget {
     DismissOverlay,
     OverlaySurface,
     InboxRow(i64),
+    InboxTrack,
+    InboxThumb,
 }
 
 #[derive(Clone, Debug)]
@@ -244,7 +246,7 @@ pub(crate) struct HitRegion {
     pub z: u8,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Observation {
     pub id: String,
     pub source_id: String,
@@ -273,7 +275,7 @@ pub(crate) struct Observation {
 }
 
 impl Observation {
-    fn parse(value: &Value) -> Option<Self> {
+    pub(crate) fn parse(value: &Value) -> Option<Self> {
         let id = value.get("id")?.as_str()?.to_owned();
         let native = value.get("native")?;
         let core = value.get("core")?;
@@ -345,6 +347,70 @@ impl Observation {
         })
     }
 
+    pub(crate) fn from_agent(agent: &crate::managed::Agent) -> Self {
+        let blocked = agent.state == "blocked";
+        let (permissions, questions) = if blocked {
+            (agent.permission_count, agent.question_count)
+        } else {
+            (0, 0)
+        };
+        let attention_kind = match (blocked, permissions, questions) {
+            (true, 1.., _) => "approval",
+            (true, 0, 1..) => "question",
+            (true, ..) => "needs_input",
+            (false, ..) if agent.returned_idle => "returned_idle",
+            _ => "none",
+        };
+        let pending_count = u64::from(
+            (blocked && permissions == 0 && questions == 0) || (!blocked && agent.returned_idle),
+        );
+        let source_id = if agent.endpoint_label.is_empty() {
+            agent.provider.clone()
+        } else {
+            format!("{} / {}", agent.endpoint_label, agent.provider)
+        };
+        let activity = if matches!(agent.state.as_str(), "idle" | "working" | "blocked") {
+            agent.state.clone()
+        } else {
+            "unknown".to_owned()
+        };
+        let pending = blocked || agent.returned_idle;
+        let freshness = if agent.stale { "stale" } else { "fresh" };
+        let core_process = if agent.stale {
+            "unknown".to_owned()
+        } else {
+            agent.process.clone()
+        };
+        Self {
+            id: agent.id.clone(),
+            source_id,
+            session_id: agent
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "unverified".to_owned()),
+            pane_id: Some(agent.pane_id.clone()),
+            activity,
+            last_activity: None,
+            native_exists: Some(agent.process == "running"),
+            native_freshness: freshness.to_owned(),
+            observed_at_ms: 0,
+            attention_kind: attention_kind.to_owned(),
+            permission_count: u64::from(permissions),
+            question_count: u64::from(questions),
+            pending_count,
+            attention_revision: agent.revision.clone(),
+            acknowledged: agent.seen,
+            pending,
+            attention_available: pending,
+            core_process,
+            pty_generation: Some(agent.generation.clone()),
+            core_freshness: freshness.to_owned(),
+            binding: agent.binding_label().to_owned(),
+            frontend_verified: false,
+            columns: agent.columns,
+        }
+    }
+
     pub(crate) fn is_unavailable(&self) -> bool {
         self.native_exists != Some(true)
             || self.native_freshness == "stale"
@@ -379,6 +445,7 @@ pub(crate) enum Drag {
     ListThumb { grab: u16 },
     InspectorThumb { grab: u16 },
     HelpThumb { grab: u16 },
+    InboxThumb { grab: u16 },
 }
 
 #[derive(Clone, Debug)]
@@ -450,6 +517,10 @@ pub struct App {
     pub(crate) last_area: Rect,
     /// The inbox view of the management window.
     pub(crate) inbox: super::inbox::InboxState,
+    /// Monotonic counters so view caches invalidate without deep-comparing state.
+    pub(crate) rows_version: u64,
+    pub(crate) details_version: u64,
+    pub(crate) inspector_cache: Option<super::view::InspectorCache>,
 }
 
 impl App {
@@ -507,6 +578,9 @@ impl App {
             endpoint_line: None,
             last_area: Rect::default(),
             inbox: Default::default(),
+            rows_version: 0,
+            details_version: 0,
+            inspector_cache: None,
         }
     }
 
@@ -520,6 +594,27 @@ impl App {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let revision = snapshot
+            .get("revision")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let rows = snapshot
+            .get("observations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Observation::parse)
+            .collect::<Vec<_>>();
+        self.apply_observations(next_epoch, revision, rows);
+    }
+
+    pub(crate) fn apply_observations(
+        &mut self,
+        next_epoch: String,
+        revision: String,
+        mut rows: Vec<Observation>,
+    ) {
         let epoch_changed = !self.epoch.is_empty() && self.epoch != next_epoch;
         let previous_ids = self.filtered_ids();
         let previous_position = self
@@ -527,13 +622,6 @@ impl App {
             .as_ref()
             .and_then(|id| previous_ids.iter().position(|candidate| candidate == id))
             .unwrap_or(0);
-        let mut rows = snapshot
-            .get("observations")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Observation::parse)
-            .collect::<Vec<_>>();
         if !self.managed {
             rows.sort_by(|left, right| {
                 right
@@ -543,15 +631,15 @@ impl App {
             });
         }
         self.epoch = next_epoch;
-        self.revision = snapshot
-            .get("revision")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+        self.revision = revision;
         self.rows = rows;
+        self.rows_version = self.rows_version.wrapping_add(1);
         // Inspect responses are supplemental to one complete projection. A new
         // projection invalidates them even when the observation ID survives.
-        self.details.clear();
+        if !self.details.is_empty() {
+            self.details.clear();
+            self.details_version = self.details_version.wrapping_add(1);
+        }
 
         let current_ids = self.filtered_ids();
         if current_ids != previous_ids {
@@ -576,7 +664,10 @@ impl App {
             self.overlay = None;
             self.ack_in_flight = None;
             self.prompt_in_flight = false;
-            self.details.clear();
+            if !self.details.is_empty() {
+                self.details.clear();
+                self.details_version = self.details_version.wrapping_add(1);
+            }
             self.toast = None;
         } else if let Some(pressed) = &self.pressed
             && let Some((id, revision)) = &pressed.identity
@@ -610,6 +701,7 @@ impl App {
     pub fn set_details(&mut self, id: &str, full_observation: Value) {
         if self.rows.iter().any(|row| row.id == id) {
             self.details.insert(id.to_owned(), full_observation);
+            self.details_version = self.details_version.wrapping_add(1);
             self.details_open = true;
             self.inspector_scroll = 0;
             self.focus = Focus::Inspector;
@@ -622,7 +714,7 @@ impl App {
         if !self.rows.iter().any(|row| row.id == id) {
             return false;
         }
-        if !self.filtered_ids().iter().any(|candidate| candidate == id) {
+        if !self.is_filtered_id(id) {
             self.filter = Filter::All;
             self.search.clear();
             self.search_cursor = 0;
@@ -657,18 +749,39 @@ impl App {
     }
 
     pub(crate) fn filtered_ids(&self) -> Vec<String> {
+        let query = SearchQuery::new(&self.search);
         self.rows
             .iter()
-            .filter(|row| self.matches(row))
+            .filter(|row| self.matches_with(row, &query))
             .map(|row| row.id.clone())
             .collect()
     }
 
-    pub(crate) fn filtered_rows(&self) -> Vec<&Observation> {
-        self.rows.iter().filter(|row| self.matches(row)).collect()
+    pub(crate) fn filtered_indices(&self) -> Vec<usize> {
+        let query = SearchQuery::new(&self.search);
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| self.matches_with(row, &query).then_some(index))
+            .collect()
     }
 
-    fn matches(&self, row: &Observation) -> bool {
+    pub(crate) fn filtered_count(&self) -> usize {
+        let query = SearchQuery::new(&self.search);
+        self.rows
+            .iter()
+            .filter(|row| self.matches_with(row, &query))
+            .count()
+    }
+
+    fn is_filtered_id(&self, id: &str) -> bool {
+        let query = SearchQuery::new(&self.search);
+        self.rows
+            .iter()
+            .any(|row| row.id == id && self.matches_with(row, &query))
+    }
+
+    fn matches_with(&self, row: &Observation, query: &SearchQuery<'_>) -> bool {
         let filter_matches = match self.filter {
             Filter::All => true,
             Filter::Attention => row.pending && row.attention_available,
@@ -678,17 +791,10 @@ impl App {
         if !filter_matches {
             return false;
         }
-        let query = self.search.to_lowercase();
-        query.is_empty()
-            || row.id.to_lowercase().contains(&query)
-            || row.source_id.to_lowercase().contains(&query)
-            || row.session_id.to_lowercase().contains(&query)
-            || row
-                .pane_id
-                .as_deref()
-                .unwrap_or_default()
-                .to_lowercase()
-                .contains(&query)
+        query.matches(&row.id)
+            || query.matches(&row.source_id)
+            || query.matches(&row.session_id)
+            || query.matches(row.pane_id.as_deref().unwrap_or_default())
     }
 
     pub(crate) fn action_enabled(&self, action: Action) -> bool {
@@ -848,11 +954,26 @@ impl App {
     }
 
     pub(crate) fn clamp_selection_and_scroll(&mut self) {
-        let ids = self.filtered_ids();
-        if !self.selected_id.as_ref().is_some_and(|id| ids.contains(id)) {
-            self.selected_id = ids.first().cloned();
+        let query = SearchQuery::new(&self.search);
+        let mut count = 0usize;
+        let mut first_index = None;
+        let mut has_selected = false;
+        for (index, row) in self.rows.iter().enumerate() {
+            if !self.matches_with(row, &query) {
+                continue;
+            }
+            if first_index.is_none() {
+                first_index = Some(index);
+            }
+            if self.selected_id.as_deref() == Some(row.id.as_str()) {
+                has_selected = true;
+            }
+            count += 1;
         }
-        let max = ids.len().saturating_sub(self.list_page.max(1));
+        if !has_selected {
+            self.selected_id = first_index.map(|index| self.rows[index].id.clone());
+        }
+        let max = count.saturating_sub(self.list_page.max(1));
         self.list_scroll = self.list_scroll.min(max);
         self.inspector_scroll = self.inspector_scroll.min(
             self.inspector_lines
@@ -865,18 +986,72 @@ impl App {
 
     pub(crate) fn reveal_selection(&mut self) {
         self.clamp_selection_and_scroll();
-        let ids = self.filtered_ids();
-        let selected = self
-            .selected_id
-            .as_ref()
-            .and_then(|id| ids.iter().position(|candidate| candidate == id))
-            .unwrap_or(0);
+        let query = SearchQuery::new(&self.search);
+        let mut selected = 0usize;
+        let mut position = 0usize;
+        for row in &self.rows {
+            if !self.matches_with(row, &query) {
+                continue;
+            }
+            if self.selected_id.as_deref() == Some(row.id.as_str()) {
+                selected = position;
+                break;
+            }
+            position += 1;
+        }
         if selected < self.list_scroll {
             self.list_scroll = selected;
         } else if selected >= self.list_scroll + self.list_page.max(1) {
             self.list_scroll = selected + 1 - self.list_page.max(1);
         }
     }
+}
+
+/// Pre-prepared case-insensitive substring matcher. ASCII queries compare
+/// bytes in place with zero heap allocation per candidate row.
+enum SearchQuery<'a> {
+    Empty,
+    Ascii(&'a [u8]),
+    Unicode(String),
+}
+
+impl<'a> SearchQuery<'a> {
+    fn new(search: &'a str) -> Self {
+        if search.is_empty() {
+            Self::Empty
+        } else if search.is_ascii() {
+            Self::Ascii(search.as_bytes())
+        } else {
+            Self::Unicode(search.to_lowercase())
+        }
+    }
+
+    fn matches(&self, haystack: &str) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Ascii(needle) => contains_ignore_ascii_case(haystack.as_bytes(), needle),
+            Self::Unicode(needle) => haystack.to_lowercase().contains(needle.as_str()),
+        }
+    }
+}
+
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let first = needle[0].to_ascii_lowercase();
+    let last = haystack.len() - needle.len();
+    for start in 0..=last {
+        if haystack[start].to_ascii_lowercase() == first
+            && haystack[start..start + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

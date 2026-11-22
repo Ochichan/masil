@@ -8,10 +8,15 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    path::Path,
-    sync::{Arc, Mutex},
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
 
 #[derive(Clone, Serialize)]
@@ -33,26 +38,157 @@ struct Cached {
     error: Option<String>,
     updated: Instant,
 }
-type PollResult = (String, String, Result<(String, Vec<Agent>), String>);
-#[derive(Default)]
+pub(crate) type PollResult = (String, String, Result<(String, Vec<Agent>), String>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PathStamp {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl PathStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        Some(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mode: meta.mode(),
+            uid: meta.uid(),
+            len: meta.len(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        })
+    }
+}
+
+struct EndpointsCache {
+    path: PathBuf,
+    dir_stamp: Option<PathStamp>,
+    file_stamp: Option<PathStamp>,
+    endpoints: Vec<Endpoint>,
+}
+
+struct CompletionSender {
+    id: String,
+    fingerprint: String,
+    tx: mpsc::UnboundedSender<PollResult>,
+    cancelled: Arc<AtomicBool>,
+    sent: bool,
+}
+
+impl CompletionSender {
+    fn send(mut self, result: Result<(String, Vec<Agent>), String>) {
+        self.sent = true;
+        if !self.cancelled.load(Ordering::Acquire) {
+            let _ = self.tx.send((
+                std::mem::take(&mut self.id),
+                std::mem::take(&mut self.fingerprint),
+                result,
+            ));
+        }
+    }
+}
+
+impl Drop for CompletionSender {
+    fn drop(&mut self) {
+        if !self.sent && !self.cancelled.load(Ordering::Acquire) {
+            let _ = self.tx.send((
+                std::mem::take(&mut self.id),
+                std::mem::take(&mut self.fingerprint),
+                Err("job_failed: inventory task panicked".to_owned()),
+            ));
+        }
+    }
+}
+
 struct State {
     cache: HashMap<String, Cached>,
-    pending: HashMap<String, (String, AbortHandle)>,
-    work: JoinSet<PollResult>,
+    pending: HashMap<String, (String, AbortHandle, Arc<AtomicBool>)>,
+    work: JoinSet<()>,
+    completed_tx: mpsc::UnboundedSender<PollResult>,
+    completed_rx: Option<mpsc::UnboundedReceiver<PollResult>>,
+    endpoints_cache: Option<EndpointsCache>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        let (completed_tx, completed_rx) = mpsc::unbounded_channel();
+        Self {
+            cache: HashMap::new(),
+            pending: HashMap::new(),
+            work: JoinSet::new(),
+            completed_tx,
+            completed_rx: Some(completed_rx),
+            endpoints_cache: None,
+        }
+    }
 }
 impl State {
+    /// Applies one completed poll result if it still matches an active endpoint.
+    fn apply_result(&mut self, done: PollResult, endpoints: &[Endpoint]) {
+        let (id, fingerprint, result) = done;
+        if id != "local" && !endpoints.iter().any(|e| e.enabled && key(e) == fingerprint) {
+            return;
+        }
+        // Drop stale results from an aborted earlier generation of this endpoint.
+        if self
+            .pending
+            .get(&id)
+            .is_some_and(|(expected, _, _)| *expected != fingerprint)
+        {
+            return;
+        }
+        self.pending.remove(&id);
+        match result {
+            Ok((boot, agents)) => {
+                self.cache.insert(
+                    id,
+                    Cached {
+                        key: fingerprint,
+                        boot,
+                        agents,
+                        error: None,
+                        updated: Instant::now(),
+                    },
+                );
+            }
+            Err(error) => {
+                let entry = self.cache.entry(id).or_insert_with(|| Cached {
+                    key: fingerprint.clone(),
+                    boot: String::new(),
+                    agents: Vec::new(),
+                    error: None,
+                    updated: Instant::now(),
+                });
+                if entry.key != fingerprint {
+                    entry.agents.clear();
+                    entry.boot.clear();
+                    entry.key = fingerprint;
+                }
+                entry.error = Some(error);
+                entry.updated = Instant::now();
+            }
+        }
+    }
+
     /// Ends the pending poll of the task that died without a result, and
     /// keeps `error` as that endpoint's error.
+    #[cfg(test)]
     fn task_failed(&mut self, task: tokio::task::Id, error: String) {
         let Some(id) = self
             .pending
             .iter()
-            .find(|(_, (_, handle))| handle.id() == task)
+            .find(|(_, (_, handle, _))| handle.id() == task)
             .map(|(id, _)| id.clone())
         else {
             return;
         };
-        let Some((fingerprint, _)) = self.pending.remove(&id) else {
+        let Some((fingerprint, _, _)) = self.pending.remove(&id) else {
             return;
         };
         let entry = self.cache.entry(id).or_insert_with(|| Cached {
@@ -118,110 +254,129 @@ impl Fleet {
             .ok_or("target_absent: unknown or disabled endpoint")?;
         Ok(key(&endpoint))
     }
+    /// Hands off the completion stream so the management desk wakes the instant
+    /// any local or remote poll finishes instead of waiting for the next 1 s tick.
+    pub(crate) fn take_updates(&self) -> Option<mpsc::UnboundedReceiver<PollResult>> {
+        self.state.lock().ok()?.completed_rx.take()
+    }
+
+    /// Loads endpoints, skipping file open and JSON parse when the config file
+    /// and its parent directory stat stamps are unchanged.
+    fn load_endpoints(&self) -> Result<Vec<Endpoint>, String> {
+        let path = endpoints::config_root().map(|root| root.join("masil/endpoints.json"));
+        if let Some(ref path) = path {
+            let dir_stamp = path.parent().and_then(PathStamp::of);
+            let file_stamp = PathStamp::of(path);
+            if let Ok(state) = self.state.lock()
+                && let Some(cached) = &state.endpoints_cache
+                && cached.path == *path
+                && cached.dir_stamp == dir_stamp
+                && cached.file_stamp == file_stamp
+            {
+                return Ok(cached.endpoints.clone());
+            }
+            let loaded = endpoints::load()?;
+            if let Ok(mut state) = self.state.lock() {
+                state.endpoints_cache = Some(EndpointsCache {
+                    path: path.clone(),
+                    dir_stamp,
+                    file_stamp,
+                    endpoints: loaded.clone(),
+                });
+            }
+            return Ok(loaded);
+        }
+        endpoints::load()
+    }
+
+    /// Applies one completed poll result immediately and builds an updated snapshot.
+    pub(crate) fn finish_poll(&self, done: PollResult) -> Result<FleetSnapshot, String> {
+        let endpoints = self.load_endpoints()?;
+        let mut state = self.state.lock().map_err(|_| "fleet state unavailable")?;
+        // Reap finished JoinSet handles without blocking.
+        while state.work.try_join_next().is_some() {}
+        state.apply_result(done, &endpoints);
+        Self::build_snapshot(&state, &endpoints)
+    }
+
     pub async fn poll(&self) -> Result<FleetSnapshot, String> {
-        let endpoints = endpoints::load()?;
+        let endpoints = self.load_endpoints()?;
         {
             let mut state = self.state.lock().map_err(|_| "fleet state unavailable")?;
             state
                 .cache
                 .retain(|id, _| id == "local" || endpoints.iter().any(|e| e.id == *id));
-            state.pending.retain(|id, (old, handle)| {
+            state.pending.retain(|id, (old, handle, cancelled)| {
                 let keep = id == "local"
                     || endpoints
                         .iter()
                         .any(|e| e.id == *id && e.enabled && key(e) == *old);
                 if !keep {
+                    cancelled.store(true, Ordering::Release);
                     handle.abort();
                 }
                 keep
             });
-            while let Some(completed) = state.work.try_join_next_with_id() {
-                let (id, fingerprint, result) = match completed {
-                    Ok((_, done)) => done,
-                    Err(error) => {
-                        // A panicked task has no result. Drop its pending
-                        // mark and record the failure, or the endpoint is
-                        // never polled again.
-                        state.task_failed(
-                            error.id(),
-                            format!("job_failed: inventory task failed: {error}"),
-                        );
-                        continue;
-                    }
-                };
-                if id != "local" && !endpoints.iter().any(|e| e.enabled && key(e) == fingerprint) {
-                    continue;
+            while state.work.try_join_next().is_some() {}
+            let mut ready = Vec::new();
+            if let Some(rx) = &mut state.completed_rx {
+                while let Ok(done) = rx.try_recv() {
+                    ready.push(done);
                 }
-                state.pending.remove(&id);
-                match result {
-                    Ok((boot, agents)) => {
-                        state.cache.insert(
-                            id,
-                            Cached {
-                                key: fingerprint,
-                                boot,
-                                agents,
-                                error: None,
-                                updated: Instant::now(),
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        let entry = state.cache.entry(id).or_insert_with(|| Cached {
-                            key: fingerprint.clone(),
-                            boot: String::new(),
-                            agents: Vec::new(),
-                            error: None,
-                            updated: Instant::now(),
-                        });
-                        if entry.key != fingerprint {
-                            entry.agents.clear();
-                            entry.boot.clear();
-                            entry.key = fingerprint;
-                        }
-                        entry.error = Some(error);
-                        entry.updated = Instant::now();
-                    }
-                }
+            }
+            for done in ready {
+                state.apply_result(done, &endpoints);
             }
             for endpoint in &endpoints {
                 if endpoint.enabled && !state.pending.contains_key(&endpoint.id) {
                     let request_endpoint = endpoint.clone();
                     let local = self.local.native.socket.clone();
+                    let fingerprint = key(endpoint);
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    let sender = CompletionSender {
+                        id: request_endpoint.id.clone(),
+                        fingerprint: fingerprint.clone(),
+                        tx: state.completed_tx.clone(),
+                        cancelled: cancelled.clone(),
+                        sent: false,
+                    };
                     let handle = state.work.spawn(async move {
                         let result = request_endpoint
                             .call_through(&Request::List, Some(&local))
                             .await
                             .and_then(parse_inventory);
-                        let fingerprint = key(&request_endpoint);
-                        (request_endpoint.id, fingerprint, result)
+                        sender.send(result);
                     });
                     state
                         .pending
-                        .insert(endpoint.id.clone(), (key(endpoint), handle));
+                        .insert(endpoint.id.clone(), (fingerprint, handle, cancelled));
                 }
             }
             if !state.pending.contains_key("local") {
                 let local = self.local.clone();
                 let view = self.local_view.clone();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let sender = CompletionSender {
+                    id: "local".to_owned(),
+                    fingerprint: "local".to_owned(),
+                    tx: state.completed_tx.clone(),
+                    cancelled: cancelled.clone(),
+                    sent: false,
+                };
                 let handle = state.work.spawn(async move {
-                    let result = async {
-                        let before = local.boot().await?;
-                        let agents = local.list_view_for(view.as_deref()).await?;
-                        if before != local.boot().await? {
-                            return Err("native server restarted during inventory".to_owned());
-                        }
-                        Ok((before, agents))
-                    }
-                    .await;
-                    ("local".to_owned(), "local".to_owned(), result)
+                    let result = local.list_view_with_boot(view.as_deref()).await;
+                    sender.send(result);
                 });
                 state
                     .pending
-                    .insert("local".into(), ("local".into(), handle));
+                    .insert("local".into(), ("local".into(), handle, cancelled));
             }
         }
         let state = self.state.lock().map_err(|_| "fleet state unavailable")?;
+        Self::build_snapshot(&state, &endpoints)
+    }
+
+    fn build_snapshot(state: &State, endpoints: &[Endpoint]) -> Result<FleetSnapshot, String> {
         let mut agents = Vec::new();
         let mut statuses = Vec::new();
         let mut epoch = Vec::new();
@@ -830,7 +985,10 @@ mod tests {
         let mut state = State::default();
         let handle = state.work.spawn(async { panic!("poll task panic") });
         let task = handle.id();
-        state.pending.insert("edge".into(), ("key".into(), handle));
+        state.pending.insert(
+            "edge".into(),
+            ("key".into(), handle, Arc::new(AtomicBool::new(false))),
+        );
         let (_, joined) = state
             .work
             .join_next_with_id()
@@ -969,5 +1127,114 @@ mod tests {
             connection_command(&endpoint, &agent, &"0".repeat(32)).unwrap_err(),
             "invalid_argument: the connection window name contains '#'"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_poll_delivers_immediately_via_update_channel() {
+        let mut state = State::default();
+        let mut rx = state.completed_rx.take().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let sender = CompletionSender {
+            id: "local".into(),
+            fingerprint: "local".into(),
+            tx: state.completed_tx.clone(),
+            cancelled: cancelled.clone(),
+            sent: false,
+        };
+        let (_, agents) = parse_inventory(inventory(|_| {})).unwrap();
+        let handle = state.work.spawn(async move {
+            sender.send(Ok((BOOT.to_owned(), agents)));
+        });
+        state
+            .pending
+            .insert("local".into(), ("local".into(), handle, cancelled));
+        // Receive directly from the channel without waiting for a second poll tick.
+        let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("immediate update")
+            .expect("channel open");
+        state.apply_result(done, &[]);
+        assert!(state.pending.is_empty());
+        let cached = &state.cache["local"];
+        assert_eq!(cached.boot, BOOT);
+        assert_eq!(cached.agents.len(), 1);
+        assert!(cached.error.is_none());
+        let snapshot = Fleet::build_snapshot(&state, &[]).unwrap();
+        assert_eq!(snapshot.agents.len(), 1);
+        assert!(snapshot.endpoints[0].connected);
+    }
+
+    #[tokio::test]
+    async fn a_panicked_completion_sender_reports_failure_and_clears_pending() {
+        let mut state = State::default();
+        let mut rx = state.completed_rx.take().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let sender = CompletionSender {
+            id: "edge".into(),
+            fingerprint: "fp".into(),
+            tx: state.completed_tx.clone(),
+            cancelled: cancelled.clone(),
+            sent: false,
+        };
+        let handle = state.work.spawn(async move {
+            let _guard = sender;
+            panic!("simulated poll panic");
+        });
+        state
+            .pending
+            .insert("edge".into(), ("fp".into(), handle, cancelled));
+        let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("panic notification")
+            .expect("channel open");
+        assert_eq!(done.0, "edge");
+        assert!(done.2.as_ref().unwrap_err().starts_with("job_failed:"));
+        // A cancelled sender emits nothing when dropped.
+        let cancelled = Arc::new(AtomicBool::new(true));
+        drop(CompletionSender {
+            id: "edge".into(),
+            fingerprint: "fp".into(),
+            tx: state.completed_tx.clone(),
+            cancelled,
+            sent: false,
+        });
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn server_restart_during_inventory_is_rejected() {
+        let other = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        assert!(super::super::view::verify_boot_unchanged(BOOT, Some(BOOT), None).is_ok());
+        assert!(super::super::view::verify_boot_unchanged(BOOT, Some(BOOT), Some(BOOT)).is_ok());
+        assert_eq!(
+            super::super::view::verify_boot_unchanged(BOOT, Some(other), None).unwrap_err(),
+            "native server restarted during inventory"
+        );
+        assert_eq!(
+            super::super::view::verify_boot_unchanged(BOOT, Some(BOOT), Some(other)).unwrap_err(),
+            "native server restarted during inventory"
+        );
+        // Applying a restart error marks local disconnected so stale rows cannot act.
+        let mut state = State::default();
+        let (_, agents) = parse_inventory(inventory(|_| {})).unwrap();
+        state.apply_result(
+            ("local".into(), "local".into(), Ok((BOOT.into(), agents))),
+            &[],
+        );
+        state.apply_result(
+            (
+                "local".into(),
+                "local".into(),
+                Err("native server restarted during inventory".into()),
+            ),
+            &[],
+        );
+        let snapshot = Fleet::build_snapshot(&state, &[]).unwrap();
+        assert!(!snapshot.endpoints[0].connected);
+        assert_eq!(
+            snapshot.endpoints[0].error.as_deref(),
+            Some("native server restarted during inventory")
+        );
+        assert!(snapshot.agents.iter().all(|agent| agent.stale));
     }
 }

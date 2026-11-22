@@ -2,12 +2,12 @@
 
 use super::catalog::{SETTINGS, Scope, Setting, UI_KEY};
 use super::store::{self, LAYER};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_LIMIT: u64 = 256 * 1024;
@@ -96,7 +96,7 @@ impl Server {
     ) -> Result<(bool, String, String), String> {
         // -u keeps UTF-8 output, which some list formats rely on, without a
         // UTF-8 locale.
-        let mut child = Command::new(&self.binary)
+        let child = Command::new(&self.binary)
             .arg("-u")
             .arg("-S")
             .arg(&self.socket)
@@ -106,37 +106,18 @@ impl Server {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("cannot run masil: {error}"))?;
-        let mut stdout = child.stdout.take().ok_or("masil output unavailable")?;
-        let mut stderr = child.stderr.take().ok_or("masil output unavailable")?;
-        let out = std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = (&mut stdout).take(OUTPUT_LIMIT).read_to_string(&mut text);
-            text
-        });
-        let err = std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = (&mut stderr).take(OUTPUT_LIMIT).read_to_string(&mut text);
-            text
-        });
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let status = loop {
-            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-                break status;
-            }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                let _ = child.kill();
-                let _ = child.wait();
-                // The pipes close with the child, so the readers end; a
-                // caller that forks next must not leave them running.
-                let _ = out.join();
-                let _ = err.join();
-                return Err(format!("{NO_ANSWER}: {}", args.join(" ")));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let out = out.join().unwrap_or_default();
-        let err = err.join().unwrap_or_default();
-        Ok((status.success(), out, err))
+        let captured = crate::process::capture_child(child, timeout, OUTPUT_LIMIT as usize)
+            .map_err(|error| match error {
+                crate::process::CaptureError::Timeout => {
+                    format!("{NO_ANSWER}: {}", args.join(" "))
+                }
+                crate::process::CaptureError::Io(error) => error.to_string(),
+            })?;
+        Ok((
+            captured.status.success(),
+            crate::process::into_string_lossy(captured.stdout),
+            crate::process::into_string_lossy(captured.stderr),
+        ))
     }
 
     /// The global value of an option, or None when it is unset.

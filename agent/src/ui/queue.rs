@@ -57,6 +57,7 @@ pub(super) struct QueueWindow {
     editor_top: usize,
     notice: Option<String>,
     hits: Vec<(Rect, Hit)>,
+    hover: Option<Hit>,
     pressed: Option<Hit>,
 }
 
@@ -88,7 +89,7 @@ enum Mode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Hit {
+pub(super) enum Hit {
     Row(usize),
     Key(KeyCode),
 }
@@ -122,8 +123,13 @@ impl QueueWindow {
             editor_top: 0,
             notice: None,
             hits: Vec::new(),
+            hover: None,
             pressed: None,
         }
+    }
+
+    pub(super) fn hover(&self) -> Option<Hit> {
+        self.hover
     }
 
     fn word(&self, english: &'static str, korean: &'static str) -> &'static str {
@@ -290,14 +296,18 @@ impl QueueWindow {
                             && mouse.row < rect.bottom()
                     })
                     .map(|(_, hit)| *hit);
-                if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                    self.pressed = target;
-                    return QueueOutcome::None;
-                }
-                if !matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
-                    || self.pressed.take() != target
-                {
-                    return QueueOutcome::None;
+                match mouse.kind {
+                    MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                        self.hover = target;
+                        return QueueOutcome::None;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.pressed = target;
+                        return QueueOutcome::None;
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if self.pressed.take() == target => {}
+                    MouseEventKind::Up(MouseButton::Left) => return QueueOutcome::None,
+                    _ => return QueueOutcome::None,
                 }
                 match target {
                     Some(Hit::Row(index)) if matches!(self.mode, Mode::List) => {
@@ -798,7 +808,9 @@ impl QueueWindow {
             width,
             height,
         );
-        let (panel, text, muted, accent, accent_text) = dialog_colors(theme);
+        let palette = super::view::Palette::for_theme(theme);
+        let (panel, text, _, accent, accent_text) = dialog_colors(theme);
+        let muted_style = palette.muted_style().bg(panel);
         frame.render_widget(Clear, modal);
         let title = format!(
             " {} · {} ",
@@ -832,10 +844,18 @@ impl QueueWindow {
                     break;
                 }
                 let selected = index == self.selected;
+                let hovered = self.hover == Some(Hit::Row(index));
                 let style = if selected {
-                    Style::default().fg(accent_text).bg(accent)
+                    Style::default()
+                        .fg(accent_text)
+                        .bg(accent)
+                        .add_modifier(Modifier::BOLD)
+                } else if hovered {
+                    Style::default()
+                        .fg(if entry.held { palette.muted } else { text })
+                        .bg(palette.raised_fill())
                 } else if entry.held {
-                    Style::default().fg(muted).bg(panel)
+                    muted_style
                 } else {
                     Style::default().fg(text).bg(panel)
                 };
@@ -844,6 +864,9 @@ impl QueueWindow {
                     Paragraph::new(ellipsize(&self.row(entry), text_width)).style(style),
                     rect,
                 );
+                if !selected && hovered {
+                    palette.raise(frame, rect);
+                }
                 hits.push((rect, Hit::Row(index)));
                 y += 1;
             }
@@ -869,11 +892,11 @@ impl QueueWindow {
                 break;
             }
             frame.render_widget(
-                Paragraph::new(line).style(
-                    Style::default()
-                        .fg(if quiet { muted } else { text })
-                        .bg(panel),
-                ),
+                Paragraph::new(line).style(if quiet {
+                    muted_style
+                } else {
+                    Style::default().fg(text).bg(panel)
+                }),
                 Rect::new(inner.x, y, inner.width, 1),
             );
             y += 1;
@@ -893,7 +916,7 @@ impl QueueWindow {
             "본문은 지울 때까지 이 기기의 operation store에 남습니다.",
         );
         frame.render_widget(
-            Paragraph::new(ellipsize(keep, text_width)).style(Style::default().fg(muted).bg(panel)),
+            Paragraph::new(ellipsize(keep, text_width)).style(muted_style),
             Rect::new(inner.x, modal.bottom().saturating_sub(3), inner.width, 1),
         );
         let button_y = modal.bottom().saturating_sub(2);
@@ -921,17 +944,37 @@ impl QueueWindow {
                 break;
             }
             let rect = Rect::new(right - label_width, button_y, label_width, 1);
-            let style = if index == last {
-                Style::default()
-                    .bg(accent)
-                    .fg(accent_text)
-                    .add_modifier(Modifier::BOLD)
+            let clickable = code != KeyCode::Null;
+            let hit = Hit::Key(code);
+            let is_pressed = clickable && self.pressed == Some(hit);
+            let is_hovered = clickable && self.hover == Some(hit);
+            let (style, raised) = if !clickable {
+                (muted_style, false)
+            } else if is_pressed {
+                (
+                    Style::default()
+                        .bg(palette.warning)
+                        .fg(accent_text)
+                        .add_modifier(Modifier::BOLD),
+                    false,
+                )
+            } else if index == last || is_hovered {
+                (
+                    Style::default()
+                        .bg(accent)
+                        .fg(accent_text)
+                        .add_modifier(Modifier::BOLD),
+                    false,
+                )
             } else {
-                Style::default().fg(text).bg(panel)
+                (Style::default().fg(text).bg(palette.raised_fill()), true)
             };
             frame.render_widget(Paragraph::new(label).style(style), rect);
-            if code != KeyCode::Null {
-                hits.push((rect, Hit::Key(code)));
+            if raised {
+                palette.raise(frame, rect);
+            }
+            if clickable {
+                hits.push((rect, hit));
             }
             right = rect.x.saturating_sub(1);
         }

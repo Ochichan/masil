@@ -239,6 +239,76 @@ impl Manager {
         }
     }
 
+    /// Reads the server boot ID, active saved view, and pane inventory in one
+    /// atomic tmux invocation when possible, reducing steady-state polling to a
+    /// single subprocess spawn. If follow-up commands (captures or tracked
+    /// writes) ran, verifies the server boot ID again afterwards and rejects on
+    /// restart.
+    pub(crate) async fn list_view_with_boot(
+        &self,
+        view: Option<&str>,
+    ) -> Result<(String, Vec<Agent>), String> {
+        let (before, saved_view, initial) = match view {
+            Some(text) => {
+                let parsed_view = client_view_from_text(text)?;
+                let output = self
+                    .command(&[
+                        "display-message",
+                        "-p",
+                        "#{masil_core_boot_id}",
+                        ";",
+                        "list-panes",
+                        "-a",
+                        "-F",
+                        super::FORMAT,
+                    ])
+                    .await?;
+                let (header, listing) = split_header_line(&output)?;
+                let before = super::valid_boot(header.trim())?.to_owned();
+                let initial = super::Manager::parse_inventory_text(listing)?;
+                (before, parsed_view, initial)
+            }
+            None => {
+                const VIEW_END: &str = "==masil-view-end==";
+                let output = self
+                    .command(&[
+                        "display-message",
+                        "-p",
+                        "#{masil_core_boot_id}",
+                        ";",
+                        "show-options",
+                        "-gqv",
+                        OPTION,
+                        ";",
+                        "display-message",
+                        "-p",
+                        VIEW_END,
+                        ";",
+                        "list-panes",
+                        "-a",
+                        "-F",
+                        super::FORMAT,
+                    ])
+                    .await?;
+                let (boot_part, rest) = split_header_line(&output)?;
+                let before = super::valid_boot(boot_part.trim())?.to_owned();
+                let (view_part, listing) = split_sentinel_section(rest, VIEW_END)?;
+                let parsed_view = view_from_text(view_part)?;
+                let initial = super::Manager::parse_inventory_text(listing)?;
+                (before, parsed_view, initial)
+            }
+        };
+        let (agents, inventory_boot, multi_command) =
+            self.collect_with_initial_inventory(initial).await?;
+        let after = if multi_command {
+            Some(self.boot().await?)
+        } else {
+            None
+        };
+        verify_boot_unchanged(&before, inventory_boot.as_deref(), after.as_deref())?;
+        Ok((before, apply_view(&saved_view, agents)))
+    }
+
     pub async fn list_view(&self) -> Result<Vec<Agent>, String> {
         let view = self.load_view().await?;
         Ok(apply_view(&view, self.list().await?))
@@ -248,6 +318,41 @@ impl Manager {
         let encoded = self.command(&["show-options", "-gqv", OPTION]).await?;
         view_from_text(&encoded)
     }
+}
+
+fn split_header_line(output: &str) -> Result<(&str, &str), String> {
+    match output.split_once('\n') {
+        Some((header, rest)) => Ok((header, rest)),
+        None => Ok((output, "")),
+    }
+}
+
+fn split_sentinel_section<'a>(
+    output: &'a str,
+    sentinel: &str,
+) -> Result<(&'a str, &'a str), String> {
+    if let Some(rest) = output.strip_prefix(sentinel) {
+        let rest = rest.strip_prefix('\n').unwrap_or(rest);
+        return Ok(("", rest));
+    }
+    let marker = format!("\n{sentinel}");
+    let (before, after) = output
+        .split_once(&marker)
+        .ok_or("invalid native view section header")?;
+    let after = after.strip_prefix('\n').unwrap_or(after);
+    Ok((before, after))
+}
+
+pub(crate) fn verify_boot_unchanged(
+    before: &str,
+    inventory_boot: Option<&str>,
+    after: Option<&str>,
+) -> Result<(), String> {
+    if inventory_boot.is_some_and(|boot| boot != before) || after.is_some_and(|boot| boot != before)
+    {
+        return Err("native server restarted during inventory".to_owned());
+    }
+    Ok(())
 }
 
 /// The saved view an option value holds; the default view when it is empty.
@@ -572,5 +677,22 @@ mod tests {
         assert!(priority("unknown") < priority("exited"));
         assert!(pane_number("%9") < pane_number("%10"));
         assert_eq!(pane_number("bad"), u64::MAX);
+    }
+
+    #[test]
+    fn sentinel_section_splits_empty_and_encoded_views() {
+        assert_eq!(
+            split_sentinel_section("==end==\n%1\tline\n", "==end==").unwrap(),
+            ("", "%1\tline\n")
+        );
+        assert_eq!(
+            split_sentinel_section("hexview\n==end==\n%1\tline\n", "==end==").unwrap(),
+            ("hexview", "%1\tline\n")
+        );
+        assert_eq!(
+            split_sentinel_section("==end==\n", "==end==").unwrap(),
+            ("", "")
+        );
+        assert!(split_sentinel_section("no marker here", "==end==").is_err());
     }
 }

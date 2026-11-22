@@ -213,7 +213,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                 return Err("a background task panicked; the desk closed".into());
             }
             if app.dirty {
-                terminal.terminal().draw(|frame| app.draw(frame)).map_err(|e| e.to_string())?;
+                terminal.draw(|frame| app.draw(frame)).map_err(|e| e.to_string())?;
                 app.dirty = false;
             }
             let effects = tokio::select! {

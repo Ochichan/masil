@@ -1135,14 +1135,19 @@ impl Manager {
         self.inventory_text().await.map(|(records, _)| records)
     }
 
-    /// The inventory and the text of `list-panes` it was parsed from.
-    async fn inventory_text(&self) -> Result<(Vec<Vec<String>>, String), String> {
-        let output = self.command(&["list-panes", "-a", "-F", FORMAT]).await?;
-        let records = distinct_panes(records(&output)?);
+    /// Parses raw `list-panes -a -F FORMAT` output into distinct bounded pane records.
+    pub(super) fn parse_inventory_text(output: &str) -> Result<(Vec<Vec<String>>, String), String> {
+        let records = distinct_panes(records(output)?);
         if records.len() > MAX_PANES {
             return Err("agent management supports at most 64 panes per server".into());
         }
-        Ok((records, output))
+        Ok((records, output.to_owned()))
+    }
+
+    /// The inventory and the text of `list-panes` it was parsed from.
+    async fn inventory_text(&self) -> Result<(Vec<Vec<String>>, String), String> {
+        let output = self.command(&["list-panes", "-a", "-F", FORMAT]).await?;
+        Self::parse_inventory_text(&output)
     }
 
     async fn capture_cache_misses(
@@ -1434,24 +1439,19 @@ impl Manager {
         Ok((agents, text))
     }
 
-    async fn collect_with_bridge_scope(
+    /// Runs `collect` starting from an already-fetched `list-panes` snapshot.
+    /// Returns `(agents, core_boot_id, multi_command)` where `multi_command` is
+    /// true whenever any follow-up native command ran after that initial listing.
+    pub(super) async fn collect_with_initial_inventory(
         &self,
-        target: Option<&str>,
-        read_only: bool,
-    ) -> Result<(Vec<Agent>, HashSet<String>, Option<String>, bool), String> {
+        initial: (Vec<Vec<String>>, String),
+    ) -> Result<(Vec<Agent>, Option<String>, bool), String> {
+        let mut initial = Some(initial);
         let mut retried = false;
         loop {
-            let result = self.collect_once(target, read_only).await;
+            let result = self.collect_once(None, false, initial.take()).await;
             let lost = match &result {
-                Ok((agents, uncommitted, _, _, _)) => uncommitted.iter().any(|pane| match target {
-                    None => true,
-                    Some(target) => {
-                        pane == target
-                            || agents
-                                .iter()
-                                .any(|agent| &agent.pane_id == pane && agent.name == target)
-                    }
-                }),
+                Ok((_, uncommitted, _, _, _, _)) => !uncommitted.is_empty(),
                 Err(error) => error.starts_with("identity_mismatch"),
             };
             if lost && !retried {
@@ -1460,19 +1460,57 @@ impl Manager {
             }
             return match result {
                 Ok(_) if lost => Err(TRACKED_LOST.into()),
-                result => result.map(|(agents, _, bridge_scope, core_boot_id, inbox_changed)| {
-                    (agents, bridge_scope, core_boot_id, inbox_changed)
+                result => result.map(|(agents, _, _, core_boot_id, _, had_secondary)| {
+                    (agents, core_boot_id, retried || had_secondary)
                 }),
             };
         }
     }
 
+    async fn collect_with_bridge_scope(
+        &self,
+        target: Option<&str>,
+        read_only: bool,
+    ) -> Result<(Vec<Agent>, HashSet<String>, Option<String>, bool), String> {
+        let mut retried = false;
+        loop {
+            let result = self.collect_once(target, read_only, None).await;
+            let lost = match &result {
+                Ok((agents, uncommitted, _, _, _, _)) => {
+                    uncommitted.iter().any(|pane| match target {
+                        None => true,
+                        Some(target) => {
+                            pane == target
+                                || agents
+                                    .iter()
+                                    .any(|agent| &agent.pane_id == pane && agent.name == target)
+                        }
+                    })
+                }
+                Err(error) => error.starts_with("identity_mismatch"),
+            };
+            if lost && !retried {
+                retried = true;
+                continue;
+            }
+            return match result {
+                Ok(_) if lost => Err(TRACKED_LOST.into()),
+                result => result.map(
+                    |(agents, _, bridge_scope, core_boot_id, inbox_changed, _)| {
+                        (agents, bridge_scope, core_boot_id, inbox_changed)
+                    },
+                ),
+            };
+        }
+    }
+
     /// One pass of `collect`; also returns the panes whose tracked write did
-    /// not commit.
+    /// not commit and whether any follow-up native command ran after listing.
     async fn collect_once(
         &self,
         target: Option<&str>,
         read_only: bool,
+        initial: Option<(Vec<Vec<String>>, String)>,
     ) -> Result<
         (
             Vec<Agent>,
@@ -1480,10 +1518,14 @@ impl Manager {
             HashSet<String>,
             Option<String>,
             bool,
+            bool,
         ),
         String,
     > {
-        let (mut inventory, inventory_text) = self.inventory_text().await?;
+        let (mut inventory, inventory_text) = match initial {
+            Some(existing) => existing,
+            None => self.inventory_text().await?,
+        };
         validate_inventory(&inventory)?;
         if let Some(queries) = &self.queries {
             *queries
@@ -1511,6 +1553,9 @@ impl Manager {
         let mut prepared = self
             .capture_cache_misses(&inventory, &identified, target)
             .await?;
+        let captured_any = prepared
+            .values()
+            .any(|item| matches!(item, PreparedEvidence::Screen(_)));
         // Whether some pane is in a column window, which a full pass needs
         // to settle `@masil-attention`. Read here because the loop below
         // consumes the inventory.
@@ -1924,12 +1969,15 @@ impl Manager {
                 .filter(|agent| agent.bridge_watchable())
                 .map(|agent| agent.pane_id.clone()),
         );
+        let had_secondary = captured_any
+            || (!read_only && (!tracked_groups.is_empty() || !epoch_groups.is_empty()));
         Ok((
             agents,
             uncommitted,
             bridge_scope,
             core_boot_id,
             inbox_changed,
+            had_secondary,
         ))
     }
 
@@ -3761,7 +3809,7 @@ impl Agent {
 
     /// The desk's binding label. Rows from an endpoint without run evidence
     /// keep the configured-but-unverified wording.
-    fn binding_label(&self) -> &'static str {
+    pub(crate) fn binding_label(&self) -> &'static str {
         match self.binding.state.as_str() {
             "reported" if self.binding.origin.is_some() => "managed_reported_origin",
             "reported" => "managed_reported",
@@ -3778,6 +3826,7 @@ impl Agent {
         self.state == "blocked" || self.returned_idle
     }
 
+    #[cfg(test)]
     pub fn projection(&self) -> Value {
         let blocked = self.state == "blocked";
         // Counts come from the provider's own server or the requests its hooks

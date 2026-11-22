@@ -50,7 +50,7 @@ pub(super) struct Item {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hit {
+pub(super) enum Hit {
     Item(usize),
     Close,
     Surface,
@@ -67,6 +67,8 @@ pub(super) struct Palette {
     /// The agent that agent actions apply to.
     context: Option<String>,
     query: String,
+    /// Grapheme distance from the end of `query` (0 = caret at end).
+    cursor_from_end: usize,
     items: Vec<Item>,
     /// Indices into `items`, ranked for the current query.
     shown: Vec<usize>,
@@ -77,7 +79,7 @@ pub(super) struct Palette {
     hits: Vec<(Rect, Hit)>,
     modal: Rect,
     pressed: Option<(Option<Hit>, Instant)>,
-    hover: Option<usize>,
+    hover: Option<Hit>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,6 +102,7 @@ impl Palette {
             language,
             context,
             query: String::new(),
+            cursor_from_end: 0,
             items,
             shown: Vec::new(),
             selected: 0,
@@ -179,8 +182,21 @@ impl Palette {
         self.scroll = 0;
     }
 
+    fn cursor_grapheme(&self) -> usize {
+        let count = self.query.graphemes(true).count();
+        count.saturating_sub(self.cursor_from_end.min(count))
+    }
+
+    fn grapheme_byte_offset(&self, grapheme_index: usize) -> usize {
+        self.query
+            .grapheme_indices(true)
+            .nth(grapheme_index)
+            .map_or(self.query.len(), |(offset, _)| offset)
+    }
+
     fn insert(&mut self, text: &str) {
         let before = self.query.len();
+        let mut cursor = self.cursor_grapheme();
         for grapheme in text.graphemes(true) {
             if grapheme.chars().any(char::is_control)
                 || self.query.graphemes(true).count() >= QUERY_GRAPHEMES
@@ -188,9 +204,13 @@ impl Palette {
             {
                 continue;
             }
-            self.query.push_str(grapheme);
+            let at = self.grapheme_byte_offset(cursor);
+            self.query.insert_str(at, grapheme);
+            cursor += 1;
         }
         if self.query.len() != before {
+            let count = self.query.graphemes(true).count();
+            self.cursor_from_end = count.saturating_sub(cursor);
             self.rank();
         }
     }
@@ -218,6 +238,10 @@ impl Palette {
             Some(item) if item.enabled => PaletteResult::Activate(item.target.clone()),
             _ => PaletteResult::None,
         }
+    }
+
+    pub(super) fn hover(&self) -> Option<Hit> {
+        self.hover
     }
 
     pub(super) fn handle(&mut self, event: Event, now: Instant) -> PaletteResult {
@@ -265,7 +289,7 @@ impl Palette {
                     }
                     MouseEventKind::Moved | MouseEventKind::Drag(_) => {
                         self.hover = match target {
-                            Some(Hit::Item(position)) => Some(position),
+                            Some(Hit::Item(_) | Hit::Close) => target,
                             _ => None,
                         };
                     }
@@ -322,9 +346,59 @@ impl Palette {
                 self.reveal();
                 PaletteResult::None
             }
+            KeyCode::Left => {
+                let count = self.query.graphemes(true).count();
+                self.cursor_from_end = (self.cursor_from_end + 1).min(count);
+                PaletteResult::None
+            }
+            KeyCode::Right => {
+                self.cursor_from_end = self.cursor_from_end.saturating_sub(1);
+                PaletteResult::None
+            }
+            KeyCode::Char('a') if control => {
+                self.cursor_from_end = self.query.graphemes(true).count();
+                PaletteResult::None
+            }
+            KeyCode::Char('e') if control => {
+                self.cursor_from_end = 0;
+                PaletteResult::None
+            }
             KeyCode::Backspace => {
-                if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
-                    self.query.truncate(index);
+                let cursor = self.cursor_grapheme();
+                if cursor > 0 {
+                    let start = self.grapheme_byte_offset(cursor - 1);
+                    let end = self.grapheme_byte_offset(cursor);
+                    self.query.replace_range(start..end, "");
+                    self.rank();
+                }
+                PaletteResult::None
+            }
+            KeyCode::Delete => {
+                let cursor = self.cursor_grapheme();
+                let count = self.query.graphemes(true).count();
+                if cursor < count {
+                    let start = self.grapheme_byte_offset(cursor);
+                    let end = self.grapheme_byte_offset(cursor + 1);
+                    self.query.replace_range(start..end, "");
+                    self.cursor_from_end = self.cursor_from_end.saturating_sub(1);
+                    self.rank();
+                }
+                PaletteResult::None
+            }
+            KeyCode::Char('w') if control => {
+                let cursor = self.cursor_grapheme();
+                if cursor > 0 {
+                    let graphemes: Vec<&str> = self.query.graphemes(true).collect();
+                    let mut target = cursor;
+                    while target > 0 && graphemes[target - 1].chars().all(char::is_whitespace) {
+                        target -= 1;
+                    }
+                    while target > 0 && !graphemes[target - 1].chars().all(char::is_whitespace) {
+                        target -= 1;
+                    }
+                    let start = self.grapheme_byte_offset(target);
+                    let end = self.grapheme_byte_offset(cursor);
+                    self.query.replace_range(start..end, "");
                     self.rank();
                 }
                 PaletteResult::None
@@ -332,6 +406,7 @@ impl Palette {
             KeyCode::Char('u') if control => {
                 if !self.query.is_empty() {
                     self.query.clear();
+                    self.cursor_from_end = 0;
                     self.rank();
                 }
                 PaletteResult::None
@@ -381,8 +456,9 @@ impl Palette {
             height,
         );
         self.modal = modal;
+        let palette = super::view::Palette::for_theme(theme);
         let (panel, text, _, accent, accent_text) = super::managed::dialog_colors(theme);
-        let muted = super::view::Palette::for_theme(theme).muted_style();
+        let muted = palette.muted_style();
         frame.render_widget(Clear, modal);
         let inner = Rect::new(
             modal.x + 2,
@@ -411,24 +487,35 @@ impl Palette {
         );
         let close_label = " Esc ";
         let close = Rect::new(modal.right().saturating_sub(7), modal.y, 5, 1);
-        frame.render_widget(
-            Paragraph::new(close_label).style(Style::default().fg(accent).bg(panel)),
-            close,
-        );
+        let close_pressed = self.pressed.is_some_and(|(hit, _)| hit == Some(Hit::Close));
+        let close_hovered = self.hover == Some(Hit::Close);
+        let close_style = if close_pressed {
+            Style::default()
+                .fg(accent_text)
+                .bg(palette.warning)
+                .add_modifier(Modifier::BOLD)
+        } else if close_hovered {
+            Style::default()
+                .fg(accent_text)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(accent).bg(panel)
+        };
+        frame.render_widget(Paragraph::new(close_label).style(close_style), close);
         self.hits.push((close, Hit::Close));
 
-        // Query line: the end of a long query stays visible. The marker
-        // takes two cells and the caret one, so the text gets the rest.
+        // Query line: keep the caret visible whether appending at the end or
+        // editing in the middle. The marker takes two cells and the caret one.
         let count = format!(" {}", self.shown.len());
         let field_width = text_width.saturating_sub(cell_width(&count));
-        let visible = super::managed::tail(&self.query, field_width.saturating_sub(3));
-        // An IME draws its preedit at the terminal cursor, on the caret.
-        let caret = 2 + cell_width(&visible);
-        if caret < field_width {
-            frame.set_cursor_position((inner.x + caret as u16, inner.y));
-        }
-        let query = if self.query.is_empty() {
-            Span::styled(
+        let query_width = field_width.saturating_sub(3);
+        let cursor = self.cursor_grapheme();
+        let query_spans = if self.query.is_empty() {
+            if 2 < field_width {
+                frame.set_cursor_position((inner.x + 2, inner.y));
+            }
+            vec![Span::styled(
                 ellipsize(
                     word(
                         self.language,
@@ -438,18 +525,42 @@ impl Palette {
                     field_width.saturating_sub(2),
                 ),
                 muted,
-            )
+            )]
+        } else if self.cursor_from_end == 0 {
+            let visible = super::managed::tail(&self.query, query_width);
+            let caret = 2 + cell_width(&visible);
+            if caret < field_width {
+                frame.set_cursor_position((inner.x + caret as u16, inner.y));
+            }
+            vec![Span::styled(
+                format!("{visible}▏"),
+                Style::default().fg(text),
+            )]
         } else {
-            Span::styled(format!("{visible}▏"), Style::default().fg(text))
+            let (visible, cursor_x, start) =
+                super::view::search_window(&self.query, cursor, query_width);
+            let rel = cursor.saturating_sub(start);
+            let split_byte = visible
+                .grapheme_indices(true)
+                .nth(rel)
+                .map_or(visible.len(), |(offset, _)| offset);
+            let caret = 2 + cursor_x;
+            if caret < field_width {
+                frame.set_cursor_position((inner.x + caret as u16, inner.y));
+            }
+            vec![
+                Span::styled(visible[..split_byte].to_owned(), Style::default().fg(text)),
+                Span::styled("▏", Style::default().fg(accent)),
+                Span::styled(visible[split_byte..].to_owned(), Style::default().fg(text)),
+            ]
         };
+        let mut query_line = vec![Span::styled(
+            "› ",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )];
+        query_line.extend(query_spans);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "› ",
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-                query,
-            ])),
+            Paragraph::new(Line::from(query_line)),
             Rect::new(inner.x, inner.y, field_width as u16, 1),
         );
         frame.render_widget(
@@ -509,6 +620,8 @@ impl Palette {
                 Rect::new(inner.x, list_top, inner.width, 1),
             );
         }
+        let has_scroll = self.shown.len() > list_height as usize && text_width > 6;
+        let row_text_width = text_width.saturating_sub(usize::from(has_scroll));
         let kind_width = [Kind::Agent, Kind::Pane, Kind::Action]
             .into_iter()
             .map(|kind| cell_width(self.kind_label(kind)))
@@ -521,15 +634,23 @@ impl Palette {
         {
             let item = &self.items[self.shown[position]];
             let y = list_top + row as u16;
-            let rect = Rect::new(modal.x + 1, y, modal.width.saturating_sub(2), 1);
+            let row_width = modal.width.saturating_sub(2 + u16::from(has_scroll));
+            let rect = Rect::new(modal.x + 1, y, row_width, 1);
             let selected = position == self.selected;
+            let hovered = self.hover == Some(Hit::Item(position));
             // A selected entry that cannot run keeps its muted text on the
             // panel. The marker, the underline and the hint show that it is
             // selected and that Enter does nothing now.
             let active = selected && item.enabled;
             let unavailable = selected && !item.enabled;
             let plain = |color| Style::default().fg(color);
-            let bg = if active { accent } else { panel };
+            let bg = if active {
+                accent
+            } else if hovered && item.enabled {
+                palette.raised_fill()
+            } else {
+                panel
+            };
             let label_style = if active {
                 plain(accent_text)
             } else if item.enabled {
@@ -539,7 +660,7 @@ impl Palette {
             };
             let marker = if selected {
                 "›"
-            } else if self.hover == Some(position) {
+            } else if hovered {
                 "·"
             } else {
                 " "
@@ -549,8 +670,8 @@ impl Palette {
             } else {
                 item.hint.as_str()
             };
-            let hint_width = cell_width(hint).min(text_width / 3);
-            let body_width = text_width.saturating_sub(kind_width + hint_width + 1);
+            let hint_width = cell_width(hint).min(row_text_width / 3);
+            let body_width = row_text_width.saturating_sub(kind_width + hint_width + 1);
             let label = ellipsize(&item.label, body_width);
             let detail_width = body_width.saturating_sub(cell_width(&label) + 2);
             let detail = if detail_width > 3 {
@@ -559,10 +680,24 @@ impl Palette {
                 String::new()
             };
             let used = kind_width + cell_width(&label) + cell_width(&detail);
-            let gap = text_width.saturating_sub(used + hint_width);
+            let gap = row_text_width.saturating_sub(used + hint_width);
             let secondary = if active { plain(accent_text) } else { muted };
             let edge = plain(if active { accent_text } else { accent });
-            let line = Line::from(vec![
+            let base_label_style = label_style.add_modifier(if active {
+                Modifier::BOLD
+            } else if unavailable {
+                Modifier::UNDERLINED
+            } else {
+                Modifier::empty()
+            });
+            let match_style = if active {
+                plain(accent_text).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else if item.enabled {
+                plain(accent).add_modifier(Modifier::BOLD)
+            } else {
+                base_label_style
+            };
+            let mut spans = vec![
                 Span::styled(format!("{marker} "), edge),
                 Span::styled(
                     {
@@ -574,25 +709,71 @@ impl Palette {
                     },
                     secondary,
                 ),
-                Span::styled(
-                    label,
-                    label_style.add_modifier(if active {
-                        Modifier::BOLD
-                    } else if unavailable {
-                        Modifier::UNDERLINED
-                    } else {
-                        Modifier::empty()
-                    }),
-                ),
-                Span::styled(detail, secondary),
-                Span::raw(" ".repeat(gap)),
-                Span::styled(
-                    ellipsize(hint, hint_width),
-                    if unavailable { muted } else { edge },
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), rect);
+            ];
+            let mask = finder::match_mask(&self.query, &label);
+            if mask.iter().any(|&matched| matched) {
+                let mut run = String::new();
+                let mut current = false;
+                for (ch, matched) in label.chars().zip(mask) {
+                    if !run.is_empty() && matched != current {
+                        spans.push(Span::styled(
+                            std::mem::take(&mut run),
+                            if current {
+                                match_style
+                            } else {
+                                base_label_style
+                            },
+                        ));
+                    }
+                    current = matched;
+                    run.push(ch);
+                }
+                if !run.is_empty() {
+                    spans.push(Span::styled(
+                        run,
+                        if current {
+                            match_style
+                        } else {
+                            base_label_style
+                        },
+                    ));
+                }
+            } else {
+                spans.push(Span::styled(label, base_label_style));
+            }
+            spans.push(Span::styled(detail, secondary));
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(
+                ellipsize(hint, hint_width),
+                if unavailable { muted } else { edge },
+            ));
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
+                rect,
+            );
+            if !active && hovered && item.enabled {
+                palette.raise(frame, rect);
+            }
             self.hits.push((rect, Hit::Item(position)));
+        }
+        if has_scroll {
+            let track = Rect::new(modal.right().saturating_sub(2), list_top, 1, list_height);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(palette.track)),
+                track,
+            );
+            let total = self.shown.len();
+            let page = list_height as usize;
+            let thumb_height = ((list_height as usize * page) / total)
+                .max(1)
+                .min(list_height as usize);
+            let max_offset = total.saturating_sub(page).max(1);
+            let travel = list_height as usize - thumb_height;
+            let thumb_y = track.y + (travel * self.scroll.min(max_offset) / max_offset) as u16;
+            frame.render_widget(
+                Block::default().style(Style::default().bg(accent)),
+                Rect::new(track.x, thumb_y, 1, thumb_height as u16),
+            );
         }
         // Hidden entries are marked in the border.
         for (hidden, y) in [
@@ -798,5 +979,32 @@ mod tests {
         palette.handle(Event::Paste("가".repeat(400)), Instant::now());
         assert_eq!(palette.query.graphemes(true).count(), QUERY_GRAPHEMES);
         assert!(palette.query.len() <= QUERY_BYTES);
+    }
+
+    #[test]
+    fn inline_cursor_editing_inserts_deletes_and_kills_words() {
+        let mut palette = Palette::new(Language::English, Vec::new(), None);
+        let now = Instant::now();
+        palette.handle(Event::Paste("alpha gamma".into()), now);
+        // Move left past "gamma" (5 chars) and insert "beta ".
+        for _ in 0..5 {
+            palette.handle(key(KeyCode::Left), now);
+        }
+        palette.handle(Event::Paste("beta ".into()), now);
+        assert_eq!(palette.query, "alpha beta gamma");
+        // Ctrl-W deletes "beta ".
+        palette.handle(
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('w'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            }),
+            now,
+        );
+        assert_eq!(palette.query, "alpha gamma");
+        // Delete removes 'g'.
+        palette.handle(key(KeyCode::Delete), now);
+        assert_eq!(palette.query, "alpha amma");
     }
 }

@@ -202,6 +202,28 @@ fn row_width(controls: &[Control], gap: u16) -> u16 {
         .saturating_add(gap.saturating_mul(controls.len().saturating_sub(1) as u16))
 }
 
+/// Cached wrapped lines for the evidence inspector so hovering or scrolling
+/// avoids rebuilding and re-wrapping every entry on each frame.
+#[derive(PartialEq, Eq)]
+struct InspectorCacheKey {
+    width: u16,
+    height: u16,
+    language: Language,
+    theme: Theme,
+    connected: bool,
+    native_available: bool,
+    managed: bool,
+    rows_version: u64,
+    details_version: u64,
+    selected_id: Option<String>,
+}
+
+pub(crate) struct InspectorCache {
+    key: InspectorCacheKey,
+    has_scroll: bool,
+    lines: Vec<Line<'static>>,
+}
+
 /// One logical inspector entry before wrapping to the current width.
 #[derive(Clone, Debug, PartialEq)]
 enum Entry {
@@ -901,6 +923,27 @@ impl App {
         ]
     }
 
+    /// Exact rendered cell width of `row_attention(row, verbose)` without allocating.
+    fn row_attention_width(&self, row: &Observation, verbose: bool) -> usize {
+        let kind = compact_attention_label(self.language, &row.attention_kind);
+        if !row.pending {
+            return cell_width(kind);
+        }
+        let mut width = cell_width(kind) + 1 + decimal_digits(row.attention_total());
+        if verbose {
+            width += 1 + cell_width(tr(self.language, Text::Pending));
+        }
+        let seen = tr(
+            self.language,
+            if row.acknowledged {
+                Text::Seen
+            } else {
+                Text::Unseen
+            },
+        );
+        width + 2 + cell_width(seen)
+    }
+
     fn draw_list(&mut self, frame: &mut Frame, area: Rect, palette: Palette, two_line: bool) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -912,39 +955,32 @@ impl App {
             self.list_page = 1;
             return;
         }
-        let rows = self
-            .filtered_rows()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let indices = self.filtered_indices();
         // Columns are sized from every filtered row, not just the visible
         // page, so they stay put while the list scrolls.
         let state_column = |brief: bool| {
-            rows.iter()
-                .map(|row| cell_width(self.row_state(row, brief).0))
+            indices
+                .iter()
+                .map(|&idx| cell_width(self.row_state(&self.rows[idx], brief).0))
                 .max()
                 .unwrap_or(0)
         };
-        let id_width = rows
+        let id_width = indices
             .iter()
-            .map(|row| cell_width(&row.id))
+            .map(|&idx| cell_width(&self.rows[idx].id))
             .max()
             .unwrap_or(0);
         let attention_width = |verbose: bool| {
-            rows.iter()
-                .map(|row| {
-                    self.row_attention(row, verbose)
-                        .iter()
-                        .map(|(text, _, _)| cell_width(text))
-                        .sum::<usize>()
-                })
+            indices
+                .iter()
+                .map(|&idx| self.row_attention_width(&self.rows[idx], verbose))
                 .max()
                 .unwrap_or(0)
         };
         let (short_attention, long_attention) = (attention_width(false), attention_width(true));
         // One line keeps the whole attention column and at least a short
         // identity prefix; otherwise attention moves to a second line.
-        let one_line_scroll = rows.len() > inner.height as usize;
+        let one_line_scroll = indices.len() > inner.height as usize;
         let one_line_width = inner.width.saturating_sub(u16::from(one_line_scroll)) as usize;
         let fits = |state_width: usize| {
             2 + id_width.min(MIN_ID_COLUMN) + 2 + state_width + 2 + short_attention
@@ -963,7 +999,7 @@ impl App {
         } else {
             self.reveal_selection();
         }
-        if rows.is_empty() {
+        if indices.is_empty() {
             let (message, hint) = self.empty_list_text();
             let width = inner.width.saturating_sub(2) as usize;
             let height = inner.height as usize;
@@ -989,7 +1025,7 @@ impl App {
             );
             return;
         }
-        let has_scroll = rows.len() > self.list_page;
+        let has_scroll = indices.len() > self.list_page;
         let content_width = inner.width.saturating_sub(u16::from(has_scroll)) as usize;
         // Keep "pending" only while every row's attention fits beside the
         // identity; the kind, count and seen state always stay.
@@ -1003,7 +1039,7 @@ impl App {
         } else {
             short_attention
         };
-        for (visible, observation) in rows
+        for (visible, &row_idx) in indices
             .iter()
             .skip(self.list_scroll)
             .take(self.list_page)
@@ -1015,6 +1051,7 @@ impl App {
                 continue;
             }
             let rect = Rect::new(inner.x, y, content_width as u16, height);
+            let observation = &self.rows[row_idx];
             let selected = self.selected_id.as_deref() == Some(observation.id.as_str());
             let target = HitTarget::Row {
                 id: observation.id.clone(),
@@ -1063,11 +1100,12 @@ impl App {
                 // Identity left, state right; attention on its own line.
                 let room = content_width.saturating_sub(2 + 2 + cell_width(state) + 1);
                 let id = ellipsize(&observation.id, room);
-                let pad = content_width.saturating_sub(2 + cell_width(&id) + cell_width(state) + 1);
+                let pad_len =
+                    content_width.saturating_sub(2 + cell_width(&id) + cell_width(state) + 1);
                 let first = vec![
                     marker,
                     Span::styled(id, id_style),
-                    Span::raw(" ".repeat(pad)),
+                    Span::raw(" ".repeat(pad_len)),
                     Span::styled(state, state_style),
                 ];
                 frame.render_widget(
@@ -1121,7 +1159,7 @@ impl App {
                 Rect::new(inner.right() - 1, inner.y, 1, inner.height),
                 self.list_scroll,
                 self.list_page,
-                rows.len(),
+                indices.len(),
                 HitTarget::ListTrack,
                 HitTarget::ListThumb,
                 palette,
@@ -1180,7 +1218,7 @@ impl App {
     }
 
     fn draw_divider(&mut self, frame: &mut Frame, divider: Rect, palette: Palette) {
-        let dragging = self.drag.is_some();
+        let dragging = matches!(self.drag, Some(super::model::Drag::Divider { .. }));
         let hovered = self.hover == Some(HitTarget::Divider);
         frame.render_widget(
             Block::default().style(Style::default().bg(if dragging {
@@ -1221,13 +1259,42 @@ impl App {
         }
         let page = inner.height.max(1) as usize;
         let padded = |scroll: bool| inset_x(inner, 1).width.saturating_sub(u16::from(scroll));
-        // Wrapping depends on whether a scrollbar takes a column.
-        let mut lines = self.inspector_view(padded(false) as usize, palette);
-        let has_scroll = lines.len() > page;
-        if has_scroll {
-            lines = self.inspector_view(padded(true) as usize, palette);
+        let key = InspectorCacheKey {
+            width: inner.width,
+            height: inner.height,
+            language: self.language,
+            theme: self.theme,
+            connected: self.connected,
+            native_available: self.native_available,
+            managed: self.managed,
+            rows_version: self.rows_version,
+            details_version: self.details_version,
+            selected_id: self.selected_id.clone(),
+        };
+        let cache_hit = self
+            .inspector_cache
+            .as_ref()
+            .is_some_and(|cached| cached.key == key);
+        if !cache_hit {
+            let entries = self.inspector_entries();
+            // Wrapping depends on whether a scrollbar takes a column.
+            let mut lines =
+                Self::format_inspector_entries(&entries, padded(false) as usize, palette);
+            let has_scroll = lines.len() > page;
+            if has_scroll {
+                lines = Self::format_inspector_entries(&entries, padded(true) as usize, palette);
+            }
+            self.inspector_cache = Some(InspectorCache {
+                key,
+                has_scroll,
+                lines,
+            });
         }
-        self.inspector_lines = lines.len();
+        let (line_count, has_scroll) = {
+            let cached = self.inspector_cache.as_ref().expect("populated cache");
+            (cached.lines.len(), cached.has_scroll)
+        };
+        self.inspector_lines = line_count;
         self.inspector_page = page;
         self.clamp_selection_and_scroll();
         let content = Rect::new(
@@ -1236,11 +1303,16 @@ impl App {
             padded(has_scroll),
             inner.height,
         );
-        let visible = lines
-            .into_iter()
-            .skip(self.inspector_scroll)
-            .take(self.inspector_page)
-            .collect::<Vec<_>>();
+        let visible = {
+            let cached = self.inspector_cache.as_ref().expect("populated cache");
+            cached
+                .lines
+                .iter()
+                .skip(self.inspector_scroll)
+                .take(self.inspector_page)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         frame.render_widget(Paragraph::new(visible), content);
         self.push_hit(inner, HitTarget::InspectorBody, 1);
         if has_scroll {
@@ -1465,8 +1537,11 @@ impl App {
 
     /// Wraps inspector entries to `width`. Values wrap under their own
     /// column, so a narrow panel never drops the end of an evidence label.
-    fn inspector_view(&self, width: usize, palette: Palette) -> Vec<Line<'static>> {
-        let entries = self.inspector_entries();
+    fn format_inspector_entries(
+        entries: &[Entry],
+        width: usize,
+        palette: Palette,
+    ) -> Vec<Line<'static>> {
         let label_width = entries
             .iter()
             .filter_map(|entry| match entry {
@@ -1483,7 +1558,7 @@ impl App {
         for entry in entries {
             match entry {
                 Entry::Gap => lines.push(Line::default()),
-                Entry::Banner(text) => lines.extend(wrap(&text, width).into_iter().map(|line| {
+                Entry::Banner(text) => lines.extend(wrap(text, width).into_iter().map(|line| {
                     Line::styled(
                         line,
                         Style::default()
@@ -1491,7 +1566,7 @@ impl App {
                             .add_modifier(Modifier::BOLD),
                     )
                 })),
-                Entry::Title(text) => lines.extend(wrap(&text, width).into_iter().map(|line| {
+                Entry::Title(text) => lines.extend(wrap(text, width).into_iter().map(|line| {
                     Line::styled(
                         line,
                         Style::default()
@@ -1499,37 +1574,53 @@ impl App {
                             .add_modifier(Modifier::BOLD),
                     )
                 })),
-                Entry::Heading(text) => lines.extend(
-                    wrap(&text, width)
-                        .into_iter()
-                        .map(|line| Line::styled(line, muted.add_modifier(Modifier::BOLD))),
-                ),
+                Entry::Heading(text) => {
+                    let wrapped = wrap(text, width);
+                    let last_idx = wrapped.len().saturating_sub(1);
+                    let heading_style = muted.add_modifier(Modifier::BOLD);
+                    let rule_style = Style::default().fg(palette.track);
+                    for (index, line) in wrapped.into_iter().enumerate() {
+                        if index == last_idx {
+                            let used = cell_width(&line);
+                            let rule_len = width.saturating_sub(used + 1);
+                            if rule_len >= 3 {
+                                lines.push(Line::from(vec![
+                                    Span::styled(line, heading_style),
+                                    Span::raw(" "),
+                                    Span::styled("─".repeat(rule_len), rule_style),
+                                ]));
+                                continue;
+                            }
+                        }
+                        lines.push(Line::styled(line, heading_style));
+                    }
+                }
                 Entry::Note(text) => lines.extend(
-                    wrap(&text, width)
+                    wrap(text, width)
                         .into_iter()
                         .map(|line| Line::styled(line, Style::default().fg(palette.warning))),
                 ),
                 Entry::Placeholder(text) => lines.extend(
-                    wrap(&text, width)
+                    wrap(text, width)
                         .into_iter()
                         .map(|line| Line::styled(line, muted)),
                 ),
                 Entry::Raw(text) => lines.extend(
-                    wrap(&text, width)
+                    wrap(text, width)
                         .into_iter()
                         .map(|line| Line::styled(line, Style::default().fg(palette.text))),
                 ),
                 Entry::Field(label, value, tone) => {
-                    let value_style = palette.tone_style(tone);
+                    let value_style = palette.tone_style(*tone);
                     if stacked {
                         lines.push(Line::styled(clip(label, width), muted));
-                        lines.extend(wrap(&value, width.saturating_sub(2)).into_iter().map(
+                        lines.extend(wrap(value, width.saturating_sub(2)).into_iter().map(
                             |line| {
                                 Line::from(vec![Span::raw("  "), Span::styled(line, value_style)])
                             },
                         ));
                     } else {
-                        let values = wrap(&value, width.saturating_sub(label_width));
+                        let values = wrap(value, width.saturating_sub(label_width));
                         for (index, line) in values.into_iter().enumerate() {
                             let lead = if index == 0 {
                                 Span::styled(pad(label, label_width), muted)
@@ -1761,6 +1852,28 @@ impl App {
                 return hint(
                     Text::NavigationUnavailable,
                     Text::NavigationUnavailableShort,
+                );
+            }
+            Some(HitTarget::Action(Action::SendPrompt))
+                if !self.action_enabled(Action::SendPrompt) =>
+            {
+                return hint(
+                    Text::SendPromptUnavailable,
+                    Text::SendPromptUnavailableShort,
+                );
+            }
+            Some(HitTarget::Action(Action::ResumeAgent))
+                if !self.action_enabled(Action::ResumeAgent) =>
+            {
+                return hint(Text::ResumeUnavailable, Text::ResumeUnavailableShort);
+            }
+            Some(HitTarget::Action(Action::Answer)) if !self.action_enabled(Action::Answer) => {
+                return hint(Text::AnswerUnavailable, Text::AnswerUnavailableShort);
+            }
+            Some(HitTarget::Action(action)) if !self.action_enabled(*action) => {
+                return hint(
+                    Text::ManagedActionUnavailable,
+                    Text::ManagedActionUnavailableShort,
                 );
             }
             Some(HitTarget::Divider) => return hint(Text::DividerHint, Text::DividerHintShort),
@@ -2030,7 +2143,7 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_scrollbar(
+    pub(super) fn draw_scrollbar(
         &mut self,
         frame: &mut Frame,
         track: Rect,
@@ -2206,11 +2319,25 @@ pub(super) fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static
     Line::from(output)
 }
 
+/// Decimal digit count without formatting to a String.
+fn decimal_digits(mut value: u64) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
 /// Clips to `width` cells and pads with spaces to exactly that width.
 pub(super) fn pad(text: &str, width: usize) -> String {
     let mut output = clip(text, width);
     let used = cell_width(&output);
-    output.push_str(&" ".repeat(width.saturating_sub(used)));
+    let spaces = width.saturating_sub(used);
+    output.reserve(spaces);
+    for _ in 0..spaces {
+        output.push(' ');
+    }
     output
 }
 
@@ -2369,7 +2496,7 @@ pub(super) fn utc_timestamp(milliseconds: u64) -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03} UTC")
 }
 
-fn search_window(text: &str, cursor: usize, width: usize) -> (String, usize, usize) {
+pub(super) fn search_window(text: &str, cursor: usize, width: usize) -> (String, usize, usize) {
     if width == 0 {
         return (String::new(), 0, cursor);
     }
@@ -3087,5 +3214,78 @@ mod tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_ui_draw_50_agents() {
+        let mut observations = Vec::with_capacity(50);
+        for index in 0..50 {
+            let pending = index % 5 == 0;
+            let activity = match index % 4 {
+                0 => "blocked",
+                1 => "working",
+                2 => "idle",
+                _ => "retrying",
+            };
+            observations.push(json!({
+                "id": format!("agent-{index:02}-worker"),
+                "source_id": "claude",
+                "session_id": format!("ses_{index:08x}"),
+                "pane_id": format!("%{index}"),
+                "native": {
+                    "exists": true,
+                    "activity": activity,
+                    "attention": if pending { "approval" } else { "none" },
+                    "permission_count": u64::from(pending),
+                    "question_count": 0,
+                    "pending_count": 0,
+                    "freshness": "fresh",
+                    "observed_at_ms": 1_700_000_000_000u64 + index as u64,
+                },
+                "core": {
+                    "process": "running",
+                    "pty_generation": "1",
+                    "freshness": "fresh",
+                },
+                "binding": "managed_reported",
+                "frontend_verified": false,
+                "attention": {
+                    "revision": format!("rev-{index}"),
+                    "acknowledged": false,
+                    "pending": pending,
+                    "available": pending,
+                },
+            }));
+        }
+        let snap = json!({"epoch": "boot-1", "revision": "1", "observations": observations});
+        let mut app = App::new(false, Language::English, Theme::Dark);
+        app.set_managed();
+        app.set_connection(true, None);
+        app.set_native_available(true);
+        app.apply_snapshot(snap);
+        app.search = "worker".into();
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // Warm up.
+        for _ in 0..20 {
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
+        let frames = 2000usize;
+        let start = std::time::Instant::now();
+        for index in 0..frames {
+            app.hover = Some(HitTarget::Row {
+                id: format!("agent-{:02}-worker", index % 50),
+                revision: format!("rev-{}", index % 50),
+            });
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "BENCH_WIDE_50_DRAW: total_ms={:.2} us_per_frame={:.2}",
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1_000_000.0 / frames as f64
+        );
     }
 }

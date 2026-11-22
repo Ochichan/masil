@@ -42,6 +42,8 @@ enum Hit {
     Step(usize, i64),
     /// The Reset row's button.
     Reset(usize),
+    ScrollTrack,
+    ScrollThumb,
     Close,
 }
 
@@ -68,6 +70,10 @@ struct App {
     row: usize,
     focus: Focus,
     scroll: usize,
+    scroll_max: usize,
+    scroll_page: usize,
+    scroll_track: Rect,
+    dragging_scroll: bool,
     layer_on: bool,
     values: HashMap<&'static str, String>,
     /// Effective values that differ from the saved choice, per key.
@@ -80,6 +86,7 @@ struct App {
     hits: Vec<(Rect, Hit)>,
     hover: Option<Hit>,
     pressed: Option<Hit>,
+    dirty: bool,
     quit: bool,
 }
 
@@ -102,6 +109,10 @@ impl App {
             row: 0,
             focus: Focus::Rows,
             scroll: 0,
+            scroll_max: 0,
+            scroll_page: 1,
+            scroll_track: Rect::default(),
+            dragging_scroll: false,
             layer_on: true,
             values: HashMap::new(),
             configured: HashMap::new(),
@@ -110,6 +121,7 @@ impl App {
             hits: Vec::new(),
             hover: None,
             pressed: None,
+            dirty: true,
             quit: false,
         };
         app.reload();
@@ -285,15 +297,25 @@ impl App {
     /// One terminal event at `now`.
     fn event(&mut self, event: Event, now: Instant) {
         match event {
-            Event::Key(key) => self.key(key, now),
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Release {
+                    self.key(key, now);
+                    self.dirty = true;
+                }
+            }
             Event::Mouse(mouse) => self.mouse(mouse, now),
             Event::Resize(..) => {
                 self.hover = None;
                 self.pressed = None;
                 self.reset_armed = None;
+                self.dirty = true;
             }
             // A focus change or a paste is no answer to the Reset question.
-            _ => self.reset_armed = None,
+            _ => {
+                if self.reset_armed.take().is_some() {
+                    self.dirty = true;
+                }
+            }
         }
     }
 
@@ -384,6 +406,7 @@ impl App {
                     self.shift(row, delta);
                 }
             }
+            Hit::ScrollTrack | Hit::ScrollThumb => {}
             Hit::Close => self.quit = true,
         }
     }
@@ -411,6 +434,22 @@ impl App {
                 Focus::Groups => self.select_group(self.group + 1),
                 Focus::Rows => self.row = (self.row + 1).min(rows.len().saturating_sub(1)),
             },
+            KeyCode::Home if self.focus == Focus::Rows => {
+                self.row = 0;
+                self.scroll = 0;
+            }
+            KeyCode::End if self.focus == Focus::Rows => {
+                self.row = rows.len().saturating_sub(1);
+                self.scroll = self.scroll_max;
+            }
+            KeyCode::PageUp if self.focus == Focus::Rows => {
+                self.scroll = self.scroll.saturating_sub(self.scroll_page.max(1));
+                self.row = self.row.saturating_sub(3);
+            }
+            KeyCode::PageDown if self.focus == Focus::Rows => {
+                self.scroll = (self.scroll + self.scroll_page.max(1)).min(self.scroll_max);
+                self.row = (self.row + 3).min(rows.len().saturating_sub(1));
+            }
             KeyCode::Left | KeyCode::Char('h') if self.focus == Focus::Rows => {
                 if let Some(row) = rows.get(self.row).copied() {
                     self.shift(row, -1);
@@ -452,35 +491,107 @@ impl App {
             .map(|(_, hit)| hit.clone())
     }
 
+    fn scroll_to_row(&mut self, row: u16) {
+        if self.scroll_track.height <= 1 || self.scroll_max == 0 {
+            return;
+        }
+        let relative = row
+            .saturating_sub(self.scroll_track.y)
+            .min(self.scroll_track.height - 1) as usize;
+        let next = (relative * self.scroll_max) / (self.scroll_track.height as usize - 1);
+        if self.scroll != next {
+            self.scroll = next;
+            self.dirty = true;
+        }
+    }
+
     fn mouse(&mut self, mouse: MouseEvent, now: Instant) {
         match mouse.kind {
-            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
-                self.hover = self.hit_at(mouse.column, mouse.row);
+            MouseEventKind::Moved => {
+                self.dragging_scroll = false;
+                let next = self.hit_at(mouse.column, mouse.row);
+                if self.hover != next {
+                    self.hover = next;
+                    self.dirty = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.dragging_scroll {
+                    self.scroll_to_row(mouse.row);
+                } else {
+                    let next = self.hit_at(mouse.column, mouse.row);
+                    if self.hover != next {
+                        self.hover = next;
+                        self.dirty = true;
+                    }
+                }
+            }
+            MouseEventKind::Drag(_) => {
+                let next = self.hit_at(mouse.column, mouse.row);
+                if self.hover != next {
+                    self.hover = next;
+                    self.dirty = true;
+                }
             }
             // Only a press and release on the Reset button keep its
             // question open; any other press, a release elsewhere and the
             // wheel take it back.
             MouseEventKind::Down(MouseButton::Left) => {
-                self.pressed = self.hit_at(mouse.column, mouse.row);
-                if !matches!(self.pressed, Some(Hit::Reset(_))) {
+                let next = self.hit_at(mouse.column, mouse.row);
+                if matches!(next, Some(Hit::ScrollTrack | Hit::ScrollThumb)) {
+                    self.dragging_scroll = true;
+                    self.scroll_to_row(mouse.row);
                     self.reset_armed = None;
+                    self.dirty = true;
+                    return;
+                }
+                if self.pressed != next {
+                    self.pressed = next;
+                    self.dirty = true;
+                }
+                if !matches!(self.pressed, Some(Hit::Reset(_))) && self.reset_armed.take().is_some()
+                {
+                    self.dirty = true;
                 }
             }
-            MouseEventKind::Down(_) => self.reset_armed = None,
+            MouseEventKind::Down(_) => {
+                self.dragging_scroll = false;
+                if self.reset_armed.take().is_some() {
+                    self.dirty = true;
+                }
+            }
             MouseEventKind::Up(MouseButton::Left) => {
+                if self.dragging_scroll {
+                    self.dragging_scroll = false;
+                    self.dirty = true;
+                    return;
+                }
                 let released = self.hit_at(mouse.column, mouse.row);
                 match self.pressed.take() {
-                    Some(hit) if released.as_ref() == Some(&hit) => self.activate(hit, now),
-                    _ => self.reset_armed = None,
+                    Some(hit) if released.as_ref() == Some(&hit) => {
+                        self.activate(hit, now);
+                        self.dirty = true;
+                    }
+                    Some(_) => {
+                        self.reset_armed = None;
+                        self.dirty = true;
+                    }
+                    None => {
+                        if self.reset_armed.take().is_some() {
+                            self.dirty = true;
+                        }
+                    }
                 }
             }
             MouseEventKind::ScrollDown => {
                 self.scroll = self.scroll.saturating_add(2);
                 self.reset_armed = None;
+                self.dirty = true;
             }
             MouseEventKind::ScrollUp => {
                 self.scroll = self.scroll.saturating_sub(2);
                 self.reset_armed = None;
+                self.dirty = true;
             }
             _ => {}
         }
@@ -514,24 +625,45 @@ impl App {
         let width = cell_width(&text) as u16;
         let hovered = self.hover.as_ref() == Some(&hit);
         let pressed = self.pressed.as_ref() == Some(&hit);
-        let style = if pressed {
-            Style::default().fg(palette.accent_text).bg(palette.warning)
+        let (style, raised) = if pressed {
+            (
+                Style::default()
+                    .fg(palette.accent_text)
+                    .bg(palette.warning)
+                    .add_modifier(Modifier::BOLD),
+                false,
+            )
         } else if selected {
-            Style::default()
-                .fg(palette.accent_text)
-                .bg(palette.accent)
-                .add_modifier(Modifier::BOLD)
+            (
+                Style::default()
+                    .fg(palette.accent_text)
+                    .bg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+                false,
+            )
         } else if hovered {
-            Style::default().fg(palette.accent).bg(palette.raised)
+            (
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.raised_fill()),
+                true,
+            )
         } else {
-            Style::default().fg(palette.text).bg(palette.raised)
+            (
+                Style::default().fg(palette.text).bg(palette.raised_fill()),
+                true,
+            )
         };
         if y >= clip_to.y && y < clip_to.bottom() && x < clip_to.right() {
             let visible = width.min(clip_to.right() - x);
+            let rect = Rect::new(x, y, visible, 1);
             frame.render_widget(
                 Paragraph::new(clip(&text, visible as usize)).style(style),
-                Rect::new(x, y, visible, 1),
+                rect,
             );
+            if raised {
+                palette.raise(frame, rect);
+            }
         }
         self.push_hit(Rect::new(x, y, width, 1), clip_to, hit);
         width
@@ -616,11 +748,18 @@ impl App {
         }
         let full = text(
             language,
+            "Tab sections  ↑↓/PgUp/PgDn/Home/End move  ←→ change  Enter select  q close",
+            "Tab 항목  ↑↓/PgUp/PgDn/Home/End 이동  ←→ 값 변경  Enter 선택  q 닫기",
+        );
+        let medium = text(
+            language,
             "Tab sections  ↑↓ move  ←→ change  Enter select  q close",
             "Tab 항목  ↑↓ 이동  ←→ 값 변경  Enter 선택  q 닫기",
         );
         let hint = if cell_width(full) <= line.width as usize {
             full
+        } else if cell_width(medium) <= line.width as usize {
+            medium
         } else {
             text(
                 language,
@@ -630,8 +769,7 @@ impl App {
         };
         if receipt.1.len() < 2 {
             frame.render_widget(
-                Paragraph::new(ellipsize(hint, line.width as usize))
-                    .style(Style::default().fg(palette.muted)),
+                Paragraph::new(ellipsize(hint, line.width as usize)).style(palette.muted_style()),
                 Rect::new(line.x, line.y + 1, line.width, 1),
             );
         }
@@ -694,7 +832,7 @@ impl App {
                     .fg(palette.accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(palette.muted)
+                palette.muted_style()
             })
             .border_style(Style::default().fg(if focused {
                 palette.accent
@@ -723,7 +861,7 @@ impl App {
             let style = if selected {
                 Style::default()
                     .fg(palette.text)
-                    .bg(palette.raised)
+                    .bg(palette.raised_fill())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(if hovered {
@@ -736,19 +874,21 @@ impl App {
                 Paragraph::new(Line::from(vec![
                     Span::styled(
                         marker,
-                        Style::default()
-                            .fg(if selected {
-                                palette.accent
-                            } else {
-                                palette.muted
-                            })
-                            .add_modifier(Modifier::BOLD),
+                        if selected {
+                            Style::default().fg(palette.accent)
+                        } else {
+                            palette.muted_style()
+                        }
+                        .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(group.label(self.language)),
                 ]))
                 .style(style),
                 rect,
             );
+            if selected {
+                palette.raise(frame, rect);
+            }
             self.push_hit(rect, inner, Hit::Group(index));
         }
     }
@@ -760,92 +900,107 @@ impl App {
         frame.render_widget(self.block(group.label(language), focused, palette), area);
         let inner = inset_x(inset(area, 1), 1);
         if inner.width == 0 || inner.height == 0 {
+            self.scroll_max = 0;
+            self.scroll_track = Rect::default();
             return;
         }
         let rows = self.rows();
         self.row = self.row.min(rows.len().saturating_sub(1));
 
-        // Each row: label, controls, wrapped help and notes, then a gap.
-        let mut blocks = Vec::new();
-        for row in &rows {
-            let mut notes: Vec<(Tone, String)> = Vec::new();
-            let help = match row {
-                Row::Setting(setting) => {
-                    if let Some(effective) = self.configured.get(setting.key) {
-                        notes.push((
-                            Tone::Warn,
-                            match language {
-                                Language::English => format!(
-                                    "Your tmux configuration sets {effective}; choosing here overrides it until masil restarts."
-                                ),
-                                Language::Korean => format!(
-                                    "tmux 설정 파일이 {effective}로 정합니다. 여기서 고르면 masil을 다시 시작할 때까지 덮어씁니다."
-                                ),
-                            },
-                        ));
+        let layout = |width: u16| {
+            let mut blocks = Vec::new();
+            for row in &rows {
+                let mut notes: Vec<(Tone, String)> = Vec::new();
+                let help = match row {
+                    Row::Setting(setting) => {
+                        if let Some(effective) = self.configured.get(setting.key) {
+                            notes.push((
+                                Tone::Warn,
+                                match language {
+                                    Language::English => format!(
+                                        "Your tmux configuration sets {effective}; choosing here overrides it until masil restarts."
+                                    ),
+                                    Language::Korean => format!(
+                                        "tmux 설정 파일이 {effective}로 정합니다. 여기서 고르면 masil을 다시 시작할 때까지 덮어씁니다."
+                                    ),
+                                },
+                            ));
+                        }
+                        setting.help(language)
                     }
-                    setting.help(language)
-                }
-                Row::Layer => text(
-                    language,
-                    "Off restores tmux defaults, removes masil buttons and re-reads your tmux.conf.",
-                    "끄면 tmux 기본값으로 돌아가고 masil 버튼을 없애며 tmux.conf를 다시 읽습니다.",
-                ),
-                Row::Reset => {
-                    if self.reset_armed.is_some() {
-                        notes.push((
-                            Tone::Warn,
-                            text(
-                                language,
-                                "After one second, Enter or a click on Reset now runs it. Any other key or click cancels, and so do 5 seconds without one.",
-                                "1초 뒤부터 Enter나 '지금 초기화' 클릭으로 실행합니다. 다른 키나 클릭은 취소하고, 5초 동안 누르지 않아도 취소됩니다.",
-                            )
-                            .to_owned(),
-                        ));
-                    }
-                    text(
+                    Row::Layer => text(
                         language,
-                        "Puts every setting on this screen back to its default. Other @masil lines in settings.conf stay.",
-                        "이 화면의 설정을 모두 기본값으로 되돌립니다. settings.conf의 다른 @masil 줄은 그대로 둡니다.",
-                    )
+                        "Off restores tmux defaults, removes masil buttons and re-reads your tmux.conf.",
+                        "끄면 tmux 기본값으로 돌아가고 masil 버튼을 없애며 tmux.conf를 다시 읽습니다.",
+                    ),
+                    Row::Reset => {
+                        if self.reset_armed.is_some() {
+                            notes.push((
+                                Tone::Warn,
+                                text(
+                                    language,
+                                    "After one second, Enter or a click on Reset now runs it. Any other key or click cancels, and so do 5 seconds without one.",
+                                    "1초 뒤부터 Enter나 '지금 초기화' 클릭으로 실행합니다. 다른 키나 클릭은 취소하고, 5초 동안 누르지 않아도 취소됩니다.",
+                                )
+                                .to_owned(),
+                            ));
+                        }
+                        text(
+                            language,
+                            "Puts every setting on this screen back to its default. Other @masil lines in settings.conf stay.",
+                            "이 화면의 설정을 모두 기본값으로 되돌립니다. settings.conf의 다른 @masil 줄은 그대로 둡니다.",
+                        )
+                    }
+                };
+                let mut lines = wrap(help, width as usize)
+                    .into_iter()
+                    .map(|line| (Tone::Muted, line))
+                    .collect::<Vec<_>>();
+                for (tone, note) in notes {
+                    lines.extend(
+                        wrap(&note, width as usize)
+                            .into_iter()
+                            .map(|line| (tone, line)),
+                    );
                 }
-            };
-            let mut lines = wrap(help, inner.width as usize)
-                .into_iter()
-                .map(|line| (Tone::Muted, line))
-                .collect::<Vec<_>>();
-            for (tone, note) in notes {
-                lines.extend(
-                    wrap(&note, inner.width as usize)
-                        .into_iter()
-                        .map(|line| (tone, line)),
-                );
+                blocks.push(lines);
             }
-            blocks.push(lines);
-        }
-        let heights = blocks
-            .iter()
-            .zip(&rows)
-            .map(|(lines, row)| 1 + self.control_lines(*row, inner.width) + lines.len() as u16 + 1)
-            .collect::<Vec<_>>();
-        let total: u16 = heights.iter().sum();
+            let heights = blocks
+                .iter()
+                .zip(&rows)
+                .map(|(lines, row)| 1 + self.control_lines(*row, width) + lines.len() as u16 + 1)
+                .collect::<Vec<_>>();
+            let total: u16 = heights.iter().sum();
+            (blocks, heights, total)
+        };
+        let (mut blocks, mut heights, mut total) = layout(inner.width);
+        let has_scroll = total > inner.height && inner.width > 4;
+        let content_inner = if has_scroll {
+            let narrowed = Rect::new(inner.x, inner.y, inner.width - 2, inner.height);
+            (blocks, heights, total) = layout(narrowed.width);
+            narrowed
+        } else {
+            inner
+        };
         let top: u16 = heights[..self.row].iter().sum();
-        let max_scroll = total.saturating_sub(inner.height) as usize;
-        if focused {
+        let max_scroll = total.saturating_sub(content_inner.height) as usize;
+        self.scroll_max = max_scroll;
+        self.scroll_page = content_inner.height.max(1) as usize;
+        if focused && !self.dragging_scroll {
             // Keep the focused row visible.
             let bottom = top + heights[self.row];
             if (top as usize) < self.scroll {
                 self.scroll = top as usize;
-            } else if bottom as usize > self.scroll + inner.height as usize {
-                self.scroll = (bottom - inner.height.min(bottom)) as usize;
+            } else if bottom as usize > self.scroll + content_inner.height as usize {
+                self.scroll = (bottom - content_inner.height.min(bottom)) as usize;
             }
         }
         self.scroll = self.scroll.min(max_scroll);
 
-        let mut y = inner.y as i32 - self.scroll as i32;
+        let mut y = content_inner.y as i32 - self.scroll as i32;
         for (index, row) in rows.iter().enumerate() {
             let height = heights[index] as i32;
-            if y + height <= inner.y as i32 || y >= inner.bottom() as i32 {
+            if y + height <= content_inner.y as i32 || y >= content_inner.bottom() as i32 {
                 y += height;
                 continue;
             }
@@ -855,7 +1010,7 @@ impl App {
                 Row::Layer => text(language, "masil UI layer", "masil UI 레이어"),
                 Row::Reset => text(language, "Reset", "초기화"),
             };
-            if y >= inner.y as i32 {
+            if y >= content_inner.y as i32 {
                 let marker = if selected { "› " } else { "" };
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
@@ -874,27 +1029,52 @@ impl App {
                             }),
                         ),
                     ])),
-                    Rect::new(inner.x, y as u16, inner.width, 1),
+                    Rect::new(content_inner.x, y as u16, content_inner.width, 1),
                 );
                 self.push_hit(
-                    Rect::new(inner.x, y as u16, inner.width, 1),
-                    inner,
+                    Rect::new(content_inner.x, y as u16, content_inner.width, 1),
+                    content_inner,
                     Hit::Row(index),
                 );
             }
-            self.draw_controls(frame, *row, index, inner, y + 1, palette);
-            let help_y = y + 1 + self.control_lines(*row, inner.width) as i32;
+            self.draw_controls(frame, *row, index, content_inner, y + 1, palette);
+            let help_y = y + 1 + self.control_lines(*row, content_inner.width) as i32;
             for (offset, (tone, line)) in blocks[index].iter().enumerate() {
                 let line_y = help_y + offset as i32;
-                if line_y >= inner.y as i32 && line_y < inner.bottom() as i32 {
+                if line_y >= content_inner.y as i32 && line_y < content_inner.bottom() as i32 {
                     frame.render_widget(
-                        Paragraph::new(pad(line, inner.width as usize))
-                            .style(Style::default().fg(palette.tone(*tone))),
-                        Rect::new(inner.x, line_y as u16, inner.width, 1),
+                        Paragraph::new(pad(line, content_inner.width as usize))
+                            .style(palette.tone_style(*tone)),
+                        Rect::new(content_inner.x, line_y as u16, content_inner.width, 1),
                     );
                 }
             }
             y += height;
+        }
+        if has_scroll {
+            let track = Rect::new(inner.right() - 1, inner.y, 1, inner.height);
+            self.scroll_track = track;
+            frame.render_widget(
+                Block::default().style(Style::default().bg(palette.track)),
+                track,
+            );
+            self.push_hit(track, inner, Hit::ScrollTrack);
+            let page = content_inner.height as usize;
+            let total_rows = total as usize;
+            let thumb_height = ((track.height as usize * page) / total_rows.max(1))
+                .max(1)
+                .min(track.height as usize);
+            let travel = track.height as usize - thumb_height;
+            let thumb_y =
+                track.y + (travel * self.scroll.min(max_scroll) / max_scroll.max(1)) as u16;
+            let thumb = Rect::new(track.x, thumb_y, 1, thumb_height as u16);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(palette.accent)),
+                thumb,
+            );
+            self.push_hit(thumb, inner, Hit::ScrollThumb);
+        } else {
+            self.scroll_track = Rect::default();
         }
     }
 
@@ -1203,19 +1383,30 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     let mut app = App::new(server);
     let mut session = Session::open()?;
     while !app.quit {
-        session
-            .terminal()
-            .draw(|frame| app.draw(frame))
-            .map_err(|error| error.to_string())?;
+        if app.dirty {
+            session
+                .draw(|frame| app.draw(frame))
+                .map_err(|error| error.to_string())?;
+            app.dirty = false;
+        }
         // An open Reset question ends on its own, and the row shows that.
         if let Some(wait) = app.reset_wait(Instant::now())
             && !event::poll(wait).map_err(|error| error.to_string())?
         {
             app.reset_armed = None;
+            app.dirty = true;
             continue;
         }
-        let event = event::read().map_err(|error| error.to_string())?;
-        app.event(event, Instant::now());
+        let first = event::read().map_err(|error| error.to_string())?;
+        app.event(first, Instant::now());
+        // Coalesce burst mouse moves/scrolls before drawing the next frame.
+        for _ in 0..63 {
+            if app.quit || !event::poll(Duration::ZERO).map_err(|error| error.to_string())? {
+                break;
+            }
+            let next = event::read().map_err(|error| error.to_string())?;
+            app.event(next, Instant::now());
+        }
     }
     Ok(0)
 }
@@ -1299,6 +1490,10 @@ mod tests {
             row: 0,
             focus: Focus::Rows,
             scroll: 0,
+            scroll_max: 0,
+            scroll_page: 1,
+            scroll_track: Rect::default(),
+            dragging_scroll: false,
             layer_on: true,
             values: HashMap::new(),
             configured: HashMap::new(),
@@ -1307,6 +1502,7 @@ mod tests {
             hits: Vec::new(),
             hover: None,
             pressed: None,
+            dirty: true,
             quit: false,
         }
     }
@@ -1461,5 +1657,27 @@ mod tests {
         app.event(mouse(MouseEventKind::Up(left), button.x, button.y), start);
         assert_eq!(app.reset_armed, Some(start));
         assert!(app.receipt.is_none());
+    }
+
+    #[test]
+    fn overflow_shows_a_clickable_scrollbar_and_terminal_theme_raises_chips() {
+        let mut app = screen();
+        app.group = 0;
+        app.theme = Theme::Terminal;
+        // Short viewport forces overflow on the first section.
+        let _ = drawn(&mut app, 76, 12);
+        assert!(
+            app.hits.iter().any(|(_, hit)| *hit == Hit::ScrollTrack),
+            "expected scrollbar track when rows overflow"
+        );
+        assert!(
+            app.hits.iter().any(|(_, hit)| *hit == Hit::ScrollThumb),
+            "expected scrollbar thumb when rows overflow"
+        );
+        assert!(app.scroll_max > 0);
+        // Clicking the bottom of the track scrolls to the bottom.
+        let bottom_y = app.scroll_track.bottom() - 1;
+        app.scroll_to_row(bottom_y);
+        assert_eq!(app.scroll, app.scroll_max);
     }
 }

@@ -19,6 +19,10 @@ const ENTER: &[u8] =
     b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h";
 const LEAVE: &[u8] =
     b"\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l";
+/// DEC Mode 2026 Synchronized Output markers (BSU / ESU). Supporting terminals
+/// buffer the frame until ESU; terminals that do not support it ignore CSI ?2026.
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
 
 struct TtyIdentity {
     device: libc::dev_t,
@@ -118,26 +122,34 @@ const PENDING_LIMIT: usize = 64 * 1024;
 pub(super) struct TtyWriter {
     file: File,
     pending: Vec<u8>,
+    /// Reusable flush buffer swapped with `pending` before writing so a
+    /// stalled terminal can never see the same frame twice while avoiding
+    /// per-frame heap allocation.
+    flushing: Vec<u8>,
+    sync_frames: bool,
+    in_sync_frame: bool,
 }
 impl Write for TtyWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.sync_frames && !self.in_sync_frame {
+            self.in_sync_frame = true;
+            self.pending.extend_from_slice(SYNC_BEGIN);
+        }
         if self.pending.len() + bytes.len() > PENDING_LIMIT {
-            self.flush()?;
+            self.flush_pending()?;
         }
         self.pending.extend_from_slice(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
-        // Taken first: a stalled terminal must not see this frame again.
-        let pending = std::mem::take(&mut self.pending);
-        let mut remaining = pending.as_slice();
-        while !remaining.is_empty() {
-            match self.write_bounded(remaining, Duration::from_secs(2))? {
-                0 => return Err(io::ErrorKind::WriteZero.into()),
-                written => remaining = &remaining[written..],
-            }
+        if self.in_sync_frame {
+            self.in_sync_frame = false;
+            self.pending.extend_from_slice(SYNC_END);
         }
-        Ok(())
+        self.flush_pending()
     }
 }
 impl TtyWriter {
@@ -145,45 +157,87 @@ impl TtyWriter {
         Self {
             file,
             pending: Vec::new(),
+            flushing: Vec::new(),
+            sync_frames: false,
+            in_sync_frame: false,
         }
+    }
+
+    fn new_framed(file: File) -> Self {
+        Self {
+            sync_frames: true,
+            ..Self::new(file)
+        }
+    }
+
+    fn flush_pending(&mut self) -> io::Result<()> {
+        // Swapped first: a stalled terminal must not see this frame again.
+        self.flushing.clear();
+        std::mem::swap(&mut self.pending, &mut self.flushing);
+        if self.flushing.is_empty() {
+            return Ok(());
+        }
+        let result = (|| {
+            let mut offset = 0;
+            while offset < self.flushing.len() {
+                let written = write_bounded(
+                    &mut self.file,
+                    &self.flushing[offset..],
+                    Duration::from_secs(2),
+                )?;
+                if written == 0 {
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+                offset += written;
+            }
+            Ok(())
+        })();
+        self.flushing.clear();
+        if self.flushing.capacity() > PENDING_LIMIT {
+            self.flushing.shrink_to(PENDING_LIMIT);
+        }
+        result
     }
 
     /// One write straight to the terminal, past anything pending.
     fn write_bounded(&mut self, bytes: &[u8], budget: Duration) -> io::Result<usize> {
-        let end = Instant::now() + budget;
-        loop {
-            match self.file.write(bytes) {
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let remaining = end.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "terminal output stalled",
-                        ));
-                    }
-                    let mut fd = libc::pollfd {
-                        fd: self.file.as_raw_fd(),
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    };
-                    // This descriptor belongs to the UI, opened independently of
-                    // stdout, so its nonblocking flag cannot leak into the shell.
-                    let ready =
-                        unsafe { libc::poll(&mut fd, 1, remaining.as_millis().min(100) as i32) };
-                    if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
+        write_bounded(&mut self.file, bytes, budget)
+    }
+}
+
+fn write_bounded(file: &mut File, bytes: &[u8], budget: Duration) -> io::Result<usize> {
+    let end = Instant::now() + budget;
+    loop {
+        match file.write(bytes) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = end.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "terminal output stalled",
+                    ));
                 }
-                value => return value,
+                let mut fd = libc::pollfd {
+                    fd: file.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // This descriptor belongs to the UI, opened independently of
+                // stdout, so its nonblocking flag cannot leak into the shell.
+                let ready =
+                    unsafe { libc::poll(&mut fd, 1, remaining.as_millis().min(100) as i32) };
+                if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    return Err(io::Error::last_os_error());
+                }
             }
-            if Instant::now() >= end {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "terminal output stalled",
-                ));
-            }
+            value => return value,
+        }
+        if Instant::now() >= end {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "terminal output stalled",
+            ));
         }
     }
 }
@@ -308,15 +362,19 @@ impl Session {
         guard.writer.write_all(ENTER).map_err(|e| e.to_string())?;
         guard.writer.flush().map_err(|e| e.to_string())?;
         restore_on_panic(for_panic, guard.panicked.clone(), guard.left.clone());
-        let terminal = Terminal::new(CrosstermBackend::new(TtyWriter::new(copy)))
+        let terminal = Terminal::new(CrosstermBackend::new(TtyWriter::new_framed(copy)))
             .map_err(|e| e.to_string())?;
         Ok(Self {
             terminal: Some(terminal),
             guard,
         })
     }
-    pub fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<TtyWriter>> {
-        self.terminal.as_mut().expect("active terminal")
+    pub fn draw(&mut self, f: impl FnOnce(&mut ratatui::Frame)) -> io::Result<()> {
+        self.terminal
+            .as_mut()
+            .expect("active terminal")
+            .draw(f)
+            .map(|_| ())
     }
     /// Whether the panic hook ran. A panic in a background task does not
     /// unwind the desk, which must then stop drawing and close.
@@ -414,6 +472,32 @@ mod tests {
         give_back(&open, &panicked, &left);
         assert!(panicked.load(Ordering::SeqCst) && left.load(Ordering::SeqCst));
         assert_eq!(std::fs::read(&path).unwrap(), [LEAVE, LEAVE].concat());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sync_frame_wraps_output_in_dec_2026_and_clears_buffer_on_write_error() {
+        let (file, path) = scratch("sync");
+        let mut writer = TtyWriter::new_framed(file);
+        writer.write_all(b"\x1b[1;1Hhi").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"\x1b[?2026h\x1b[1;1Hhi\x1b[?2026l"
+        );
+        // A second empty flush writes nothing stale from the reused buffer.
+        writer.flush().unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"\x1b[?2026h\x1b[1;1Hhi\x1b[?2026l"
+        );
+        // A read-only descriptor errors on flush, and pending is already empty
+        // so a subsequent write does not replay the failed frame.
+        let mut readonly = TtyWriter::new_framed(File::open(&path).unwrap());
+        readonly.write_all(b"stale").unwrap();
+        assert!(readonly.flush().is_err());
+        assert!(readonly.pending.is_empty());
+        assert!(readonly.flushing.is_empty());
         let _ = std::fs::remove_file(path);
     }
 }

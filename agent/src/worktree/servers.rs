@@ -3,11 +3,10 @@
 //! answer is.
 
 use crate::managed::{PANE_RUNS, PaneRun, pane_runs};
-use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long one server may take to list its panes.
 const ANSWER: Duration = Duration::from_secs(2);
@@ -84,7 +83,7 @@ pub(super) fn query(socket: &Path) -> Server {
 
 fn list(socket: &Path) -> Result<String, String> {
     let binary = crate::native_ui::native_executable()?;
-    let mut child = Command::new(binary)
+    let child = Command::new(binary)
         .arg("-u")
         .arg("-S")
         .arg(socket)
@@ -94,39 +93,22 @@ fn list(socket: &Path) -> Result<String, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("cannot run masil: {error}"))?;
-    let mut stdout = child.stdout.take().ok_or("masil output unavailable")?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        (&mut stdout)
-            .take(OUTPUT_LIMIT)
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("cannot read the pane list: {error}"))?;
-        // A cut-off list would read as "no pane there".
-        if bytes.len() as u64 >= OUTPUT_LIMIT {
-            return Err("output too large".to_owned());
-        }
-        // A pane path that is not UTF-8 must not hide the others.
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
-    });
-    let deadline = Instant::now() + ANSWER;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("it did not answer within 2 s".into());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let output = reader
-        .join()
-        .map_err(|_| "the pane list reader failed".to_owned())??;
-    if !status.success() {
-        return Err(format!("list-panes failed ({status})"));
+    let captured = crate::process::capture_child(child, Some(ANSWER), OUTPUT_LIMIT as usize)
+        .map_err(|error| match error {
+            crate::process::CaptureError::Timeout => "it did not answer within 2 s".to_owned(),
+            crate::process::CaptureError::Io(error) => {
+                format!("cannot read the pane list: {error}")
+            }
+        })?;
+    // A cut-off list would read as "no pane there".
+    if captured.stdout_truncated || captured.stdout.len() as u64 >= OUTPUT_LIMIT {
+        return Err("output too large".to_owned());
     }
-    Ok(output)
+    if !captured.status.success() {
+        return Err(format!("list-panes failed ({})", captured.status));
+    }
+    // A pane path that is not UTF-8 must not hide the others.
+    Ok(crate::process::into_string_lossy(captured.stdout))
 }
 
 /// Whether `path`, or one of its parents, is the directory `identity`.
