@@ -22,7 +22,7 @@ pub(super) enum Server {
 
 /// `realpath(TMUX_TMPDIR or /tmp)/masil-<uid>`, where masil puts default
 /// and `-L` sockets.
-pub(super) fn socket_dir() -> Option<PathBuf> {
+pub(crate) fn socket_dir() -> Option<PathBuf> {
     let base = std::env::var_os("TMUX_TMPDIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -33,7 +33,7 @@ pub(super) fn socket_dir() -> Option<PathBuf> {
 }
 
 /// Sockets in `dir`: socket files whose names do not start with `.`.
-pub(super) fn sockets_in(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn sockets_in(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -51,7 +51,7 @@ pub(super) fn sockets_in(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Whether a server listens on `socket`. Refused or missing means no.
-fn listening(socket: &Path) -> Result<bool, String> {
+pub(crate) fn listening(socket: &Path) -> Result<bool, String> {
     match std::os::unix::net::UnixStream::connect(socket) {
         Ok(_) => Ok(true),
         Err(error)

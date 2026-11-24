@@ -1,0 +1,18 @@
+services:
+  masil-relay:
+    build:
+      context: ..
+      dockerfile: relay/Dockerfile
+    ports:
+      - "8787:8787"
+    environment:
+      MASIL_RELAY_LISTEN: "0.0.0.0:8787"
+      # Optional: configure APNs and/or FCM for native background push.
+      # MASIL_PUSH_APNS_KEY_PEM: ""
+      # MASIL_PUSH_APNS_KEY_ID: ""
+      # MASIL_PUSH_APNS_TEAM_ID: ""
+      # MASIL_PUSH_APNS_BUNDLE_ID: "dev.masil.app"
+      # MASIL_PUSH_FCM_PROJECT_ID: ""
+      # MASIL_PUSH_FCM_CLIENT_EMAIL: ""
+      # MASIL_PUSH_FCM_PRIVATE_KEY_PEM: ""
+    restart: unless-stopped

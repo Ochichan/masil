@@ -205,8 +205,8 @@ the compiler, flags, revision and binary hash. licenses/ holds the tmux
 
 
 CORE_INPUTS = ('core', 'scripts/build.py', 'LICENSE', 'NOTICE')
-# The agent embeds the UI layer configuration from core.
-AGENT_INPUTS = ('agent', '.cargo', 'core/masil-ui-layer.conf', 'scripts/build.py')
+# The agent embeds the UI layer configuration from core and links the shared wire crate.
+AGENT_INPUTS = ('agent', 'crates/masil-wire', '.cargo', 'core/masil-ui-layer.conf', 'scripts/build.py')
 
 
 def git_revision(inputs=CORE_INPUTS):

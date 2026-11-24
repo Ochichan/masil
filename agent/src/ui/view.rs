@@ -51,17 +51,17 @@ impl Palette {
             },
             Theme::Light => Self {
                 host: false,
-                canvas: Color::Rgb(238, 242, 244),
-                panel: Color::Rgb(250, 251, 251),
-                raised: Color::Rgb(220, 227, 230),
+                canvas: Color::Rgb(232, 237, 241),
+                panel: Color::Rgb(250, 251, 252),
+                raised: Color::Rgb(210, 220, 226),
                 text: Color::Rgb(25, 34, 41),
                 muted: Color::Rgb(84, 100, 111),
                 accent: Color::Rgb(0, 112, 127),
                 accent_text: Color::Rgb(255, 255, 255),
-                warning: Color::Rgb(144, 84, 0),
+                warning: Color::Rgb(154, 98, 20),
                 danger: Color::Rgb(170, 42, 52),
                 success: Color::Rgb(22, 112, 54),
-                track: Color::Rgb(190, 202, 207),
+                track: Color::Rgb(185, 198, 204),
             },
             // `raised` and `muted` are fixed greys that a light host can
             // make unreadable. They stay for callers that need a colour.
@@ -254,9 +254,9 @@ impl App {
         }
 
         let dense = area.height < 18;
-        let compact_narrow = self.compact && area.width < 60;
+        let compact_narrow = (self.compact && area.width < 60) || area.width < 52;
         // Chrome text lines up with the text inside bordered regions.
-        let gutter = u16::from(!compact_narrow);
+        let gutter = u16::from(!compact_narrow || area.width >= 36);
         let header_height = if dense {
             1
         } else if compact_narrow || area.height >= 28 {
@@ -509,12 +509,13 @@ impl App {
         );
         let levels = self.header_levels();
         self.header_controls = 0;
-        if self.compact && area.width < 60 && !dense {
+        if ((self.compact && area.width < 60) || area.width < 52) && !dense {
             // Row 0: identity and connection. Row 1: controls. Row 2 separates
             // the header controls from the filter controls below.
+            let bar = inset_x(area, u16::from(area.width >= 36));
             let (status, color) = self.connection_label(true, palette);
-            let status_width = cell_width(status).min(area.width as usize) as u16;
-            let title_width = area.width.saturating_sub(status_width + 1);
+            let status_width = cell_width(status).min(bar.width as usize) as u16;
+            let title_width = bar.width.saturating_sub(status_width + 1);
             let title = clip_line(
                 vec![
                     product,
@@ -529,24 +530,24 @@ impl App {
             );
             frame.render_widget(
                 Paragraph::new(title),
-                Rect::new(area.x, area.y, title_width, 1),
+                Rect::new(bar.x, bar.y, title_width, 1),
             );
             frame.render_widget(
                 Paragraph::new(status).style(Style::default().fg(color)),
                 Rect::new(
-                    area.right().saturating_sub(status_width),
-                    area.y,
+                    bar.right().saturating_sub(status_width),
+                    bar.y,
                     status_width,
                     1,
                 ),
             );
-            let level = fit_level(&levels, 1, area.width);
-            let controls_y = area.y + 1.min(area.height.saturating_sub(1));
-            let mut x = area.x;
+            let level = fit_level(&levels, 1, bar.width);
+            let controls_y = bar.y + 1.min(bar.height.saturating_sub(1));
+            let mut x = bar.x;
             // Drawn left to right, so walk the focus order backwards.
             for (focus_index, control) in levels[level].iter().enumerate().rev() {
                 let width = control.width();
-                if x + width > area.right() {
+                if x + width > bar.right() {
                     break;
                 }
                 let target = header_target(focus_index);
@@ -706,17 +707,26 @@ impl App {
             ))
             .collect::<Vec<_>>();
 
-        if self.compact && area.width < 60 && !dense {
-            // Two labelled columns across two rows.
-            let width = area.width.saturating_sub(1) / 2;
+        if (self.compact || area.width < 52) && area.height >= 2 && !dense {
+            // Two labelled columns across two rows so narrow panes never
+            // collapse filter pills to bare unlabeled numbers. Inset by 1 cell
+            // when >= 36 cols so edges line up with the Search and Agents frames.
+            let grid = inset_x(area, u16::from(area.width >= 36));
+            let left_w = grid.width.saturating_sub(1) / 2;
+            let right_w = grid.width.saturating_sub(left_w + 1);
             let level = levels
                 .iter()
-                .position(|controls| controls.iter().all(|control| control.width() <= width))
+                .position(|controls| controls.iter().all(|control| control.width() <= left_w))
                 .unwrap_or(levels.len() - 1);
             for (index, filter) in Filter::ALL.into_iter().enumerate() {
                 let column = (index % 2) as u16;
                 let row = (index / 2) as u16;
-                let rect = Rect::new(area.x + column * (width + 1), area.y + row, width, 1);
+                let (x, w) = if column == 0 {
+                    (grid.x, left_w)
+                } else {
+                    (grid.x + left_w + 1, right_w)
+                };
+                let rect = Rect::new(x, grid.y + row, w, 1);
                 self.draw_control(
                     frame,
                     rect,
@@ -907,7 +917,8 @@ impl App {
             ),
             (
                 format!(
-                    "  {}",
+                    "{}{}",
+                    if verbose { "  " } else { " " },
                     tr(
                         self.language,
                         if row.acknowledged {
@@ -941,7 +952,7 @@ impl App {
                 Text::Unseen
             },
         );
-        width + 2 + cell_width(seen)
+        width + if verbose { 2 } else { 1 } + cell_width(seen)
     }
 
     fn draw_list(&mut self, frame: &mut Frame, area: Rect, palette: Palette, two_line: bool) {
@@ -991,14 +1002,38 @@ impl App {
         let brief = two_line || !fits(state_column(false));
         let state_width = state_column(brief);
         let two_line = two_line || !fits(state_width);
-        let row_height = if two_line { 2 } else { 1 };
+        let row_heights: Vec<u16> = indices
+            .iter()
+            .map(|&idx| {
+                if two_line && self.rows[idx].pending {
+                    2
+                } else {
+                    1
+                }
+            })
+            .collect();
+        let total_visual_rows: usize = row_heights.iter().map(|&h| h as usize).sum();
+        let has_scroll = total_visual_rows > inner.height as usize;
         let previous_page = self.list_page;
-        self.list_page = (inner.height / row_height).max(1) as usize;
+        let visible_from = |start: usize| -> usize {
+            let mut used = 0u16;
+            let mut count = 0usize;
+            for &h in row_heights.iter().skip(start) {
+                if used + h > inner.height {
+                    break;
+                }
+                used += h;
+                count += 1;
+            }
+            count.max(1)
+        };
+        self.list_page = visible_from(self.list_scroll.min(indices.len().saturating_sub(1)));
         if self.list_page == previous_page {
             self.clamp_selection_and_scroll();
         } else {
             self.reveal_selection();
         }
+        self.list_page = visible_from(self.list_scroll.min(indices.len().saturating_sub(1)));
         if indices.is_empty() {
             let (message, hint) = self.empty_list_text();
             let width = inner.width.saturating_sub(2) as usize;
@@ -1025,8 +1060,12 @@ impl App {
             );
             return;
         }
-        let has_scroll = indices.len() > self.list_page;
-        let content_width = inner.width.saturating_sub(u16::from(has_scroll)) as usize;
+        let right_pad = if has_scroll {
+            1
+        } else {
+            u16::from(!two_line && inner.width >= 40)
+        };
+        let content_width = inner.width.saturating_sub(right_pad) as usize;
         // Keep "pending" only while every row's attention fits beside the
         // identity; the kind, count and seen state always stay.
         let verbose = if two_line {
@@ -1039,18 +1078,19 @@ impl App {
         } else {
             short_attention
         };
-        for (visible, &row_idx) in indices
+        let mut cursor_y = inner.y;
+        for (&row_idx, &wanted_h) in indices
             .iter()
+            .zip(row_heights.iter())
             .skip(self.list_scroll)
             .take(self.list_page)
-            .enumerate()
         {
-            let y = inner.y + visible as u16 * row_height;
-            let height = row_height.min(inner.bottom().saturating_sub(y));
+            let height = wanted_h.min(inner.bottom().saturating_sub(cursor_y));
             if height == 0 {
-                continue;
+                break;
             }
-            let rect = Rect::new(inner.x, y, content_width as u16, height);
+            let rect = Rect::new(inner.x, cursor_y, content_width as u16, height);
+            cursor_y += height;
             let observation = &self.rows[row_idx];
             let selected = self.selected_id.as_deref() == Some(observation.id.as_str());
             let target = HitTarget::Row {
@@ -1075,11 +1115,13 @@ impl App {
                 }
                 .add_modifier(Modifier::BOLD),
             );
-            let id_style = Style::default().fg(palette.text).add_modifier(if selected {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            });
+            let id_style = Style::default().fg(palette.text).add_modifier(
+                if selected || (two_line && observation.pending) {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                },
+            );
             let (state, state_tone) = self.row_state(observation, brief);
             let state_style = palette.tone_style(state_tone);
             let attention = self
@@ -1113,14 +1155,34 @@ impl App {
                     Rect::new(rect.x, rect.y, rect.width, 1),
                 );
                 if height > 1 {
-                    // The indent goes before any attention text is cut.
+                    // Indent line 2 to align under the agent name, and right-align the
+                    // Seen/Unseen token to match the line-1 status column when space allows.
                     let indent = if spans_width(&attention) + 2 <= content_width {
                         "  "
                     } else {
                         ""
                     };
-                    let mut second = vec![Span::raw(indent)];
-                    second.extend(attention);
+                    let second = if attention.len() == 2 {
+                        let left = attention[0].clone();
+                        let right_text = attention[1].content.trim_start().to_owned();
+                        let right = Span::styled(right_text, attention[1].style);
+                        let used = cell_width(indent)
+                            + cell_width(left.content.as_ref())
+                            + cell_width(right.content.as_ref())
+                            + 1;
+                        if used < content_width {
+                            let gap = content_width.saturating_sub(used);
+                            vec![Span::raw(indent), left, Span::raw(" ".repeat(gap)), right]
+                        } else {
+                            let mut fallback = vec![Span::raw(indent)];
+                            fallback.extend(attention);
+                            fallback
+                        }
+                    } else {
+                        let mut fallback = vec![Span::raw(indent)];
+                        fallback.extend(attention);
+                        fallback
+                    };
                     frame.render_widget(
                         Paragraph::new(clip_line(second, content_width)),
                         Rect::new(rect.x, rect.y + 1, rect.width, 1),
@@ -1224,21 +1286,18 @@ impl App {
             Block::default().style(Style::default().bg(if dragging {
                 palette.accent
             } else {
-                palette.canvas
+                palette.panel
             })),
             divider,
         );
-        if !dragging {
+        if hovered && !dragging {
             let grip = divider.height.min(3);
             let top = divider.y + divider.height.saturating_sub(grip) / 2;
             frame.render_widget(
                 Paragraph::new(vec![Line::from("┃"); grip as usize]).style(
-                    if hovered {
-                        Style::default().fg(palette.accent)
-                    } else {
-                        palette.muted_style()
-                    }
-                    .add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Rect::new(divider.x, top, 1, grip),
             );
@@ -1427,10 +1486,19 @@ impl App {
             row.source_id.clone(),
             Tone::Normal,
         ));
+        let session_display = if row.session_id == "unverified" && language == Language::Korean {
+            "미확인".to_owned()
+        } else {
+            row.session_id.clone()
+        };
         entries.push(Entry::Field(
             tr(language, Text::Session),
-            row.session_id.clone(),
-            Tone::Normal,
+            session_display,
+            if row.session_id == "unverified" {
+                Tone::Muted
+            } else {
+                Tone::Normal
+            },
         ));
         entries.push(Entry::Field(
             tr(language, Text::Pane),
@@ -1678,19 +1746,26 @@ impl App {
         let levels = self.action_levels(&actions, expanded);
         self.action_controls = 0;
         self.action_focus = self.action_focus.min(actions.len().saturating_sub(1));
-        if self.compact && self.last_area.width < 60 && !dense {
-            let width = area.width.saturating_sub(1) / 2;
+        if ((self.compact && self.last_area.width < 60) || self.last_area.width < 52) && !dense {
+            let grid = inset_x(area, u16::from(area.width >= 36));
+            let left_w = grid.width.saturating_sub(1) / 2;
+            let right_w = grid.width.saturating_sub(left_w + 1);
             let level = levels
                 .iter()
-                .position(|controls| controls.iter().all(|control| control.width() <= width))
+                .position(|controls| controls.iter().all(|control| control.width() <= left_w))
                 .unwrap_or(levels.len() - 1);
             for (index, action) in actions.into_iter().enumerate() {
                 let column = (index % 2) as u16;
                 let row = (index / 2) as u16;
-                if row >= area.height {
+                if row >= grid.height {
                     break;
                 }
-                let rect = Rect::new(area.x + column * (width + 1), area.y + row, width, 1);
+                let (x, w) = if column == 0 {
+                    (grid.x, left_w)
+                } else {
+                    (grid.x + left_w + 1, right_w)
+                };
+                let rect = Rect::new(x, grid.y + row, w, 1);
                 self.draw_control(
                     frame,
                     rect,
@@ -1741,7 +1816,22 @@ impl App {
         );
         let line = inset_x(area, gutter);
         let width = line.width as usize;
-        let style = if self.toast.is_some() {
+        let is_warning_toast = self.toast.as_deref().is_some_and(|m| {
+            m.contains("MASIL_CLIENT_KEY")
+                || m.contains("not kept")
+                || m.contains("damaged")
+                || m.contains("unavailable")
+                || m.contains("cannot")
+                || m.contains("failed")
+                || m.contains("저장하지")
+                || m.contains("손상")
+                || m.contains("불가")
+                || m.contains("실패")
+                || m.contains("없습니다")
+        });
+        let style = if is_warning_toast {
+            Style::default().fg(palette.warning)
+        } else if self.toast.is_some() {
             Style::default().fg(palette.accent)
         } else if self.connected {
             palette.muted_style()
@@ -1751,11 +1841,28 @@ impl App {
         // A message may take every footer row except the server status
         // line's; a hint shortens to one row.
         let rows = area.height - u16::from(area.height > 1 && self.endpoint_line.is_some());
-        let lines = match self.toast.as_deref().or(self.connection_message.as_deref()) {
+        let formatted_toast = self.toast.as_deref().map(|msg| {
+            if msg.contains("MASIL_CLIENT_KEY") && width < 56 {
+                match self.language {
+                    Language::English => "! Set MASIL_CLIENT_KEY to keep view".to_owned(),
+                    Language::Korean => "! 뷰 유지: MASIL_CLIENT_KEY 설정".to_owned(),
+                }
+            } else if is_warning_toast && !msg.starts_with("! ") {
+                format!("! {msg}")
+            } else {
+                msg.to_owned()
+            }
+        });
+        let lines = match formatted_toast
+            .as_deref()
+            .or(self.connection_message.as_deref())
+        {
             Some(message) => wrap_rows(message, width, rows as usize),
             None => {
                 let hints = self.current_hint();
-                let first = usize::from(self.compact && self.last_area.width < 60);
+                let first = usize::from(
+                    (self.compact && self.last_area.width < 60) || self.last_area.width < 52,
+                );
                 let hint = hints[first..]
                     .iter()
                     .find(|hint| cell_width(hint) <= width)
@@ -1774,16 +1881,19 @@ impl App {
         }
         let y = area.bottom() - 1;
         if let Some((note, offline)) = &self.endpoint_line {
+            let bar_style = if *offline {
+                Style::default().fg(palette.warning)
+            } else {
+                palette.muted_style()
+            }
+            .bg(palette.panel);
             frame.render_widget(
-                Paragraph::new(ellipsize(note, area.width as usize)).style(
-                    if *offline {
-                        Style::default().fg(palette.warning)
-                    } else {
-                        palette.muted_style()
-                    }
-                    .bg(palette.panel),
-                ),
+                Block::default().style(bar_style),
                 Rect::new(area.x, y, area.width, 1),
+            );
+            frame.render_widget(
+                Paragraph::new(ellipsize(note, width)).style(bar_style),
+                Rect::new(line.x, y, line.width, 1),
             );
         } else if self.compact {
             frame.render_widget(
@@ -2158,6 +2268,12 @@ impl App {
         if track.width == 0 || track.height == 0 || total <= page {
             return;
         }
+        let active_bar = match thumb_target {
+            HitTarget::ListThumb => self.focus == Focus::List,
+            HitTarget::InspectorThumb => self.focus == Focus::Inspector,
+            _ => true,
+        } || self.hover.as_ref() == Some(&thumb_target)
+            || self.hover.as_ref() == Some(&track_target);
         frame.render_widget(
             Block::default().style(Style::default().bg(palette.track)),
             track,
@@ -2170,8 +2286,13 @@ impl App {
         let travel = track.height as usize - thumb_height;
         let thumb_y = track.y + (travel * offset.min(max_offset) / max_offset) as u16;
         let thumb = Rect::new(track.x, thumb_y, 1, thumb_height as u16);
+        let thumb_color = if active_bar {
+            palette.accent
+        } else {
+            palette.muted
+        };
         frame.render_widget(
-            Block::default().style(Style::default().bg(palette.accent)),
+            Block::default().style(Style::default().bg(thumb_color)),
             thumb,
         );
         self.push_hit(thumb, thumb_target, z + 1);

@@ -1,0 +1,19 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'dev.masil.terminal'
+version = '0.1.0'
+
+android {
+  namespace "dev.masil.terminal"
+  defaultConfig {
+    versionCode 1
+    versionName '0.1.0'
+  }
+}
+
+dependencies {
+  implementation project(':expo-modules-core')
+}

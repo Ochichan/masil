@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "masil-terminal": ["./modules/masil-terminal/src/index.tsx"]
+    }
+  },
+  "include": [
+    "app.config.ts",
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "modules/**/*.ts",
+    "modules/**/*.tsx"
+  ],
+  "exclude": ["node_modules", "dist", "ios", "android"]
+}

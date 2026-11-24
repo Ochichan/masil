@@ -8,7 +8,7 @@ mod helper;
 mod lease;
 mod registry;
 mod remove;
-mod servers;
+pub(crate) mod servers;
 mod setup;
 
 pub(crate) use lease::{Found, abandon, begin, detect, launched, record_session, start_dir};

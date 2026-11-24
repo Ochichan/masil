@@ -1,6 +1,6 @@
 PREFIX ?= $(HOME)/.local
 
-.PHONY: all core agent baseline install test test-ci test-benchmark benchmark benchmark-env clean
+.PHONY: all core agent relay test-relay baseline install test test-ci test-benchmark benchmark benchmark-env clean
 
 all: core agent
 
@@ -9,6 +9,15 @@ core:
 
 agent:
 	python3 scripts/build.py --agent
+
+relay:
+	env -u LIBRARY_PATH cargo build --locked --release --manifest-path relay/Cargo.toml
+	mkdir -p bin
+	cp relay/target/release/masil-relay bin/masil-relay
+
+test-relay:
+	env -u LIBRARY_PATH cargo test --locked --manifest-path crates/masil-wire/Cargo.toml
+	env -u LIBRARY_PATH cargo test --locked --manifest-path relay/Cargo.toml
 
 baseline:
 	python3 scripts/build.py --baseline

@@ -2,6 +2,16 @@
 bin/
 target/
 agent/target/
+relay/target/
+crates/masil-wire/target/
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+mobile/ios/
+mobile/android/
+mobile/artifacts/
+mobile/modules/*/android/build/
+mobile/modules/*/ios/build/
 __pycache__/
 *.pyc
 core/autom4te.cache/
@@ -14,6 +24,7 @@ core/etc/
 # Notes and review records stay local. Public documentation is allowlisted.
 *.md
 !/README.md
+!/README.ko.md
 /docs/
 !/docs/
 /docs/*
@@ -50,6 +61,7 @@ core/etc/
 !/tests/test_managed_restore.py
 !/tests/test_performance_compare.py
 !/tests/test_management_probe.py
+!/tests/test_remote_e2e.py
 !/tests/test_remote_links.py
 !/tests/test_restore.py
 /core/regress/

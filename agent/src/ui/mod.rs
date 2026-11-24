@@ -19,6 +19,7 @@ mod network;
 mod palette;
 mod preferences;
 mod queue;
+pub(crate) mod remote_onboarding;
 pub(crate) mod settings;
 mod terminal;
 mod view;

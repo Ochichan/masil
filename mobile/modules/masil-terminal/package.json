@@ -1,0 +1,7 @@
+{
+  "name": "masil-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "main": "src/index.tsx"
+}

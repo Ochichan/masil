@@ -23,10 +23,12 @@ mod opencode;
 mod process;
 mod provider_support;
 mod providers;
+mod remote;
 mod schedule;
 mod session;
 mod ui;
 mod worktree;
+mod wrap;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
@@ -741,6 +743,12 @@ fn execute() -> Result<i32, String> {
                 Ok(class.exit_code())
             }
         };
+    }
+    if args[0] == "remote" {
+        return remote::run(&args[1..]);
+    }
+    if args[0] == "wrap" {
+        return wrap::run(&args[1..]);
     }
     if args[0] == "agentd" {
         return coordinator::run(&args[1..]);

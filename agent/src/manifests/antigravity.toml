@@ -26,7 +26,7 @@ priority = 100
 region = "whole_recent"
 visible_working = true
 interruptible = true
-line_regex = ['^\s*[\u2800-\u28FF]+\s+\p{Alphabetic}+\w*ing\b']
+line_regex = ['^\s*[\u2800-\u28FF]+\s+(?:\d+/\d+\s+steps(?:\s*·.*)?|\p{Alphabetic}+\w*ing\b|\S.*\b(?:\d+h\s+)?(?:\d+m\s+)?\d+s\s*$)']
 
 [[rules]]
 id = "background_tasks_working"

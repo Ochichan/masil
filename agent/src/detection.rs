@@ -2467,6 +2467,20 @@ contains = ["x"]
                 "",
             ),
             (
+                "agy",
+                format!("⣷  0/8 steps · Editing files...\n{rule}\n>\n{rule}\nesc to cancel                    auto · Gemini 4 Neon · xhigh\n"),
+                "",
+                "working",
+                "spinner_working",
+            ),
+            (
+                "agy",
+                format!("⣽  The canonical_vault_root function will be corrected... 1m 58s\n{rule}\n>\n{rule}\nesc to cancel                    auto · Gemini 4 Neon · xhigh\n"),
+                "",
+                "working",
+                "spinner_working",
+            ),
+            (
                 "kimi",
                 "  Trust this folder?\n  ↑↓ navigate · Enter select · Esc exit\n   ❯ Trust this folder\n     Enable project MCP servers. Remembered for this folder.\n     Don't trust\n     Exit Kimi Code. Asked again next launch.\n".into(),
                 "",

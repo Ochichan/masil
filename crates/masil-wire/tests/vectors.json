@@ -1,0 +1,15 @@
+{
+  "handshake_hash_b64": "UGqLuMNVBd+WS1O78b2L4+QmAtE/UET70T+haSyuvLw=",
+  "initiator_ephemeral_secret_b64": "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A=",
+  "initiator_to_responder_text_plain_b64": "eyJ2IjoxLCJpZCI6IjEiLCJ0eXBlIjoiYWdlbnQubGlzdC5yZXF1ZXN0IiwicGFyYW1zIjp7fX0=",
+  "initiator_to_responder_text_wire_b64": "AE7epC0WeP43ILvTFZ8jiNEVQxhQ9YbVKg3Tl98+vHYkzA7V7/VPvhjCCXOGRZG7zqhVnNE0fh/Kc+VbF4CXYK4d3tgEVPbn6Jf4Bn8c8G8=",
+  "msg1_b64": "WGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpns1/MXibGOWGbELqQJdkn3mrSw=",
+  "msg2_b64": "ZLEBsdC+WocEvQePmJUAH8A+jp+VIvGI3RKNmEbUhGaleAIRMGtgcbesnOF9nA4aM/M=",
+  "prologue": "masil-remote-e2ee/1",
+  "protocol_name": "Noise_NK_25519_ChaChaPoly_SHA256",
+  "responder_ephemeral_secret_b64": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A=",
+  "responder_static_public_b64": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=",
+  "responder_static_secret_b64": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+  "responder_to_initiator_binary_plain_b64": "AQADG1sxbWhpG1swbQ==",
+  "responder_to_initiator_binary_wire_b64": "ACPmO0TrNdhMXkIcf5cueIFhErY1V1me0qP3NeMgI8RIUy0pcg=="
+}
