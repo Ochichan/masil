@@ -1,255 +1,180 @@
 # masil
 
-masil keeps your tmux commands, configuration and default key bindings while adding coding-agent management. Run Claude Code, Codex or OpenCode in their own terminal panes, inspect which agent needs attention, and track whether a management command was delivered or its outcome is still unknown.
+**English** | [한국어](README.ko.md)
 
-The repository has two programs. `core/` is tmux at commit `94796f6b1182507efac8a272fc309a79e22e58a5`, on the `next-3.9` development line, with masil's changes. `make core` builds it into `bin/masil`. `agent/` is a Rust program, `masil-agent`, that finds and controls agents and provides the agent UI, layout templates, saved sessions and diagnostics.
+A tmux-compatible terminal workspace built for running multiple AI coding agents side by side, with an optional mobile app to monitor, steer, and launch agents from your phone.
 
-masil is still in development. The tests run on macOS arm64 and Debian 13.7 x86_64.
+Run Claude Code, Codex, OpenCode, Antigravity CLI, Gemini CLI, Cursor, and other terminal coding tools in real terminal panes without losing your tmux key bindings, `~/.tmux.conf`, or shell speed. When you run several agents at once, masil shows which ones are working, waiting for input, or done, lets you jump straight to the right pane, and optionally syncs conversations and git changes to your phone over end-to-end encryption.
 
-Start with [installation and updates](docs/public/install.md),
-[provider support and setup](docs/public/providers.md), or
-[verification and performance](docs/public/validation.md).
-The [architecture and compatibility guide](docs/public/architecture.md)
-explains the tmux boundary and operational limits. Windows is not a supported
-masil host. Provider recognition does not mean every operation has been tested.
+## Why masil
 
-## Install with Homebrew
+If you use terminal AI coding tools every day, the same friction shows up quickly:
 
-This repository is also a Homebrew tap. Until the first stable release is
-published and its formula is promoted, install the current development version:
+- You start three or four agents across different repos and lose track of which pane is working, idle, or blocked on a permission prompt.
+- Switching tabs to inspect diffs, roll back a bad edit, or launch another agent in a fresh git worktree breaks focus.
+- Once you step away from your desk, you cannot check progress or send the next prompt without setting up an ad-hoc SSH session on a tiny phone screen.
+
+masil solves this without wrapping your terminal in a heavy Electron app or putting a proxy in front of your shell:
+
+- **Your terminal stays native.** The multiplexer core is derived from tmux (C), so PTYs, rendering, scrollback, and `~/.tmux.conf` keep working at native speed.
+- **Original agent CLIs, not forks.** masil launches and observes the real `claude`, `codex`, `opencode`, `agy`, and other CLIs directly in panes.
+- **Desktop TUI + optional mobile app.** Manage everything from a keyboard/mouse TUI in the terminal, and turn on the mobile gateway only when you want phone access.
+- **Honest status reporting.** masil reports only what it can observe (process state, screen signals, hook events) and never fakes approvals or task completion.
+
+## Quick start
+
+### 1. Install on macOS or Linux
+
+**Homebrew (macOS / Linux):**
 
 ```sh
 brew tap Ochichan/masil https://github.com/Ochichan/masil
 brew install --HEAD Ochichan/masil/masil
+```
+
+Update later with `brew upgrade --fetch-HEAD Ochichan/masil/masil`. Installing masil leaves your system `tmux` binary and sockets untouched.
+
+**Prebuilt archives (macOS 15+ Apple Silicon, Ubuntu 24.04 x86_64):**
+
+Download the archive and `SHA256SUMS` from [GitHub Releases](https://github.com/Ochichan/masil/releases). Runtime libraries required:
+
+- macOS: `brew install libevent ncurses utf8proc jemalloc`
+- Ubuntu 24.04: `sudo apt-get install libevent-core-2.1-7t64 libncursesw6 libtinfo6 libutf8proc3 libjemalloc2`
+
+**Build from source:**
+
+```sh
+make            # builds bin/masil and bin/masil-agent
+make install    # installs into ~/.local/bin (override with PREFIX=/path)
+```
+
+For full dependency and upgrade details, see [docs/public/install.md](docs/public/install.md). Windows is not supported as a masil host.
+
+### 2. Start using masil with your AI coding tools
+
+Start a masil terminal session just like tmux:
+
+```sh
 masil
 ```
 
-Homebrew builds both programs from source and installs their dependencies.
-It installs the manual as `masil.1` and `THIRD-PARTY-LICENSES.txt`, the licences of the Rust crates in `masil-agent`, in the formula's share directory. It leaves the `tmux` command unchanged.
-To update a development installation, run
-`brew upgrade --fetch-HEAD Ochichan/masil/masil`.
-After a stable formula is promoted, new installations can omit `--HEAD`.
-Existing HEAD installations can switch with `brew uninstall masil` followed by
-`brew install Ochichan/masil/masil`.
-
-## Release downloads
-
-The release workflow prepares archives for macOS 15+ on Apple Silicon and
-Ubuntu 24.04 on x86_64. Download the matching archive and `SHA256SUMS` from
-[GitHub Releases](https://github.com/Ochichan/masil/releases). Check the archive
-against its entry in `SHA256SUMS` with `shasum -a 256 ARCHIVE` on macOS or
-`sha256sum ARCHIVE` on Linux before extracting it. Each archive contains both
-programs, the manual `share/man/man1/masil.1`, licenses, `THIRD-PARTY-LICENSES.txt` (the licences of the Rust crates in `masil-agent`), build metadata and a list of linked libraries.
-
-The binaries need runtime libraries. On macOS with Homebrew in `/opt/homebrew`:
+Inside masil, launch agents in managed panes (or run your CLIs manually as usual; masil detects running agent panes automatically):
 
 ```sh
-brew install libevent ncurses utf8proc jemalloc
-```
-
-On Ubuntu 24.04:
-
-```sh
-sudo apt-get install libevent-core-2.1-7t64 libncursesw6 libtinfo6 libutf8proc3 libjemalloc2
-```
-
-Extract the archive into a directory you own. Keep `bin/masil` and
-`bin/masil-agent` together and add that `bin` directory to `PATH`.
-These are dynamically linked, unsigned binaries. Other OS versions and library
-ABIs are not covered by these archives; use a source build for those systems.
-
-## Build
-
-The build needs a C compiler, make, Python 3.12 or later, pkg-config, libevent, ncurses, utf8proc and jemalloc. Only `masil-agent` needs Cargo. On macOS the build uses the Homebrew copies of these libraries. If m4, autoconf or automake is missing, the build downloads the official release archive, checks its SHA-256 and builds it under `.build/`. It does not install or replace system packages.
-
-```sh
-make            # bin/masil and bin/masil-agent
-make core       # bin/masil only
-./bin/masil -L main new-session -s work
-```
-
-For a source installation, `make install` builds and installs both programs
-under `~/.local`. Add `~/.local/bin` to `PATH`. Use
-`make install PREFIX=/path/to/prefix` to choose another directory. Updates
-prepare a complete versioned bundle and switch one link; unrelated existing
-files are refused. Existing servers keep their old core until you save your
-work and restart them. See the [install guide](docs/public/install.md).
-
-## CI and releases
-
-GitHub Actions runs on pull requests, pushes to `main`, and manual CI dispatches.
-The native jobs use `macos-15` and `ubuntu-24.04`, Python 3.13 and Rust 1.96.0.
-They run the locked Rust tests, build both programs, exercise an isolated masil
-server and its agent bridge, then package and smoke-test the extracted binaries.
-The Homebrew job builds a formula from the same checkout, runs its test and
-checks dynamic linkage. Successful builds retain archives for 14 days.
-
-Selected regression tests and their fixtures are tracked in `tests/`. CI runs
-`make test-ci` for compatibility contracts, prompt replay protection, restore,
-endpoint disconnect and local installation. This gate needs no separate tmux
-checkout, provider account or model call. The broader local `make test` still
-uses unpublished development suites and a pinned upstream checkout. Before
-the Rust tests, CI runs `cargo fmt --check` and
-`cargo clippy --all-targets -- -D warnings`. To run the public checks locally:
-
-```sh
-make all
-cargo test --locked --manifest-path agent/Cargo.toml
-make test-ci
-python3 scripts/ci_smoke.py bin
-```
-
-Release packaging additionally checks that the binaries were built from the
-current clean commit. Run it after committing and rebuilding with `make all`.
-
-To prepare a release:
-
-1. Update `agent/Cargo.toml`, its lockfile package version, and the version strings
-   in `agent/src/main.rs` together. Commit the release inputs after CI passes.
-2. Create and push a matching tag such as `v0.1.0`. Tags must match the Cargo
-   version. The release workflow runs all native and Homebrew checks again.
-3. Review the resulting **draft** GitHub Release. It contains the two binary
-   archives, a source archive, `SHA256SUMS`, and `masil.rb`. Publish the draft
-   when the files and release notes are ready. For a version with a prerelease
-   suffix, mark it as a prerelease before publishing.
-4. For a stable version, download that release's `masil.rb`, verify its checksum,
-   and copy it to `Formula/masil.rb` in a follow-up PR. Keep the stable metadata
-   marker. Once merged, `brew update` and `brew install Ochichan/masil/masil`
-   install that version from its checksummed source archive.
-
-The workflow never pushes tags, commits a formula update, or publishes the draft.
-Only the final draft job has `contents: write`; build jobs use `contents: read`.
-No personal access token or signing secret is needed. Build or test failures
-stop before draft creation. An upload failure can leave an incomplete draft.
-If a draft already exists, inspect it before deleting that draft and rerunning
-the workflow; the workflow does not overwrite release assets.
-
-The configuration follows GitHub's [runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
-and Homebrew's [tap guide](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap)
-and [formula cookbook](https://docs.brew.sh/Formula-Cookbook).
-
-## Using masil as tmux
-
-The prefix is `C-b` and the key tables are the tmux defaults. With `-f FILE`, masil adds no key bindings. Without `-f`, the UI layer described below adds a few, but only for keys that tmux does not bind by default, such as `prefix C-s` and `prefix C-r`. It reads the same configuration files as tmux, such as `~/.tmux.conf` and `~/.config/tmux/tmux.conf`.
-
-masil keeps its sockets in a `masil-UID` directory, apart from the `tmux-UID` directory that tmux uses. Its native protocol version is 136, so a masil client and a stock tmux server reject each other's connections. `masil -V` prints `tmux next-3.9` because existing scripts parse that string. For scripts that call `tmux` by name, `compat/tmux` is an optional shim. Add `compat/` to `PATH` only in the shells that need it. masil does not modify a system tmux or Herdr installation.
-
-When masil starts without `-f`, it loads a mouse UI layer before the user's configuration. The status line gets a `masil` menu, a `+` button for new windows and panes, and a `Settings` button that opens `masil-agent settings`. Clicking a pane title renames the pane. Dragging a pane title moves a floating pane or a group of floating panes. The layer also adds a scrollbar. `prefix C-s` saves all sessions, and `prefix C-r` opens a menu of snapshots to restore. After your first manual save, a background `masil-agent session autosave` process saves a snapshot every 15 minutes, and later servers start it too. `set -g @masil-autosave 30` changes the interval in minutes, and `off` or `0` stops it. The layer binds only keys that have no tmux default. The status line can sit at the top, bottom, left or right of the screen. The settings screen stores its choices as `@masil-*` options in `~/.config/masil/settings.conf`. To start with plain tmux defaults, pass `-f FILE`, for example `masil -f /dev/null`.
-
-## Coding agents
-
-Inside a masil pane, `masil-agent agent` talks to the current server. Outside one, pass `--socket PATH`. It needs no daemon and no configuration.
-
-```sh
-masil-agent agent providers
-masil-agent agent start backend codex --cwd ~/work/service
-masil-agent agent start review claude --cwd ~/work/service --split %0
+masil-agent agent start backend claude --cwd ~/Projects/api
+masil-agent agent start tests codex --cwd ~/Projects/api --split %0
 masil-agent agent list
-masil-agent agent prompt backend 'run the test suite'
-masil-agent agent wait backend --state idle --timeout 600
-masil-agent agent resume backend --name continued
 ```
 
-masil recognizes 24 providers, including Claude Code, Codex, OpenCode, Gemini CLI, Cursor, Copilot and Amp. `start` launches the provider's own TUI in a new window or split. It passes an argument vector to the program and never types a command line into a shell. A TUI that you start by hand also appears in the list once masil identifies the pane's foreground process, and `attach %N NAME` gives it a name.
+Open the interactive **Agent Desk** TUI or compact **Side Panel**:
 
-Other commands read the screen, send keys, put a draft in a tmux buffer, interrupt, close, and resume the native session for the 18 providers that support resume. `prompt` checks that the agent is idle and is still the same process, pastes the text and presses Enter. Its result means the text reached the TUI. It does not mean the provider accepted it. `wait` reports an observed state such as `idle` or `blocked`, not task success. masil never answers a provider's approval request.
-
-`masil-agent agent ui` opens a full-screen agent list with search, filters, details and actions. `masil-agent agent sidebar` opens the same list as a 34-column side panel that expands with tmux zoom. Both work with mouse and keyboard, in English and Korean, with dark, light and terminal themes. In either view, press `:` for a command palette that lists agents, panes and actions together. `masil-agent agent find QUERY` runs the same search from the shell. Every word in the query must match, and Korean initial consonants match whole syllables, so `ㄱㅂ` finds `개발서버`.
-
-### Session binding
-
-Each launch gets a run ID, and masil records which native session belongs to that run and where the evidence came from. The binding is `requested` when masil started the agent with `--session`. It is `reported` when a provider callback that carries the run's identity names a session. If a later callback names a different session and no resume, clear, switch or fork event explains the change, the binding becomes `conflict`. masil then keeps the first session and refuses to resume from the run. There is no `verified` state, because nothing yet proves which session the TUI on screen shows.
-
-Callbacks come from optional provider hooks. For 17 providers, `masil-agent agent integration export PROVIDER` prints the hook files as JSON, and you install them yourself. `masil-agent agent capabilities TARGET` lists what masil has observed for one agent. `--provider ID` shows what a provider declares.
-
-### Durable operations
-
-`start`, `resume`, `prompt`, `interrupt` and `close` write a record to a SQLite store before they change anything in a pane. The store has one file per server socket under `$XDG_STATE_HOME/masil/operations/`. A client can pass its own key. Actions on a running agent take `--run RUN --operation N`, where RUN comes from `agent get`. Launches take `--boot BOOT --operation ID`, where BOOT is the server's `#{masil_core_boot_id}`. A retry with the same key returns the recorded result and does not repeat the action. When masil cannot tell whether an action took effect, it records `outcome_unknown` and does not send it again. `masil-agent agent operations reconcile` settles expired records from evidence stored in the pane. `masil-agent agent operation resolve KEY --as delivered` or `--as not-delivered` records the user's answer.
-
-### Inbox and other agent tools
-
-Each command below is a `masil-agent` subcommand, and none of these features runs until you use it. The inbox, notifications, answers and schedules run in the coordinator described under Design.
-
-- `agent inbox enable` records approval requests, questions, `blocked` states, finished turns and operations with an unknown outcome for a person to read. `agent notify enable` also reports new inbox items to attached clients, as OS notifications, or to your own command.
-- `agent start NAME opencode --answers`, or `kilo`, lets you answer that agent's permission requests and questions with `agent requests` and `agent answer` without switching to its pane.
-- `agent queue NAME add TEXT` keeps prompts ready. Nothing is sent until you run `agent queue NAME send`.
-- `agent schedule add` applies a layout, starts an agent or queues a draft on a cron or interval schedule. It never sends a prompt.
-- `agent changes NAME` lists an agent's changed files in its git working tree. `agent checkpoint NAME make` saves them, and `checkpoint NAME restore` puts single files back after a preview.
-- `worktree create REPO BRANCH` creates and records a git worktree that an agent can start in.
-- `agent view set --client-view` keeps a separate agent list filter for each terminal client.
-
-## Layouts and saved sessions
-
-`masil-agent layout` creates a new session from a TOML template at `~/.config/masil/layouts/NAME.toml`. Each pane in a template has a working directory and may have a command or an agent. `layout plan NAME` prints what `apply` would do, and `layout apply NAME --yes` does it. It never changes an existing session.
-
-```toml
-version = 1
-session = "backend"
-root = "~/work/service"
-
-[[windows]]
-name = "code"
-layout = "even-horizontal"
-
-[[windows.panes]]
-cwd = "."
-focus = true
-
-[[windows.panes]]
-cwd = "api"
-command = ["nvim", "src/main.rs"]
-
-[[windows]]
-name = "agents"
-layout = "main-vertical"
-
-[[windows.panes]]
-cwd = "."
-
-[[windows.panes]]
-agent = { provider = "codex", name = "builder" }
+```sh
+masil-agent agent ui        # full-screen agent desk (mouse + keyboard, EN/KO, dark/light/terminal themes)
+masil-agent agent sidebar   # 34-column persistent side panel that expands with tmux zoom
 ```
 
-The first pane of a window is always a shell pane, so an agent pane cannot come first.
+Useful everyday shortcuts inside Agent Desk:
+- `j`/`k` or arrows: move across agents
+- `/`: live search (supports Korean initial consonants, so `ㄱㅂ` matches `개발서버`)
+- `:` : command palette for agents, panes, and actions
+- `g`: jump directly to the selected agent's pane
+- `l` / `t`: toggle English/Korean and Dark/Light/Terminal theme
 
-`masil-agent session save`, `list` and `restore` save and restore sessions. `session preview NAME` prints the restore plan without running it.
+### 3. Optional: connect your phone
 
-`masil-agent layout columns on` lays the current window out as a row of full-height columns with a fixed width each. The window can be wider than the screen, and each client's view moves sideways to follow the active column. `columns add`, `width`, `fit` and `close` change the columns. `columns off` puts back the layout from before `on` if the panes have not changed.
+Nothing runs in the background until you opt in. To pair your phone with your Mac or Linux machine:
 
-## Diagnostics
+```sh
+masil-agent remote setup
+```
 
-`masil-agent doctor` checks the installed binaries, the operating system, the masil server, the operation store, installed providers and local settings, and prints the result as JSON. It makes no network connections and starts nothing in the background. `--versions` also runs each provider's `--version`, all at once, with a 2 second limit. `--bundle DIR` saves the same report to `DIR/doctor.json` for bug reports.
+The terminal onboarding wizard walks through four tabs:
+1. **Provider hooks**: installs opt-in marker hooks for Claude Code, Codex, OpenCode, and Antigravity CLI without touching your existing hooks.
+2. **Relay & daemon**: configures direct LAN/Tailscale access (default port `7767`), optional self-hosted relay URL, and background daemon/service control.
+3. **QR pairing**: generates a 5-minute one-time pairing QR code right in the terminal (press `o` to open a crisp SVG QR in your browser if your terminal is short).
+4. **Paired devices**: view connected phones and revoke access immediately.
 
-## Other servers
+Once paired, all traffic between your phone and host is end-to-end encrypted with Noise NK.
 
-`masil-agent agent endpoints add` registers up to eight other masil servers, on the same machine or over SSH. Registering an endpoint does not connect to it. `masil-agent agent list --all` shows agents from every enabled endpoint, and `masil-agent agent --endpoint ID COMMAND` runs a command on one of them. SSH connections use your OpenSSH configuration for authentication and host keys.
+## Supported AI coding tools
 
-## OpenCode observer daemon
+masil recognizes **24 coding agent CLIs**, including Claude Code, Codex, OpenCode, Antigravity CLI (`agy`), Gemini CLI, Cursor, GitHub Copilot CLI, Amp, Kilo, and OMP.
 
-`masil-agent serve` is an optional daemon that follows configured OpenCode sessions through the OpenCode HTTP API. Nothing starts it automatically. It adds `attention`, which lists agents waiting on an approval or a question, and `watch-agents`, which streams the agent list. `ack` marks an item as read for every client of the daemon until the daemon exits. An ack never approves a provider request. The daemon reads the core through a bridge socket. The masil server opens it by default at `<socket dir>/.masil/<socket name>.bridge` when only its owner can write to the socket directory. Set `MASIL_BRIDGE_SOCKET` before starting the server to choose another path, or to `off` to turn the bridge off.
+- **Full desktop + mobile support (hooks, live conversation sync, model/effort/mode controls):** Claude Code, Codex, OpenCode, Antigravity CLI (`agy`).
+- **Desktop pane discovery, status tracking, prompt delivery, and session resume:** 18 providers with native resume support.
 
-## Design
+Run `masil-agent agent providers` to inspect detected providers on your machine, or read [docs/public/providers.md](docs/public/providers.md).
 
-The tmux C core owns the PTY, the VT parser, the grid and history, key handling and the renderer. Terminal input and output never pass through Rust or a database, and masil has no second terminal parser. `masil-agent` keeps agent metadata in tmux pane options. Without the mouse UI layer, `masil-agent` runs only when you start a command or the UI. With the layer, each server runs one `masil-agent session autosave` process once you have saved a session. A per-server coordinator, `masil-agent agentd`, starts only on `coordinator start`, `inbox enable`, or `agent start` while a coordinator feature is on, and autosave brings it back after a server restart. It exits 10 minutes after every feature is off and no client is attached. masil starts no other background process by itself.
+## What you can do
 
-## Performance
+### Terminal workspace & Agent Desk
+- **Drop-in tmux compatibility**: default `C-b` prefix, `~/.tmux.conf` support, isolated `masil-UID` sockets (never collides with stock `tmux`), and an optional `compat/tmux` shim for scripts.
+- **Built-in mouse UI layer**: status bar menu, `+` button for new windows/panes, floating pane drag, scrollbars, and session snapshots (`prefix C-s` to save, `prefix C-r` to restore, optional 15-minute autosave). Pass `masil -f /dev/null` for plain tmux behavior.
+- **Safe prompt delivery & waits**: `masil-agent agent prompt NAME 'run tests'` checks that the agent is idle and still the same process, records the operation in SQLite before sending, and avoids duplicate replays. Use `masil-agent agent wait NAME --state idle --timeout 600` in scripts.
+- **Inbox & notifications**: enable `masil-agent agent inbox enable` and `masil-agent agent notify enable` to collect blocked prompts, approval requests, questions, and finished turns.
+- **Git worktrees & file checkpoints**:
+  - `masil-agent worktree create REPO BRANCH` creates an isolated git worktree for a task.
+  - `masil-agent agent changes NAME` lists modified files in an agent's working tree.
+  - `masil-agent agent checkpoint NAME make` and `checkpoint NAME restore` save and roll back single files with a preview.
+- **Workspace templates & column layouts**:
+  - `masil-agent layout apply NAME --yes` spins up repeatable multi-pane repos and agents from `~/.config/masil/layouts/NAME.toml`.
+  - `masil-agent layout columns on` arranges a window as horizontally scrollable fixed-width columns.
+- **Multi-machine control**: `masil-agent agent endpoints add` lets you inspect and control masil servers on other machines over SSH.
 
-A bounded run on 2026-11-18 compared the masil terminal core with the official
-Herdr 0.9.5 macOS arm64 binary. Two rounds reversed product order and checked
-identical 93×39 inner grids. The ranges below are the two round results, not
-confidence intervals. No agent management or real provider ran in this comparison.
+### Mobile companion app (`mobile/`)
+Built with Expo / React Native for Android and iOS:
 
-| Measure | masil core | Herdr 0.9.5 |
-| --- | --- | --- |
-| Idle server RSS, 50 panes | 4.69–4.73 MiB | 27.63–27.92 MiB |
-| Input to reconstructed screen, median | 2.44–2.47 ms | 3.03–3.11 ms |
+- **Conversation-first reading**: chat threads render clean prose and inline markdown code, collapsing noisy bursts of tool calls into lightweight 1-line summaries (tap to expand full tool input/output).
+- **Live terminal fallback**: switch to the **Terminal** tab anytime for direct interactive terminal control of the live pane.
+- **Visual agent launcher**: pick a project folder on your host machine with a GUI directory browser (plus quick recent-repo shortcuts), choose CLI provider, select model from a searchable dropdown, configure reasoning effort and execution mode, or start in a brand-new Git worktree branch.
+- **Live session tuning**: change model, reasoning effort, or mode on an already running agent from the options sheet.
+- **Workspace tools**: inspect real-time git diffs, browse project files, review checkpoints and schedules, use voice dictation, and switch between multiple paired hosts.
 
-Herdr used less CPU for single-pane scrolling output. These short synthetic
-measurements do not pass the full performance gate or establish full-product
-superiority. A separate masil-only probe enables inbox, coordinator and the
-agent desk with synthetic providers. See the [recorded results and limits](docs/public/performance-2026-11-18.md)
-and [reproduction commands](docs/public/validation.md).
+#### Building the mobile app locally
+
+```sh
+cd mobile
+npm ci
+npm run build:apk:arm64   # Android arm64 APK -> mobile/artifacts/masil-production-arm64.apk
+npm run build:ios:local   # Local iOS build (requires Xcode)
+```
+
+### Self-hosted E2EE relay (`relay/`)
+
+Over LAN or Tailscale, the mobile app connects directly to your host daemon with no external server. If you want remote access across networks without Tailscale, you can run `masil-relay` on any small VPS:
+
+```sh
+make relay                # builds bin/masil-relay
+# or with Docker:
+cd relay && docker compose -f docker-compose.example.yml up -d
+```
+
+Then pair using `masil-agent remote pair --relay wss://your-relay.example.com`. The relay only forwards opaque Noise NK encrypted envelopes and never sees prompts, code, or terminal output.
+
+## Architecture & privacy notes
+
+- **No proxy in the terminal byte path**: `core/` (C, tmux `next-3.9` fork) owns PTYs, VT parsing, scrollback, and rendering. `masil-agent` (Rust) handles agent detection, TUI views, durable operations, and the opt-in remote gateway.
+- **Zero background daemons by default**: ordinary `masil` usage starts no remote server and needs no Node.js runtime.
+- **Diagnostics**: run `masil-agent doctor` (or `--versions` / `--bundle DIR`) for a local-only JSON health check with no network calls.
+
+For deeper technical details, see:
+- [Installation and updates](docs/public/install.md)
+- [Provider support and setup](docs/public/providers.md)
+- [Architecture and compatibility boundaries](docs/public/architecture.md)
+- [Verification and benchmarks](docs/public/validation.md) and [recorded performance results](docs/public/performance-2026-11-18.md)
+
+## Development & checks
+
+```sh
+make all                                                # build bin/masil and bin/masil-agent
+cargo fmt --manifest-path agent/Cargo.toml --check
+cargo clippy --locked --manifest-path agent/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path agent/Cargo.toml
+make test-ci                                            # core regression suite
+make test-relay                                         # wire & relay Rust tests
+cd mobile && npm run typecheck && npm test              # mobile app tests
+```
 
 ## License
 
-masil uses the MIT License. `core/` is derived from tmux and keeps its ISC License. `NOTICE` lists the included third-party code, which is tmux, yyjson and the agent detection manifests from Herdr.
+masil is licensed under the MIT License. `core/` is derived from tmux and retains its ISC License. Bundled mobile fonts (`Pretendard` and `Cascadia Mono`) are licensed under the SIL Open Font License 1.1. See [NOTICE](NOTICE) for third-party attributions.
