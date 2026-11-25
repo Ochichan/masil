@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 import {
@@ -61,6 +61,8 @@ function bindingLabel(
   }
 }
 
+const EMPTY_PLUGIN_COMMANDS: PluginCommandDef[] = [];
+
 export function AgentDetailScreen({ hostId, agent }: AgentDetailScreenProps) {
   const { palette } = useMasilTheme();
   const { t } = useTranslation();
@@ -71,7 +73,9 @@ export function AgentDetailScreen({ hostId, agent }: AgentDetailScreenProps) {
   const refreshHost = useHostRuntimeStore((s) => s.refreshHost);
   const hostOrder = useHostRuntimeStore((s) => s.hostOrder);
   const pluginCommands = useHostRuntimeStore((s) =>
-    hostId ? s.hosts[hostId]?.plugins?.commands ?? [] : []
+    hostId
+      ? s.hosts[hostId]?.plugins?.commands ?? EMPTY_PLUGIN_COMMANDS
+      : EMPTY_PLUGIN_COMMANDS
   );
 
   const [mode, setMode] = useState<"conversation" | "terminal">("conversation");
@@ -88,6 +92,10 @@ export function AgentDetailScreen({ hostId, agent }: AgentDetailScreenProps) {
   const [composerDraftOverride, setComposerDraftOverride] = useState<
     string | null
   >(null);
+  const clearComposerDraftOverride = useCallback(
+    () => setComposerDraftOverride(null),
+    []
+  );
 
   const page =
     hostId && agent ? timelines[`${hostId}::${agent.remote_id}`] ?? null : null;
@@ -464,7 +472,7 @@ export function AgentDetailScreen({ hostId, agent }: AgentDetailScreenProps) {
               isWorking={agent.state === "working" || agent.state === "retrying"}
               pluginCommands={pluginCommands}
               draftOverride={composerDraftOverride}
-              onDraftOverrideConsumed={() => setComposerDraftOverride(null)}
+              onDraftOverrideConsumed={clearComposerDraftOverride}
               onSend={sendPrompt}
               onPluginCommand={runPluginCommand}
               onQueueAdd={queuePrompt}

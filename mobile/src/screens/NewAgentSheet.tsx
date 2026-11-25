@@ -76,6 +76,8 @@ function suggestAgentName(dirName: string | undefined, provider: string): string
   return cleanDir ? `${cleanDir}-${provider}` : `${provider}-mobile`;
 }
 
+const EMPTY_PLUGIN_PRESETS: PluginPresetDef[] = [];
+
 export function NewAgentSheet({
   visible,
   hostId,
@@ -88,7 +90,7 @@ export function NewAgentSheet({
   const selectAgent = useHostRuntimeStore((s) => s.selectAgent);
   const selectPanel = useMobilePanelsStore((s) => s.selectPanel);
   const presets = useHostRuntimeStore(
-    (s) => s.hosts[hostId]?.plugins?.presets ?? []
+    (s) => s.hosts[hostId]?.plugins?.presets ?? EMPTY_PLUGIN_PRESETS
   );
 
   const [provider, setProvider] = useState("agy");
