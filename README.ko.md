@@ -20,6 +20,7 @@ masil은 무거운 일렉트론 앱으로 터미널을 감싸거나 셸 앞단�
 - **원본 CLI 그대로 실행**: `claude`, `codex`, `opencode`, `agy` 등 각 도구의 원본 TUI를 수정 없이 패널에서 실행하고 관찰합니다.
 - **터미널 TUI + 선택형 모바일 앱**: 평소에는 키보드·마우스 TUI로 터미널 안에서 완결하고, 원격 접속이 필요할 때만 모바일 게이트웨이를 켤 수 있습니다.
 - **근거 기반 상태 표시**: 프로세스 상태, 화면 시그널, 훅 이벤트 등 실제로 확인된 근거만 표시하며 승인이나 작업 완료를 임의로 추정하지 않습니다.
+- **AI로 즉석 제작하는 로컬 플러그인**: Claude Code, Codex, Antigravity에 공식 `masil-plugin` 스킬을 설치해 테마, 패널, `/slash` 커맨드, 타임라인 카드, 훅, 프리셋을 대화로 만들고 TUI와 모바일에 실시간 반영합니다.
 
 ## 빠른 시작
 
@@ -129,6 +130,7 @@ Expo / React Native 기반 Android·iOS 앱입니다.
 - **GUI 에이전트 실행기**: 호스트의 프로젝트 폴더를 GUI 탐색기와 최근 저장소 칩으로 고르고, CLI·검색형 모델 드롭다운·추론 강도·실행 모드·새 Git 워크트리 브랜치 옵션을 지정해 바로 에이전트를 띄웁니다.
 - **실행 중 세션 옵션 변경**: 이미 돌아가는 에이전트의 모델, 추론 강도, 실행 모드를 옵션 시트에서 바로 전환합니다.
 - **워크스페이스 도구**: 실시간 Git Diff, 프로젝트 파일 탐색, 체크포인트·예약 확인, 음성 입력, 여러 호스트 전환을 지원합니다.
+- **실시간 플러그인 & Creator Mode**: 입력창 `/slash` 커맨드 자동완성, 워크스페이스 패널 탭, 대화 타임라인 카드, TUI와 동기화되는 플러그인 테마, 실행 프리셋을 지원하며 **설정 -> 플러그인 -> AI로 플러그인 만들기**로 즉석 제작 세션을 바로 실행할 수 있습니다.
 
 #### 모바일 앱 로컬 빌드
 
@@ -151,6 +153,50 @@ cd relay && docker compose -f docker-compose.example.yml up -d
 
 이후 `masil-agent remote pair --relay wss://your-relay.example.com`으로 페어링하면 됩니다. 릴레이 서버는 Noise NK로 암호화된 패킷만 중계하므로 프롬프트, 코드, 터미널 내용을 볼 수 없습니다.
 
+## 로컬 플러그인 (Claude Code · Codex · Antigravity 즉석 제작)
+
+바이너리나 모바일 APK를 다시 빌드하지 않고 Rust TUI와 모바일 앱 양쪽을 확장할 수 있습니다. 모든 플러그인은 `~/.config/masil/plugins/<id>/`(또는 경로로 등록한 로컬 폴더)에 위치하며 변경 사항이 연결된 클라이언트에 실시간 반영됩니다.
+
+플러그인 하나(`masil-plugin.toml`)에 아래 6가지 기능을 자유롭게 조합할 수 있습니다.
+- **테마 (`theme.toml`)**: Omarchy 스타일의 색상 파일만으로 코드 없이 TUI와 모바일 테마를 동시에 전환합니다.
+- **워크스페이스 패널**: Masil UI Spec v1 선언형 블록(`metric_row`, `table`, `list`, `markdown`, `code`, `diff`, `progress`, `sparkline`, `callout`, `button`, `toggle`, `select`, `form`)을 반환하면 모바일 워크스페이스 도구 탭과 TUI 명령 팔레트(`:`)에서 네이티브로 렌더링됩니다.
+- **슬래시 커맨드**: 모바일 입력창 `/` 자동완성과 TUI 명령 팔레트에 등록되며 토스트, UI 시트, 입력창 초안, 타임라인 카드를 반환할 수 있습니다.
+- **타임라인 카드**: 구조화된 UI 카드를 에이전트 대화 타임라인에 영속적으로 표시합니다.
+- **라이프사이클 훅**: `agent.state_changed`, `agent.started`, `agent.closed`, `inbox.event`, `theme.changed`, `prompt.before` 이벤트에 반응합니다.
+- **에이전트 실행 프리셋**: 자주 쓰는 프로바이더, 모델, 추론 강도, 모드, 워크트리, 초기 프롬프트 조합을 모바일 실행기 상단 원탭 칩으로 추가합니다.
+
+### 공식 `masil-plugin` AI 스킬 설치
+
+내장 스킬을 한 번 설치해 두면 Claude Code, Codex, Antigravity가 최신 스키마, UI 명세, 검증 루프를 정확히 알고 플러그인을 제작합니다.
+
+```sh
+masil-agent plugin skill install --target all
+masil-agent plugin skill status
+```
+
+설치 경로:
+- Claude Code: `~/.claude/skills/masil-plugin/`
+- Codex: `~/.codex/skills/masil-plugin/`, `~/.agents/skills/masil-plugin/`
+- Antigravity (`agy`): `~/.gemini/config/skills/masil-plugin/`
+
+이후 Claude Code, Codex, Antigravity 아무 세션에서나 바로 요청하면 됩니다.
+- *"masil용 Tokyo Night 다크 테마 플러그인 만들어서 바로 적용해줘."*
+- *"현재 저장소 TODO 체크리스트를 관리하는 masil 패널과 `/todo` 슬래시 커맨드 만들어줘."*
+- *"에이전트가 blocked 상태가 되면 대화 타임라인에 알림 카드를 남기는 masil 훅 플러그인 만들어줘."*
+
+에이전트가 `masil-agent plugin schema` 확인 -> `init` 생성 -> `check`·`test` 검증 -> `reload` 반영까지 자동으로 처리해 터미널과 휴대폰에 즉시 나타납니다.
+
+### 기본 제공 예제 플러그인 체험
+
+```sh
+masil-agent plugin install examples/plugins/catppuccin-mocha
+masil-agent plugin install examples/plugins/repo-pulse
+masil-agent plugin theme set catppuccin-mocha
+masil-agent plugin ls
+```
+
+모바일 앱(**설정 -> 플러그인 -> AI로 플러그인 만들기** 또는 워크스페이스 도구 상단 버튼)이나 TUI 명령 팔레트(`:` -> **AI로 Masil 플러그인 만들기**)에서도 **Creator Mode**를 바로 시작할 수 있습니다. 플러그인의 FD 3 Masil API 호출은 선언된 `scope = read|act|admin` 범위로 제한되며 승인 프롬프트는 항상 사람만 응답할 수 있습니다. 전체 명세는 [docs/public/plugins.md](docs/public/plugins.md)를 참고하세요.
+
 ## 아키텍처와 프라이버시
 
 - **터미널 입출력 경로에 프록시 없음**: C 기반 코어(`core/`, tmux `next-3.9` 포크)가 PTY, VT 파싱, 스크롤백, 렌더링을 전담합니다. Rust 바이너리(`masil-agent`)는 에이전트 감지, TUI, 작업 기록, 선택형 원격 게이트웨이를 담당합니다.
@@ -159,6 +205,7 @@ cd relay && docker compose -f docker-compose.example.yml up -d
 
 더 자세한 문서는 아래를 참고하세요.
 - [설치 및 업데이트 가이드](docs/public/install.md)
+- [로컬 플러그인 및 AI 스킬 가이드](docs/public/plugins.md)
 - [프로바이더 지원 및 설정](docs/public/providers.md)
 - [아키텍처 및 호환성 경계](docs/public/architecture.md)
 - [검증 및 벤치마크](docs/public/validation.md) / [성능 측정 기록](docs/public/performance-2026-11-18.md)
@@ -172,6 +219,7 @@ cargo clippy --locked --manifest-path agent/Cargo.toml --all-targets -- -D warni
 cargo test --locked --manifest-path agent/Cargo.toml
 make test-ci                                            # 코어 회귀 테스트
 make test-relay                                         # wire·relay Rust 테스트
+PYTHONPATH=tests python3 -m unittest -v tests/test_plugins_e2e.py  # 로컬 플러그인 CLI·스킬 E2E
 cd mobile && npm run typecheck && npm test              # 모바일 앱 타입체크·테스트
 ```
 

@@ -20,6 +20,7 @@ masil solves this without wrapping your terminal in a heavy Electron app or putt
 - **Original agent CLIs, not forks.** masil launches and observes the real `claude`, `codex`, `opencode`, `agy`, and other CLIs directly in panes.
 - **Desktop TUI + optional mobile app.** Manage everything from a keyboard/mouse TUI in the terminal, and turn on the mobile gateway only when you want phone access.
 - **Honest status reporting.** masil reports only what it can observe (process state, screen signals, hook events) and never fakes approvals or task completion.
+- **Vibe-codable local plugins.** Extend both the TUI and mobile app with themes, panels, `/slash` commands, timeline cards, hooks, and presets using the bundled `masil-plugin` skill for Claude Code, Codex, and Antigravity.
 
 ## Quick start
 
@@ -129,6 +130,7 @@ Built with Expo / React Native for Android and iOS:
 - **Visual agent launcher**: pick a project folder on your host machine with a GUI directory browser (plus quick recent-repo shortcuts), choose CLI provider, select model from a searchable dropdown, configure reasoning effort and execution mode, or start in a brand-new Git worktree branch.
 - **Live session tuning**: change model, reasoning effort, or mode on an already running agent from the options sheet.
 - **Workspace tools**: inspect real-time git diffs, browse project files, review checkpoints and schedules, use voice dictation, and switch between multiple paired hosts.
+- **Live plugins & Creator Mode**: run plugin `/slash` commands in the composer, view interactive plugin tabs in Workspace Tools and cards in conversations, switch synced plugin themes, launch from plugin presets, or tap **Settings -> Plugins -> Create plugin with AI** to build a new plugin on the spot.
 
 #### Building the mobile app locally
 
@@ -151,6 +153,50 @@ cd relay && docker compose -f docker-compose.example.yml up -d
 
 Then pair using `masil-agent remote pair --relay wss://your-relay.example.com`. The relay only forwards opaque Noise NK encrypted envelopes and never sees prompts, code, or terminal output.
 
+## Local plugins (vibe-codable with Claude Code, Codex, and Antigravity)
+
+Extend both the Rust TUI and the Mobile app without recompiling binaries or rebuilding the APK. Every plugin lives in `~/.config/masil/plugins/<id>/` (or any local folder registered by path) and hot-reloads live across connected clients.
+
+A single plugin (`masil-plugin.toml`) can contribute any combination of:
+- **Themes (`theme.toml`)**: Omarchy-style hex palettes with zero code required, synced live between TUI and mobile.
+- **Workspace panels**: declarative Masil UI Spec v1 blocks (`metric_row`, `table`, `list`, `markdown`, `code`, `diff`, `progress`, `sparkline`, `callout`, `button`, `toggle`, `select`, `form`) rendered natively in Mobile Workspace Tools and the TUI Command Palette (`:`).
+- **Slash commands**: `/command [args]` with autocomplete in the mobile composer and entries in the TUI Command Palette, returning toasts, UI sheets, composer drafts, or inline timeline cards.
+- **Timeline cards**: persistent structured cards pushed into an agent's conversation view.
+- **Lifecycle hooks**: react to `agent.state_changed`, `agent.started`, `agent.closed`, `inbox.event`, `theme.changed`, and `prompt.before`.
+- **Agent launch presets**: one-tap provider, model, effort, mode, worktree, and initial-prompt profiles in the mobile launcher.
+
+### Install the official `masil-plugin` AI skill
+
+Install the bundled skill once so Claude Code, Codex, and Antigravity know the live schema, UI spec, and verification commands:
+
+```sh
+masil-agent plugin skill install --target all
+masil-agent plugin skill status
+```
+
+Target directories:
+- Claude Code: `~/.claude/skills/masil-plugin/`
+- Codex: `~/.codex/skills/masil-plugin/` and `~/.agents/skills/masil-plugin/`
+- Antigravity (`agy`): `~/.gemini/config/skills/masil-plugin/`
+
+Then ask Claude Code, Codex, or Antigravity directly:
+- *"Create a Tokyo Night dark theme plugin for masil and apply it now."*
+- *"Build a masil workspace panel showing my project's TODO checklist and a `/todo` slash command."*
+- *"Add a masil hook plugin that posts a summary card whenever an agent enters blocked state."*
+
+The agent runs `masil-agent plugin schema`, scaffolds with `init`, validates with `check` and `test`, and hot-reloads via `reload` so changes appear live in your terminal and phone.
+
+### Try the bundled starter plugins
+
+```sh
+masil-agent plugin install examples/plugins/catppuccin-mocha
+masil-agent plugin install examples/plugins/repo-pulse
+masil-agent plugin theme set catppuccin-mocha
+masil-agent plugin ls
+```
+
+You can also start **Creator Mode** directly from Mobile (**Settings -> Plugins -> Create plugin with AI** or the sparkle button in Workspace Tools) or from the TUI Command Palette (`:` -> **Create Masil plugin with AI**). All plugin Masil API calls over FD 3 obey `scope = read|act|admin`, and approval prompts remain strictly human-only. See [docs/public/plugins.md](docs/public/plugins.md) for the full contract.
+
 ## Architecture & privacy notes
 
 - **No proxy in the terminal byte path**: `core/` (C, tmux `next-3.9` fork) owns PTYs, VT parsing, scrollback, and rendering. `masil-agent` (Rust) handles agent detection, TUI views, durable operations, and the opt-in remote gateway.
@@ -159,6 +205,7 @@ Then pair using `masil-agent remote pair --relay wss://your-relay.example.com`. 
 
 For deeper technical details, see:
 - [Installation and updates](docs/public/install.md)
+- [Local plugins and AI skill authoring](docs/public/plugins.md)
 - [Provider support and setup](docs/public/providers.md)
 - [Architecture and compatibility boundaries](docs/public/architecture.md)
 - [Verification and benchmarks](docs/public/validation.md) and [recorded performance results](docs/public/performance-2026-11-18.md)
@@ -172,6 +219,7 @@ cargo clippy --locked --manifest-path agent/Cargo.toml --all-targets -- -D warni
 cargo test --locked --manifest-path agent/Cargo.toml
 make test-ci                                            # core regression suite
 make test-relay                                         # wire & relay Rust tests
+PYTHONPATH=tests python3 -m unittest -v tests/test_plugins_e2e.py  # local plugin CLI & skill E2E
 cd mobile && npm run typecheck && npm test              # mobile app tests
 ```
 
