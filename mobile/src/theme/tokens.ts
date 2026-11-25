@@ -83,3 +83,87 @@ export const LIGHT_PALETTE: MasilPalette = {
 };
 
 export type ThemePreference = "system" | "dark" | "light";
+
+export interface PluginThemeColorsInput {
+  appearance: "dark" | "light" | string;
+  canvas: string;
+  panel: string;
+  raised: string;
+  text: string;
+  muted: string;
+  accent: string;
+  accent_text: string;
+  warning: string;
+  danger: string;
+  success: string;
+  track: string;
+}
+
+function parseHex(hex: string): [number, number, number] | null {
+  const clean = hex.trim().replace(/^#/, "");
+  if (!/^[0-9a-fA-F]{6}$/.test(clean)) return null;
+  return [
+    parseInt(clean.slice(0, 2), 16),
+    parseInt(clean.slice(2, 4), 16),
+    parseInt(clean.slice(4, 6), 16),
+  ];
+}
+
+function withAlpha(hex: string, alpha: number, fallback: string): string {
+  const rgb = parseHex(hex);
+  if (!rgb) return fallback;
+  return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
+}
+
+function mixHex(a: string, b: string, weight: number, fallback: string): string {
+  const ra = parseHex(a);
+  const rb = parseHex(b);
+  if (!ra || !rb) return fallback;
+  const ch = (i: number) =>
+    Math.max(
+      0,
+      Math.min(255, Math.round(ra[i]! * (1 - weight) + rb[i]! * weight))
+    )
+      .toString(16)
+      .padStart(2, "0");
+  return `#${ch(0)}${ch(1)}${ch(2)}`;
+}
+
+/**
+ * Expands an Omarchy-style 11-color plugin theme into the full 24-token
+ * MasilPalette used across every mobile surface.
+ */
+export function expandPluginThemeToPalette(
+  theme: PluginThemeColorsInput
+): MasilPalette {
+  const isDark = theme.appearance !== "light";
+  const base = isDark ? DARK_PALETTE : LIGHT_PALETTE;
+  const softAlpha = isDark ? 0.14 : 0.1;
+
+  return {
+    canvas: theme.canvas || base.canvas,
+    panel: theme.panel || base.panel,
+    raised: theme.raised || base.raised,
+    text: theme.text || base.text,
+    textSecondary: mixHex(theme.text, theme.muted, 0.35, base.textSecondary),
+    muted: theme.muted || base.muted,
+    accent: theme.accent || base.accent,
+    accentText: theme.accent_text || base.accentText,
+    accentSoft: withAlpha(theme.accent, softAlpha, base.accentSoft),
+    accentBorder: withAlpha(theme.accent, isDark ? 0.48 : 0.42, base.accentBorder),
+    warning: theme.warning || base.warning,
+    warningSoft: withAlpha(theme.warning, softAlpha, base.warningSoft),
+    danger: theme.danger || base.danger,
+    dangerSoft: withAlpha(theme.danger, softAlpha, base.dangerSoft),
+    success: theme.success || base.success,
+    successSoft: withAlpha(theme.success, softAlpha, base.successSoft),
+    track: theme.track || base.track,
+    hairline: withAlpha(theme.text, 0.08, base.hairline),
+    borderSubtle: withAlpha(theme.text, 0.15, base.borderSubtle),
+    segmentTrack: mixHex(theme.canvas, theme.panel, 0.45, base.segmentTrack),
+    segmentThumb: isDark ? theme.raised || base.segmentThumb : "#ffffff",
+    disabledBg: mixHex(theme.panel, theme.raised, 0.5, base.disabledBg),
+    disabledText: theme.muted || base.disabledText,
+    isDark,
+  };
+}

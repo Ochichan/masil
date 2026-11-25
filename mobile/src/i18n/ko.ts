@@ -55,4 +55,6 @@ export const ko = {
   voiceModeHost: "호스트 whisper.cpp / STT (E2EE)",
   pushStatusConfigured: "릴레이 푸시 브리지 사용 가능",
   pushStatusHookFallback: "릴레이 푸시 미설정 (notify.toml hook 병행)",
+  plugins: "플러그인",
+  createPluginWithAi: "AI로 플러그인 만들기",
 } as const;

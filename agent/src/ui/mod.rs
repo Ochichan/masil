@@ -17,6 +17,7 @@ mod managed;
 pub(crate) mod model;
 mod network;
 mod palette;
+mod plugin_view;
 mod preferences;
 mod queue;
 pub(crate) mod remote_onboarding;

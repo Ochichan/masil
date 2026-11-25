@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 import {
   ChevronDown,
@@ -11,6 +11,7 @@ import {
   SlidersHorizontal,
   Terminal,
   Trash2,
+  X,
 } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
@@ -21,13 +22,20 @@ import { ConfirmModal } from "../components/ConfirmModal";
 import { ConversationView } from "../components/ConversationView";
 import { LiveTerminalTab } from "../components/LiveTerminalTab";
 import { MobileComposer } from "../components/MobileComposer";
+import { PluginUiRenderer } from "../components/PluginUiRenderer";
 import { SegmentedTabs } from "../components/SegmentedTabs";
 import {
   getHostClient,
   useHostRuntimeStore,
 } from "../hosts/HostRuntimeController";
 import { useMobilePanelsStore } from "../mobile-panels/store";
-import type { AgentRow, BindingConfidence } from "../protocol/schemas";
+import type {
+  AgentRow,
+  BindingConfidence,
+  PluginCommandDef,
+  PluginCommandOutcome,
+  UiDocument,
+} from "../protocol/schemas";
 import { useMasilTheme } from "../theme/ThemeProvider";
 import { FONTS } from "../theme/typography";
 
@@ -62,12 +70,24 @@ export function AgentDetailScreen({ hostId, agent }: AgentDetailScreenProps) {
   const refreshTimeline = useHostRuntimeStore((s) => s.refreshTimeline);
   const refreshHost = useHostRuntimeStore((s) => s.refreshHost);
   const hostOrder = useHostRuntimeStore((s) => s.hostOrder);
+  const pluginCommands = useHostRuntimeStore((s) =>
+    hostId ? s.hosts[hostId]?.plugins?.commands ?? [] : []
+  );
 
   const [mode, setMode] = useState<"conversation" | "terminal">("conversation");
   const [refreshing, setRefreshing] = useState(false);
   const [showBindSheet, setShowBindSheet] = useState(false);
   const [showOptionsSheet, setShowOptionsSheet] = useState(false);
   const [confirmClose, setConfirmClose] = useState(false);
+  const [pluginToast, setPluginToast] = useState<string | null>(null);
+  const [pluginResultUi, setPluginResultUi] = useState<{
+    title: string;
+    pluginId: string;
+    doc: UiDocument;
+  } | null>(null);
+  const [composerDraftOverride, setComposerDraftOverride] = useState<
+    string | null
+  >(null);
 
   const page =
     hostId && agent ? timelines[`${hostId}::${agent.remote_id}`] ?? null : null;
@@ -183,6 +203,53 @@ export function AgentDetailScreen({ hostId, agent }: AgentDetailScreenProps) {
       force_keys: true,
     });
     nudgeSync();
+  };
+
+  const runPluginCommand = async (cmd: PluginCommandDef, args: string) => {
+    const client = getHostClient(hostId);
+    if (!client) return;
+    try {
+      const outcome = await client.request<PluginCommandOutcome>(
+        "plugin.command.run.request",
+        {
+          plugin_id: cmd.plugin_id,
+          command_id: cmd.id,
+          args,
+          server_socket: agent.server_socket,
+          agent: {
+            remote_id: agent.remote_id,
+            name: agent.name,
+            provider: agent.provider,
+            state: agent.state,
+            cwd: agent.cwd,
+            pane: agent.pane,
+            server_socket: agent.server_socket,
+            session_id: agent.session_id ?? null,
+          },
+        }
+      );
+      if (outcome.toast) {
+        setPluginToast(outcome.toast);
+        setTimeout(() => setPluginToast(null), 3500);
+      }
+      if (outcome.ui) {
+        setPluginResultUi({
+          title: outcome.ui.title || cmd.title,
+          pluginId: cmd.plugin_id,
+          doc: outcome.ui,
+        });
+      }
+      if (outcome.draft) {
+        setComposerDraftOverride(outcome.draft);
+      }
+      if (outcome.timeline_card_saved || outcome.refresh_agents) {
+        nudgeSync();
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setPluginToast(`/${cmd.slash}: ${msg}`);
+      setTimeout(() => setPluginToast(null), 4000);
+    }
   };
 
   const queuePrompt = async (text: string) => {
@@ -395,7 +462,11 @@ export function AgentDetailScreen({ hostId, agent }: AgentDetailScreenProps) {
               hostId={hostId}
               agentName={agent.name || agent.pane}
               isWorking={agent.state === "working" || agent.state === "retrying"}
+              pluginCommands={pluginCommands}
+              draftOverride={composerDraftOverride}
+              onDraftOverrideConsumed={() => setComposerDraftOverride(null)}
               onSend={sendPrompt}
+              onPluginCommand={runPluginCommand}
               onQueueAdd={queuePrompt}
               onInterrupt={interruptAgent}
             />
@@ -436,6 +507,64 @@ export function AgentDetailScreen({ hostId, agent }: AgentDetailScreenProps) {
         onCancel={() => setConfirmClose(false)}
         onConfirm={() => void closeAgent()}
       />
+
+      {pluginToast ? (
+        <View
+          pointerEvents="none"
+          style={[
+            styles.toastBar,
+            {
+              backgroundColor: palette.raised,
+              borderColor: palette.accentBorder,
+            },
+          ]}
+        >
+          <Text
+            numberOfLines={2}
+            style={[styles.toastText, { color: palette.text }]}
+          >
+            {pluginToast}
+          </Text>
+        </View>
+      ) : null}
+
+      <Modal
+        visible={Boolean(pluginResultUi)}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setPluginResultUi(null)}
+      >
+        <View style={styles.resultBackdrop}>
+          <View
+            style={[
+              styles.resultSheet,
+              {
+                backgroundColor: palette.panel,
+                borderColor: palette.borderSubtle,
+              },
+            ]}
+          >
+            <View style={styles.resultHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.resultTitle, { color: palette.text }]}>
+                  {pluginResultUi?.title}
+                </Text>
+                <Text style={[styles.resultSub, { color: palette.muted }]}>
+                  {pluginResultUi?.pluginId}
+                </Text>
+              </View>
+              <Pressable onPress={() => setPluginResultUi(null)} hitSlop={8}>
+                <X size={19} color={palette.muted} />
+              </Pressable>
+            </View>
+            <ScrollView contentContainerStyle={styles.resultBody}>
+              {pluginResultUi ? (
+                <PluginUiRenderer blocks={pluginResultUi.doc.blocks ?? []} />
+              ) : null}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -552,4 +681,39 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingBottom: 8,
   },
+  toastBar: {
+    position: "absolute",
+    top: 112,
+    left: 16,
+    right: 16,
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 13,
+    paddingVertical: 9,
+  },
+  toastText: {
+    fontFamily: FONTS.semi,
+    fontSize: 12.5,
+  },
+  resultBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    justifyContent: "flex-end",
+  },
+  resultSheet: {
+    maxHeight: "82%",
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderTopWidth: 1,
+  },
+  resultHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 13,
+    gap: 10,
+  },
+  resultTitle: { fontFamily: FONTS.bold, fontSize: 15.5 },
+  resultSub: { fontFamily: FONTS.mono, fontSize: 11 },
+  resultBody: { padding: 16, paddingTop: 4, paddingBottom: 32 },
 });

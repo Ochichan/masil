@@ -1,7 +1,8 @@
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -14,10 +15,12 @@ import {
   MicOff,
   Paperclip,
   Square,
+  Terminal,
   X,
 } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { useHostRuntimeStore } from "../hosts/HostRuntimeController";
+import type { PluginCommandDef } from "../protocol/schemas";
 import { useMasilTheme } from "../theme/ThemeProvider";
 import { FONTS } from "../theme/typography";
 import { useVoiceDictation } from "../voice/useVoiceDictation";
@@ -26,7 +29,11 @@ interface MobileComposerProps {
   hostId: string;
   agentName: string;
   isWorking: boolean;
+  pluginCommands?: PluginCommandDef[];
+  draftOverride?: string | null;
+  onDraftOverrideConsumed?: () => void;
   onSend: (text: string) => Promise<void>;
+  onPluginCommand?: (cmd: PluginCommandDef, args: string) => Promise<void>;
   onQueueAdd: (text: string) => Promise<void>;
   onInterrupt: () => Promise<void>;
 }
@@ -35,7 +42,11 @@ export function MobileComposer({
   hostId,
   agentName,
   isWorking,
+  pluginCommands = [],
+  draftOverride,
+  onDraftOverrideConsumed,
   onSend,
+  onPluginCommand,
   onQueueAdd,
   onInterrupt,
 }: MobileComposerProps) {
@@ -45,6 +56,29 @@ export function MobileComposer({
   const [busy, setBusy] = useState(false);
   const attachment = useHostRuntimeStore((s) => s.composerAttachment);
   const setAttachment = useHostRuntimeStore((s) => s.setComposerAttachment);
+
+  useEffect(() => {
+    if (draftOverride) {
+      setDraft(draftOverride);
+      onDraftOverrideConsumed?.();
+    }
+  }, [draftOverride, onDraftOverrideConsumed]);
+
+  const matchingSlashCommands = useMemo(() => {
+    if (!pluginCommands.length) return [];
+    const trimmed = draft.trimStart();
+    if (!trimmed.startsWith("/") || trimmed.includes("\n")) return [];
+    const token = trimmed.slice(1).split(/\s+/)[0]?.toLowerCase() ?? "";
+    if (trimmed.includes(" ")) return [];
+    return pluginCommands
+      .filter(
+        (c) =>
+          !token ||
+          c.slash.toLowerCase().startsWith(token) ||
+          c.title.toLowerCase().includes(token)
+      )
+      .slice(0, 6);
+  }, [draft, pluginCommands]);
 
   const lang = i18n.language.startsWith("ko") ? "ko" : "en";
   const voice = useVoiceDictation(hostId, agentName, lang, (spoken) => {
@@ -62,6 +96,26 @@ export function MobileComposer({
   const handleSend = async () => {
     const text = composeFinalText();
     if (!text || busy) return;
+    if (!attachment && onPluginCommand && text.startsWith("/")) {
+      const firstSpace = text.indexOf(" ");
+      const cmdToken = (
+        firstSpace === -1 ? text.slice(1) : text.slice(1, firstSpace)
+      ).toLowerCase();
+      const args = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
+      const matched = pluginCommands.find(
+        (c) => c.slash.toLowerCase() === cmdToken
+      );
+      if (matched) {
+        setBusy(true);
+        try {
+          await onPluginCommand(matched, args);
+          setDraft("");
+        } finally {
+          setBusy(false);
+        }
+        return;
+      }
+    }
     setBusy(true);
     try {
       await onSend(text);
@@ -69,6 +123,22 @@ export function MobileComposer({
       setAttachment(null);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleSelectSlash = async (cmd: PluginCommandDef) => {
+    if (cmd.argument_hint) {
+      setDraft(`/${cmd.slash} `);
+      return;
+    }
+    if (onPluginCommand && !busy) {
+      setBusy(true);
+      try {
+        await onPluginCommand(cmd, "");
+        setDraft("");
+      } finally {
+        setBusy(false);
+      }
     }
   };
 
@@ -125,6 +195,56 @@ export function MobileComposer({
           <Pressable onPress={() => setAttachment(null)} hitSlop={8}>
             <X size={13} color={palette.muted} />
           </Pressable>
+        </View>
+      ) : null}
+
+      {matchingSlashCommands.length > 0 ? (
+        <View
+          style={[
+            styles.slashBox,
+            {
+              backgroundColor: palette.panel,
+              borderColor: palette.borderSubtle,
+            },
+          ]}
+        >
+          <ScrollView keyboardShouldPersistTaps="handled" style={{ maxHeight: 190 }}>
+            {matchingSlashCommands.map((cmd, idx) => (
+              <Pressable
+                key={`${cmd.plugin_id}:${cmd.id}`}
+                onPress={() => void handleSelectSlash(cmd)}
+                style={[
+                  styles.slashRow,
+                  idx > 0 && {
+                    borderTopWidth: 1,
+                    borderTopColor: palette.hairline,
+                  },
+                ]}
+              >
+                <Terminal size={13} color={palette.accent} />
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <View style={styles.slashTop}>
+                    <Text style={[styles.slashName, { color: palette.accent }]}>
+                      /{cmd.slash}
+                      {cmd.argument_hint ? ` ${cmd.argument_hint}` : ""}
+                    </Text>
+                    <Text
+                      numberOfLines={1}
+                      style={[styles.slashPlugin, { color: palette.muted }]}
+                    >
+                      {cmd.plugin_id}
+                    </Text>
+                  </View>
+                  <Text
+                    numberOfLines={1}
+                    style={[styles.slashDesc, { color: palette.textSecondary }]}
+                  >
+                    {cmd.description || cmd.title}
+                  </Text>
+                </View>
+              </Pressable>
+            ))}
+          </ScrollView>
         </View>
       ) : null}
 
@@ -283,6 +403,37 @@ const styles = StyleSheet.create({
     fontFamily: FONTS.regular,
     fontSize: 11.5,
     paddingHorizontal: 4,
+  },
+  slashBox: {
+    borderWidth: 1,
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  slashRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+  },
+  slashTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  slashName: {
+    fontFamily: FONTS.mono,
+    fontSize: 12.5,
+  },
+  slashPlugin: {
+    fontFamily: FONTS.mono,
+    fontSize: 10.5,
+  },
+  slashDesc: {
+    fontFamily: FONTS.regular,
+    fontSize: 11.5,
+    marginTop: 1,
   },
   composerBox: {
     flexDirection: "row",

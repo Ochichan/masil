@@ -5,6 +5,7 @@ use super::{
     i18n::action_label,
     model::{Action, App, Effect, Language, Observation, Overlay, Theme},
     palette::{self, Palette, PaletteResult},
+    plugin_view::{PluginViewOutcome, PluginViewOverlay},
     preferences,
     queue::{QueueOutcome, QueueWindow},
     terminal,
@@ -123,13 +124,14 @@ enum DialogKind {
     Prompt(Agent),
     Interrupt(Agent),
     Close(Agent),
+    CreatePluginWithAi,
 }
 
 impl DialogKind {
     /// The agent a dialog acts on. The start dialog has none.
     fn agent(&self) -> Option<&Agent> {
         match self {
-            Self::Start { .. } => None,
+            Self::Start { .. } | Self::CreatePluginWithAi => None,
             Self::Resume(agent)
             | Self::Rename(agent)
             | Self::Draft(agent)
@@ -440,6 +442,43 @@ impl Dialog {
         )
     }
 
+    fn create_plugin_with_ai(language: Language) -> Self {
+        Self {
+            language,
+            kind: DialogKind::CreatePluginWithAi,
+            title: word(
+                language,
+                "Create Masil plugin with AI",
+                "AI로 Masil 플러그인 만들기",
+            )
+            .to_owned(),
+            note: word(
+                language,
+                "Launches agy, claude, or codex with the official masil-plugin skill to build and hot-reload your plugin.",
+                "공식 masil-plugin 스킬과 함께 agy, claude, codex 세션을 실행해 플러그인을 만들고 실시간 반영합니다.",
+            )
+            .to_owned(),
+            notice: None,
+            submit: word(language, "Launch AI creator", "AI 제작 시작"),
+            fields: vec![
+                Field::new(
+                    word(language, "Provider (agy/claude/codex)", "도구 (agy/claude/codex)"),
+                    "agy".into(),
+                    32,
+                ),
+                Field::new(
+                    word(language, "Plugin goal", "만들 플러그인 설명"),
+                    String::new(),
+                    512,
+                ),
+            ],
+            focus: 1,
+            hits: Vec::new(),
+            hover: None,
+            pressed: None,
+        }
+    }
+
     fn confirm(
         language: Language,
         kind: DialogKind,
@@ -508,6 +547,35 @@ impl Dialog {
                 name(usize::from(*endpoint_field))
             }
             DialogKind::Resume(_) | DialogKind::Rename(_) => name(0),
+            DialogKind::CreatePluginWithAi => {
+                let provider = value(0).trim().to_ascii_lowercase();
+                if !matches!(
+                    provider.as_str(),
+                    "agy" | "antigravity" | "claude" | "codex"
+                ) {
+                    return Some((
+                        0,
+                        word(
+                            self.language,
+                            "Choose agy, claude, or codex",
+                            "agy, claude, codex 중 하나를 입력하세요",
+                        )
+                        .to_owned(),
+                    ));
+                }
+                if value(1).trim().is_empty() {
+                    return Some((
+                        1,
+                        word(
+                            self.language,
+                            "Describe what the plugin should do",
+                            "플러그인 기능을 입력하세요",
+                        )
+                        .to_owned(),
+                    ));
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -1077,29 +1145,9 @@ fn prompt_receipt(language: Language, value: &Value) -> String {
 /// entry is a fixed grey; `view::Palette::muted_style` dims the host's own
 /// foreground instead and stays readable on a light host.
 pub(super) fn dialog_colors(theme: Theme) -> (Color, Color, Color, Color, Color) {
-    match theme {
-        Theme::Dark => (
-            Color::Rgb(31, 39, 49),
-            Color::Rgb(230, 235, 241),
-            Color::Rgb(155, 168, 182),
-            Color::Rgb(91, 181, 194),
-            Color::Rgb(5, 19, 22),
-        ),
-        Theme::Light => (
-            Color::Rgb(250, 251, 251),
-            Color::Rgb(25, 34, 41),
-            Color::Rgb(84, 100, 111),
-            Color::Rgb(0, 112, 127),
-            Color::Rgb(255, 255, 255),
-        ),
-        Theme::Terminal => (
-            Color::Reset,
-            Color::Reset,
-            Color::Gray,
-            Color::Cyan,
-            Color::Black,
-        ),
-    }
+    let p = super::view::Palette::for_theme(theme);
+    let panel = if p.host { Color::Reset } else { p.raised };
+    (panel, p.text, p.muted, p.accent, p.accent_text)
 }
 
 fn contains(rect: Rect, column: u16, row: u16) -> bool {
@@ -1158,6 +1206,15 @@ enum Work {
     Changes(ChangesMessage),
     /// A pager popup that could not open.
     Pager(Result<(), String>),
+    /// A plugin panel render completed.
+    PluginPanel(Result<crate::plugin::ui_spec::UiDocument, String>),
+    /// A plugin slash command completed.
+    PluginCommand {
+        plugin_id: String,
+        title: String,
+        agent: Option<Value>,
+        result: Result<crate::plugin::runner::CommandOutcome, String>,
+    },
 }
 
 struct ChangesMessage {
@@ -1425,6 +1482,12 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     let mut queueing: Option<QueueWindow> = None;
     let mut changing: Option<super::changes::ChangesWindow> = None;
     let mut palette: Option<Palette> = None;
+    let mut plugin_view: Option<PluginViewOverlay> = None;
+    let mut plugin_fp = crate::plugin::manifest::catalog_fingerprint();
+    let mut plugin_catalog = crate::plugin::manifest::load_catalog().ok();
+    if let Some(cat) = &plugin_catalog {
+        super::view::set_plugin_palette(cat.active_resolved_theme().as_ref());
+    }
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|error| error.to_string())?;
@@ -1442,13 +1505,19 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
             }
             if app.dirty {
                 // The search cursor stays out from under a window drawn above the desk.
-                app.modal_open = dialog.is_some() || answering.is_some() || queueing.is_some() || changing.is_some() || palette.is_some();
+                app.modal_open = dialog.is_some()
+                    || answering.is_some()
+                    || queueing.is_some()
+                    || changing.is_some()
+                    || palette.is_some()
+                    || plugin_view.is_some();
                 terminal.draw(|frame| {
                     app.draw(frame);
                     if let Some(dialog) = &mut dialog { dialog.draw(frame, app.theme); }
                     if let Some(answering) = &mut answering { answering.draw(frame, app.theme); }
                     if let Some(queueing) = &mut queueing { queueing.draw(frame, app.theme); }
                     if let Some(changing) = &mut changing { changing.draw(frame, app.theme); }
+                    if let Some(plugin_view) = &mut plugin_view { plugin_view.draw(frame, app.theme); }
                     if let Some(palette) = &mut palette { palette.draw(frame, app.theme); }
                 }).map_err(|error| error.to_string())?;
                 app.dirty = false;
@@ -1456,6 +1525,19 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
             let mut poll_result: Option<Result<FleetSnapshot, String>> = None;
             let effects = tokio::select! {
                 _ = poll.tick(), if !poll_pending => {
+                    let next_fp = crate::plugin::manifest::catalog_fingerprint();
+                    if next_fp != plugin_fp {
+                        plugin_fp = next_fp;
+                        plugin_catalog = crate::plugin::manifest::load_catalog().ok();
+                        super::view::set_plugin_palette(
+                            plugin_catalog
+                                .as_ref()
+                                .and_then(|c| c.active_resolved_theme())
+                                .as_ref(),
+                        );
+                        app.inspector_cache = None;
+                        app.dirty = true;
+                    }
                     poll_pending = true;
                     let fleet = fleet.clone();
                     tasks.spawn(async move {
@@ -1505,7 +1587,58 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 PaletteResult::Close => palette = None,
                                 PaletteResult::Activate(target) => {
                                     palette = None;
-                                    effects.extend(activate_palette(target, &mut app, &agents, fleet.clone(), &mut tasks, owned_pane.as_deref(), &current_epoch));
+                                    effects.extend(activate_palette(
+                                        target,
+                                        &mut app,
+                                        &agents,
+                                        fleet.clone(),
+                                        &mut tasks,
+                                        owned_pane.as_deref(),
+                                        &current_epoch,
+                                        &mut dialog,
+                                        &mut plugin_view,
+                                        &mut plugin_catalog,
+                                        &mut plugin_fp,
+                                    ));
+                                }
+                            }
+                        } else if let Some(active) = &mut plugin_view {
+                            match active.handle(event) {
+                                PluginViewOutcome::None => app.dirty = true,
+                                PluginViewOutcome::Close => {
+                                    plugin_view = None;
+                                    app.dirty = true;
+                                }
+                                PluginViewOutcome::Refresh => {
+                                    if let Some(panel_id) = active.panel_id.clone() {
+                                        spawn_plugin_panel(
+                                            &mut tasks,
+                                            active.plugin_id.clone(),
+                                            panel_id,
+                                            active.agent.clone(),
+                                            None,
+                                            None,
+                                            Some(fleet.local.native.socket.clone()),
+                                        );
+                                    }
+                                    app.dirty = true;
+                                }
+                                PluginViewOutcome::Invoke {
+                                    plugin_id,
+                                    panel_id,
+                                    action,
+                                    payload,
+                                } => {
+                                    spawn_plugin_panel(
+                                        &mut tasks,
+                                        plugin_id,
+                                        panel_id,
+                                        active.agent.clone(),
+                                        Some(action),
+                                        payload,
+                                        Some(fleet.local.native.socket.clone()),
+                                    );
+                                    app.dirty = true;
                                 }
                             }
                         } else if matches!(&event, Event::Key(key) if key.code == KeyCode::Char(':') && key.modifiers.difference(KeyModifiers::SHIFT).is_empty())
@@ -1513,11 +1646,16 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             && answering.is_none()
                             && queueing.is_none()
                             && changing.is_none()
+                            && plugin_view.is_none()
                             && app.overlay.is_none()
                             && app.focus != super::model::Focus::Search
                         {
                             let context = selected_agent(&app, &agents).map(crate::managed::find::agent_label);
-                            palette = Some(Palette::new(app.language, palette_items(&app, &agents), context));
+                            palette = Some(Palette::new(
+                                app.language,
+                                palette_items(&app, &agents, plugin_catalog.as_ref()),
+                                context,
+                            ));
                             let fleet = fleet.clone();
                             tasks.spawn(async move { Work::Panes(fleet.local.pane_targets().await) });
                             app.dirty = true;
@@ -1759,6 +1897,47 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                 app.dirty = true;
                             }
                         }
+                        Ok(Work::PluginPanel(result)) => {
+                            if let Some(view) = &mut plugin_view {
+                                view.set_document(result);
+                                app.dirty = true;
+                            }
+                        }
+                        Ok(Work::PluginCommand {
+                            plugin_id,
+                            title,
+                            agent,
+                            result,
+                        }) => {
+                            match result {
+                                Ok(out) => {
+                                    if let Some(toast) = out.toast {
+                                        app.notify(toast);
+                                    }
+                                    if let Some(doc) = out.ui {
+                                        plugin_view = Some(PluginViewOverlay::with_document(
+                                            app.language,
+                                            plugin_id,
+                                            None,
+                                            title,
+                                            agent,
+                                            doc,
+                                        ));
+                                    } else if let Some(draft) = out.draft
+                                        && let Some(selected) = selected_agent(&app, &agents)
+                                    {
+                                        let mut d = Dialog::prompt(selected, app.language);
+                                        if let Some(f) = d.fields.first_mut() {
+                                            f.value = draft;
+                                            f.cursor = f.grapheme_count();
+                                        }
+                                        dialog = Some(d);
+                                    }
+                                }
+                                Err(err) => app.notify(format!("Plugin error: {err}")),
+                            }
+                            app.dirty = true;
+                        }
                         Err(error) => { poll_pending = false; app.finish_action(); app.notify(self::message(app.language, format!("Action failed: {error}"), format!("작업 실패: {error}"))); }
                     }
                     Vec::new()
@@ -1950,7 +2129,11 @@ fn build_managed_projection(agents: &[Agent]) -> Vec<ManagedProjectionRow> {
 
 /// Agents in desk order, then the desk actions for the current selection.
 /// Panes of this server are added once the background query returns.
-fn palette_items(app: &App, agents: &HashMap<String, Agent>) -> Vec<palette::Item> {
+fn palette_items(
+    app: &App,
+    agents: &HashMap<String, Agent>,
+    catalog: Option<&crate::plugin::manifest::PluginCatalog>,
+) -> Vec<palette::Item> {
     // The inbox view selects events, not agents: only its own actions.
     if app.managed && app.inbox.open {
         return [Action::Inbox, Action::NextUnseen]
@@ -2000,10 +2183,162 @@ fn palette_items(app: &App, agents: &HashMap<String, Agent>) -> Vec<palette::Ite
                 pane: None,
             }),
     );
+    if let Some(cat) = catalog {
+        for plugin in cat.active_plugins() {
+            let Some(m) = &plugin.manifest else {
+                continue;
+            };
+            for panel in &m.panels {
+                items.push(palette::Item {
+                    kind: palette::Kind::Panel,
+                    label: panel.title.clone(),
+                    detail: format!("plugin: {}", plugin.id),
+                    hint: "panel".into(),
+                    target: palette::Target::PluginPanel {
+                        plugin_id: plugin.id.clone(),
+                        panel_id: panel.id.clone(),
+                        title: panel.title.clone(),
+                    },
+                    enabled: true,
+                    pane: None,
+                });
+            }
+            for cmd in &m.commands {
+                let slash = format!("/{}", cmd.slash.trim_start_matches('/'));
+                items.push(palette::Item {
+                    kind: palette::Kind::Plugin,
+                    label: format!("{slash} {}", cmd.title),
+                    detail: cmd.description.clone(),
+                    hint: plugin.id.clone(),
+                    target: palette::Target::PluginCommand {
+                        plugin_id: plugin.id.clone(),
+                        command_id: cmd.id.clone(),
+                        title: cmd.title.clone(),
+                    },
+                    enabled: true,
+                    pane: None,
+                });
+            }
+        }
+        for t in cat.all_themes() {
+            let active = cat.active_theme.as_deref() == Some(t.id.as_str());
+            items.push(palette::Item {
+                kind: palette::Kind::Theme,
+                label: format!("Theme: {}", t.name),
+                detail: format!("{} · {}", t.appearance, t.plugin_id),
+                hint: if active {
+                    "active".into()
+                } else {
+                    t.id.clone()
+                },
+                target: palette::Target::PluginTheme {
+                    theme_id: Some(t.id),
+                    name: t.name,
+                },
+                enabled: true,
+                pane: None,
+            });
+        }
+        if cat.active_theme.is_some() {
+            items.push(palette::Item {
+                kind: palette::Kind::Theme,
+                label: word(app.language, "Theme: Reset default", "테마: 기본값 복원").into(),
+                detail: String::new(),
+                hint: "reset".into(),
+                target: palette::Target::PluginTheme {
+                    theme_id: None,
+                    name: "default".into(),
+                },
+                enabled: true,
+                pane: None,
+            });
+        }
+    }
+    items.push(palette::Item {
+        kind: palette::Kind::Plugin,
+        label: word(
+            app.language,
+            "Create Masil plugin with AI",
+            "AI로 Masil 플러그인 만들기",
+        )
+        .into(),
+        detail: word(
+            app.language,
+            "Launch agy, claude, or codex in Creator Mode",
+            "agy, claude, codex로 즉석 플러그인 제작",
+        )
+        .into(),
+        hint: "creator".into(),
+        target: palette::Target::CreatePluginWithAi,
+        enabled: true,
+        pane: None,
+    });
+    items.push(palette::Item {
+        kind: palette::Kind::Plugin,
+        label: word(app.language, "Reload plugins", "플러그인 다시 불러오기").into(),
+        detail: String::new(),
+        hint: "reload".into(),
+        target: palette::Target::ReloadPlugins,
+        enabled: true,
+        pane: None,
+    });
     items
 }
 
+fn agent_to_plugin_json(agent: &Agent, socket: &std::path::Path) -> Value {
+    json!({
+        "name": agent.name,
+        "provider": agent.provider,
+        "state": agent.state,
+        "cwd": agent.cwd,
+        "pane": agent.pane_id,
+        "pane_id": agent.pane_id,
+        "server_socket": socket.to_string_lossy(),
+        "session_id": agent.session_id,
+    })
+}
+
+fn spawn_plugin_panel(
+    tasks: &mut JoinSet<Work>,
+    plugin_id: String,
+    panel_id: String,
+    agent: Option<Value>,
+    action: Option<String>,
+    payload: Option<Value>,
+    socket: Option<PathBuf>,
+) {
+    tasks.spawn(async move {
+        let loaded = tokio::task::spawn_blocking(move || {
+            let cat = crate::plugin::manifest::load_catalog()?;
+            let p = cat
+                .find_plugin(&plugin_id)
+                .cloned()
+                .ok_or_else(|| format!("plugin '{plugin_id}' not found"))?;
+            Ok::<_, String>(p)
+        })
+        .await;
+        let res = match loaded {
+            Ok(Ok(plugin)) => {
+                crate::plugin::runner::invoke_panel(
+                    &plugin,
+                    &panel_id,
+                    agent,
+                    action,
+                    payload,
+                    serde_json::Map::new(),
+                    socket,
+                )
+                .await
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(e.to_string()),
+        };
+        Work::PluginPanel(res)
+    });
+}
+
 /// Run a palette entry through the same guarded paths as keys and clicks.
+#[allow(clippy::too_many_arguments)]
 fn activate_palette(
     target: palette::Target,
     app: &mut App,
@@ -2012,6 +2347,10 @@ fn activate_palette(
     tasks: &mut JoinSet<Work>,
     owned_pane: Option<&str>,
     expected_boot: &str,
+    dialog: &mut Option<Dialog>,
+    plugin_view: &mut Option<PluginViewOverlay>,
+    plugin_catalog: &mut Option<crate::plugin::manifest::PluginCatalog>,
+    plugin_fp: &mut String,
 ) -> Vec<Effect> {
     let language = app.language;
     match target {
@@ -2064,6 +2403,122 @@ fn activate_palette(
             Vec::new()
         }
         palette::Target::Action(action) => app.effect_for(action).into_iter().collect(),
+        palette::Target::PluginPanel {
+            plugin_id,
+            panel_id,
+            title,
+        } => {
+            let agent_json = selected_agent(app, agents)
+                .map(|a| agent_to_plugin_json(a, &fleet.local.native.socket));
+            *plugin_view = Some(PluginViewOverlay::loading(
+                app.language,
+                plugin_id.clone(),
+                Some(panel_id.clone()),
+                title,
+                agent_json.clone(),
+            ));
+            spawn_plugin_panel(
+                tasks,
+                plugin_id,
+                panel_id,
+                agent_json,
+                None,
+                None,
+                Some(fleet.local.native.socket.clone()),
+            );
+            Vec::new()
+        }
+        palette::Target::PluginCommand {
+            plugin_id,
+            command_id,
+            title,
+        } => {
+            let agent_json = selected_agent(app, agents)
+                .map(|a| agent_to_plugin_json(a, &fleet.local.native.socket));
+            let sock = Some(fleet.local.native.socket.clone());
+            tasks.spawn(async move {
+                let pid = plugin_id.clone();
+                let loaded = tokio::task::spawn_blocking(move || {
+                    let cat = crate::plugin::manifest::load_catalog()?;
+                    cat.find_plugin(&pid)
+                        .cloned()
+                        .ok_or_else(|| format!("plugin '{pid}' not found"))
+                })
+                .await;
+                let result = match loaded {
+                    Ok(Ok(plugin)) => {
+                        crate::plugin::runner::invoke_command(
+                            &plugin,
+                            &command_id,
+                            String::new(),
+                            agent_json.clone(),
+                            sock,
+                        )
+                        .await
+                    }
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(e.to_string()),
+                };
+                Work::PluginCommand {
+                    plugin_id,
+                    title,
+                    agent: agent_json,
+                    result,
+                }
+            });
+            Vec::new()
+        }
+        palette::Target::PluginTheme { theme_id, name } => {
+            match crate::plugin::set_active_theme(theme_id.as_deref()) {
+                Ok(_) => {
+                    *plugin_fp = crate::plugin::manifest::catalog_fingerprint();
+                    *plugin_catalog = crate::plugin::manifest::load_catalog().ok();
+                    super::view::set_plugin_palette(
+                        plugin_catalog
+                            .as_ref()
+                            .and_then(|c| c.active_resolved_theme())
+                            .as_ref(),
+                    );
+                    app.inspector_cache = None;
+                    app.notify(message(
+                        language,
+                        format!("Theme set to {name}"),
+                        format!("테마 적용: {name}"),
+                    ));
+                }
+                Err(e) => app.notify(format!("Theme error: {e}")),
+            }
+            Vec::new()
+        }
+        palette::Target::ReloadPlugins => {
+            if let Ok(mut cfg) = crate::plugin::manifest::PluginsConfig::load() {
+                cfg.bump_reload();
+                let _ = cfg.save();
+            }
+            *plugin_fp = crate::plugin::manifest::catalog_fingerprint();
+            *plugin_catalog = crate::plugin::manifest::load_catalog().ok();
+            super::view::set_plugin_palette(
+                plugin_catalog
+                    .as_ref()
+                    .and_then(|c| c.active_resolved_theme())
+                    .as_ref(),
+            );
+            app.inspector_cache = None;
+            let count = plugin_catalog
+                .as_ref()
+                .map(|c| c.active_plugins().count())
+                .unwrap_or(0);
+            app.notify(message(
+                language,
+                format!("Reloaded plugins ({count} active)"),
+                format!("플러그인 새로고침 완료 ({count}개 활성)"),
+            ));
+            Vec::new()
+        }
+        palette::Target::CreatePluginWithAi => {
+            *dialog = Some(Dialog::create_plugin_with_ai(app.language));
+            Vec::new()
+        }
     }
 }
 
@@ -2883,6 +3338,91 @@ fn submit_dialog(
                     ))
                 });
                 action_message(epoch, Some(target), result)
+            });
+        }
+        DialogKind::CreatePluginWithAi => {
+            let epoch = current_epoch.to_owned();
+            let raw_provider = values
+                .first()
+                .map(String::as_str)
+                .unwrap_or("agy")
+                .trim()
+                .to_ascii_lowercase();
+            let provider = match raw_provider.as_str() {
+                "antigravity" => "agy".to_owned(),
+                other => other.to_owned(),
+            };
+            let goal = values
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            tasks.spawn(async move {
+                let res = async {
+                    let plugins_root = crate::plugin::manifest::plugins_dir()?;
+                    let _ = std::fs::create_dir_all(&plugins_root);
+                    let target_skill = provider.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::plugin::skill::install_target(&target_skill, false)
+                    })
+                    .await;
+                    let slug: String = goal
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                        .take(12)
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    let agent_name = if slug.is_empty() {
+                        format!("plugin-ai-{}", crate::remote::config::now_ms() % 1000)
+                    } else {
+                        format!("plugin-{slug}")
+                    };
+                    let prompt =
+                        crate::plugin::skill::build_creator_prompt(&goal, None, &plugins_root);
+                    let sock = fleet.local.native.socket.clone();
+                    let cwd = plugins_root.to_string_lossy().into_owned();
+                    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                    let out = tokio::process::Command::new(&exe)
+                        .args([
+                            "agent",
+                            "--socket",
+                            &sock.to_string_lossy(),
+                            "start",
+                            &agent_name,
+                            &provider,
+                            "--cwd",
+                            &cwd,
+                        ])
+                        .output()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if !out.status.success() {
+                        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+                    }
+                    let name_for_prompt = agent_name.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(2400)).await;
+                        let _ = tokio::process::Command::new(&exe)
+                            .args([
+                                "agent",
+                                "--socket",
+                                &sock.to_string_lossy(),
+                                "prompt",
+                                &name_for_prompt,
+                                &prompt,
+                            ])
+                            .output()
+                            .await;
+                    });
+                    Ok(ActionResult::Receipt(message(
+                        language,
+                        format!("Started AI plugin creator '{agent_name}' ({provider})"),
+                        format!("AI 플러그인 제작 세션 '{agent_name}' ({provider}) 시작됨"),
+                    )))
+                }
+                .await;
+                action_message(epoch, None, res)
             });
         }
     }

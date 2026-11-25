@@ -25,6 +25,10 @@ core/etc/
 *.md
 !/README.md
 !/README.ko.md
+!/agent/src/plugin/skill_bundle/SKILL.md
+!/agent/src/plugin/skill_bundle/references/ui-spec.md
+!/agent/src/plugin/skill_bundle/references/examples.md
+!/examples/plugins/**/OVERVIEW.md
 /docs/
 !/docs/
 /docs/*
@@ -61,6 +65,7 @@ core/etc/
 !/tests/test_managed_restore.py
 !/tests/test_performance_compare.py
 !/tests/test_management_probe.py
+!/tests/test_plugins_e2e.py
 !/tests/test_remote_e2e.py
 !/tests/test_remote_links.py
 !/tests/test_restore.py

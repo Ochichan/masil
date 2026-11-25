@@ -56,4 +56,6 @@ export const en = {
   pushStatusConfigured: "Relay push bridge ready",
   pushStatusHookFallback:
     "Relay push unconfigured (notify.toml hook fallback active)",
+  plugins: "Plugins",
+  createPluginWithAi: "Create plugin with AI",
 } as const;

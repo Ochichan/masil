@@ -38,7 +38,10 @@ import {
   useHostRuntimeStore,
 } from "../hosts/HostRuntimeController";
 import { useMobilePanelsStore } from "../mobile-panels/store";
-import type { ProviderModelsResponse } from "../protocol/schemas";
+import type {
+  PluginPresetDef,
+  ProviderModelsResponse,
+} from "../protocol/schemas";
 import { useMasilTheme } from "../theme/ThemeProvider";
 import { FONTS, isScratchDirectory } from "../theme/typography";
 
@@ -84,8 +87,15 @@ export function NewAgentSheet({
   const refreshHost = useHostRuntimeStore((s) => s.refreshHost);
   const selectAgent = useHostRuntimeStore((s) => s.selectAgent);
   const selectPanel = useMobilePanelsStore((s) => s.selectPanel);
+  const presets = useHostRuntimeStore(
+    (s) => s.hosts[hostId]?.plugins?.presets ?? []
+  );
 
   const [provider, setProvider] = useState("agy");
+  const [activePresetId, setActivePresetId] = useState<string | null>(null);
+  const [presetInitialPrompt, setPresetInitialPrompt] = useState<string | null>(
+    null
+  );
   const [selectedDir, setSelectedDir] = useState<DirEntryItem | null>(null);
   const [quickDirs, setQuickDirs] = useState<DirEntryItem[]>([]);
   const [loadingQuick, setLoadingQuick] = useState(false);
@@ -176,10 +186,27 @@ export function NewAgentSheet({
   }, [visible, hostId, provider]);
 
   const handleChooseProvider = (nextProvider: string) => {
+    setActivePresetId(null);
+    setPresetInitialPrompt(null);
     setProvider(nextProvider);
     if (!nameEdited) {
       setName(suggestAgentName(selectedDir?.name, nextProvider));
     }
+  };
+
+  const applyPreset = (preset: PluginPresetDef) => {
+    setActivePresetId(`${preset.plugin_id}:${preset.id}`);
+    setProvider(preset.provider);
+    setCreateWorktree(Boolean(preset.worktree));
+    setPresetInitialPrompt(preset.initial_prompt ?? null);
+    if (!nameEdited) {
+      setName(suggestAgentName(selectedDir?.name, preset.id));
+    }
+    setTimeout(() => {
+      if (preset.model) setSelectedModel(preset.model);
+      if (preset.effort) setSelectedEffort(preset.effort);
+      if (preset.mode) setSelectedMode(preset.mode);
+    }, 60);
   };
 
   const handleChooseDir = (dir: DirEntryItem) => {
@@ -244,6 +271,19 @@ export function NewAgentSheet({
       if (found) {
         selectAgent(hostId, found.remote_id);
         selectPanel("agent");
+        if (presetInitialPrompt?.trim()) {
+          const initialText = presetInitialPrompt.trim();
+          setTimeout(() => {
+            void client
+              .request("agent.prompt.request", {
+                server_socket: found.server_socket,
+                target: found.name || found.pane,
+                text: initialText,
+                force_keys: true,
+              })
+              .catch(() => {});
+          }, 2200);
+        }
       }
       onClose();
     } catch (e) {
@@ -285,6 +325,27 @@ export function NewAgentSheet({
             contentContainerStyle={styles.form}
             showsVerticalScrollIndicator={false}
           >
+            {presets.length > 0 ? (
+              <View style={styles.section}>
+                <Text style={[styles.label, { color: palette.muted }]}>
+                  플러그인 프리셋
+                </Text>
+                <View style={styles.chips}>
+                  {presets.map((preset) => {
+                    const key = `${preset.plugin_id}:${preset.id}`;
+                    return (
+                      <SelectableChip
+                        key={key}
+                        label={preset.name}
+                        selected={activePresetId === key}
+                        onPress={() => applyPreset(preset)}
+                      />
+                    );
+                  })}
+                </View>
+              </View>
+            ) : null}
+
             {/* 1. Workspace Directory */}
             <View style={styles.section}>
               <View style={styles.sectionHeader}>

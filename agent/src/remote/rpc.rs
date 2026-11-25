@@ -104,6 +104,8 @@ fn host_capabilities(config: &RemoteConfig) -> Value {
         "voice_host_stt": config.stt_command.as_ref().is_some_and(|v| !v.is_empty()),
         "relay_configured": config.relay_url.is_some(),
         "push_enabled": config.push_enabled && config.relay_url.is_some(),
+        "plugins": true,
+        "plugin_ui_spec": crate::plugin::ui_spec::UI_SPEC_VERSION,
     })
 }
 
@@ -339,8 +341,21 @@ async fn dispatch_authenticated(
                 args.push("--".into());
                 args.extend(extra);
             }
-            match run_blocking_agent(socket, args).await {
-                Ok(val) => RpcResponse::ok(id, &kind, val),
+            match run_blocking_agent(socket.clone(), args).await {
+                Ok(val) => {
+                    let started_val = val.clone();
+                    let sock_path = socket.map(std::path::PathBuf::from);
+                    tokio::spawn(async move {
+                        crate::plugin::runner::dispatch_hook_event(
+                            "agent.started",
+                            started_val.clone(),
+                            Some(started_val),
+                            sock_path,
+                        )
+                        .await;
+                    });
+                    RpcResponse::ok(id, &kind, val)
+                }
                 Err(e) => RpcResponse::err(id, &kind, "agent_start_failed", e),
             }
         }
@@ -394,7 +409,17 @@ async fn dispatch_authenticated(
         "agent.prompt.request" => {
             let socket = resolve_socket_param(&params);
             let target = params["target"].as_str().unwrap_or("").to_owned();
-            let text = params["text"].as_str().unwrap_or("").to_owned();
+            let raw_text = params["text"].as_str().unwrap_or("").to_owned();
+            let hook_agent = json!({
+                "name": target,
+                "server_socket": socket.clone().unwrap_or_default(),
+            });
+            let text = crate::plugin::runner::run_prompt_before_hooks(
+                &raw_text,
+                Some(hook_agent),
+                socket.as_deref().map(std::path::PathBuf::from),
+            )
+            .await;
             let allow_raw_slash =
                 text.trim_start().starts_with('/') || text.trim_start().starts_with('!');
             if allow_raw_slash {
@@ -481,8 +506,20 @@ async fn dispatch_authenticated(
         "agent.close.request" => {
             let socket = resolve_socket_param(&params);
             let target = params["target"].as_str().unwrap_or("").to_owned();
-            match run_blocking_agent(socket, vec!["close".into(), target]).await {
-                Ok(val) => RpcResponse::ok(id, &kind, val),
+            match run_blocking_agent(socket.clone(), vec!["close".into(), target.clone()]).await {
+                Ok(val) => {
+                    let sock_path = socket.map(std::path::PathBuf::from);
+                    tokio::spawn(async move {
+                        crate::plugin::runner::dispatch_hook_event(
+                            "agent.closed",
+                            json!({ "target": target }),
+                            None,
+                            sock_path,
+                        )
+                        .await;
+                    });
+                    RpcResponse::ok(id, &kind, val)
+                }
                 Err(e) => RpcResponse::err(id, &kind, "close_failed", e),
             }
         }
@@ -687,6 +724,313 @@ async fn dispatch_authenticated(
             match run_blocking_agent(socket, vec!["schedule".into(), "remove".into(), name]).await {
                 Ok(val) => RpcResponse::ok(id, &kind, val),
                 Err(e) => RpcResponse::err(id, &kind, "schedule_remove_failed", e),
+            }
+        }
+        "plugin.list.request" => {
+            match tokio::task::spawn_blocking(crate::plugin::catalog_json).await {
+                Ok(Ok(val)) => RpcResponse::ok(id, &kind, val),
+                Ok(Err(e)) => RpcResponse::err(id, &kind, "plugin_list_failed", e),
+                Err(e) => RpcResponse::err(id, &kind, "plugin_list_failed", e.to_string()),
+            }
+        }
+        "plugin.toggle.request" => {
+            let plugin_id = params["plugin_id"].as_str().unwrap_or("").to_owned();
+            let enabled = params["enabled"].as_bool().unwrap_or(true);
+            let res = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+                let mut cfg = crate::plugin::manifest::PluginsConfig::load()?;
+                cfg.set_plugin_enabled(&plugin_id, enabled);
+                cfg.save()?;
+                crate::plugin::catalog_json()
+            })
+            .await;
+            match res {
+                Ok(Ok(val)) => RpcResponse::ok(id, &kind, val),
+                Ok(Err(e)) => RpcResponse::err(id, &kind, "plugin_toggle_failed", e),
+                Err(e) => RpcResponse::err(id, &kind, "plugin_toggle_failed", e.to_string()),
+            }
+        }
+        "plugin.reload.request" => {
+            let res = tokio::task::spawn_blocking(|| -> Result<Value, String> {
+                let mut cfg = crate::plugin::manifest::PluginsConfig::load()?;
+                cfg.bump_reload();
+                cfg.save()?;
+                crate::plugin::catalog_json()
+            })
+            .await;
+            match res {
+                Ok(Ok(val)) => RpcResponse::ok(id, &kind, val),
+                Ok(Err(e)) => RpcResponse::err(id, &kind, "plugin_reload_failed", e),
+                Err(e) => RpcResponse::err(id, &kind, "plugin_reload_failed", e.to_string()),
+            }
+        }
+        "plugin.theme.set.request" => {
+            let theme_id = params["theme_id"].as_str().map(str::to_owned);
+            let res = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+                crate::plugin::set_active_theme(theme_id.as_deref())?;
+                crate::plugin::catalog_json()
+            })
+            .await;
+            match res {
+                Ok(Ok(val)) => RpcResponse::ok(id, &kind, val),
+                Ok(Err(e)) => RpcResponse::err(id, &kind, "plugin_theme_failed", e),
+                Err(e) => RpcResponse::err(id, &kind, "plugin_theme_failed", e.to_string()),
+            }
+        }
+        "plugin.panel.render.request" => {
+            let plugin_id = params["plugin_id"].as_str().unwrap_or("").to_owned();
+            let panel_id = params["panel_id"].as_str().unwrap_or("").to_owned();
+            let action = params["action"].as_str().map(str::to_owned);
+            let payload = params.get("payload").cloned().filter(|v| !v.is_null());
+            let form_values = params
+                .get("form_values")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let agent = params.get("agent").cloned().filter(|v| !v.is_null());
+            let socket = resolve_socket_param(&params).map(std::path::PathBuf::from);
+            let loaded = tokio::task::spawn_blocking(move || {
+                let catalog = crate::plugin::manifest::load_catalog()?;
+                let p = catalog
+                    .find_plugin(&plugin_id)
+                    .cloned()
+                    .ok_or_else(|| format!("plugin '{plugin_id}' not found"))?;
+                if !p.is_active(catalog.enabled) {
+                    return Err(format!("plugin '{plugin_id}' is disabled or has errors"));
+                }
+                Ok::<_, String>(p)
+            })
+            .await;
+            match loaded {
+                Ok(Ok(plugin)) => match crate::plugin::runner::invoke_panel(
+                    &plugin,
+                    &panel_id,
+                    agent,
+                    action,
+                    payload,
+                    form_values,
+                    socket,
+                )
+                .await
+                {
+                    Ok(doc) => {
+                        RpcResponse::ok(id, &kind, serde_json::to_value(doc).unwrap_or(Value::Null))
+                    }
+                    Err(e) => RpcResponse::err(id, &kind, "plugin_panel_failed", e),
+                },
+                Ok(Err(e)) => RpcResponse::err(id, &kind, "plugin_panel_failed", e),
+                Err(e) => RpcResponse::err(id, &kind, "plugin_panel_failed", e.to_string()),
+            }
+        }
+        "plugin.command.run.request" => {
+            let plugin_id = params["plugin_id"].as_str().unwrap_or("").to_owned();
+            let command_id = params["command_id"].as_str().unwrap_or("").to_owned();
+            let args = params["args"].as_str().unwrap_or("").to_owned();
+            let agent = params.get("agent").cloned().filter(|v| !v.is_null());
+            let socket = resolve_socket_param(&params).map(std::path::PathBuf::from);
+            let loaded = tokio::task::spawn_blocking(move || {
+                let catalog = crate::plugin::manifest::load_catalog()?;
+                let p = catalog
+                    .find_plugin(&plugin_id)
+                    .cloned()
+                    .ok_or_else(|| format!("plugin '{plugin_id}' not found"))?;
+                if !p.is_active(catalog.enabled) {
+                    return Err(format!("plugin '{plugin_id}' is disabled or has errors"));
+                }
+                Ok::<_, String>(p)
+            })
+            .await;
+            match loaded {
+                Ok(Ok(plugin)) => match crate::plugin::runner::invoke_command(
+                    &plugin,
+                    &command_id,
+                    args,
+                    agent,
+                    socket,
+                )
+                .await
+                {
+                    Ok(out) => {
+                        RpcResponse::ok(id, &kind, serde_json::to_value(out).unwrap_or(Value::Null))
+                    }
+                    Err(e) => RpcResponse::err(id, &kind, "plugin_command_failed", e),
+                },
+                Ok(Err(e)) => RpcResponse::err(id, &kind, "plugin_command_failed", e),
+                Err(e) => RpcResponse::err(id, &kind, "plugin_command_failed", e.to_string()),
+            }
+        }
+        "plugin.logs.request" => {
+            let plugin_id = params["plugin_id"].as_str().unwrap_or("").to_owned();
+            let tail = params["tail"].as_u64().unwrap_or(80) as usize;
+            match tokio::task::spawn_blocking(move || {
+                crate::plugin::runner::read_plugin_logs(&plugin_id, tail)
+            })
+            .await
+            {
+                Ok(Ok(lines)) => RpcResponse::ok(id, &kind, json!({ "lines": lines })),
+                Ok(Err(e)) => RpcResponse::err(id, &kind, "plugin_logs_failed", e),
+                Err(e) => RpcResponse::err(id, &kind, "plugin_logs_failed", e.to_string()),
+            }
+        }
+        "plugin.skill.set.request" => {
+            let target = params["target"].as_str().unwrap_or("all").to_owned();
+            let enabled = params["enabled"].as_bool().unwrap_or(true);
+            let force = params["force"].as_bool().unwrap_or(false);
+            let res = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+                let paths = if enabled {
+                    crate::plugin::skill::install_target(&target, force)?
+                } else {
+                    crate::plugin::skill::uninstall_target(&target)?
+                };
+                Ok(json!({
+                    "ok": true,
+                    "paths": paths,
+                    "skills": crate::plugin::skill::inspect_all(),
+                }))
+            })
+            .await;
+            match res {
+                Ok(Ok(val)) => RpcResponse::ok(id, &kind, val),
+                Ok(Err(e)) => RpcResponse::err(id, &kind, "plugin_skill_failed", e),
+                Err(e) => RpcResponse::err(id, &kind, "plugin_skill_failed", e.to_string()),
+            }
+        }
+        "plugin.creator.start.request" => {
+            let goal = params["goal"].as_str().unwrap_or("").trim().to_owned();
+            if goal.is_empty() {
+                return RpcResponse::err(
+                    id,
+                    &kind,
+                    "creator_invalid",
+                    "describe the plugin you want to create",
+                );
+            }
+            let provider = match params["provider"].as_str().unwrap_or("agy") {
+                "claude" | "claude-code" => "claude",
+                "codex" => "codex",
+                "agy" | "antigravity" => "agy",
+                other => {
+                    return RpcResponse::err(
+                        id,
+                        &kind,
+                        "creator_invalid",
+                        format!(
+                            "unsupported creator provider '{other}' (use agy, claude, or codex)"
+                        ),
+                    );
+                }
+            }
+            .to_owned();
+            let plugin_id = params["plugin_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let model = params["model"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let effort = params["effort"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+
+            let plugins_root = match crate::plugin::manifest::plugins_dir() {
+                Ok(d) => {
+                    let _ = std::fs::create_dir_all(&d);
+                    d
+                }
+                Err(e) => return RpcResponse::err(id, &kind, "creator_failed", e),
+            };
+            // Ensure the selected CLI has the official `masil-plugin` skill installed.
+            let skill_target = provider.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::plugin::skill::install_target(&skill_target, false)
+            })
+            .await;
+
+            let cwd = params["cwd"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| plugins_root.to_string_lossy().into_owned());
+            let slug = plugin_id.as_deref().map(str::to_owned).unwrap_or_else(|| {
+                let s: String = goal
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .take(14)
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if s.is_empty() {
+                    format!("custom-{}", crate::remote::config::now_ms() % 10000)
+                } else {
+                    s
+                }
+            });
+            let agent_name = format!("plugin-{slug}")
+                .chars()
+                .take(30)
+                .collect::<String>();
+            let creator_prompt = crate::plugin::skill::build_creator_prompt(
+                &goal,
+                plugin_id.as_deref(),
+                &plugins_root,
+            );
+            let socket = ensure_target_socket(&params);
+            let mut args = vec![
+                "start".into(),
+                agent_name.clone(),
+                provider.clone(),
+                "--cwd".into(),
+                cwd,
+            ];
+            let extra =
+                build_provider_start_flags(&provider, model.as_deref(), effort.as_deref(), None);
+            if !extra.is_empty() {
+                args.push("--".into());
+                args.extend(extra);
+            }
+            match run_blocking_agent(socket.clone(), args).await {
+                Ok(val) => {
+                    let pane_target = val
+                        .get("pane_id")
+                        .or_else(|| val.get("pane"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&agent_name)
+                        .to_owned();
+                    let sock_clone = socket.clone();
+                    let prompt_clone = creator_prompt.clone();
+                    tokio::spawn(async move {
+                        // Give the newly started CLI a brief moment to draw its prompt input.
+                        tokio::time::sleep(Duration::from_millis(2400)).await;
+                        let delivered = run_blocking_agent(
+                            sock_clone.clone(),
+                            vec!["prompt".into(), pane_target.clone(), prompt_clone.clone()],
+                        )
+                        .await;
+                        if delivered.is_err() {
+                            let _ = send_human_keys_to_pane(
+                                sock_clone.as_deref(),
+                                &pane_target,
+                                &format!("{prompt_clone}\r"),
+                            )
+                            .await;
+                        }
+                    });
+                    RpcResponse::ok(
+                        id,
+                        &kind,
+                        json!({
+                            "started": val,
+                            "agent_name": agent_name,
+                            "provider": provider,
+                            "prompt": creator_prompt,
+                        }),
+                    )
+                }
+                Err(e) => RpcResponse::err(id, &kind, "creator_start_failed", e),
             }
         }
         _ => RpcResponse::err(id, &kind, "unknown_rpc", format!("unsupported RPC: {kind}")),

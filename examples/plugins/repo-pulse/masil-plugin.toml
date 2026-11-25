@@ -1,0 +1,27 @@
+schema_version = 1
+id = "repo-pulse"
+name = "Repo Pulse"
+version = "0.1.0"
+description = "Interactive git branch, dirty files, commit velocity sparkline, and /pulse summary card."
+author = "masil"
+scope = "read"
+entry = ["node", "plugin.mjs"]
+timeout_secs = 15
+
+[[panels]]
+id = "overview"
+title = "Pulse"
+icon = "Activity"
+context = "agent"
+handler = "panel.overview"
+refresh_secs = 20
+
+[[commands]]
+id = "pulse"
+slash = "pulse"
+title = "Repository pulse"
+description = "Inspect branch, dirty count, and post a summary card to the timeline"
+argument_hint = "[note]"
+context = "agent"
+handler = "command.pulse"
+icon = "Activity"

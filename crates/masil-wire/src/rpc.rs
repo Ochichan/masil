@@ -199,6 +199,17 @@ pub enum TimelineItem {
         level: String,
         text: String,
     },
+    PluginCard {
+        id: String,
+        seq: u64,
+        ts_ms: i64,
+        plugin_id: String,
+        card_id: String,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subtitle: Option<String>,
+        blocks: Vec<Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

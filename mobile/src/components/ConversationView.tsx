@@ -10,10 +10,16 @@ import {
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { Check, ChevronDown, ChevronRight, Copy, Wrench } from "lucide-react-native";
-import type { AgentRow, TimelineItem, TimelinePage } from "../protocol/schemas";
+import type {
+  AgentRow,
+  TimelineItem,
+  TimelinePage,
+  UiBlock,
+} from "../protocol/schemas";
 import { useMasilTheme } from "../theme/ThemeProvider";
 import { FONTS, TABULAR_NUMS } from "../theme/typography";
 import { ApprovalBanner } from "./ApprovalBanner";
+import { PluginUiRenderer } from "./PluginUiRenderer";
 import { ToolCallCard } from "./ToolCallCard";
 
 interface ConversationViewProps {
@@ -435,6 +441,48 @@ export function ConversationView({
             </Text>
           </View>
         );
+      case "plugin_card":
+        return (
+          <View
+            style={[
+              styles.pluginCard,
+              {
+                backgroundColor: palette.panel,
+                borderColor: palette.borderSubtle,
+              },
+            ]}
+          >
+            <View style={styles.pluginCardHeader}>
+              <Text
+                numberOfLines={1}
+                style={[styles.pluginCardTitle, { color: palette.text }]}
+              >
+                {item.title}
+              </Text>
+              <View
+                style={[
+                  styles.pluginCardBadge,
+                  { backgroundColor: palette.accentSoft },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.pluginCardBadgeText,
+                    { color: palette.accent },
+                  ]}
+                >
+                  {item.plugin_id}
+                </Text>
+              </View>
+            </View>
+            {item.subtitle ? (
+              <Text style={[styles.pluginCardSub, { color: palette.muted }]}>
+                {item.subtitle}
+              </Text>
+            ) : null}
+            <PluginUiRenderer blocks={(item.blocks ?? []) as UiBlock[]} />
+          </View>
+        );
       default:
         return null;
     }
@@ -573,6 +621,37 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: 10,
     padding: 11,
+  },
+  pluginCard: {
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    gap: 8,
+  },
+  pluginCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  pluginCardTitle: {
+    fontFamily: FONTS.bold,
+    fontSize: 14,
+    flex: 1,
+  },
+  pluginCardBadge: {
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 999,
+  },
+  pluginCardBadgeText: {
+    fontFamily: FONTS.mono,
+    fontSize: 10.5,
+  },
+  pluginCardSub: {
+    fontFamily: FONTS.regular,
+    fontSize: 12,
+    marginTop: -4,
   },
   mono: {
     fontFamily: FONTS.mono,

@@ -399,7 +399,7 @@ pub fn fetch_timeline(query: TimelineQuery<'_>) -> TimelinePage {
         && entry.session_id == binding.session_id
         && entry.confidence == binding.confidence
     {
-        return entry.page.clone();
+        return attach_plugin_cards(entry.page.clone(), agent_key);
     }
 
     let mut items = match (binding.confidence, binding.source_path.as_deref()) {
@@ -486,6 +486,25 @@ pub fn fetch_timeline(query: TimelineQuery<'_>) -> TimelinePage {
                 page: page.clone(),
             },
         );
+    }
+    attach_plugin_cards(page, agent_key)
+}
+
+fn attach_plugin_cards(mut page: TimelinePage, agent_key: &str) -> TimelinePage {
+    let cards = crate::plugin::runner::load_timeline_cards(agent_key);
+    if cards.is_empty() {
+        return page;
+    }
+    // Keep any trailing ApprovalBanner at the very bottom so input prompts stay prominent.
+    let trailing_banner = if matches!(page.items.last(), Some(TimelineItem::ApprovalBanner { .. }))
+    {
+        page.items.pop()
+    } else {
+        None
+    };
+    page.items.extend(cards);
+    if let Some(banner) = trailing_banner {
+        page.items.push(banner);
     }
     page
 }

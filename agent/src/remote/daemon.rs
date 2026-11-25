@@ -43,6 +43,8 @@ struct SharedDaemon {
     connected_sessions: Arc<AtomicUsize>,
     agents_tx: broadcast::Sender<Arc<Vec<Value>>>,
     refresh_notify: Arc<Notify>,
+    plugins_tx: broadcast::Sender<Arc<Value>>,
+    plugins_notify: Arc<Notify>,
     relay_push_tx: mpsc::Sender<PushNotificationRequest>,
 }
 
@@ -107,6 +109,7 @@ async fn daemon_main(
 ) -> Result<i32, String> {
     let (relay_push_tx, relay_push_rx) = mpsc::channel::<PushNotificationRequest>(64);
     let (agents_tx, _) = broadcast::channel::<Arc<Vec<Value>>>(16);
+    let (plugins_tx, _) = broadcast::channel::<Arc<Value>>(16);
     let shared = SharedDaemon {
         identity: identity.clone(),
         config: config.clone(),
@@ -114,6 +117,8 @@ async fn daemon_main(
         connected_sessions: Arc::new(AtomicUsize::new(0)),
         agents_tx,
         refresh_notify: Arc::new(Notify::new()),
+        plugins_tx,
+        plugins_notify: Arc::new(Notify::new()),
         relay_push_tx,
     };
 
@@ -123,6 +128,15 @@ async fn daemon_main(
         let shared_watch = shared.clone();
         tokio::spawn(async move {
             run_agents_watcher(shared_watch).await;
+        });
+    }
+
+    // 0b. Live plugin & theme watcher: pushes `plugins.changed` to all connected
+    //     mobile sessions whenever plugins.toml or any plugin manifest/theme changes.
+    {
+        let shared_plugins = shared.clone();
+        tokio::spawn(async move {
+            run_plugins_watcher(shared_plugins).await;
         });
     }
 
@@ -457,6 +471,7 @@ async fn run_encrypted_session(
     });
 
     let mut agents_rx = shared.agents_tx.subscribe();
+    let mut plugins_rx = shared.plugins_tx.subscribe();
     let mut revoke_tick = tokio::time::interval(Duration::from_secs(2));
     revoke_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -472,6 +487,19 @@ async fn run_encrypted_session(
                         "v": 1,
                         "event": "agents.changed",
                         "agents": agents.as_ref(),
+                    });
+                    if send_encrypted_json(&transport, &out_tx, &evt).await.is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            pushed_plugins = plugins_rx.recv(), if auth.is_some() => {
+                if let Ok(catalog) = pushed_plugins {
+                    let evt = json!({
+                        "v": 1,
+                        "event": "plugins.changed",
+                        "catalog": catalog.as_ref(),
                     });
                     if send_encrypted_json(&transport, &out_tx, &evt).await.is_err() {
                         break;
@@ -624,6 +652,14 @@ async fn run_encrypted_session(
                                     | "agent.approve.request"
                                     | "agent.configure.request"
                                     | "agent.resume.request"
+                                    | "plugin.creator.start.request"
+                            );
+                            let mutates_plugins = matches!(
+                                req.kind.as_str(),
+                                "plugin.toggle.request"
+                                    | "plugin.reload.request"
+                                    | "plugin.theme.set.request"
+                                    | "plugin.skill.set.request"
                             );
                             let resp = dispatch_authenticated_rpc(
                                 req,
@@ -634,6 +670,9 @@ async fn run_encrypted_session(
                             .await;
                             if let Ok(v) = serde_json::to_value(&resp) {
                                 let _ = send_encrypted_json(&tx_rpc, &out_rpc, &v).await;
+                            }
+                            if mutates_plugins {
+                                shared_rpc.plugins_notify.notify_one();
                             }
                             if mutates_state {
                                 shared_rpc.refresh_notify.notify_one();
@@ -758,6 +797,7 @@ fn agents_fingerprint(agents: &[Value]) -> String {
 
 async fn run_agents_watcher(shared: SharedDaemon) {
     let mut last_fp = String::new();
+    let mut last_states: HashMap<String, String> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(1000));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -774,7 +814,73 @@ async fn run_agents_watcher(shared: SharedDaemon) {
         let fp = agents_fingerprint(&agents);
         if fp != last_fp {
             last_fp = fp;
+            let mut next_states = HashMap::with_capacity(agents.len());
+            for agent in &agents {
+                let key = agent
+                    .get("remote_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let st = agent
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned();
+                if let Some(prev) = last_states.get(&key)
+                    && prev != &st
+                {
+                    let prev_state = prev.clone();
+                    let next_state = st.clone();
+                    let agent_val = agent.clone();
+                    let sock = agent
+                        .get("server_socket")
+                        .and_then(Value::as_str)
+                        .map(std::path::PathBuf::from);
+                    tokio::spawn(async move {
+                        crate::plugin::runner::dispatch_hook_event(
+                            "agent.state_changed",
+                            json!({
+                                "previous_state": prev_state,
+                                "state": next_state,
+                                "name": agent_val.get("name"),
+                                "pane": agent_val.get("pane"),
+                                "provider": agent_val.get("provider"),
+                            }),
+                            Some(agent_val),
+                            sock,
+                        )
+                        .await;
+                    });
+                }
+                next_states.insert(key, st);
+            }
+            last_states = next_states;
             let _ = shared.agents_tx.send(Arc::new(agents));
+        }
+    }
+}
+
+async fn run_plugins_watcher(shared: SharedDaemon) {
+    let mut last_fp = String::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(1500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shared.plugins_notify.notified() => {}
+        }
+        if shared.connected_sessions.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        let fp = tokio::task::spawn_blocking(crate::plugin::manifest::catalog_fingerprint)
+            .await
+            .unwrap_or_default();
+        if fp != last_fp {
+            last_fp = fp;
+            if let Ok(Ok(catalog)) = tokio::task::spawn_blocking(crate::plugin::catalog_json).await
+            {
+                let _ = shared.plugins_tx.send(Arc::new(catalog));
+            }
         }
     }
 }

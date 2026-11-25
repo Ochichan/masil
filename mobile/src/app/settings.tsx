@@ -1,5 +1,6 @@
-import React from "react";
+import React, { useState } from "react";
 import {
+  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -8,17 +9,28 @@ import {
   View,
 } from "react-native";
 import { useRouter } from "expo-router";
+import { RefreshCw, Sparkles, Terminal, X } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { PluginCreatorSheet } from "../components/PluginCreatorSheet";
 import {
   getHostClient,
   useHostRuntimeStore,
 } from "../hosts/HostRuntimeController";
 import { registerPushTokenWithHost } from "../notifications/push-manager";
+import type { PluginCatalog } from "../protocol/schemas";
 import { useMasilTheme } from "../theme/ThemeProvider";
+import { FONTS } from "../theme/typography";
 
 export default function SettingsScreen() {
-  const { palette, preference, setPreference } = useMasilTheme();
+  const {
+    palette,
+    preference,
+    activeThemeId,
+    availablePluginThemes,
+    setPreference,
+    setLocalPluginTheme,
+  } = useMasilTheme();
   const { t, i18n } = useTranslation();
   const router = useRouter();
 
@@ -27,10 +39,19 @@ export default function SettingsScreen() {
   const activeHostId = useHostRuntimeStore((s) => s.activeHostId);
   const removeHost = useHostRuntimeStore((s) => s.removeHost);
   const refreshHost = useHostRuntimeStore((s) => s.refreshHost);
+  const setHostPlugins = useHostRuntimeStore((s) => s.setHostPlugins);
   const voiceMode = useHostRuntimeStore((s) => s.voiceMode);
   const setVoiceMode = useHostRuntimeStore((s) => s.setVoiceMode);
 
+  const [showCreator, setShowCreator] = useState(false);
+  const [logModal, setLogModal] = useState<{
+    pluginId: string;
+    lines: string[];
+  } | null>(null);
+  const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
+
   const activeHost = activeHostId ? hosts[activeHostId] : undefined;
+  const plugins = activeHost?.plugins ?? null;
 
   const toggleHook = async (providerId: string, enabled: boolean) => {
     if (!activeHostId) return;
@@ -41,6 +62,83 @@ export default function SettingsScreen() {
       enabled,
     });
     await refreshHost(activeHostId);
+  };
+
+  const selectTheme = async (themeId: string) => {
+    if (themeId === "dark" || themeId === "light" || themeId === "system") {
+      setPreference(themeId);
+    } else {
+      setLocalPluginTheme(themeId);
+    }
+    if (!activeHostId) return;
+    const client = getHostClient(activeHostId);
+    if (!client) return;
+    try {
+      const next = await client.request<PluginCatalog>(
+        "plugin.theme.set.request",
+        { theme_id: themeId }
+      );
+      setHostPlugins(activeHostId, next);
+    } catch {
+      // Keep local theme choice even if host is momentarily offline.
+    }
+  };
+
+  const togglePlugin = async (pluginId: string, enabled: boolean) => {
+    if (!activeHostId) return;
+    const client = getHostClient(activeHostId);
+    if (!client) return;
+    setBusyPlugin(pluginId);
+    try {
+      const next = await client.request<PluginCatalog>(
+        "plugin.toggle.request",
+        { plugin_id: pluginId, enabled }
+      );
+      setHostPlugins(activeHostId, next);
+    } finally {
+      setBusyPlugin(null);
+    }
+  };
+
+  const reloadPlugins = async () => {
+    if (!activeHostId) return;
+    const client = getHostClient(activeHostId);
+    if (!client) return;
+    setBusyPlugin("__reload__");
+    try {
+      const next = await client.request<PluginCatalog>(
+        "plugin.reload.request"
+      );
+      setHostPlugins(activeHostId, next);
+    } finally {
+      setBusyPlugin(null);
+    }
+  };
+
+  const openLogs = async (pluginId: string) => {
+    if (!activeHostId) return;
+    const client = getHostClient(activeHostId);
+    if (!client) return;
+    try {
+      const res = await client.request<{ lines?: string[] }>(
+        "plugin.logs.request",
+        { plugin_id: pluginId, tail: 80 }
+      );
+      setLogModal({ pluginId, lines: res.lines ?? [] });
+    } catch (e) {
+      setLogModal({
+        pluginId,
+        lines: [e instanceof Error ? e.message : String(e)],
+      });
+    }
+  };
+
+  const toggleSkill = async (target: string, enabled: boolean) => {
+    if (!activeHostId) return;
+    const client = getHostClient(activeHostId);
+    if (!client) return;
+    await client.request("plugin.skill.set.request", { target, enabled });
+    await useHostRuntimeStore.getState().refreshPlugins(activeHostId);
   };
 
   return (
@@ -111,11 +209,16 @@ export default function SettingsScreen() {
             </Text>
             <View style={styles.pills}>
               {(["dark", "light", "system"] as const).map((th) => {
-                const active = preference === th;
+                const active =
+                  (!activeThemeId ||
+                    activeThemeId === "dark" ||
+                    activeThemeId === "light" ||
+                    activeThemeId === "system") &&
+                  preference === th;
                 return (
                   <Pressable
                     key={th}
-                    onPress={() => setPreference(th)}
+                    onPress={() => void selectTheme(th)}
                     style={[
                       styles.pill,
                       {
@@ -139,7 +242,223 @@ export default function SettingsScreen() {
               })}
             </View>
           </View>
+
+          {availablePluginThemes.length > 0 ? (
+            <View style={{ gap: 8 }}>
+              <Text style={{ color: palette.muted, fontSize: 11.5 }}>
+                Plugin Themes (syncs live with TUI)
+              </Text>
+              <View style={styles.themeGrid}>
+                {availablePluginThemes.map((th) => {
+                  const active = activeThemeId === th.id;
+                  return (
+                    <Pressable
+                      key={th.id}
+                      onPress={() => void selectTheme(th.id)}
+                      style={[
+                        styles.themeChip,
+                        {
+                          backgroundColor: th.panel,
+                          borderColor: active ? palette.accent : palette.track,
+                          borderWidth: active ? 2 : 1,
+                        },
+                      ]}
+                    >
+                      <View
+                        style={[
+                          styles.swatchDot,
+                          { backgroundColor: th.accent },
+                        ]}
+                      />
+                      <Text
+                        numberOfLines={1}
+                        style={{
+                          color: th.text,
+                          fontFamily: FONTS.semi,
+                          fontSize: 12,
+                        }}
+                      >
+                        {th.name}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
+          ) : null}
         </View>
+
+        {/* Plugins & Creator Mode */}
+        {activeHost ? (
+          <>
+            <View style={styles.sectionHeaderRow}>
+              <Text style={[styles.sectionTitle, { color: palette.muted }]}>
+                Plugins ({plugins?.plugins.length ?? 0})
+              </Text>
+              <Pressable
+                onPress={() => void reloadPlugins()}
+                disabled={busyPlugin === "__reload__"}
+                style={styles.inlineAction}
+              >
+                <RefreshCw size={12} color={palette.accent} />
+                <Text
+                  style={{
+                    color: palette.accent,
+                    fontFamily: FONTS.semi,
+                    fontSize: 12,
+                  }}
+                >
+                  Reload
+                </Text>
+              </Pressable>
+            </View>
+            <View
+              style={[
+                styles.card,
+                { backgroundColor: palette.panel, borderColor: palette.track },
+              ]}
+            >
+              <Pressable
+                onPress={() => setShowCreator(true)}
+                style={[
+                  styles.creatorCta,
+                  { backgroundColor: palette.accent },
+                ]}
+              >
+                <Sparkles size={15} color={palette.accentText} />
+                <Text
+                  style={{
+                    color: palette.accentText,
+                    fontFamily: FONTS.bold,
+                    fontSize: 13.5,
+                  }}
+                >
+                  {t("createPluginWithAi")}
+                </Text>
+              </Pressable>
+
+              {plugins && plugins.plugins.length > 0 ? (
+                plugins.plugins.map((p) => {
+                  const statusColor =
+                    p.status === "running"
+                      ? palette.success
+                      : p.status === "error"
+                        ? palette.danger
+                        : palette.muted;
+                  return (
+                    <View
+                      key={p.id}
+                      style={[
+                        styles.pluginItem,
+                        { borderTopColor: palette.hairline },
+                      ]}
+                    >
+                      <View style={styles.row}>
+                        <View style={{ flex: 1, gap: 2 }}>
+                          <View style={styles.pluginNameRow}>
+                            <Text
+                              style={{
+                                color: palette.text,
+                                fontFamily: FONTS.semi,
+                                fontSize: 14,
+                              }}
+                            >
+                              {p.manifest?.name || p.id}
+                            </Text>
+                            <Text
+                              style={{
+                                color: statusColor,
+                                fontFamily: FONTS.mono,
+                                fontSize: 11,
+                              }}
+                            >
+                              {p.status}
+                            </Text>
+                          </View>
+                          <Text
+                            numberOfLines={2}
+                            style={{ color: palette.muted, fontSize: 11.5 }}
+                          >
+                            {p.manifest?.description || p.id}
+                          </Text>
+                        </View>
+                        <Pressable
+                          onPress={() => void openLogs(p.id)}
+                          hitSlop={8}
+                          style={[
+                            styles.logBtn,
+                            { backgroundColor: palette.raised },
+                          ]}
+                        >
+                          <Terminal size={13} color={palette.textSecondary} />
+                        </Pressable>
+                        <Switch
+                          value={p.enabled}
+                          disabled={busyPlugin === p.id}
+                          onValueChange={(v) => void togglePlugin(p.id, v)}
+                          trackColor={{
+                            false: palette.track,
+                            true: palette.accent,
+                          }}
+                        />
+                      </View>
+                      {p.errors.length > 0 ? (
+                        <Text
+                          style={{
+                            color: palette.danger,
+                            fontFamily: FONTS.mono,
+                            fontSize: 11,
+                          }}
+                        >
+                          {p.errors.join(" · ")}
+                        </Text>
+                      ) : null}
+                    </View>
+                  );
+                })
+              ) : (
+                <Text style={{ color: palette.muted, fontSize: 12.5 }}>
+                  설치된 플러그인이 없습니다. 위 버튼으로 Claude Code, Codex,
+                  Antigravity에게 원하는 플러그인을 즉석 제작해보세요.
+                </Text>
+              )}
+            </View>
+
+            {/* AI CLI Plugin Skills */}
+            <Text style={[styles.sectionTitle, { color: palette.muted }]}>
+              AI Plugin Skills (Claude Code · Codex · Antigravity)
+            </Text>
+            <View
+              style={[
+                styles.card,
+                { backgroundColor: palette.panel, borderColor: palette.track },
+              ]}
+            >
+              <Text style={{ color: palette.muted, fontSize: 12 }}>
+                각 AI 코딩 CLI에 공식 masil-plugin 스킬을 설치하면 대화창에서
+                바로 Masil 플러그인을 만들고 실시간 반영할 수 있습니다.
+              </Text>
+              {(plugins?.skills ?? []).map((sk) => (
+                <View key={sk.id} style={styles.row}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: palette.text, fontWeight: "600" }}>
+                      {sk.label}
+                    </Text>
+                    <Text style={{ color: palette.muted, fontSize: 11 }}>
+                      {sk.cli_installed ? "CLI detected" : "CLI not in PATH"} ·{" "}
+                      {sk.skill_installed ? "Skill installed" : "Not installed"}
+                    </Text>
+                  </View>
+                  <Switch
+                    value={sk.skill_installed}
+                    onValueChange={(v) => void toggleSkill(sk.id, v)}
+                    trackColor={{ false: palette.track, true: palette.accent }}
+                  />
+                </View>
+              ))}
+            </View>
+          </>
+        ) : null}
 
         {/* Voice Dictation STT Mode */}
         <Text style={[styles.sectionTitle, { color: palette.muted }]}>
@@ -190,10 +509,21 @@ export default function SettingsScreen() {
                   : t("pushStatusHookFallback")}
               </Text>
               <Pressable
-                onPress={() => void registerPushTokenWithHost(activeHost.host.hostId)}
-                style={[styles.pill, { backgroundColor: palette.raised, alignSelf: "flex-start" }]}
+                onPress={() =>
+                  void registerPushTokenWithHost(activeHost.host.hostId)
+                }
+                style={[
+                  styles.pill,
+                  { backgroundColor: palette.raised, alignSelf: "flex-start" },
+                ]}
               >
-                <Text style={{ color: palette.accent, fontWeight: "700", fontSize: 12 }}>
+                <Text
+                  style={{
+                    color: palette.accent,
+                    fontWeight: "700",
+                    fontSize: 12,
+                  }}
+                >
                   Register push token
                 </Text>
               </Pressable>
@@ -251,6 +581,64 @@ export default function SettingsScreen() {
           })}
         </View>
       </ScrollView>
+
+      {activeHostId ? (
+        <PluginCreatorSheet
+          visible={showCreator}
+          hostId={activeHostId}
+          onClose={() => setShowCreator(false)}
+          onLaunched={() => router.back()}
+        />
+      ) : null}
+
+      <Modal
+        visible={Boolean(logModal)}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setLogModal(null)}
+      >
+        <View style={styles.logBackdrop}>
+          <View
+            style={[
+              styles.logSheet,
+              {
+                backgroundColor: palette.panel,
+                borderColor: palette.borderSubtle,
+              },
+            ]}
+          >
+            <View style={styles.row}>
+              <Text
+                style={{
+                  color: palette.text,
+                  fontFamily: FONTS.bold,
+                  fontSize: 15,
+                }}
+              >
+                Logs · {logModal?.pluginId}
+              </Text>
+              <Pressable onPress={() => setLogModal(null)} hitSlop={8}>
+                <X size={18} color={palette.muted} />
+              </Pressable>
+            </View>
+            <ScrollView style={{ maxHeight: 360 }}>
+              <Text
+                selectable
+                style={{
+                  color: palette.textSecondary,
+                  fontFamily: FONTS.mono,
+                  fontSize: 11.5,
+                  lineHeight: 17,
+                }}
+              >
+                {logModal && logModal.lines.length > 0
+                  ? logModal.lines.join("\n")
+                  : "(no logs recorded yet)"}
+              </Text>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -267,6 +655,17 @@ const styles = StyleSheet.create({
   },
   title: { fontSize: 16, fontWeight: "700" },
   content: { padding: 14, gap: 12, paddingBottom: 40 },
+  sectionHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginTop: 4,
+  },
+  inlineAction: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+  },
   sectionTitle: {
     fontSize: 12,
     fontWeight: "700",
@@ -287,4 +686,51 @@ const styles = StyleSheet.create({
   },
   pills: { flexDirection: "row", gap: 6 },
   pill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 },
+  themeGrid: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  themeChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 8,
+  },
+  swatchDot: { width: 10, height: 10, borderRadius: 5 },
+  creatorCta: {
+    height: 40,
+    borderRadius: 9,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 7,
+  },
+  pluginItem: {
+    borderTopWidth: 1,
+    paddingTop: 10,
+    gap: 6,
+  },
+  pluginNameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  logBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 7,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  logBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.58)",
+    justifyContent: "flex-end",
+  },
+  logSheet: {
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderTopWidth: 1,
+    padding: 16,
+    gap: 12,
+  },
 });

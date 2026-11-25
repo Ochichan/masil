@@ -11,8 +11,36 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use std::sync::{OnceLock, RwLock};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+static PLUGIN_PALETTE: OnceLock<RwLock<Option<Palette>>> = OnceLock::new();
+
+pub(super) fn set_plugin_palette(theme: Option<&crate::plugin::manifest::ResolvedTheme>) {
+    let parsed = theme.and_then(|t| {
+        let rgb = |hex: &str| {
+            crate::plugin::manifest::parse_hex_rgb(hex).map(|(r, g, b)| Color::Rgb(r, g, b))
+        };
+        Some(Palette {
+            host: false,
+            canvas: rgb(&t.canvas)?,
+            panel: rgb(&t.panel)?,
+            raised: rgb(&t.raised)?,
+            text: rgb(&t.text)?,
+            muted: rgb(&t.muted)?,
+            accent: rgb(&t.accent)?,
+            accent_text: rgb(&t.accent_text)?,
+            warning: rgb(&t.warning)?,
+            danger: rgb(&t.danger)?,
+            success: rgb(&t.success)?,
+            track: rgb(&t.track)?,
+        })
+    });
+    if let Ok(mut guard) = PLUGIN_PALETTE.get_or_init(|| RwLock::new(None)).write() {
+        *guard = parsed;
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct Palette {
@@ -34,6 +62,13 @@ pub(super) struct Palette {
 
 impl Palette {
     pub(super) fn for_theme(theme: Theme) -> Self {
+        if theme != Theme::Terminal
+            && let Some(lock) = PLUGIN_PALETTE.get()
+            && let Ok(guard) = lock.read()
+            && let Some(custom) = *guard
+        {
+            return custom;
+        }
         match theme {
             Theme::Dark => Self {
                 host: false,

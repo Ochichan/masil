@@ -1,0 +1,12 @@
+schema_version = 1
+id = "catppuccin-mocha"
+name = "Catppuccin Mocha"
+version = "0.1.0"
+description = "Warm pastel dark theme synced live across Masil TUI and Mobile."
+author = "masil"
+
+[[themes]]
+id = "catppuccin-mocha"
+name = "Catppuccin Mocha"
+appearance = "dark"
+file = "theme.toml"

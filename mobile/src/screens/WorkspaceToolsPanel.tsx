@@ -1,19 +1,20 @@
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { ChevronLeft } from "lucide-react-native";
+import { ChevronLeft, Sparkles } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { CheckpointsView } from "../components/CheckpointsView";
 import { FileExplorerView } from "../components/FileExplorerView";
 import { GitDiffView } from "../components/GitDiffView";
+import { PluginCreatorSheet } from "../components/PluginCreatorSheet";
+import { PluginPanelView } from "../components/PluginPanelView";
 import { SchedulesView } from "../components/SchedulesView";
 import { SegmentedTabs } from "../components/SegmentedTabs";
+import { useHostRuntimeStore } from "../hosts/HostRuntimeController";
 import { useMobilePanelsStore } from "../mobile-panels/store";
-import type { AgentRow } from "../protocol/schemas";
+import type { AgentRow, PluginPanelDef } from "../protocol/schemas";
 import { useMasilTheme } from "../theme/ThemeProvider";
 import { FONTS, shortenHomePath } from "../theme/typography";
-
-type ToolTab = "changes" | "files" | "checkpoints" | "schedules";
 
 interface WorkspaceToolsPanelProps {
   hostId: string | null;
@@ -26,15 +27,40 @@ export function WorkspaceToolsPanel({
 }: WorkspaceToolsPanelProps) {
   const { palette } = useMasilTheme();
   const { t } = useTranslation();
-  const [tab, setTab] = useState<ToolTab>("changes");
+  const [tab, setTab] = useState<string>("changes");
+  const [showCreator, setShowCreator] = useState(false);
   const selectPanel = useMobilePanelsStore((s) => s.selectPanel);
+  const plugins = useHostRuntimeStore((s) =>
+    hostId ? s.hosts[hostId]?.plugins ?? null : null
+  );
 
-  const tabs: Array<{ id: ToolTab; label: string }> = [
-    { id: "changes", label: t("changes") },
-    { id: "files", label: t("files") },
-    { id: "checkpoints", label: t("checkpoints") },
-    { id: "schedules", label: t("schedules") },
-  ];
+  const pluginPanels = useMemo<PluginPanelDef[]>(
+    () => plugins?.panels ?? [],
+    [plugins]
+  );
+
+  const tabs = useMemo(() => {
+    const base: Array<{ id: string; label: string }> = [
+      { id: "changes", label: t("changes") },
+      { id: "files", label: t("files") },
+      { id: "checkpoints", label: t("checkpoints") },
+      { id: "schedules", label: t("schedules") },
+    ];
+    for (const p of pluginPanels) {
+      base.push({ id: `plugin:${p.plugin_id}:${p.id}`, label: p.title });
+    }
+    return base;
+  }, [pluginPanels, t]);
+
+  const activePluginPanel = useMemo(() => {
+    if (!tab.startsWith("plugin:")) return null;
+    return (
+      pluginPanels.find((p) => `plugin:${p.plugin_id}:${p.id}` === tab) ?? null
+    );
+  }, [tab, pluginPanels]);
+
+  const effectiveTab =
+    tab.startsWith("plugin:") && !activePluginPanel ? "changes" : tab;
 
   const shortCwd = shortenHomePath(agent?.cwd);
 
@@ -67,32 +93,66 @@ export function WorkspaceToolsPanel({
           >
             {shortCwd}
           </Text>
+          {hostId ? (
+            <Pressable
+              onPress={() => setShowCreator(true)}
+              hitSlop={8}
+              style={[
+                styles.creatorBtn,
+                {
+                  backgroundColor: palette.accentSoft,
+                  borderColor: palette.accentBorder,
+                },
+              ]}
+              accessibilityLabel={t("createPluginWithAi")}
+            >
+              <Sparkles size={13} color={palette.accent} />
+            </Pressable>
+          ) : null}
         </View>
 
         <View style={styles.segmentRow}>
-          <SegmentedTabs options={tabs} value={tab} onChange={setTab} />
+          <SegmentedTabs
+            options={tabs}
+            value={effectiveTab}
+            onChange={setTab}
+          />
         </View>
       </View>
 
-      {!hostId || !agent ? (
+      {activePluginPanel && hostId ? (
+        <PluginPanelView
+          hostId={hostId}
+          agent={agent}
+          panel={activePluginPanel}
+        />
+      ) : !hostId || !agent ? (
         <View style={styles.emptyRoot}>
           <Text style={[styles.emptyText, { color: palette.muted }]}>
             에이전트를 선택하면 변경 내역, 파일, 체크포인트, 예약을 확인할 수 있습니다.
           </Text>
         </View>
-      ) : tab === "changes" ? (
+      ) : effectiveTab === "changes" ? (
         <GitDiffView
           hostId={hostId}
           cwd={agent.cwd}
           onOpenFiles={() => setTab("files")}
         />
-      ) : tab === "files" ? (
+      ) : effectiveTab === "files" ? (
         <FileExplorerView hostId={hostId} cwd={agent.cwd} />
-      ) : tab === "checkpoints" ? (
+      ) : effectiveTab === "checkpoints" ? (
         <CheckpointsView hostId={hostId} agent={agent} />
       ) : (
         <SchedulesView hostId={hostId} serverSocket={agent.server_socket} />
       )}
+
+      {hostId ? (
+        <PluginCreatorSheet
+          visible={showCreator}
+          hostId={hostId}
+          onClose={() => setShowCreator(false)}
+        />
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -108,7 +168,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingTop: 11,
     paddingBottom: 8,
-    gap: 10,
+    gap: 8,
   },
   backBtn: {
     flexDirection: "row",
@@ -125,6 +185,14 @@ const styles = StyleSheet.create({
     fontSize: 11.5,
     flex: 1,
     textAlign: "right",
+  },
+  creatorBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
   },
   segmentRow: {
     paddingHorizontal: 14,

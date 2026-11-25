@@ -27,6 +27,9 @@ const PRESS_EXPIRY: Duration = Duration::from_secs(2);
 pub(super) enum Kind {
     Agent,
     Action,
+    Panel,
+    Plugin,
+    Theme,
     Pane,
 }
 
@@ -35,6 +38,22 @@ pub(super) enum Target {
     Agent(String),
     Pane(Box<PaneTarget>),
     Action(Action),
+    PluginPanel {
+        plugin_id: String,
+        panel_id: String,
+        title: String,
+    },
+    PluginCommand {
+        plugin_id: String,
+        command_id: String,
+        title: String,
+    },
+    PluginTheme {
+        theme_id: Option<String>,
+        name: String,
+    },
+    ReloadPlugins,
+    CreatePluginWithAi,
 }
 
 #[derive(Clone, Debug)]
@@ -431,6 +450,9 @@ impl Palette {
             Kind::Agent => word(self.language, "Agent", "에이전트"),
             Kind::Pane => word(self.language, "Pane", "pane"),
             Kind::Action => word(self.language, "Action", "작업"),
+            Kind::Panel => word(self.language, "Panel", "패널"),
+            Kind::Plugin => word(self.language, "Plugin", "플러그인"),
+            Kind::Theme => word(self.language, "Theme", "테마"),
         }
     }
 
@@ -622,11 +644,18 @@ impl Palette {
         }
         let has_scroll = self.shown.len() > list_height as usize && text_width > 6;
         let row_text_width = text_width.saturating_sub(usize::from(has_scroll));
-        let kind_width = [Kind::Agent, Kind::Pane, Kind::Action]
-            .into_iter()
-            .map(|kind| cell_width(self.kind_label(kind)))
-            .max()
-            .unwrap_or(0)
+        let kind_width = [
+            Kind::Agent,
+            Kind::Pane,
+            Kind::Action,
+            Kind::Panel,
+            Kind::Plugin,
+            Kind::Theme,
+        ]
+        .into_iter()
+        .map(|kind| cell_width(self.kind_label(kind)))
+        .max()
+        .unwrap_or(0)
             + 1;
         for (row, position) in (self.scroll..self.shown.len())
             .take(list_height as usize)

@@ -11,6 +11,7 @@ import { ConnectionState, MasilRemoteClient } from "../protocol/client";
 import {
   AgentRow,
   InboxItem,
+  PluginCatalog,
   SavedHost,
   TimelinePage,
 } from "../protocol/schemas";
@@ -40,6 +41,7 @@ export interface HostRuntimeState {
     hook_installed: boolean;
     config_path: string;
   }>;
+  plugins: PluginCatalog | null;
 }
 
 type BinaryListener = (frame: BinaryFrame) => void;
@@ -78,6 +80,7 @@ function timelineSignature(page: TimelinePage): string {
     page.items.length,
     last?.id ?? "",
     last?.seq ?? 0,
+    last?.ts_ms ?? 0,
     last && "markdown" in last ? last.markdown.length : "",
     last && "text" in last ? last.text.length : "",
     last && "output" in last ? (last.output?.length ?? 0) : "",
@@ -92,6 +95,7 @@ function applyAgentsSnapshot(
     inbox?: InboxItem[];
     capabilities?: Record<string, unknown>;
     hooks?: HostRuntimeState["hooks"];
+    plugins?: PluginCatalog | null;
   }
 ): void {
   const agents = rawAgents.map(normalizeAgentRow);
@@ -129,6 +133,8 @@ function applyAgentsSnapshot(
           inbox: extra?.inbox ?? prev.inbox,
           capabilities: extra?.capabilities ?? prev.capabilities,
           hooks: extra?.hooks ?? prev.hooks,
+          plugins:
+            extra?.plugins !== undefined ? extra.plugins : prev.plugins,
         },
       },
       activeAgentRemoteId: nextActiveAgent,
@@ -191,6 +197,8 @@ interface RuntimeStore {
   refreshTimeline: (hostId: string, agent: AgentRow) => Promise<void>;
   setVoiceMode: (mode: VoiceSttMode) => void;
   setComposerAttachment: (path: string | null) => void;
+  setHostPlugins: (hostId: string, plugins: PluginCatalog) => void;
+  refreshPlugins: (hostId: string) => Promise<void>;
 }
 
 export function getHostClient(hostId: string): MasilRemoteClient | null {
@@ -246,6 +254,7 @@ export const useHostRuntimeStore = create<RuntimeStore>((set, get) => ({
         inbox: [],
         capabilities: {},
         hooks: [],
+        plugins: null,
       };
       order.push(host.hostId);
     }
@@ -324,6 +333,7 @@ export const useHostRuntimeStore = create<RuntimeStore>((set, get) => ({
           inbox: [],
           capabilities: {},
           hooks: [],
+          plugins: null,
         },
       },
       hostOrder: nextList.map((h) => h.hostId),
@@ -397,16 +407,23 @@ export const useHostRuntimeStore = create<RuntimeStore>((set, get) => ({
             hooks?: HostRuntimeState["hooks"];
           }>("host.info.request")
         : Promise.resolve(null);
+      const pluginsPromise = full
+        ? client
+            .request<PluginCatalog>("plugin.list.request")
+            .catch(() => null)
+        : Promise.resolve(undefined);
 
-      const [infoRes, agentsRes, inboxRes] = await Promise.all([
+      const [infoRes, agentsRes, inboxRes, pluginsRes] = await Promise.all([
         infoPromise,
         agentsPromise,
         inboxPromise,
+        pluginsPromise,
       ]);
       applyAgentsSnapshot(hostId, agentsRes.agents ?? [], {
         inbox: inboxRes.items ?? [],
         capabilities: infoRes?.capabilities,
         hooks: infoRes?.hooks,
+        plugins: pluginsRes,
       });
     } catch {
       // Retain last-known evidence on transient RPC error.
@@ -454,6 +471,27 @@ export const useHostRuntimeStore = create<RuntimeStore>((set, get) => ({
 
   setVoiceMode: (mode) => set({ voiceMode: mode }),
   setComposerAttachment: (path) => set({ composerAttachment: path }),
+  setHostPlugins: (hostId, plugins) =>
+    set((s) => {
+      const prev = s.hosts[hostId];
+      if (!prev) return s;
+      return {
+        hosts: {
+          ...s.hosts,
+          [hostId]: { ...prev, plugins },
+        },
+      };
+    }),
+  refreshPlugins: async (hostId) => {
+    const client = clientPool.get(hostId);
+    if (!client || client.connectionState !== "connected") return;
+    try {
+      const catalog = await client.request<PluginCatalog>("plugin.list.request");
+      get().setHostPlugins(hostId, catalog);
+    } catch {
+      // Keep last known catalog.
+    }
+  },
 }));
 
 function connectManagedHost(host: SavedHost): void {
@@ -499,6 +537,12 @@ function connectManagedHost(host: SavedHost): void {
     onEvent: (event) => {
       if (event.event === "agents.changed" && Array.isArray(event.agents)) {
         applyAgentsSnapshot(host.hostId, event.agents as AgentRow[]);
+        return;
+      }
+      if (event.event === "plugins.changed" && event.catalog) {
+        useHostRuntimeStore
+          .getState()
+          .setHostPlugins(host.hostId, event.catalog as PluginCatalog);
         return;
       }
       if (event.event === "voice.transcription") {

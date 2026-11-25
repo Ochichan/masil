@@ -85,6 +85,20 @@ fn tools() -> Vec<Tool> {
             acts: true,
             schema: json!({"type": "object", "properties": {"target": target, "text": {"type": "string"}}, "required": ["target", "text"], "additionalProperties": false}),
         },
+        Tool {
+            name: "masil_list_plugins",
+            title: "List Masil plugins",
+            description: "List installed Masil plugins, active theme, panels, slash commands, presets, and AI skill installation status.",
+            acts: false,
+            schema: json!({"type": "object", "additionalProperties": false}),
+        },
+        Tool {
+            name: "masil_run_plugin_command",
+            title: "Run a Masil plugin command",
+            description: "Invoke an enabled Masil plugin slash command by plugin_id and command_id.",
+            acts: true,
+            schema: json!({"type": "object", "properties": {"plugin_id": {"type": "string"}, "command_id": {"type": "string"}, "args": {"type": "string"}}, "required": ["plugin_id", "command_id"], "additionalProperties": false}),
+        },
     ]
 }
 
@@ -378,6 +392,59 @@ async fn serve(session: Session) {
 /// model can read.
 async fn tool_call(session: &Session, name: &str, arguments: &Value) -> Value {
     let error = |text: String| json!({"content": [{"type": "text", "text": text}], "structuredContent": {"error": text}, "isError": true});
+    if name == "masil_list_plugins" {
+        return match tokio::task::spawn_blocking(crate::plugin::catalog_json).await {
+            Ok(Ok(value)) => {
+                let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+                json!({"content": [{"type": "text", "text": text}], "structuredContent": value, "isError": false})
+            }
+            Ok(Err(e)) => error(e),
+            Err(e) => error(e.to_string()),
+        };
+    }
+    if name == "masil_run_plugin_command" {
+        if session.scope < Scope::Act {
+            return error("masil_run_plugin_command requires --allow-act".into());
+        }
+        let plugin_id = arguments["plugin_id"].as_str().unwrap_or("").to_owned();
+        let command_id = arguments["command_id"].as_str().unwrap_or("").to_owned();
+        let args_text = arguments["args"].as_str().unwrap_or("").to_owned();
+        if plugin_id.is_empty() || command_id.is_empty() {
+            return error("plugin_id and command_id are required".into());
+        }
+        let loaded = tokio::task::spawn_blocking(move || {
+            let catalog = crate::plugin::manifest::load_catalog()?;
+            let p = catalog
+                .find_plugin(&plugin_id)
+                .cloned()
+                .ok_or_else(|| format!("plugin '{plugin_id}' not found"))?;
+            if !p.is_active(catalog.enabled) {
+                return Err(format!("plugin '{plugin_id}' is not active"));
+            }
+            Ok::<_, String>(p)
+        })
+        .await;
+        return match loaded {
+            Ok(Ok(plugin)) => match crate::plugin::runner::invoke_command(
+                &plugin,
+                &command_id,
+                args_text,
+                None,
+                session.socket.clone(),
+            )
+            .await
+            {
+                Ok(out) => {
+                    let value = serde_json::to_value(out).unwrap_or(json!({}));
+                    let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+                    json!({"content": [{"type": "text", "text": text}], "structuredContent": value, "isError": false})
+                }
+                Err(e) => error(e),
+            },
+            Ok(Err(e)) => error(e),
+            Err(e) => error(e.to_string()),
+        };
+    }
     let (verb, mut args) = match verb(name, arguments) {
         Ok(call) => call,
         Err(problem) => return error(problem),

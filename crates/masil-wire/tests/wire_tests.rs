@@ -200,3 +200,24 @@ fn cross_language_vectors_match_checked_in_fixture() {
             .unwrap();
     assert_eq!(vector, checked_in);
 }
+
+#[test]
+fn timeline_plugin_card_roundtrip() {
+    let item = masil_wire::rpc::TimelineItem::PluginCard {
+        id: "plugin:repo-pulse:status".into(),
+        seq: 42,
+        ts_ms: 1_700_000_000_000,
+        plugin_id: "repo-pulse".into(),
+        card_id: "status".into(),
+        title: "Repo Pulse".into(),
+        subtitle: Some("main · 2 dirty".into()),
+        blocks: vec![json!({
+            "type": "metric_row",
+            "items": [{"label": "Branch", "value": "main", "tone": "accent"}]
+        })],
+    };
+    let encoded = serde_json::to_string(&item).unwrap();
+    assert!(encoded.contains("\"kind\":\"plugin_card\""));
+    let decoded: masil_wire::rpc::TimelineItem = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, item);
+}
