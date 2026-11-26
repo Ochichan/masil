@@ -676,6 +676,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::process::Command;
 
     #[test]
