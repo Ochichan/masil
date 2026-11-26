@@ -38,6 +38,9 @@ core/etc/
 !/docs/public/*.md
 !/docs/public/**/*.md
 !/docs/public/performance-2026-11-18.json
+!/docs/public/media/
+!/docs/public/media/*.png
+!/docs/public/media/*.svg
 /.impeccable/
 # Test, smoke, benchmark and capture tools stay local unless explicitly
 # selected for the fresh-clone regression and performance gates.

@@ -1,228 +1,435 @@
+<p align="center">
+  <img src="assets/icons/masil-mark.svg" width="120" alt="masil mark">
+</p>
+
 # masil
 
-**English** | [한국어](README.ko.md)
+**English** · [한국어](README.ko.md)
 
-A tmux-compatible terminal workspace built for running multiple AI coding agents side by side, with an optional mobile app to monitor, steer, and launch agents from your phone.
+[![CI](https://img.shields.io/github/actions/workflow/status/Ochichan/masil/ci.yml?branch=main&label=CI)](https://github.com/Ochichan/masil/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Ochichan/masil?include_prereleases&color=5bb5c2)](https://github.com/Ochichan/masil/releases)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Android%20%C2%B7%20iOS-5bb5c2.svg)](#install)
+[![License: MIT / ISC](https://img.shields.io/badge/license-MIT%20%2F%20ISC-f6d186.svg)](LICENSE)
 
-Run Claude Code, Codex, OpenCode, Antigravity CLI, Gemini CLI, Cursor, and other terminal coding tools in real terminal panes without losing your tmux key bindings, `~/.tmux.conf`, or shell speed. When you run several agents at once, masil shows which ones are working, waiting for input, or done, lets you jump straight to the right pane, and optionally syncs conversations and git changes to your phone over end-to-end encryption.
+**masil** is a tmux-compatible native terminal workspace built for running multiple AI coding agents side by side — with an optional Noise NK end-to-end encrypted mobile app to monitor, approve, preview, and steer your fleet from your phone.
+
+Run **Claude Code**, **Codex**, **OpenCode**, **Antigravity CLI (`agy`)**, **Gemini CLI**, **Cursor**, and 18 other coding CLIs directly in native C panes without losing your `~/.tmux.conf`, `C-b` bindings, or terminal speed. Built on a forked C tmux core (`core/`), a Rust orchestrator and TUI (`agent/`), and an Expo React Native companion (`mobile/`).
+
+[Install](#install) · [Quick start](#quick-start) · [Feature tour](#tour) · [Mobile companion](#mobile-companion) · [Safety & sandbox](#safety-and-sandbox) · [Local plugins](#local-plugins) · [Essential keys](#essential-keys)
+
+![masil terminal workspace running Claude Code and OpenAI Codex side by side with the native status bar](docs/public/media/hero-workspace.png)
+
+[View Agent Desk TUI](docs/public/media/agent-desk.png) · [View Command Palette](docs/public/media/command-palette.png) · [Jump to Mobile screenshots](#mobile-companion)
+
+---
 
 ## Why masil
 
-If you use terminal AI coding tools every day, the same friction shows up quickly:
+Running three or four AI coding agents in parallel quickly hits the same walls:
 
-- You start three or four agents across different repos and lose track of which pane is working, idle, or blocked on a permission prompt.
-- Switching tabs to inspect diffs, roll back a bad edit, or launch another agent in a fresh git worktree breaks focus.
-- Once you step away from your desk, you cannot check progress or send the next prompt without setting up an ad-hoc SSH session on a tiny phone screen.
+- You lose track of which pane is working, idle, spinning in a retry loop, or waiting on a permission prompt.
+- Sibling worktrees silently edit the same files, or an uncontained command writes outside its repo.
+- Stepping away from your desk forces awkward SSH sessions on a tiny phone screen just to check progress, preview `localhost`, or answer a prompt.
 
-masil solves this without wrapping your terminal in a heavy Electron app or putting a proxy in front of your shell:
+masil fixes this without wrapping your shell in Electron or inserting a proxy into the terminal byte stream:
 
-- **Your terminal stays native.** The multiplexer core is derived from tmux (C), so PTYs, rendering, scrollback, and `~/.tmux.conf` keep working at native speed.
-- **Original agent CLIs, not forks.** masil launches and observes the real `claude`, `codex`, `opencode`, `agy`, and other CLIs directly in panes.
-- **Desktop TUI + optional mobile app.** Manage everything from a keyboard/mouse TUI in the terminal, and turn on the mobile gateway only when you want phone access.
-- **Honest status reporting.** masil reports only what it can observe (process state, screen signals, hook events) and never fakes approvals or task completion.
-- **Vibe-codable local plugins.** Extend both the TUI and mobile app with themes, panels, `/slash` commands, timeline cards, hooks, and presets using the bundled `masil-plugin` skill for Claude Code, Codex, and Antigravity.
+- **Native C terminal core.** Derived from tmux (`next-3.9`), `core/` owns PTYs, VT parsing, scrollback, and rendering at full native speed. Stock `tmux` binaries and sockets stay completely untouched.
+- **Real agent CLIs, zero forks.** Launches and observes the upstream `claude`, `codex`, `opencode`, `agy`, and other CLIs directly inside panes.
+- **Safety on by default.** Managed agents launch inside an OS micro-sandbox (macOS Seatbelt / Linux Bubblewrap) paired with a deterministic Zero-Trust Permission Firewall and immutable SQLite audit trail.
+- **Honest, evidence-based state.** Reports only observed process state, screen signals, and provider callbacks — never fakes task completion or grants silent approval to external APIs.
+- **Zero background daemons until you opt in.** Plain `masil` starts no network listener and requires no Node.js runtime. Turn on the Noise NK mobile gateway only when you want phone access.
+
+---
+
+## Install
+
+| Target | Command |
+| --- | --- |
+| **macOS / Linux (Homebrew)** | `brew tap Ochichan/masil https://github.com/Ochichan/masil && brew install --HEAD Ochichan/masil/masil` |
+| **Prebuilt archives** *(macOS 15+ arm64, Ubuntu 24.04 x86_64)* | Download archive + `SHA256SUMS` from [GitHub Releases](https://github.com/Ochichan/masil/releases) |
+| **From source** *(macOS / Linux)* | `make && make install` *(installs to `~/.local`; override with `PREFIX=/path`)* |
+| **Self-hosted E2EE Relay** *(optional)* | `make relay` or `cd relay && docker compose -f docker-compose.example.yml up -d` |
+| **Mobile app** *(Android / iOS)* | `cd mobile && npm ci && npm run build:apk:arm64` *(iOS: `npm run build:ios:local`)* |
+
+Update Homebrew installs anytime with `brew upgrade --fetch-HEAD Ochichan/masil/masil`. Windows is not supported as a masil host.
+
+<details>
+<summary><b>Runtime libraries & installation details</b></summary>
+
+For prebuilt archives or building from source, ensure these runtime libraries are present:
+
+- **macOS:** `brew install libevent ncurses utf8proc jemalloc`
+- **Ubuntu 24.04:** `sudo apt-get install libevent-core-2.1-7t64 libncursesw6 libtinfo6 libutf8proc3 libjemalloc2`
+
+`make install` stages a content-addressed bundle under `$(PREFIX)/lib/masil/<sha256>` and atomically flips `current`, leaving running servers intact until you restart them. See [docs/public/install.md](docs/public/install.md) for full instructions.
+
+</details>
+
+---
 
 ## Quick start
 
-### 1. Install on macOS or Linux
-
-**Homebrew (macOS / Linux):**
-
-```sh
-brew tap Ochichan/masil https://github.com/Ochichan/masil
-brew install --HEAD Ochichan/masil/masil
-```
-
-Update later with `brew upgrade --fetch-HEAD Ochichan/masil/masil`. Installing masil leaves your system `tmux` binary and sockets untouched.
-
-**Prebuilt archives (macOS 15+ Apple Silicon, Ubuntu 24.04 x86_64):**
-
-Download the archive and `SHA256SUMS` from [GitHub Releases](https://github.com/Ochichan/masil/releases). Runtime libraries required:
-
-- macOS: `brew install libevent ncurses utf8proc jemalloc`
-- Ubuntu 24.04: `sudo apt-get install libevent-core-2.1-7t64 libncursesw6 libtinfo6 libutf8proc3 libjemalloc2`
-
-**Build from source:**
-
-```sh
-make            # builds bin/masil and bin/masil-agent
-make install    # installs into ~/.local/bin (override with PREFIX=/path)
-```
-
-For full dependency and upgrade details, see [docs/public/install.md](docs/public/install.md). Windows is not supported as a masil host.
-
-### 2. Start using masil with your AI coding tools
-
-Start a masil terminal session just like tmux:
+### 1. Start a terminal workspace
 
 ```sh
 masil
 ```
 
-Inside masil, launch agents in managed panes (or run your CLIs manually as usual; masil detects running agent panes automatically):
+Launch managed agents in panes (or run your CLIs manually — masil detects active agent panes automatically):
 
 ```sh
-masil-agent agent start backend claude --cwd ~/Projects/api
-masil-agent agent start tests codex --cwd ~/Projects/api --split %0
+masil-agent agent start api-auth claude --cwd ~/Projects/acme-api
+masil-agent agent start test-suite codex --cwd ~/Projects/acme-api --split %0
 masil-agent agent list
 ```
 
-Open the interactive **Agent Desk** TUI or compact **Side Panel**:
+### 2. Open Agent Desk or the persistent Sidebar
 
 ```sh
-masil-agent agent ui        # full-screen agent desk (mouse + keyboard, EN/KO, dark/light/terminal themes)
-masil-agent agent sidebar   # 34-column persistent side panel that expands with tmux zoom
+masil-agent agent ui        # full-screen Agent Desk (mouse + keyboard, EN/KO, Dark/Light/Terminal)
+masil-agent agent sidebar   # 34-column side panel that expands via native tmux zoom
 ```
 
-Useful everyday shortcuts inside Agent Desk:
-- `j`/`k` or arrows: move across agents
-- `/`: live search (supports Korean initial consonants, so `ㄱㅂ` matches `개발서버`)
-- `:` : command palette for agents, panes, and actions
-- `g`: jump directly to the selected agent's pane
-- `l` / `t`: toggle English/Korean and Dark/Light/Terminal theme
+1. Move with **`j`/`k`** or arrows, press **`g`** to jump straight to that agent's live pane.
+2. Press **`/`** for instant search (supports Korean initial consonants: `ㄱㅂ` matches `개발서버`).
+3. Press **`:`** to open the **Command Palette** for agents, Permission Firewall, Agent Arena, Time-Travel DVR, Focus Shield, Return Briefing, and plugins.
+4. Press **`?`** anytime for the live keybinding cheatsheet.
 
-### 3. Optional: connect your phone
-
-Nothing runs in the background until you opt in. To pair your phone with your Mac or Linux machine:
+### 3. Optional: pair your phone over Noise NK E2EE
 
 ```sh
 masil-agent remote setup
 ```
 
-The terminal onboarding wizard walks through four tabs:
-1. **Provider hooks**: installs opt-in marker hooks for Claude Code, Codex, OpenCode, and Antigravity CLI without touching your existing hooks.
-2. **Relay & daemon**: configures direct LAN/Tailscale access (default port `7767`), optional self-hosted relay URL, and background daemon/service control.
-3. **QR pairing**: generates a 5-minute one-time pairing QR code right in the terminal (press `o` to open a crisp SVG QR in your browser if your terminal is short).
-4. **Paired devices**: view connected phones and revoke access immediately.
+The four-tab TUI wizard configures marker hooks (without touching your existing hooks), direct LAN/Tailscale or self-hosted relay transport, background daemon/service control (`launchd` / `systemd`), and a 5-minute one-time pairing QR code (press `o` to open a crisp SVG QR in your browser).
 
-Once paired, all traffic between your phone and host is end-to-end encrypted with Noise NK.
+---
 
-## Supported AI coding tools
+## Performance & footprint
 
-masil recognizes **24 coding agent CLIs**, including Claude Code, Codex, OpenCode, Antigravity CLI (`agy`), Gemini CLI, Cursor, GitHub Copilot CLI, Amp, Kilo, and OMP.
+Measured on macOS arm64 (`2026-11-18`) across two alternating rounds comparing `masil` core against [Herdr 0.9.5](https://github.com/herdrdev/herdr/releases/tag/v0.9.5) on 1, 15, and 50 panes (93×39 fixture grids, 120×40 host PTY, ~1 MiB/s aggregate paced output). Full methodology, hashes, and caveats live in [performance-2026-11-18.md](docs/public/performance-2026-11-18.md) and [validation.md](docs/public/validation.md).
 
-- **Full desktop + mobile support (hooks, live conversation sync, model/effort/mode controls):** Claude Code, Codex, OpenCode, Antigravity CLI (`agy`).
-- **Desktop pane discovery, status tracking, prompt delivery, and session resume:** 18 providers with native resume support.
+| Measure | masil core | Herdr 0.9.5 |
+| --- | --- | --- |
+| **50-pane idle server RSS** | **4.69–4.73 MiB** | 27.63–27.92 MiB |
+| **Input RTT (median)** | **2.44–2.47 ms** | 3.03–3.11 ms |
+| **Input RTT (P99)** | **2.59–2.84 ms** | 3.24–3.32 ms |
+| **Single-pane paced-output CPU** | 4.63–5.16% | 2.58–2.78% |
+| **50-pane paced-output CPU** | **4.32–4.84%** | 9.80–10.62% |
 
-Run `masil-agent agent providers` to inspect detected providers on your machine, or read [docs/public/providers.md](docs/public/providers.md).
+> Ranges reflect observed alternating smoke rounds, not confidence intervals. `core/` stays strictly C with no Rust runtime in the terminal byte path; resident management (`coordinator` + `Agent Desk`) runs out-of-band over the local bridge socket.
 
-## What you can do
+---
 
-### Terminal workspace & Agent Desk
-- **Drop-in tmux compatibility**: default `C-b` prefix, `~/.tmux.conf` support, isolated `masil-UID` sockets (never collides with stock `tmux`), and an optional `compat/tmux` shim for scripts.
-- **Built-in mouse UI layer**: status bar menu, `+` button for new windows/panes, floating pane drag, scrollbars, and session snapshots (`prefix C-s` to save, `prefix C-r` to restore, optional 15-minute autosave). Pass `masil -f /dev/null` for plain tmux behavior.
-- **Safe prompt delivery & waits**: `masil-agent agent prompt NAME 'run tests'` checks that the agent is idle and still the same process, records the operation in SQLite before sending, and avoids duplicate replays. Use `masil-agent agent wait NAME --state idle --timeout 600` in scripts.
-- **Inbox & notifications**: enable `masil-agent agent inbox enable` and `masil-agent agent notify enable` to collect blocked prompts, approval requests, questions, and finished turns.
-- **Git worktrees & file checkpoints**:
-  - `masil-agent worktree create REPO BRANCH` creates an isolated git worktree for a task.
-  - `masil-agent agent changes NAME` lists modified files in an agent's working tree.
-  - `masil-agent agent checkpoint NAME make` and `checkpoint NAME restore` save and roll back single files with a preview.
-- **Workspace templates & column layouts**:
-  - `masil-agent layout apply NAME --yes` spins up repeatable multi-pane repos and agents from `~/.config/masil/layouts/NAME.toml`.
-  - `masil-agent layout columns on` arranges a window as horizontally scrollable fixed-width columns.
-- **Multi-machine control**: `masil-agent agent endpoints add` lets you inspect and control masil servers on other machines over SSH.
+## Tour
 
-### Mobile companion app (`mobile/`)
-Built with Expo / React Native for Android and iOS:
+### Agent Desk & Command Palette
 
-- **Conversation-first reading**: chat threads render clean prose and inline markdown code, collapsing noisy bursts of tool calls into lightweight 1-line summaries (tap to expand full tool input/output).
-- **Live terminal fallback**: switch to the **Terminal** tab anytime for direct interactive terminal control of the live pane.
-- **Visual agent launcher**: pick a project folder on your host machine with a GUI directory browser (plus quick recent-repo shortcuts), choose CLI provider, select model from a searchable dropdown, configure reasoning effort and execution mode, or start in a brand-new Git worktree branch.
-- **Live session tuning**: change model, reasoning effort, or mode on an already running agent from the options sheet.
-- **Workspace tools**: inspect real-time git diffs, browse project files, review checkpoints and schedules, use voice dictation, and switch between multiple paired hosts.
-- **Live plugins & Creator Mode**: run plugin `/slash` commands in the composer, view interactive plugin tabs in Workspace Tools and cards in conversations, switch synced plugin themes, launch from plugin presets, or tap **Settings -> Plugins -> Create plugin with AI** to build a new plugin on the spot.
+Monitor every running agent across local panes and SSH endpoints from a single keyboard-and-mouse TUI. Each row surfaces honest state (`Working`, `Waiting / Needs input`, `Idle`), inbox counts, evidence freshness, and session binding without polling loops.
 
-#### Building the mobile app locally
+![Agent Desk TUI showing four multi-provider agents and the live evidence inspector](docs/public/media/agent-desk.png)
+
+Press **`:`** from anywhere in Agent Desk to jump across agents, panes, plugins, and workspace tools from one fuzzy palette:
+
+<details>
+<summary>View the Command Palette (`:`)</summary>
+
+![Command Palette inside Agent Desk listing agents, actions, Focus Shield, Briefing, Firewall, Arena, and DVR](docs/public/media/command-palette.png)
+
+</details>
+
+- **24 coding agent CLIs recognized:** full desktop + mobile support (marker hooks, live conversation sync, model/effort/mode switching) for **Claude Code**, **Codex**, **OpenCode**, and **Antigravity CLI (`agy`)**, plus pane discovery, prompt delivery, and native session resume across **18 providers** including Gemini CLI, Cursor, GitHub Copilot CLI, Amp, Kilo, and OMP. Run `masil-agent agent providers` or see [docs/public/providers.md](docs/public/providers.md).
+- **Native mouse UI layer:** clickable window tabs, `+` button, floating pane drag, scrollbars, and session snapshots (`prefix C-s` save, `prefix C-r` restore, optional 15-minute autosave). Start with `masil -f /dev/null` for plain stock tmux behavior.
+- **Durable prompt delivery:** `masil-agent agent prompt NAME 'run tests'` verifies idle foreground identity and writes an intent record in SQLite before sending so retries never double-submit.
+
+---
+
+<a id="safety-and-sandbox"></a>
+
+### Zero-Trust Permission Firewall & OS Micro-Sandbox
+
+Every managed agent starts **sandboxed by default** with an auditable firewall in front of tool approvals:
+
+![Zero-Trust Permission Firewall TUI showing 4-Guard low-risk auto-approval rules and risk ceilings](docs/public/media/policy-firewall.png)
+
+- **Default-ON OS Micro-Sandbox (`--sandbox worktree|strict|net-off`):**
+  - Uses **macOS Seatbelt** (`/usr/bin/sandbox-exec`) on macOS and **Bubblewrap** (`bwrap`) on Linux to confine filesystem writes to the agent's task worktree while keeping read access fast.
+  - Stamps an atomic `@masil-sandbox` badge (`seatbelt:worktree`, `bwrap:strict`, etc.) at pane launch. Opt out explicitly per run with `--no-sandbox` — external MCP/API callers are hard-blocked from disabling sandboxing.
+  - Per-repo `.masil/sandbox.toml` policies require two-step SHA-256 trust confirmation (`masil-agent sandbox trust REPO --confirm SHA256`). Verify host readiness anytime with `masil-agent doctor`.
+- **Zero-Trust Permission Firewall (`masil-agent policy`):**
+  - Deterministic blast-radius classifier rates every command (`ReadOnly`, `Low`, `Medium`, `High`, `Critical`).
+  - **4-Guard Low-Risk TUI Auto-Approval:** TUI auto-approval is hard-capped at `Low` risk and fires only when all four guards pass (explicit matching rule, healthy circuit breaker, active TUI desk, exact command match). High/Critical prompts always require a human, and batch approval on mobile/TUI is strictly limited to `Low`-risk prompts.
+  - Every allow, deny, auto-approve, and revocation is recorded in a local SQLite audit trail (`masil-agent policy log`).
+
+---
+
+### Best-of-N Agent Arena
+
+Not sure whether Claude Code or Codex will produce the cleanest patch? Race them head-to-head in isolated git worktrees and promote the winner with one action:
+
+![Agent Arena TUI scorecard comparing parallel Claude Code and Codex racers with verification and BS audit status](docs/public/media/arena-overlay.png)
 
 ```sh
-cd mobile
-npm ci
-npm run build:apk:arm64   # Android arm64 APK -> mobile/artifacts/masil-production-arm64.apk
-npm run build:ios:local   # Local iOS build (requires Xcode)
+masil-agent arena start "Add sliding-window rate limiter to /v1/tokens" \
+  --racers claude,codex --verify-cmd "cargo test --locked"
+masil-agent arena verify <ARENA_ID>
+masil-agent arena promote <ARENA_ID> --winner claude --mode branch --losers archive
 ```
 
-### Self-hosted E2EE relay (`relay/`)
+- **Side-by-side scorecard:** compares exit codes of `--verify-cmd`, cross-provider BS audit verdicts, elapsed time, and diff footprints across all racers.
+- **Safe promotion:** promote the winner onto a clean `--mode branch` or `--mode squash` onto your current branch (automatically saving a safety checkpoint if your base working tree is dirty), and choose `--losers archive` or `--losers clean`. Optionally synthesize the best parts of multiple racers with `masil-agent arena synthesize <ARENA_ID> --judge claude`.
 
-Over LAN or Tailscale, the mobile app connects directly to your host daemon with no external server. If you want remote access across networks without Tailscale, you can run `masil-relay` on any small VPS:
+---
 
-```sh
-make relay                # builds bin/masil-relay
-# or with Docker:
-cd relay && docker compose -f docker-compose.example.yml up -d
-```
+### Fleet Intelligence, Time-Travel DVR & Focus Shield
 
-Then pair using `masil-agent remote pair --relay wss://your-relay.example.com`. The relay only forwards opaque Noise NK encrypted envelopes and never sees prompts, code, or terminal output.
+Built-in guardrails keep multi-agent sessions calm, verifiable, and reversible:
 
-## Local plugins (vibe-codable with Claude Code, Codex, and Antigravity)
+- **Cross-Provider BS Detector (`masil-agent agent audit`):** audits an agent's latest turn against actual git diffs and observed command outputs, flagging unsupported claims or skipped tests with one-click challenge prompts.
+- **Cross-Worktree Collision Radar (`masil-agent worktree conflicts|shadow-check|warn`):** detects overlapping dirty edits across sibling worktrees without creating dangling git objects, and lets you warn a sibling agent or run a shadow merge check before committing.
+- **Runaway Circuit Breaker & Prompt-Cache Warmth (`masil-agent agent guard`):** detects repetitive retry loops before they burn tokens, lets you extend or dismiss cleanly, and sorts cache-warm sessions to the top while prompt caches are still hot.
+- **Time-Travel DVR & Zero-CDN Redacted PR Traces (`masil-agent agent dvr` / `agent trace export`):**
+  - Snapshots git tree state per turn (capturing both model edits and Bash side effects), lets you **pin** immortal milestones (`dvr pin`), restore files (`dvr restore`), or fork a fresh worktree branch from any historical turn (`dvr fork`).
+  - `masil-agent agent trace export NAME --out trace.html --redact-strict` generates a self-contained, zero-CDN, secret-redacted HTML review trace ready to attach to pull requests.
+- **Focus Shield & 90-Second Return Briefing (`masil-agent focus` / `masil-agent briefing`):**
+  - `masil-agent focus on 60m` holds routine chimes during deep work while letting circuit-breaker trips and hard collisions through.
+  - Returning to your desk? `masil-agent briefing` builds a deterministic 90-second summary bucketed into **Needs Decision**, **Ready to Merge**, and **Review Required**.
+- **Opt-in Live Pulse:** optional lock-screen / Dynamic Island (iOS Live Activities) and Android ongoing fleet status — **strictly opt-in and off by default** (`live_activity_enabled = false`).
 
-Extend both the Rust TUI and the Mobile app without recompiling binaries or rebuilding the APK. Every plugin lives in `~/.config/masil/plugins/<id>/` (or any local folder registered by path) and hot-reloads live across connected clients.
+---
 
-A single plugin (`masil-plugin.toml`) can contribute any combination of:
-- **Themes (`theme.toml`)**: Omarchy-style hex palettes with zero code required, synced live between TUI and mobile.
-- **Workspace panels**: declarative Masil UI Spec v1 blocks (`metric_row`, `table`, `list`, `markdown`, `code`, `diff`, `progress`, `sparkline`, `callout`, `button`, `toggle`, `select`, `form`) rendered natively in Mobile Workspace Tools and the TUI Command Palette (`:`).
-- **Slash commands**: `/command [args]` with autocomplete in the mobile composer and entries in the TUI Command Palette, returning toasts, UI sheets, composer drafts, or inline timeline cards.
-- **Timeline cards**: persistent structured cards pushed into an agent's conversation view.
-- **Lifecycle hooks**: react to `agent.state_changed`, `agent.started`, `agent.closed`, `inbox.event`, `theme.changed`, and `prompt.before`.
-- **Agent launch presets**: one-tap provider, model, effort, mode, worktree, and initial-prompt profiles in the mobile launcher.
+<a id="mobile-companion"></a>
 
-### Install the official `masil-plugin` AI skill
+### Mobile Companion App (`mobile/`)
 
-Install the bundled skill once so Claude Code, Codex, and Antigravity know the live schema, UI spec, and verification commands:
+Steer your fleet from Android or iOS over **Noise NK end-to-end encryption** — direct over LAN/Tailscale (port `7767`) or through your own self-hosted `masil-relay`. Nothing leaves your network unencrypted.
+
+<p align="center">
+  <img src="docs/public/media/mobile-fleet.png" width="250" alt="Mobile Agent Fleet view with status counters, Collision Radar badges, and quick toolbar">
+  &nbsp;
+  <img src="docs/public/media/mobile-approval.png" width="250" alt="Mobile live interactive approval card with blast-radius risk badge and one-tap Confirm or Cancel">
+  &nbsp;
+  <img src="docs/public/media/mobile-firewall.png" width="250" alt="Mobile Zero-Trust Permission Firewall modal showing 4-Guard low-risk rules and instant revoke">
+</p>
+
+<p align="center">
+  <em>Left: Multi-provider Fleet & Collision Radar · Center: Live Interactive Approval + Risk Badge · Right: Zero-Trust Permission Firewall</em>
+</p>
+
+<details>
+<summary><b>More mobile screens & E2EE host onboarding wizard</b></summary>
+
+<p align="center">
+  <img src="docs/public/media/mobile-arena.png" width="260" alt="Mobile Agent Arena modal to launch parallel multi-provider races">
+  &nbsp;&nbsp;
+  <img src="docs/public/media/mobile-tools.png" width="260" alt="Mobile Workspace Tools showing Git Diff, Files, Localhost Preview, DVR, Checkpoints, Collisions, Schedules, and Plugins">
+</p>
+
+![masil-agent remote setup 4-tab TUI wizard with Noise NK E2EE and provider hooks](docs/public/media/remote-setup.png)
+
+</details>
+
+Key mobile capabilities:
+
+- **Conversation-first reading + Live Terminal canvas:** clean markdown threads collapse noisy tool bursts into 1-line expandable chips; switch to the native **Terminal** tab (`masil-terminal`) anytime for direct PTY control.
+- **Interactive approvals & blast-radius badges:** respond to live TUI permission prompts and questions with one tap, plus batch-approve low-risk prompts in a single swipe.
+- **E2EE Localhost Preview Tunnel + Visual Markup:** inspect dev servers running on your host (`localhost:3000`, `:5173`, etc.) directly inside the mobile **Preview** tab via the native `masil-tunnel-proxy` loopback bridge, annotate screenshots visually, and send markup straight back to the agent (temporary captures stay cleanly out of `git status` via `.git/info/exclude`).
+- **Visual Agent Launcher & Workspace Tools:** browse host folders visually, pick provider/model/reasoning effort/mode/sandbox/new Git worktree, inspect live Git diffs, scrub DVR timelines, review checkpoints, use voice dictation, and switch across multiple paired hosts.
+- **Self-hosted Relay (`relay/`):** over LAN/Tailscale no external server is needed. For roaming access without Tailscale, run `masil-relay` on any small VPS (`make relay` or Docker) and pair via `masil-agent remote pair --relay wss://your-relay.example.com`. The relay forwards opaque Noise NK ciphertext only.
+
+---
+
+<a id="local-plugins"></a>
+
+### Local Plugins (Vibe-Codable with Claude Code, Codex & Antigravity)
+
+Extend both the Rust TUI and the Mobile app **without recompiling binaries or rebuilding the APK**. Plugins live in `~/.config/masil/plugins/<id>/` (or any registered local path) and hot-reload across all connected clients.
+
+One plugin (`masil-plugin.toml`) can combine any of six contribution types:
+
+1. **Themes (`theme.toml`):** zero-code Omarchy-style hex palettes synced live between TUI and Mobile.
+2. **Workspace panels:** declarative Masil UI Spec v1 blocks (`metric_row`, `table`, `list`, `markdown`, `code`, `diff`, `progress`, `sparkline`, `callout`, `button`, `toggle`, `select`, `form`) rendered natively in Mobile Workspace Tools and the TUI Command Palette (`:`).
+3. **Slash commands:** `/command [args]` with autocomplete in the mobile composer and entries in the TUI palette.
+4. **Timeline cards:** persistent structured UI cards pushed inline into an agent's conversation view.
+5. **Lifecycle hooks:** react to `agent.state_changed`, `agent.started`, `agent.closed`, `inbox.event`, `theme.changed`, and `prompt.before`.
+6. **Agent launch presets:** one-tap provider, model, effort, mode, worktree, and initial-prompt chips in the mobile launcher.
+
+#### Install the official `masil-plugin` AI skill
 
 ```sh
 masil-agent plugin skill install --target all
 masil-agent plugin skill status
 ```
 
-Target directories:
-- Claude Code: `~/.claude/skills/masil-plugin/`
-- Codex: `~/.codex/skills/masil-plugin/` and `~/.agents/skills/masil-plugin/`
-- Antigravity (`agy`): `~/.gemini/config/skills/masil-plugin/`
+Then ask Claude Code, Codex, or Antigravity directly — or launch **Creator Mode** from Mobile (**Settings → Plugins → Create plugin with AI**) or the TUI Command Palette (`:` → **Create Masil plugin with AI**):
 
-Then ask Claude Code, Codex, or Antigravity directly:
 - *"Create a Tokyo Night dark theme plugin for masil and apply it now."*
-- *"Build a masil workspace panel showing my project's TODO checklist and a `/todo` slash command."*
+- *"Build a masil workspace panel showing my repo's TODO checklist and a `/todo` slash command."*
 - *"Add a masil hook plugin that posts a summary card whenever an agent enters blocked state."*
 
-The agent runs `masil-agent plugin schema`, scaffolds with `init`, validates with `check` and `test`, and hot-reloads via `reload` so changes appear live in your terminal and phone.
-
-### Try the bundled starter plugins
+Try the bundled starters right away:
 
 ```sh
 masil-agent plugin install examples/plugins/catppuccin-mocha
 masil-agent plugin install examples/plugins/repo-pulse
 masil-agent plugin theme set catppuccin-mocha
-masil-agent plugin ls
 ```
 
-You can also start **Creator Mode** directly from Mobile (**Settings -> Plugins -> Create plugin with AI** or the sparkle button in Workspace Tools) or from the TUI Command Palette (`:` -> **Create Masil plugin with AI**). All plugin Masil API calls over FD 3 obey `scope = read|act|admin`, and approval prompts remain strictly human-only. See [docs/public/plugins.md](docs/public/plugins.md) for the full contract.
+Plugin FD 3 API calls enforce the declared `scope = read|act|admin`, and human approval prompts are never exposed to plugins. See [docs/public/plugins.md](docs/public/plugins.md).
 
-## Architecture & privacy notes
+---
 
-- **No proxy in the terminal byte path**: `core/` (C, tmux `next-3.9` fork) owns PTYs, VT parsing, scrollback, and rendering. `masil-agent` (Rust) handles agent detection, TUI views, durable operations, and the opt-in remote gateway.
-- **Zero background daemons by default**: ordinary `masil` usage starts no remote server and needs no Node.js runtime.
-- **Diagnostics**: run `masil-agent doctor` (or `--versions` / `--bundle DIR`) for a local-only JSON health check with no network calls.
+<a id="essential-keys"></a>
 
-For deeper technical details, see:
-- [Installation and updates](docs/public/install.md)
-- [Local plugins and AI skill authoring](docs/public/plugins.md)
-- [Provider support and setup](docs/public/providers.md)
-- [Architecture and compatibility boundaries](docs/public/architecture.md)
-- [Verification and benchmarks](docs/public/validation.md) and [recorded performance results](docs/public/performance-2026-11-18.md)
+## Essential keys
 
-## Development & checks
+Default keys inside **Agent Desk** (`masil-agent agent ui`) and **Sidebar** (`masil-agent agent sidebar`):
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` · `↑` / `↓` | Move selection (or scroll inspector after `Tab`) |
+| `/` | Live filter & search *(supports Korean 초성: `ㄱㅂ` → `개발서버`)* |
+| `:` | Open **Command Palette** *(agents, Firewall, Arena, DVR, Briefing, Focus Shield, plugins)* |
+| `g` | Jump straight to the selected agent's live terminal pane |
+| `Enter` | Open agent details / execute highlighted palette item |
+| `n` / `s` | Start a new managed agent / resume a saved session |
+| `p` / `d` / `e` | Send safe prompt / prepare draft buffer / open prompt queue |
+| `y` / `i` / `u` | Answer approval or question / toggle Inbox / jump to next unseen |
+| `f` / `v` / `m` | Inspect Git changes & checkpoints / read live screen / voice dictate |
+| `x` / `X` / `r` | Interrupt agent / close pane / rename agent |
+| `z` | Expand or collapse Sidebar via native tmux pane zoom |
+| `l` / `t` | Switch language (`EN` / `KO`) / cycle theme (`Dark` / `Light` / `Terminal`) |
+| `?` / `q` | Live keybinding help / close Agent Desk |
+
+Inside a `masil` terminal session, standard tmux bindings (`C-b` prefix) work unchanged, plus `prefix C-s` saves a session snapshot and `prefix C-r` restores it.
+
+---
+
+## CLI reference
+
+<details>
+<summary><b>Agent lifecycle, worktrees & layouts</b></summary>
 
 ```sh
-make all                                                # build bin/masil and bin/masil-agent
+masil-agent agent providers                                  # list detected CLIs & evidence
+masil-agent agent start NAME PROVIDER [--cwd DIR] [--worktree W] [--split %N]
+masil-agent agent list [--all]                               # live fleet across local + SSH
+masil-agent agent prompt NAME "run tests"                    # idempotent, SQLite-recorded send
+masil-agent agent wait NAME --state idle --timeout 600       # scriptable state wait
+masil-agent agent changes NAME                               # dirty files in agent worktree
+masil-agent agent checkpoint NAME make|list|restore ...      # previewed single-file rollback
+masil-agent agent endpoints add|connect|status ...           # multi-machine SSH fleet control
+masil-agent worktree create REPO BRANCH [--setup]            # isolated git worktree
+masil-agent layout apply NAME --yes                          # repeatable TOML multi-pane workspace
+masil-agent layout columns on                                # horizontally scrollable fixed-width columns
+```
+
+</details>
+
+<details>
+<summary><b>Zero-Trust Firewall, OS Sandbox, Arena & Time-Travel DVR</b></summary>
+
+```sh
+# Permission Firewall
+masil-agent policy list
+masil-agent policy check "cargo test --locked" --cwd .
+masil-agent policy add --id allow-tests --match-command "cargo test*" --max-risk low --action auto_approve
+masil-agent policy revoke allow-tests
+masil-agent policy log --limit 20
+
+# OS Micro-Sandbox (default ON for managed agents)
+masil-agent sandbox status --repo .
+masil-agent sandbox trust . --confirm <SHA256>
+masil-agent agent start build claude --cwd . --sandbox strict   # or worktree | net-off | --no-sandbox
+
+# Best-of-N Agent Arena
+masil-agent arena start "<prompt>" --racers claude,codex --verify-cmd "cargo test"
+masil-agent arena list
+masil-agent arena verify <ARENA_ID>
+masil-agent arena promote <ARENA_ID> --winner claude --mode branch --losers archive
+masil-agent arena synthesize <ARENA_ID> --judge claude
+
+# Time-Travel DVR & Zero-CDN Redacted HTML Trace
+masil-agent agent dvr list NAME
+masil-agent agent dvr snapshot NAME --note "before refactor"
+masil-agent agent dvr pin NAME --turn 1 --note "clean baseline"
+masil-agent agent dvr restore NAME --turn 1
+masil-agent agent dvr fork NAME --turn 1 --branch try/alt-approach
+masil-agent agent trace export NAME --out pr-trace.html --redact-strict
+```
+
+</details>
+
+<details>
+<summary><b>Intelligence, Collision Radar, Focus Shield & Remote Mobile Gateway</b></summary>
+
+```sh
+# Intelligence & Safety Rails
+masil-agent agent audit NAME [--turn latest] [--challenge FINDING_ID]
+masil-agent agent guard NAME status|extend|dismiss
+masil-agent worktree conflicts [REPO]
+masil-agent worktree shadow-check WT_A WT_B --cmd "cargo test"
+masil-agent worktree warn TARGET --about SIBLING
+
+# Focus Shield & 90-Second Return Briefing
+masil-agent focus on 60m --reason "deep refactor"
+masil-agent focus status
+masil-agent focus off
+masil-agent briefing --since 8h
+
+# Opt-in E2EE Mobile Gateway
+masil-agent remote setup
+masil-agent remote status
+masil-agent remote pair [--relay wss://relay.example.com] [--open]
+masil-agent remote devices
+masil-agent remote revoke <DEVICE_ID>
+masil-agent remote install-service | uninstall-service
+```
+
+</details>
+
+---
+
+## Troubleshooting
+
+Run `masil-agent doctor` (or `masil-agent doctor --versions` / `--bundle DIR`) for a local-only JSON health check with zero network calls.
+
+| Symptom | Fix |
+| --- | --- |
+| `sandbox.backend` warning in `doctor` | On macOS verify `/usr/bin/sandbox-exec`; on Linux install Bubblewrap (`sudo apt install bubblewrap`). Pass `--no-sandbox` only when explicitly intended. |
+| Agent stays `unknown` or misses turns | Install provider marker hooks with `masil-agent remote setup-hooks --install all` (or `masil-agent agent integration export PROVIDER`) and start a fresh run. |
+| Mobile app cannot reach host on LAN | Check `masil-agent remote status`, verify port `7767` is reachable over LAN/Tailscale, or pair through a self-hosted `masil-relay`. |
+| Want stock tmux with no mouse layer | Launch an isolated server with `masil -f /dev/null`. Stock `tmux` sockets (`tmux-UID`) and binaries are never modified. |
+| Scripts hardcode the `tmux` command | Prepend `compat/` to `PATH` in that shell so `tmux` shims cleanly to `masil`. |
+
+---
+
+## Architecture, documentation & development
+
+- **Clean separation of concerns:** `core/` (C, tmux `next-3.9` fork) handles PTYs, VT parsing, and rendering with no proxy in the byte path. `agent/` (Rust) handles multi-provider detection, TUI, SQLite operations, firewall, OS sandbox, Arena, DVR, plugins, and the opt-in remote gateway. `crates/masil-wire/` implements the Noise NK E2EE wire protocol shared with `relay/` and `mobile/`.
+- **Public documentation:**
+  - [Installation and updates](docs/public/install.md)
+  - [Local plugins and AI skill authoring](docs/public/plugins.md)
+  - [Provider support and live observations](docs/public/providers.md) · [Observation catalog](docs/public/provider-observations.md)
+  - [Architecture and compatibility boundaries](docs/public/architecture.md)
+  - [Verification and benchmarks](docs/public/validation.md) · [Performance report (2026-11-18)](docs/public/performance-2026-11-18.md)
+
+<details>
+<summary><b>Build & test commands for contributors</b></summary>
+
+```sh
+make all && make relay                                  # build bin/masil, bin/masil-agent, bin/masil-relay
 cargo fmt --manifest-path agent/Cargo.toml --check
 cargo clippy --locked --manifest-path agent/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path agent/Cargo.toml
-make test-ci                                            # core regression suite
-make test-relay                                         # wire & relay Rust tests
-PYTHONPATH=tests python3 -m unittest -v tests/test_plugins_e2e.py  # local plugin CLI & skill E2E
-cd mobile && npm run typecheck && npm test              # mobile app tests
+make test-ci                                            # core C + management regression gate
+make test-relay                                         # Noise NK wire & relay Rust tests
+PYTHONPATH=tests python3 -m unittest -v tests/test_phase1.py tests/test_phase2.py tests/test_phase3.py tests/test_plugins_e2e.py tests/test_remote_e2e.py
+cd mobile && npm run typecheck && npm test              # mobile app TypeScript & Vitest suite
 ```
+
+</details>
 
 ## License
 
-masil is licensed under the MIT License. `core/` is derived from tmux and retains its ISC License. Bundled mobile fonts (`Pretendard` and `Cascadia Mono`) are licensed under the SIL Open Font License 1.1. See [NOTICE](NOTICE) for third-party attributions.
+**masil** is licensed under the [MIT License](LICENSE). `core/` is derived from tmux and retains its ISC License. Bundled mobile fonts (`Pretendard` and `Cascadia Mono`) are licensed under the SIL Open Font License 1.1. See [NOTICE](NOTICE) for full third-party attributions.

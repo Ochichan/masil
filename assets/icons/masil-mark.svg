@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -64 256 320" width="256" height="320" role="img" aria-label="masil mark">
+  <defs>
+    <radialGradient id="bg" cx="0.25" cy="0.15" r="1">
+      <stop offset="0" stop-color="#192a3d"/>
+      <stop offset="1" stop-color="#0d1520"/>
+    </radialGradient>
+    <linearGradient id="sprout" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#4dc9b8"/>
+      <stop offset="1" stop-color="#98fce4"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+    <filter id="sproutGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+  <!-- Cat ears -->
+  <polygon points="30,72 22,-46 112,14" fill="#142233" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2" stroke-linejoin="round"/>
+  <polygon points="44,56 36,-20 96,22" fill="#5bb5c2" stroke="#5bb5c2" stroke-width="6" stroke-linejoin="round"/>
+  <polygon points="226,72 234,-46 144,14" fill="#142233" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2" stroke-linejoin="round"/>
+  <polygon points="212,56 220,-20 160,22" fill="#5bb5c2" stroke="#5bb5c2" stroke-width="6" stroke-linejoin="round"/>
+  <!-- Glowing mint sprout -->
+  <g id="sprout-mark">
+    <path d="M128 8 C128 -8 128 -16 128 -22" fill="none" stroke="#6ce5cb" stroke-width="7" stroke-linecap="round"/>
+    <path d="M128 -18 C116 -22 103 -32 105 -42 C117 -44 128 -33 128 -18 Z" fill="url(#sprout)"/>
+    <path d="M128 -18 C140 -22 153 -32 151 -42 C139 -44 128 -33 128 -18 Z" fill="url(#sprout)"/>
+  </g>
+  <use href="#sprout-mark" filter="url(#sproutGlow)" opacity="0.55"/>
+  <use href="#sprout-mark"/>
+  <!-- Rounded terminal frame -->
+  <rect width="256" height="256" rx="58" fill="url(#bg)"/>
+  <rect x="1" y="1" width="254" height="254" rx="57" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+  <!-- Prompt chevron + multi-pane agent grid -->
+  <g id="mark">
+    <path d="M56 82 L104 128 L56 174" fill="none" stroke="#f6d186" stroke-width="21" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="124" y="80" width="76" height="40" rx="12" fill="#7ef0d6"/>
+    <rect x="124" y="132" width="34" height="46" rx="12" fill="#5bb5c2"/>
+    <rect x="168" y="132" width="32" height="46" rx="12" fill="#f29b82"/>
+  </g>
+  <use href="#mark" filter="url(#glow)" opacity="0.42"/>
+  <use href="#mark"/>
+  <!-- Sparkles -->
+  <path d="M208 42 Q212.5 53.5 224 58 Q212.5 62.5 208 74 Q203.5 62.5 192 58 Q203.5 53.5 208 42 Z" fill="#7ef0d6"/>
+  <path d="M229 84 Q231.2 89.8 237 92 Q231.2 94.2 229 100 Q226.8 94.2 221 92 Q226.8 89.8 229 84 Z" fill="#7ef0d6"/>
+  <!-- Blush marks -->
+  <g stroke="#f29b82" stroke-opacity="0.65" stroke-width="6" stroke-linecap="round">
+    <line x1="30" y1="232" x2="40" y2="218"/>
+    <line x1="44" y1="232" x2="54" y2="218"/>
+  </g>
+  <g stroke="#f29b82" stroke-opacity="0.65" stroke-width="6" stroke-linecap="round">
+    <line x1="198" y1="232" x2="208" y2="218"/>
+    <line x1="212" y1="232" x2="222" y2="218"/>
+  </g>
+</svg>
