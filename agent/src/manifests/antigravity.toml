@@ -20,6 +20,49 @@ any = [
 ]
 
 [[rules]]
+id = "question_or_select_dialog"
+state = "blocked"
+priority = 400
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+any = [
+  { all = [
+    { any = [
+      { contains = ["↑/↓"] },
+      { contains = ["↑↓"] },
+      { contains = ["arrow keys to navigate"] },
+      { contains = ["arrows to navigate"] },
+    ] },
+    { any = [
+      { contains = ["enter confirm"] },
+      { contains = ["enter to confirm"] },
+      { contains = ["enter select"] },
+      { contains = ["enter to select"] },
+      { contains = ["enter submit"] },
+      { contains = ["enter to submit"] },
+      { contains = ["enter next"] },
+      { contains = ["enter to continue"] },
+    ] },
+  ] },
+  { all = [
+    { contains = ["space"] },
+    { any = [{ contains = ["toggle"] }, { contains = ["select"] }] },
+    { any = [{ contains = ["enter"] }, { contains = ["submit"] }] },
+    { contains = ["esc"] },
+  ] },
+  { all = [
+    { contains = ["do you want to proceed?"] },
+    { any = [
+      { line_regex = ['(?i)^\s*[>❯›●▶]\s*(?:1\.\s*)?(?:yes|allow|approve|proceed)\b'] },
+      { line_regex = ['(?i)^\s*1\.\s*(?:yes|allow|approve|proceed)\b'] },
+    ] },
+  ] },
+]
+not = [
+  { line_regex = ['^\? for shortcuts'] },
+]
+
+[[rules]]
 id = "spinner_working"
 state = "working"
 priority = 100

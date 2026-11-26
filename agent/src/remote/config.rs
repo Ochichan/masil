@@ -123,6 +123,54 @@ fn sanitize_host_id(raw: &str) -> String {
     }
 }
 
+pub const DEFAULT_TUNNEL_DENIED_PORTS: &[u16] = &[
+    22, 25, 53, 111, 445, 548, 3306, 5432, 5900, 6379, 7767, 27017,
+];
+pub const DEFAULT_TUNNEL_MAX_STREAMS: usize = 32;
+pub const DEFAULT_TUNNEL_IDLE_TIMEOUT_SECS: u64 = 300;
+
+fn default_denied_ports() -> Vec<u16> {
+    DEFAULT_TUNNEL_DENIED_PORTS.to_vec()
+}
+
+fn default_max_streams() -> usize {
+    DEFAULT_TUNNEL_MAX_STREAMS
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    DEFAULT_TUNNEL_IDLE_TIMEOUT_SECS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelConfig {
+    #[serde(default = "default_denied_ports")]
+    pub denied_ports: Vec<u16>,
+    #[serde(default = "default_max_streams")]
+    pub max_streams_per_client: usize,
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        Self {
+            denied_ports: default_denied_ports(),
+            max_streams_per_client: default_max_streams(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+        }
+    }
+}
+
+fn is_default_tunnel(cfg: &TunnelConfig) -> bool {
+    *cfg == TunnelConfig::default()
+}
+
+impl TunnelConfig {
+    pub fn is_port_denied(&self, port: u16) -> bool {
+        port == 0 || self.denied_ports.contains(&port)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteConfig {
     #[serde(default)]
@@ -139,6 +187,16 @@ pub struct RemoteConfig {
     pub push_enabled: bool,
     #[serde(default)]
     pub stt_command: Option<Vec<String>>,
+    /// Phase 2B (D-09): Opt-in Live Activity / Android Ongoing Fleet Pulse push.
+    #[serde(default)]
+    pub live_activity_enabled: bool,
+    /// Phase 2B (D-09): Opt-in single-line redacted summary (<= 60 chars) in Live Activity.
+    #[serde(default)]
+    pub live_activity_summary: bool,
+    /// Phase 2A (D-07): Loopback localhost tunnel port & stream limits.
+    /// Placed last (TOML tables must follow top-level scalars) and omitted when default.
+    #[serde(default, skip_serializing_if = "is_default_tunnel")]
+    pub tunnel: TunnelConfig,
 }
 
 fn default_true() -> bool {
@@ -155,6 +213,9 @@ impl Default for RemoteConfig {
             host_name: None,
             push_enabled: true,
             stt_command: None,
+            live_activity_enabled: false,
+            live_activity_summary: false,
+            tunnel: TunnelConfig::default(),
         }
     }
 }
@@ -274,6 +335,14 @@ pub struct PairedDevice {
     pub secret_hash: String,
     #[serde(default)]
     pub push_token: Option<String>,
+    #[serde(default)]
+    pub live_activity_enabled: bool,
+    #[serde(default)]
+    pub live_activity_summary: bool,
+    #[serde(default)]
+    pub live_activity_push_to_start_token: Option<String>,
+    #[serde(default)]
+    pub live_activity_push_token: Option<String>,
     pub paired_at_ms: i64,
     pub last_seen_ms: i64,
 }
@@ -331,7 +400,13 @@ impl DeviceStore {
         });
         Self::save(&data)?;
 
-        let direct_addr = resolve_advertised_direct(config);
+        let direct_addrs = resolve_advertised_direct_addrs(config);
+        let direct_addr = direct_addrs.first().cloned();
+        let direct_fallback_addrs = if direct_addrs.len() > 1 {
+            direct_addrs[1..].to_vec()
+        } else {
+            Vec::new()
+        };
         let offer = PairingOffer {
             version: masil_wire::PROTOCOL_VERSION,
             host_id: identity.host_id.clone(),
@@ -339,6 +414,7 @@ impl DeviceStore {
             pair_token,
             relay_url: config.relay_url.clone(),
             direct_addr,
+            direct_fallback_addrs,
             host_name: config.effective_host_name(),
         };
         let uri = offer.to_uri().map_err(|e| e.to_string())?;
@@ -375,6 +451,10 @@ impl DeviceStore {
             },
             secret_hash: sha256_hex(device_secret.as_bytes()),
             push_token: None,
+            live_activity_enabled: false,
+            live_activity_summary: false,
+            live_activity_push_to_start_token: None,
+            live_activity_push_token: None,
             paired_at_ms: now,
             last_seen_ms: now,
         };
@@ -416,6 +496,52 @@ impl DeviceStore {
         Self::save(&data)
     }
 
+    pub fn register_live_pulse(
+        device_id: &str,
+        platform: &str,
+        enabled: bool,
+        summary_enabled: bool,
+        push_to_start_token: Option<&str>,
+        push_token: Option<&str>,
+    ) -> Result<PairedDevice, String> {
+        let mut data = Self::load()?;
+        let dev = data
+            .devices
+            .iter_mut()
+            .find(|d| d.device_id == device_id)
+            .ok_or("device_not_found")?;
+        if !platform.trim().is_empty() {
+            dev.platform = platform.trim().to_owned();
+        }
+        dev.live_activity_enabled = enabled;
+        dev.live_activity_summary = enabled && summary_enabled;
+        if !enabled {
+            // D-09: disabled devices retain zero APNs liveactivity tokens.
+            dev.live_activity_push_to_start_token = None;
+            dev.live_activity_push_token = None;
+        } else {
+            if let Some(tok) = push_to_start_token {
+                let trimmed = tok.trim();
+                dev.live_activity_push_to_start_token = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                };
+            }
+            if let Some(tok) = push_token {
+                let trimmed = tok.trim();
+                dev.live_activity_push_token = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                };
+            }
+        }
+        let cloned = dev.clone();
+        Self::save(&data)?;
+        Ok(cloned)
+    }
+
     pub fn revoke(device_id: &str) -> Result<bool, String> {
         let mut data = Self::load()?;
         let before = data.devices.len();
@@ -443,15 +569,50 @@ impl DeviceStore {
     }
 }
 
-pub fn detect_preferred_direct_ip() -> Option<String> {
+fn is_wildcard_listen(listen: &str) -> bool {
+    listen.starts_with("0.0.0.0:") || listen.starts_with("[::]:") || listen.starts_with(":::")
+}
+
+fn is_loopback_addr(addr: &str) -> bool {
+    let trimmed = addr
+        .trim()
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://");
+    trimmed.starts_with("127.")
+        || trimmed.starts_with("localhost:")
+        || trimmed == "localhost"
+        || trimmed.starts_with("[::1]")
+}
+
+fn is_tailscale_ip_str(ip: &str) -> bool {
+    let mut parts = ip.split('.');
+    let Some(a) = parts.next().and_then(|v| v.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(b) = parts.next().and_then(|v| v.parse::<u8>().ok()) else {
+        return false;
+    };
+    a == 100 && (64..=127).contains(&b)
+}
+
+/// Detects active non-loopback IPv4 endpoints in connection-preference order:
+/// home/local LAN (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`) first, followed
+/// by Tailscale CGNAT (`100.64.0.0/10`) as the off-network fallback.
+pub fn detect_direct_ips() -> Vec<String> {
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates a linked list freed by freeifaddrs below.
     if unsafe { libc::getifaddrs(&mut ifap) } != 0 || ifap.is_null() {
-        return None;
+        return Vec::new();
     }
-    let mut tailscale: Option<String> = None;
-    let mut lan_192: Option<String> = None;
-    let mut lan_other: Option<String> = None;
+    let mut lan_192: Vec<String> = Vec::new();
+    let mut lan_other: Vec<String> = Vec::new();
+    let mut tailscale: Vec<String> = Vec::new();
+
+    let push_unique = |list: &mut Vec<String>, ip: String| {
+        if !list.iter().any(|existing| existing == &ip) {
+            list.push(ip);
+        }
+    };
 
     let mut cur = ifap;
     while !cur.is_null() {
@@ -469,17 +630,11 @@ pub fn detect_preferred_direct_ip() -> Option<String> {
                 let octets = u32::from_be(sin.sin_addr.s_addr).to_be_bytes();
                 let ip = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
                 if octets[0] == 100 && (64..=127).contains(&octets[1]) {
-                    if tailscale.is_none() {
-                        tailscale = Some(ip);
-                    }
+                    push_unique(&mut tailscale, ip);
                 } else if octets[0] == 192 && octets[1] == 168 {
-                    if lan_192.is_none() {
-                        lan_192 = Some(ip);
-                    }
-                } else if (octets[0] == 10 || (octets[0] == 172 && (16..=31).contains(&octets[1])))
-                    && lan_other.is_none()
-                {
-                    lan_other = Some(ip);
+                    push_unique(&mut lan_192, ip);
+                } else if octets[0] == 10 || (octets[0] == 172 && (16..=31).contains(&octets[1])) {
+                    push_unique(&mut lan_other, ip);
                 }
             }
         }
@@ -487,33 +642,76 @@ pub fn detect_preferred_direct_ip() -> Option<String> {
     }
     // SAFETY: ifap was allocated by getifaddrs.
     unsafe { libc::freeifaddrs(ifap) };
-    lan_192.or(tailscale).or(lan_other)
+
+    let mut out = Vec::with_capacity(lan_192.len() + lan_other.len() + tailscale.len());
+    out.extend(lan_192);
+    out.extend(lan_other);
+    out.extend(tailscale);
+    out
 }
 
-pub fn resolve_advertised_direct(config: &RemoteConfig) -> Option<String> {
-    if let Some(ref adv) = config.advertise_direct
-        && !adv.trim().is_empty()
-    {
-        return Some(adv.trim().to_owned());
-    }
-    let listen = config.listen_addr.as_deref()?.trim();
-    if listen.is_empty() {
-        return None;
-    }
+pub fn resolve_advertised_direct_addrs_with_ips(
+    config: &RemoteConfig,
+    detected_ips: &[String],
+) -> Vec<String> {
+    let listen = config.listen_addr.as_deref().map(str::trim).unwrap_or("");
     let port = listen
         .rsplit_once(':')
         .map(|(_, p)| p)
         .filter(|p| !p.is_empty())
         .unwrap_or("7767");
-    if (listen.starts_with("127.0.0.1:")
-        || listen.starts_with("0.0.0.0:")
-        || listen.starts_with("[::]:")
-        || listen.starts_with(":::"))
-        && let Some(ip) = detect_preferred_direct_ip()
+    let wildcard = is_wildcard_listen(listen);
+
+    let mut out: Vec<String> = Vec::new();
+    let push_unique = |list: &mut Vec<String>, addr: String| {
+        if !addr.is_empty() && !list.iter().any(|existing| existing == &addr) {
+            list.push(addr);
+        }
+    };
+
+    if let Some(ref adv) = config.advertise_direct
+        && !adv.trim().is_empty()
     {
-        return Some(format!("{ip}:{port}"));
+        for part in adv.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                push_unique(&mut out, trimmed.to_owned());
+            }
+        }
+        // When listening on all interfaces (`0.0.0.0` / `[::]`), augment explicit
+        // direct addresses with detected off-network Tailscale fallback (and LAN
+        // addresses if `advertise_direct` was set to loopback only).
+        if wildcard {
+            let only_loopback = !out.is_empty() && out.iter().all(|a| is_loopback_addr(a));
+            for ip in detected_ips {
+                if only_loopback || is_tailscale_ip_str(ip) {
+                    push_unique(&mut out, format!("{ip}:{port}"));
+                }
+            }
+        }
+        return out;
     }
-    Some(listen.to_owned())
+
+    if listen.is_empty() {
+        return out;
+    }
+
+    if wildcard || listen.starts_with("127.0.0.1:") {
+        for ip in detected_ips {
+            push_unique(&mut out, format!("{ip}:{port}"));
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    push_unique(&mut out, listen.to_owned());
+    out
+}
+
+/// Resolves all advertised direct endpoints (LAN primary + Tailscale fallback).
+pub fn resolve_advertised_direct_addrs(config: &RemoteConfig) -> Vec<String> {
+    let detected = detect_direct_ips();
+    resolve_advertised_direct_addrs_with_ips(config, &detected)
 }
 
 pub fn render_terminal_qr(uri: &str) -> Result<Vec<String>, String> {
@@ -615,4 +813,108 @@ button {{ background:#5bb5c2; color:#0c1016; border:0; border-radius:8px; paddin
     let path = state_dir()?.join("pair-qr.html");
     write_private_atomic(&path, html.as_bytes())?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertises_lan_and_tailscale_fallback_on_wildcard_listen() {
+        let cfg = RemoteConfig {
+            enabled: true,
+            relay_url: None,
+            listen_addr: Some("0.0.0.0:7767".into()),
+            advertise_direct: None,
+            host_name: None,
+            push_enabled: true,
+            stt_command: None,
+            ..RemoteConfig::default()
+        };
+        let detected = vec!["192.168.0.15".into(), "100.97.190.15".into()];
+        assert_eq!(
+            resolve_advertised_direct_addrs_with_ips(&cfg, &detected),
+            vec!["192.168.0.15:7767", "100.97.190.15:7767"]
+        );
+    }
+
+    #[test]
+    fn explicit_lan_advertise_still_appends_tailscale_fallback() {
+        let cfg = RemoteConfig {
+            enabled: true,
+            relay_url: None,
+            listen_addr: Some("0.0.0.0:7767".into()),
+            advertise_direct: Some("192.168.0.15:7767".into()),
+            host_name: None,
+            push_enabled: true,
+            stt_command: None,
+            ..RemoteConfig::default()
+        };
+        let detected = vec!["10.0.0.9".into(), "100.97.190.15".into()];
+        assert_eq!(
+            resolve_advertised_direct_addrs_with_ips(&cfg, &detected),
+            vec!["192.168.0.15:7767", "100.97.190.15:7767"]
+        );
+    }
+
+    #[test]
+    fn explicit_loopback_with_wildcard_listen_adds_lan_and_tailscale() {
+        let cfg = RemoteConfig {
+            enabled: true,
+            relay_url: None,
+            listen_addr: Some("0.0.0.0:7767".into()),
+            advertise_direct: Some("127.0.0.1:7767".into()),
+            host_name: None,
+            push_enabled: true,
+            stt_command: None,
+            ..RemoteConfig::default()
+        };
+        let detected = vec!["10.249.169.162".into(), "100.97.190.15".into()];
+        assert_eq!(
+            resolve_advertised_direct_addrs_with_ips(&cfg, &detected),
+            vec![
+                "127.0.0.1:7767",
+                "10.249.169.162:7767",
+                "100.97.190.15:7767",
+            ]
+        );
+    }
+
+    #[test]
+    fn loopback_only_listener_stays_isolated_for_local_tests() {
+        let cfg = RemoteConfig {
+            enabled: true,
+            relay_url: None,
+            listen_addr: Some("127.0.0.1:17767".into()),
+            advertise_direct: Some("127.0.0.1:17767".into()),
+            host_name: None,
+            push_enabled: true,
+            stt_command: None,
+            ..RemoteConfig::default()
+        };
+        let detected = vec!["192.168.0.15".into(), "100.97.190.15".into()];
+        assert_eq!(
+            resolve_advertised_direct_addrs_with_ips(&cfg, &detected),
+            vec!["127.0.0.1:17767"]
+        );
+    }
+
+    #[test]
+    fn remote_config_toml_roundtrips_default_and_custom_tunnel() {
+        let def_str = toml::to_string_pretty(&RemoteConfig::default()).unwrap();
+        assert!(!def_str.contains("[tunnel]"));
+        let parsed_def: RemoteConfig = toml::from_str(&def_str).unwrap();
+        assert_eq!(parsed_def.tunnel, TunnelConfig::default());
+
+        let mut custom = RemoteConfig {
+            live_activity_enabled: true,
+            ..Default::default()
+        };
+        custom.tunnel.denied_ports.push(9999);
+        let custom_str = toml::to_string_pretty(&custom).unwrap();
+        assert!(custom_str.contains("[tunnel]"));
+        let parsed_custom: RemoteConfig = toml::from_str(&custom_str).unwrap();
+        assert!(parsed_custom.live_activity_enabled);
+        assert!(parsed_custom.tunnel.is_port_denied(9999));
+    }
 }

@@ -27,7 +27,7 @@ pub enum RelayControlMessage {
         data: String,
     },
     Push {
-        request: PushNotificationRequest,
+        request: Box<PushNotificationRequest>,
     },
     Ping {
         ts: u64,
@@ -146,6 +146,158 @@ pub struct ApprovalOption {
     pub key_sequence: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractivePromptKind {
+    Permission,
+    Question,
+    Input,
+    Confirmation,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractivePromptMode {
+    StructuredApi,
+    TerminalTui,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteractiveOption {
+    pub id: String,
+    pub index: usize,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotkey: Option<String>,
+    #[serde(default)]
+    pub is_custom_input: bool,
+    #[serde(default)]
+    pub is_destructive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredQuestionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredQuestion {
+    #[serde(default)]
+    pub header: String,
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<StructuredQuestionOption>,
+    #[serde(default = "default_true")]
+    pub custom: bool,
+    #[serde(default)]
+    pub multiple: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptRiskTier {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl PromptRiskTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "SAFE READ",
+            Self::Medium => "WORKTREE WRITE",
+            Self::High => "EXTERNAL / NET",
+            Self::Critical => "DESTRUCTIVE / SECRET",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptRiskAssessment {
+    pub tier: PromptRiskTier,
+    pub label: String,
+    pub score: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_rule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_action: Option<String>,
+    #[serde(default)]
+    pub batch_eligible: bool,
+    pub prompt_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteractivePrompt {
+    pub id: String,
+    pub kind: InteractivePromptKind,
+    pub mode: InteractivePromptMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_label: Option<String>,
+    #[serde(default)]
+    pub options: Vec<InteractiveOption>,
+    #[serde(default)]
+    pub selected_index: usize,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default)]
+    pub allows_free_text: bool,
+    #[serde(default)]
+    pub free_text_only: bool,
+    #[serde(default = "default_true")]
+    pub allows_cancel: bool,
+    #[serde(default)]
+    pub can_navigate_tabs: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub always_patterns: Vec<String>,
+    #[serde(default)]
+    pub session_peers_count: usize,
+    #[serde(default)]
+    pub is_subagent: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<StructuredQuestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_line: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<PromptRiskAssessment>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TimelineItem {
@@ -212,10 +364,150 @@ pub enum TimelineItem {
     },
 }
 
+pub const LIVE_ACTIVITY_MAX_ALIAS_CHARS: usize = 32;
+pub const LIVE_ACTIVITY_MAX_SUMMARY_CHARS: usize = 60;
+
+/// Strict whitelist of fixed event labels permitted to traverse the external
+/// push bridge for iOS Live Activities and Android Ongoing Fleet Pulse (D-09).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveActivityEventKind {
+    ApprovalRequested,
+    QuestionAsked,
+    LoopPaused,
+    HardConflict,
+    BsFlagged,
+    TurnFinished,
+}
+
+impl LiveActivityEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApprovalRequested => "approval_requested",
+            Self::QuestionAsked => "question_asked",
+            Self::LoopPaused => "loop_paused",
+            Self::HardConflict => "hard_conflict",
+            Self::BsFlagged => "bs_flagged",
+            Self::TurnFinished => "turn_finished",
+        }
+    }
+
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::ApprovalRequested => "Approval requested",
+            Self::QuestionAsked => "Question waiting",
+            Self::LoopPaused => "Loop paused",
+            Self::HardConflict => "Worktree conflict",
+            Self::BsFlagged => "Audit warning",
+            Self::TurnFinished => "Turn finished",
+        }
+    }
+}
+
+/// Strictly whitelisted Live Activity / Ongoing Fleet Pulse payload (D-09).
+/// `deny_unknown_fields` guarantees prompts, diffs, or raw code can never be
+/// smuggled across the push relay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LiveActivityPayload {
+    pub host_id: String,
+    pub host_name: String,
+    pub working_count: u32,
+    pub blocked_count: u32,
+    pub done_count: u32,
+    pub alert_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_agent_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_event_kind: Option<LiveActivityEventKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_summary_line: Option<String>,
+    pub deep_link: String,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+impl LiveActivityPayload {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.host_id.trim().is_empty() || self.host_id.len() > 64 {
+            return Err("invalid host_id length".into());
+        }
+        if self.host_name.chars().count() > 64 {
+            return Err("host_name exceeds 64 chars".into());
+        }
+        if let Some(ref alias) = self.top_agent_alias
+            && alias.chars().count() > LIVE_ACTIVITY_MAX_ALIAS_CHARS
+        {
+            return Err(format!(
+                "top_agent_alias exceeds {LIVE_ACTIVITY_MAX_ALIAS_CHARS} chars"
+            ));
+        }
+        if let Some(ref summary) = self.top_summary_line {
+            if summary.chars().count() > LIVE_ACTIVITY_MAX_SUMMARY_CHARS {
+                return Err(format!(
+                    "top_summary_line exceeds {LIVE_ACTIVITY_MAX_SUMMARY_CHARS} chars"
+                ));
+            }
+            if summary.contains('\n') || summary.contains('\r') {
+                return Err("top_summary_line must be single-line".into());
+            }
+        }
+        if !self.deep_link.starts_with("masil://") || self.deep_link.len() > 256 {
+            return Err("deep_link must be a bounded masil:// URI".into());
+        }
+        Ok(())
+    }
+
+    pub fn sanitized(&self) -> Self {
+        let clean_single_line = |raw: &str, max_chars: usize| -> String {
+            raw.replace(['\r', '\n', '\t'], " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(max_chars)
+                .collect()
+        };
+        let top_agent_alias = self
+            .top_agent_alias
+            .as_deref()
+            .map(|s| clean_single_line(s, LIVE_ACTIVITY_MAX_ALIAS_CHARS))
+            .filter(|s| !s.is_empty());
+        let top_summary_line = self
+            .top_summary_line
+            .as_deref()
+            .map(|s| clean_single_line(s, LIVE_ACTIVITY_MAX_SUMMARY_CHARS))
+            .filter(|s| !s.is_empty());
+        let deep_link = if self.deep_link.starts_with("masil://") {
+            self.deep_link.chars().take(256).collect()
+        } else {
+            format!("masil://host/{}", self.host_id)
+        };
+        Self {
+            host_id: self.host_id.chars().take(64).collect(),
+            host_name: clean_single_line(&self.host_name, 64),
+            working_count: self.working_count,
+            blocked_count: self.blocked_count,
+            done_count: self.done_count,
+            alert_count: self.alert_count,
+            top_agent_alias,
+            top_event_kind: self.top_event_kind,
+            top_summary_line,
+            deep_link,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PushDeviceToken {
     pub platform: String,
     pub token: String,
+    /// Optional push channel discriminator: `None` / `"alert"` for standard alerts,
+    /// `"liveactivity"` / `"liveactivity_start"` for iOS ActivityKit push tokens,
+    /// or `"android_ongoing"` for Android silent data-only Fleet Pulse updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -227,4 +519,6 @@ pub struct PushNotificationRequest {
     pub event_kind: String,
     pub occurred_ms: i64,
     pub tokens: Vec<PushDeviceToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_activity: Option<LiveActivityPayload>,
 }

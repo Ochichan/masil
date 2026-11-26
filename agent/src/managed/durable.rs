@@ -1165,6 +1165,29 @@ impl Manager {
         key: Option<ClientKey<'_>>,
         answers: bool,
     ) -> Result<Value, String> {
+        let guard_cfg = crate::guard::config::GuardConfig::load();
+        let sandbox = crate::sandbox::resolve_start_profile(None, false, &guard_cfg.sandbox)
+            .unwrap_or(crate::sandbox::SandboxProfile::Worktree);
+        self.start_with_operation_and_sandbox(
+            name, provider, cwd, args, session, split, key, answers, sandbox,
+        )
+        .await
+    }
+
+    /// Start with explicit OS micro-sandbox profile (Phase 3A, D-11).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_operation_and_sandbox(
+        &self,
+        name: &str,
+        provider: &str,
+        cwd: &std::path::Path,
+        args: &[String],
+        session: Option<&str>,
+        split: Option<&str>,
+        key: Option<ClientKey<'_>>,
+        answers: bool,
+        sandbox: crate::sandbox::SandboxProfile,
+    ) -> Result<Value, String> {
         if answers {
             // docs/agent-answers.md: only the TUI of a provider with an
             // answer profile can take the listening options safely.
@@ -1256,6 +1279,7 @@ impl Manager {
             .await?;
         prepared.answers = answers;
         prepared.core_path = core_path;
+        prepared.sandbox = sandbox;
         let mut reconciled = false;
         let ticket = loop {
             let request = NewOperation {

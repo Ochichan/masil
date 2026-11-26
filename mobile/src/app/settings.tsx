@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   Modal,
   Pressable,
@@ -9,7 +9,7 @@ import {
   View,
 } from "react-native";
 import { useRouter } from "expo-router";
-import { RefreshCw, Sparkles, Terminal, X } from "lucide-react-native";
+import { Bell, RefreshCw, Sparkles, Terminal, X } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { PluginCreatorSheet } from "../components/PluginCreatorSheet";
@@ -17,7 +17,18 @@ import {
   getHostClient,
   useHostRuntimeStore,
 } from "../hosts/HostRuntimeController";
-import { registerPushTokenWithHost } from "../notifications/push-manager";
+import {
+  type NotificationPermissionState,
+  getNotificationPermissionStatus,
+  registerPushTokenWithHost,
+  requestNotificationPermissions,
+  sendTestNotification,
+} from "../notifications/push-manager";
+import {
+  classifyEndpointRoute,
+  displayEndpointAddress,
+  normalizeDirectAddrList,
+} from "../protocol/endpoints";
 import type { PluginCatalog } from "../protocol/schemas";
 import { useMasilTheme } from "../theme/ThemeProvider";
 import { FONTS } from "../theme/typography";
@@ -42,6 +53,12 @@ export default function SettingsScreen() {
   const setHostPlugins = useHostRuntimeStore((s) => s.setHostPlugins);
   const voiceMode = useHostRuntimeStore((s) => s.voiceMode);
   const setVoiceMode = useHostRuntimeStore((s) => s.setVoiceMode);
+  const notificationPrefs = useHostRuntimeStore((s) => s.notificationPrefs);
+  const setNotificationPrefs = useHostRuntimeStore(
+    (s) => s.setNotificationPrefs
+  );
+  const livePulsePrefs = useHostRuntimeStore((s) => s.livePulsePrefs);
+  const setLivePulsePrefs = useHostRuntimeStore((s) => s.setLivePulsePrefs);
 
   const [showCreator, setShowCreator] = useState(false);
   const [logModal, setLogModal] = useState<{
@@ -49,6 +66,53 @@ export default function SettingsScreen() {
     lines: string[];
   } | null>(null);
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
+  const [pluginNotice, setPluginNotice] = useState<string | null>(null);
+  const [notifPerm, setNotifPerm] =
+    useState<NotificationPermissionState>("undetermined");
+  const [notifNotice, setNotifNotice] = useState<{
+    text: string;
+    isError?: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    void getNotificationPermissionStatus().then(setNotifPerm);
+  }, []);
+
+  const handleRequestNotifPermission = async () => {
+    const granted = await requestNotificationPermissions();
+    const status = await getNotificationPermissionStatus();
+    setNotifPerm(status);
+    if (granted && activeHostId) {
+      void registerPushTokenWithHost(activeHostId, {
+        promptIfUndetermined: false,
+      });
+    }
+  };
+
+  const handleSendTestNotification = async () => {
+    setNotifNotice(null);
+    const sent = await sendTestNotification(i18n.language || "ko");
+    const status = await getNotificationPermissionStatus();
+    setNotifPerm(status);
+    setNotifNotice({
+      text: sent ? t("testNotificationSent") : t("testNotificationFailed"),
+      isError: !sent,
+    });
+  };
+
+  const handleRegisterPushToken = async () => {
+    if (!activeHostId) return;
+    setNotifNotice(null);
+    const res = await registerPushTokenWithHost(activeHostId, {
+      promptIfUndetermined: true,
+    });
+    const status = await getNotificationPermissionStatus();
+    setNotifPerm(status);
+    setNotifNotice({
+      text: res.ok ? t("pushTokenRegistered") : t("pushTokenFallback"),
+      isError: !res.ok && res.reason === "permission_denied",
+    });
+  };
 
   const activeHost = activeHostId ? hosts[activeHostId] : undefined;
   const plugins = activeHost?.plugins ?? null;
@@ -89,12 +153,15 @@ export default function SettingsScreen() {
     const client = getHostClient(activeHostId);
     if (!client) return;
     setBusyPlugin(pluginId);
+    setPluginNotice(null);
     try {
       const next = await client.request<PluginCatalog>(
         "plugin.toggle.request",
         { plugin_id: pluginId, enabled }
       );
       setHostPlugins(activeHostId, next);
+    } catch (e) {
+      setPluginNotice(e instanceof Error ? e.message : String(e));
     } finally {
       setBusyPlugin(null);
     }
@@ -105,11 +172,14 @@ export default function SettingsScreen() {
     const client = getHostClient(activeHostId);
     if (!client) return;
     setBusyPlugin("__reload__");
+    setPluginNotice(null);
     try {
       const next = await client.request<PluginCatalog>(
         "plugin.reload.request"
       );
       setHostPlugins(activeHostId, next);
+    } catch (e) {
+      setPluginNotice(e instanceof Error ? e.message : String(e));
     } finally {
       setBusyPlugin(null);
     }
@@ -137,8 +207,13 @@ export default function SettingsScreen() {
     if (!activeHostId) return;
     const client = getHostClient(activeHostId);
     if (!client) return;
-    await client.request("plugin.skill.set.request", { target, enabled });
-    await useHostRuntimeStore.getState().refreshPlugins(activeHostId);
+    setPluginNotice(null);
+    try {
+      await client.request("plugin.skill.set.request", { target, enabled });
+      await useHostRuntimeStore.getState().refreshPlugins(activeHostId);
+    } catch (e) {
+      setPluginNotice(e instanceof Error ? e.message : String(e));
+    }
   };
 
   return (
@@ -337,6 +412,17 @@ export default function SettingsScreen() {
                 </Text>
               </Pressable>
 
+              {pluginNotice ? (
+                <Text
+                  style={{
+                    color: palette.danger,
+                    fontFamily: FONTS.mono,
+                    fontSize: 11.5,
+                  }}
+                >
+                  {pluginNotice}
+                </Text>
+              ) : null}
               {plugins && plugins.plugins.length > 0 ? (
                 plugins.plugins.map((p) => {
                   const statusColor =
@@ -345,6 +431,17 @@ export default function SettingsScreen() {
                       : p.status === "error"
                         ? palette.danger
                         : palette.muted;
+                  const badges: string[] = [];
+                  const themeCount = p.manifest?.theme_count ?? 0;
+                  const panelCount = p.manifest?.panel_count ?? 0;
+                  const cmdCount = p.manifest?.command_count ?? 0;
+                  const hookCount = p.manifest?.hook_count ?? 0;
+                  const presetCount = p.manifest?.preset_count ?? 0;
+                  if (themeCount > 0) badges.push(t("badgeThemes", { count: themeCount }));
+                  if (panelCount > 0) badges.push(t("badgePanels", { count: panelCount }));
+                  if (cmdCount > 0) badges.push(t("badgeCommands", { count: cmdCount }));
+                  if (hookCount > 0) badges.push(t("badgeHooks", { count: hookCount }));
+                  if (presetCount > 0) badges.push(t("badgePresets", { count: presetCount }));
                   return (
                     <View
                       key={p.id}
@@ -381,6 +478,18 @@ export default function SettingsScreen() {
                           >
                             {p.manifest?.description || p.id}
                           </Text>
+                          {badges.length > 0 ? (
+                            <Text
+                              numberOfLines={1}
+                              style={{
+                                color: palette.accent,
+                                fontFamily: FONTS.mono,
+                                fontSize: 10.5,
+                              }}
+                            >
+                              {badges.join(" · ")}
+                            </Text>
+                          ) : null}
                         </View>
                         <Pressable
                           onPress={() => void openLogs(p.id)}
@@ -418,8 +527,7 @@ export default function SettingsScreen() {
                 })
               ) : (
                 <Text style={{ color: palette.muted, fontSize: 12.5 }}>
-                  설치된 플러그인이 없습니다. 위 버튼으로 Claude Code, Codex,
-                  Antigravity에게 원하는 플러그인을 즉석 제작해보세요.
+                  {t("noPluginsInstalledHint")}
                 </Text>
               )}
             </View>
@@ -435,8 +543,7 @@ export default function SettingsScreen() {
               ]}
             >
               <Text style={{ color: palette.muted, fontSize: 12 }}>
-                각 AI 코딩 CLI에 공식 masil-plugin 스킬을 설치하면 대화창에서
-                바로 Masil 플러그인을 만들고 실시간 반영할 수 있습니다.
+                {t("pluginSkillsHint")}
               </Text>
               {(plugins?.skills ?? []).map((sk) => (
                 <View key={sk.id} style={styles.row}>
@@ -491,6 +598,215 @@ export default function SettingsScreen() {
           ))}
         </View>
 
+        {/* Phone Notifications */}
+        <Text style={[styles.sectionTitle, { color: palette.muted }]}>
+          {t("notifications")}
+        </Text>
+        <View
+          style={[
+            styles.card,
+            { backgroundColor: palette.panel, borderColor: palette.track },
+          ]}
+        >
+          <Text style={{ color: palette.muted, fontSize: 12, lineHeight: 17 }}>
+            {t("notificationsDesc")}
+          </Text>
+
+          <View style={styles.row}>
+            <View style={{ flex: 1, flexDirection: "row", alignItems: "center", gap: 7 }}>
+              <Bell
+                size={14}
+                color={
+                  notifPerm === "granted" ? palette.success : palette.warning
+                }
+              />
+              <Text
+                style={{
+                  color:
+                    notifPerm === "granted" ? palette.success : palette.warning,
+                  fontFamily: FONTS.semi,
+                  fontSize: 12,
+                  flexShrink: 1,
+                }}
+              >
+                {notifPerm === "granted"
+                  ? t("notificationPermissionGranted")
+                  : notifPerm === "denied"
+                    ? t("notificationPermissionDenied")
+                    : t("notificationPermissionUndetermined")}
+              </Text>
+            </View>
+            {notifPerm !== "granted" ? (
+              <Pressable
+                onPress={() => void handleRequestNotifPermission()}
+                style={[styles.pill, { backgroundColor: palette.accent }]}
+              >
+                <Text
+                  style={{
+                    color: palette.accentText,
+                    fontWeight: "700",
+                    fontSize: 12,
+                  }}
+                >
+                  {t("allowNotifications")}
+                </Text>
+              </Pressable>
+            ) : null}
+          </View>
+
+          <View style={styles.row}>
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: palette.text, fontWeight: "600" }}>
+                {t("notificationsEnabled")}
+              </Text>
+            </View>
+            <Switch
+              value={notificationPrefs.enabled}
+              onValueChange={(v) => {
+                setNotificationPrefs({ enabled: v });
+                if (v && notifPerm !== "granted") {
+                  void handleRequestNotifPermission();
+                }
+              }}
+              trackColor={{ false: palette.track, true: palette.accent }}
+            />
+          </View>
+
+          {notificationPrefs.enabled ? (
+            <>
+              <View style={styles.row}>
+                <View style={{ flex: 1, gap: 2 }}>
+                  <Text style={{ color: palette.text, fontWeight: "600" }}>
+                    {t("notifyInputNeeded")}
+                  </Text>
+                  <Text style={{ color: palette.muted, fontSize: 11 }}>
+                    {t("notifyInputNeededDesc")}
+                  </Text>
+                </View>
+                <Switch
+                  value={notificationPrefs.notifyInputNeeded}
+                  onValueChange={(v) =>
+                    setNotificationPrefs({ notifyInputNeeded: v })
+                  }
+                  trackColor={{ false: palette.track, true: palette.accent }}
+                />
+              </View>
+
+              <View style={styles.row}>
+                <View style={{ flex: 1, gap: 2 }}>
+                  <Text style={{ color: palette.text, fontWeight: "600" }}>
+                    {t("notifyTaskCompleted")}
+                  </Text>
+                  <Text style={{ color: palette.muted, fontSize: 11 }}>
+                    {t("notifyTaskCompletedDesc")}
+                  </Text>
+                </View>
+                <Switch
+                  value={notificationPrefs.notifyTaskCompleted}
+                  onValueChange={(v) =>
+                    setNotificationPrefs({ notifyTaskCompleted: v })
+                  }
+                  trackColor={{ false: palette.track, true: palette.accent }}
+                />
+              </View>
+
+              <View style={styles.row}>
+                <View style={{ flex: 1, gap: 2 }}>
+                  <Text style={{ color: palette.text, fontWeight: "600" }}>
+                    {t("notifyActiveAgent")}
+                  </Text>
+                  <Text style={{ color: palette.muted, fontSize: 11 }}>
+                    {t("notifyActiveAgentDesc")}
+                  </Text>
+                </View>
+                <Switch
+                  value={notificationPrefs.notifyActiveAgent}
+                  onValueChange={(v) =>
+                    setNotificationPrefs({ notifyActiveAgent: v })
+                  }
+                  trackColor={{ false: palette.track, true: palette.accent }}
+                />
+              </View>
+            </>
+          ) : null}
+
+          <View style={styles.pills}>
+            <Pressable
+              onPress={() => void handleSendTestNotification()}
+              style={[styles.pill, { backgroundColor: palette.raised }]}
+            >
+              <Text
+                style={{
+                  color: palette.accent,
+                  fontWeight: "700",
+                  fontSize: 12,
+                }}
+              >
+                {t("sendTestNotification")}
+              </Text>
+            </Pressable>
+          </View>
+
+          {notifNotice ? (
+            <Text
+              style={{
+                color: notifNotice.isError ? palette.danger : palette.textSecondary,
+                fontSize: 11.5,
+              }}
+            >
+              {notifNotice.text}
+            </Text>
+          ) : null}
+        </View>
+
+        {/* Lock Screen Fleet Pulse (Phase 2B / D-09 Strict Opt-In) */}
+        <Text style={[styles.sectionTitle, { color: palette.muted }]}>
+          {t("livePulseSection")}
+        </Text>
+        <View
+          style={[
+            styles.card,
+            { backgroundColor: palette.panel, borderColor: palette.track },
+          ]}
+        >
+          <Text style={{ color: palette.muted, fontSize: 12, lineHeight: 17 }}>
+            {t("livePulseDesc")}
+          </Text>
+
+          <View style={styles.row}>
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: palette.text, fontWeight: "600" }}>
+                {t("livePulseEnabled")}
+              </Text>
+            </View>
+            <Switch
+              value={livePulsePrefs.enabled}
+              onValueChange={(v) => void setLivePulsePrefs({ enabled: v })}
+              trackColor={{ false: palette.track, true: palette.accent }}
+            />
+          </View>
+
+          {livePulsePrefs.enabled ? (
+            <View style={styles.row}>
+              <View style={{ flex: 1, gap: 2 }}>
+                <Text style={{ color: palette.text, fontWeight: "600" }}>
+                  {t("livePulseSummaryEnabled")}
+                </Text>
+                <Text style={{ color: palette.muted, fontSize: 11 }}>
+                  {t("livePulseSummaryDesc")}
+                </Text>
+              </View>
+              <Switch
+                value={livePulsePrefs.summaryEnabled}
+                onValueChange={(v) =>
+                  void setLivePulsePrefs({ summaryEnabled: v })
+                }
+                trackColor={{ false: palette.track, true: palette.accent }}
+              />
+            </View>
+          ) : null}
+        </View>
+
         {/* Active Host Provider Hooks & Push */}
         {activeHost ? (
           <>
@@ -509,9 +825,7 @@ export default function SettingsScreen() {
                   : t("pushStatusHookFallback")}
               </Text>
               <Pressable
-                onPress={() =>
-                  void registerPushTokenWithHost(activeHost.host.hostId)
-                }
+                onPress={() => void handleRegisterPushToken()}
                 style={[
                   styles.pill,
                   { backgroundColor: palette.raised, alignSelf: "flex-start" },
@@ -524,7 +838,7 @@ export default function SettingsScreen() {
                     fontSize: 12,
                   }}
                 >
-                  Register push token
+                  {t("registerPushToken")}
                 </Text>
               </Pressable>
               {activeHost.hooks.map((h) => (
@@ -561,15 +875,70 @@ export default function SettingsScreen() {
           {hostOrder.map((hid) => {
             const h = hosts[hid];
             if (!h) return null;
+            const directList = normalizeDirectAddrList([
+              h.host.directAddr,
+              ...(h.host.directAddrs ?? []),
+            ]);
+            const routeParts = [
+              ...directList,
+              ...(h.host.relayUrl ? [h.host.relayUrl] : []),
+            ];
+            const activeRoute = h.activeEndpoint
+              ? classifyEndpointRoute(
+                  h.activeEndpoint,
+                  h.host.relayUrl,
+                  h.host.hostId
+                )
+              : null;
+            const activeRouteLabel =
+              activeRoute === "lan"
+                ? t("routeLan")
+                : activeRoute === "tailscale"
+                  ? t("routeTailscale")
+                  : activeRoute === "relay"
+                    ? t("routeRelay")
+                    : activeRoute === "direct"
+                      ? t("routeDirect")
+                      : null;
             return (
               <View key={hid} style={styles.row}>
-                <View style={{ flex: 1 }}>
-                  <Text style={{ color: palette.text, fontWeight: "700" }}>
-                    {h.host.hostName}
-                  </Text>
+                <View style={{ flex: 1, gap: 2 }}>
+                  <View style={styles.pluginNameRow}>
+                    <Text style={{ color: palette.text, fontWeight: "700" }}>
+                      {h.host.hostName}
+                    </Text>
+                    {activeRouteLabel && h.connection === "connected" ? (
+                      <Text
+                        style={{
+                          color:
+                            activeRoute === "tailscale"
+                              ? palette.accent
+                              : palette.success,
+                          fontFamily: FONTS.monoSemi,
+                          fontSize: 10.5,
+                        }}
+                      >
+                        {activeRouteLabel}
+                      </Text>
+                    ) : null}
+                  </View>
                   <Text style={{ color: palette.muted, fontSize: 11 }}>
-                    {h.host.relayUrl || h.host.directAddr} · {h.connection}
+                    {h.activeEndpoint && h.connection === "connected"
+                      ? `${displayEndpointAddress(h.activeEndpoint)} · ${h.connection}`
+                      : `${routeParts.join(" → ")} · ${h.connection}`}
                   </Text>
+                  {routeParts.length > 1 ? (
+                    <Text
+                      numberOfLines={2}
+                      style={{
+                        color: palette.muted,
+                        fontFamily: FONTS.mono,
+                        fontSize: 10,
+                      }}
+                    >
+                      {routeParts.join(" → ")}
+                    </Text>
+                  ) : null}
                 </View>
                 <Pressable onPress={() => void removeHost(hid)}>
                   <Text style={{ color: palette.danger, fontWeight: "700" }}>

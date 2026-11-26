@@ -42,6 +42,10 @@ enum Hit {
     Step(usize, i64),
     /// The Reset row's button.
     Reset(usize),
+    PluginTheme(usize, String),
+    PluginOpenPanel(usize, String, String, String),
+    PluginToggle(usize, String, bool),
+    PluginReload(usize),
     ScrollTrack,
     ScrollThumb,
     Close,
@@ -53,12 +57,16 @@ enum Focus {
     Rows,
 }
 
-/// A row of the selected group: a catalog setting or a layer action.
+/// A row of the selected group: a catalog setting, plugin control, or layer action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Row {
     Setting(&'static Setting),
     Layer,
     Reset,
+    PluginTheme,
+    PluginPanels,
+    PluginItem(usize),
+    PluginReload,
 }
 
 struct App {
@@ -78,6 +86,7 @@ struct App {
     values: HashMap<&'static str, String>,
     /// Effective values that differ from the saved choice, per key.
     configured: HashMap<&'static str, String>,
+    plugin_catalog: Option<crate::plugin::manifest::PluginCatalog>,
     /// When Reset was last asked for: an Enter or click on it between
     /// `RESET_PAUSE` and `RESET_EXPIRY` later runs it. Any other key, click,
     /// wheel step, resize or focus change takes the question back.
@@ -116,6 +125,7 @@ impl App {
             layer_on: true,
             values: HashMap::new(),
             configured: HashMap::new(),
+            plugin_catalog: None,
             reset_armed: None,
             receipt: None,
             hits: Vec::new(),
@@ -167,12 +177,51 @@ impl App {
             Some("terminal" | "tmux") => Theme::Terminal,
             _ => Theme::Dark,
         };
+        self.plugin_catalog = crate::plugin::manifest::load_catalog().ok();
+        if let Some(t) = self
+            .plugin_catalog
+            .as_ref()
+            .and_then(|c| c.active_resolved_theme())
+        {
+            super::view::set_plugin_palette(Some(&t));
+            self.theme = if t.appearance == "light" {
+                Theme::Light
+            } else {
+                Theme::Dark
+            };
+        } else {
+            super::view::set_plugin_palette(None);
+        }
     }
 
     fn rows(&self) -> Vec<Row> {
         let group = Group::ALL[self.group];
         if group == Group::Layer {
             return vec![Row::Layer, Row::Reset];
+        }
+        if group == Group::Plugins {
+            let mut out = Vec::new();
+            let has_themes = self
+                .plugin_catalog
+                .as_ref()
+                .is_some_and(|c| !c.all_themes().is_empty() || c.active_resolved_theme().is_some());
+            if has_themes {
+                out.push(Row::PluginTheme);
+            }
+            let has_panels = self.plugin_catalog.as_ref().is_some_and(|c| {
+                c.active_plugins()
+                    .any(|p| p.manifest.as_ref().is_some_and(|m| !m.panels.is_empty()))
+            });
+            if has_panels {
+                out.push(Row::PluginPanels);
+            }
+            if let Some(cat) = &self.plugin_catalog {
+                for idx in 0..cat.plugins.len() {
+                    out.push(Row::PluginItem(idx));
+                }
+            }
+            out.push(Row::PluginReload);
+            return out;
         }
         SETTINGS
             .iter()
@@ -235,6 +284,13 @@ impl App {
     }
 
     fn choose(&mut self, setting: &'static Setting, value: String) {
+        if setting.key == "@masil-theme" {
+            let next_plugin_theme = match value.as_str() {
+                "tmux" => None,
+                other => Some(other),
+            };
+            let _ = crate::plugin::set_active_theme(next_plugin_theme);
+        }
         let outcome = server::apply(&self.server, self.path.as_deref(), setting, &value);
         // Describe the change in the language now in effect.
         self.reload();
@@ -249,6 +305,114 @@ impl App {
         };
         let what = format!("{} → {label}", setting.label(self.language));
         self.receipt(outcome, what);
+    }
+
+    fn choose_plugin_theme(&mut self, theme_id: &str) {
+        let arg = (!theme_id.is_empty()).then_some(theme_id);
+        match crate::plugin::set_active_theme(arg) {
+            Ok(_) => {
+                self.reload();
+                let label = if theme_id.is_empty() {
+                    text(self.language, "Default", "기본값").to_owned()
+                } else {
+                    self.plugin_catalog
+                        .as_ref()
+                        .and_then(|c| c.all_themes().into_iter().find(|t| t.id == theme_id))
+                        .map(|t| t.name)
+                        .unwrap_or_else(|| theme_id.to_owned())
+                };
+                self.receipt = Some((
+                    Tone::Good,
+                    format!(
+                        "{} {} → {label}",
+                        text(self.language, "Applied:", "적용됨:"),
+                        text(self.language, "Plugin theme", "플러그인 테마")
+                    ),
+                ));
+            }
+            Err(err) => {
+                self.receipt = Some((Tone::Bad, err));
+            }
+        }
+    }
+
+    fn toggle_plugin_enabled(&mut self, plugin_id: &str, enabled: bool) {
+        let res = crate::plugin::manifest::PluginsConfig::load().and_then(|mut cfg| {
+            cfg.set_plugin_enabled(plugin_id, enabled);
+            cfg.save()?;
+            if let Ok(cat) = crate::plugin::manifest::load_catalog() {
+                crate::plugin::sync_theme_to_masil_servers(&cat);
+            }
+            Ok(())
+        });
+        match res {
+            Ok(()) => {
+                self.reload();
+                let state = if enabled {
+                    text(self.language, "On", "켜짐")
+                } else {
+                    text(self.language, "Off", "꺼짐")
+                };
+                self.receipt = Some((
+                    Tone::Good,
+                    format!(
+                        "{} {plugin_id} → {state}",
+                        text(self.language, "Applied:", "적용됨:")
+                    ),
+                ));
+            }
+            Err(err) => self.receipt = Some((Tone::Bad, err)),
+        }
+    }
+
+    fn open_plugin_panel(&mut self, plugin_id: &str, panel_id: &str, title: &str) {
+        let Ok(exe) = std::env::current_exe() else {
+            self.receipt = Some((Tone::Bad, "cannot locate masil-agent".into()));
+            return;
+        };
+        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let sock = self.server.socket_path().to_string_lossy().into_owned();
+        let shell_cmd = format!(
+            "{} plugin open {} {} --socket {}",
+            q(&exe.to_string_lossy()),
+            q(plugin_id),
+            q(panel_id),
+            q(&sock)
+        );
+        match self.server.run(&[
+            "new-pane", "-x", "52%", "-y", "58%", "-T", title, &shell_cmd,
+        ]) {
+            Ok(_) => self.quit = true,
+            Err(err) => self.receipt = Some((Tone::Bad, err)),
+        }
+    }
+
+    fn reload_plugins(&mut self) {
+        let res = crate::plugin::manifest::PluginsConfig::load().and_then(|mut cfg| {
+            cfg.bump_reload();
+            cfg.save()
+        });
+        match res {
+            Ok(()) => {
+                self.reload();
+                if let Some(cat) = &self.plugin_catalog {
+                    crate::plugin::sync_theme_to_masil_servers(cat);
+                }
+                let count = self
+                    .plugin_catalog
+                    .as_ref()
+                    .map(|c| c.active_plugins().count())
+                    .unwrap_or(0);
+                self.receipt = Some((
+                    Tone::Good,
+                    match self.language {
+                        Language::English => format!("Reloaded plugins ({count} active)"),
+                        Language::Korean => format!("플러그인 다시 불러오기 완료 ({count}개 활성)"),
+                    },
+                ));
+            }
+            Err(err) => self.receipt = Some((Tone::Bad, err)),
+        }
     }
 
     fn set_layer(&mut self, on: bool) {
@@ -353,7 +517,38 @@ impl App {
                     self.set_layer(delta < 0);
                 }
             }
-            Row::Reset => {}
+            Row::PluginTheme => {
+                let mut ids = vec![String::new()];
+                if let Some(cat) = &self.plugin_catalog {
+                    for t in cat.all_themes() {
+                        ids.push(t.id);
+                    }
+                }
+                let current = self
+                    .plugin_catalog
+                    .as_ref()
+                    .and_then(|c| c.active_resolved_theme())
+                    .map(|t| t.id)
+                    .unwrap_or_default();
+                let idx = ids.iter().position(|id| *id == current).unwrap_or(0) as i64;
+                let next = (idx + delta).clamp(0, ids.len() as i64 - 1) as usize;
+                if ids[next] != current {
+                    let chosen = ids[next].clone();
+                    self.choose_plugin_theme(&chosen);
+                }
+            }
+            Row::PluginItem(idx) => {
+                if let Some(p) = self
+                    .plugin_catalog
+                    .as_ref()
+                    .and_then(|c| c.plugins.get(idx))
+                    .cloned()
+                    && (delta < 0) != p.enabled
+                {
+                    self.toggle_plugin_enabled(&p.id, delta < 0);
+                }
+            }
+            Row::Reset | Row::PluginPanels | Row::PluginReload => {}
         }
     }
 
@@ -380,6 +575,26 @@ impl App {
                 if rows.get(index) == Some(&Row::Reset) {
                     self.confirm_reset(armed, now);
                 }
+            }
+            Hit::PluginTheme(index, theme_id) => {
+                self.row = index.min(rows.len().saturating_sub(1));
+                self.focus = Focus::Rows;
+                self.choose_plugin_theme(&theme_id);
+            }
+            Hit::PluginOpenPanel(index, plugin_id, panel_id, title) => {
+                self.row = index.min(rows.len().saturating_sub(1));
+                self.focus = Focus::Rows;
+                self.open_plugin_panel(&plugin_id, &panel_id, &title);
+            }
+            Hit::PluginToggle(index, plugin_id, enabled) => {
+                self.row = index.min(rows.len().saturating_sub(1));
+                self.focus = Focus::Rows;
+                self.toggle_plugin_enabled(&plugin_id, enabled);
+            }
+            Hit::PluginReload(index) => {
+                self.row = index.min(rows.len().saturating_sub(1));
+                self.focus = Focus::Rows;
+                self.reload_plugins();
             }
             Hit::Value(index, value) => {
                 self.row = index;
@@ -462,9 +677,33 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') => match self.focus {
                 Focus::Groups => self.focus = Focus::Rows,
-                Focus::Rows => match rows.get(self.row) {
+                Focus::Rows => match rows.get(self.row).copied() {
                     Some(Row::Reset) => self.confirm_reset(armed, now),
                     Some(Row::Layer) => self.set_layer(!self.layer_on),
+                    Some(Row::PluginReload) => self.reload_plugins(),
+                    Some(Row::PluginItem(idx)) => {
+                        if let Some(p) = self
+                            .plugin_catalog
+                            .as_ref()
+                            .and_then(|c| c.plugins.get(idx))
+                            .cloned()
+                        {
+                            self.toggle_plugin_enabled(&p.id, !p.enabled);
+                        }
+                    }
+                    Some(Row::PluginPanels) => {
+                        let first_panel =
+                            self.plugin_catalog.as_ref().and_then(|c| {
+                                c.active_plugins().find_map(|p| {
+                                    p.manifest.as_ref()?.panels.first().map(|pan| {
+                                        (p.id.clone(), pan.id.clone(), pan.title.clone())
+                                    })
+                                })
+                            });
+                        if let Some((pid, pan_id, title)) = first_panel {
+                            self.open_plugin_panel(&pid, &pan_id, &title);
+                        }
+                    }
                     _ => {}
                 },
             },
@@ -911,7 +1150,7 @@ impl App {
             let mut blocks = Vec::new();
             for row in &rows {
                 let mut notes: Vec<(Tone, String)> = Vec::new();
-                let help = match row {
+                let help: String = match row {
                     Row::Setting(setting) => {
                         if let Some(effective) = self.configured.get(setting.key) {
                             notes.push((
@@ -926,13 +1165,14 @@ impl App {
                                 },
                             ));
                         }
-                        setting.help(language)
+                        setting.help(language).to_owned()
                     }
                     Row::Layer => text(
                         language,
                         "Off restores tmux defaults, removes masil buttons and re-reads your tmux.conf.",
                         "끄면 tmux 기본값으로 돌아가고 masil 버튼을 없애며 tmux.conf를 다시 읽습니다.",
-                    ),
+                    )
+                    .to_owned(),
                     Row::Reset => {
                         if self.reset_armed.is_some() {
                             notes.push((
@@ -950,9 +1190,90 @@ impl App {
                             "Puts every setting on this screen back to its default. Other @masil lines in settings.conf stay.",
                             "이 화면의 설정을 모두 기본값으로 되돌립니다. settings.conf의 다른 @masil 줄은 그대로 둡니다.",
                         )
+                        .to_owned()
                     }
+                    Row::PluginTheme => text(
+                        language,
+                        "Applies an installed plugin theme live across the masil bar, borders, TUI and Mobile.",
+                        "설치된 플러그인 테마를 masil 사이드바, 경계선, TUI, 모바일 앱에 즉시 적용합니다.",
+                    )
+                    .to_owned(),
+                    Row::PluginPanels => text(
+                        language,
+                        "Click any panel to open it in a live floating pane inside masil.",
+                        "패널을 클릭하면 masil 안에 실시간 플로팅 창으로 바로 엽니다.",
+                    )
+                    .to_owned(),
+                    Row::PluginItem(idx) => {
+                        if let Some(p) = self
+                            .plugin_catalog
+                            .as_ref()
+                            .and_then(|c| c.plugins.get(*idx))
+                        {
+                            if !p.errors.is_empty() {
+                                notes.push((Tone::Bad, p.errors.join(" · ")));
+                            }
+                            let desc = p
+                                .manifest
+                                .as_ref()
+                                .map(|m| m.description.as_str())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(p.id.as_str());
+                            let mut parts = Vec::new();
+                            if !p.themes.is_empty() {
+                                parts.push(format!(
+                                    "{} {}",
+                                    text(language, "themes", "테마"),
+                                    p.themes.len()
+                                ));
+                            }
+                            if let Some(m) = &p.manifest {
+                                if !m.panels.is_empty() {
+                                    parts.push(format!(
+                                        "{} {}",
+                                        text(language, "panels", "패널"),
+                                        m.panels.len()
+                                    ));
+                                }
+                                if !m.commands.is_empty() {
+                                    parts.push(format!(
+                                        "{} {}",
+                                        text(language, "cmds", "커맨드"),
+                                        m.commands.len()
+                                    ));
+                                }
+                                if !m.hooks.is_empty() {
+                                    parts.push(format!(
+                                        "{} {}",
+                                        text(language, "hooks", "훅"),
+                                        m.hooks.len()
+                                    ));
+                                }
+                                if !m.presets.is_empty() {
+                                    parts.push(format!(
+                                        "{} {}",
+                                        text(language, "presets", "프리셋"),
+                                        m.presets.len()
+                                    ));
+                                }
+                            }
+                            if parts.is_empty() {
+                                desc.to_owned()
+                            } else {
+                                format!("{desc} ({})", parts.join(" · "))
+                            }
+                        } else {
+                            String::new()
+                        }
+                    }
+                    Row::PluginReload => text(
+                        language,
+                        "Reloads manifests, scripts, themes and panels from ~/.config/masil/plugins.",
+                        "~/.config/masil/plugins의 매니페스트, 스크립트, 테마, 패널을 다시 불러옵니다.",
+                    )
+                    .to_owned(),
                 };
-                let mut lines = wrap(help, width as usize)
+                let mut lines = wrap(&help, width as usize)
                     .into_iter()
                     .map(|line| (Tone::Muted, line))
                     .collect::<Vec<_>>();
@@ -1005,10 +1326,36 @@ impl App {
                 continue;
             }
             let selected = focused && index == self.row;
-            let label = match row {
-                Row::Setting(setting) => setting.label(language),
-                Row::Layer => text(language, "masil UI layer", "masil UI 레이어"),
-                Row::Reset => text(language, "Reset", "초기화"),
+            let label: String = match row {
+                Row::Setting(setting) => setting.label(language).to_owned(),
+                Row::Layer => text(language, "masil UI layer", "masil UI 레이어").to_owned(),
+                Row::Reset => text(language, "Reset", "초기화").to_owned(),
+                Row::PluginTheme => text(language, "Plugin theme", "플러그인 테마").to_owned(),
+                Row::PluginPanels => {
+                    text(language, "Open plugin panel", "플러그인 패널 열기").to_owned()
+                }
+                Row::PluginItem(idx) => self
+                    .plugin_catalog
+                    .as_ref()
+                    .and_then(|c| c.plugins.get(*idx))
+                    .map(|p| {
+                        let name = p
+                            .manifest
+                            .as_ref()
+                            .map(|m| m.name.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(p.id.as_str());
+                        let status = if !p.enabled {
+                            text(language, "off", "꺼짐")
+                        } else if !p.errors.is_empty() {
+                            text(language, "error", "오류")
+                        } else {
+                            text(language, "running", "실행 중")
+                        };
+                        format!("{name} [{status}]")
+                    })
+                    .unwrap_or_default(),
+                Row::PluginReload => text(language, "Reload", "다시 불러오기").to_owned(),
             };
             if y >= content_inner.y as i32 {
                 let marker = if selected { "› " } else { "" };
@@ -1079,7 +1426,7 @@ impl App {
     }
 
     /// The chips of a row's choices; a number row has its own controls.
-    fn row_chips(&self, row: Row, index: usize) -> Vec<(&'static str, Hit, bool)> {
+    fn row_chips(&self, row: Row, index: usize) -> Vec<(String, Hit, bool)> {
         let language = self.language;
         match row {
             Row::Setting(setting) => {
@@ -1094,7 +1441,7 @@ impl App {
                     .iter()
                     .map(|choice| {
                         (
-                            choice.label(language),
+                            choice.label(language).to_owned(),
                             Hit::Value(index, choice.value.to_owned()),
                             choice.value == current,
                         )
@@ -1105,7 +1452,7 @@ impl App {
                 .into_iter()
                 .map(|(value, en, ko)| {
                     (
-                        text(language, en, ko),
+                        text(language, en, ko).to_owned(),
                         Hit::Value(index, value.to_owned()),
                         (value == "on") == self.layer_on,
                     )
@@ -1113,15 +1460,82 @@ impl App {
                 .collect(),
             Row::Reset => vec![(
                 if self.reset_armed.is_some() {
-                    text(language, "Reset now", "지금 초기화")
+                    text(language, "Reset now", "지금 초기화").to_owned()
                 } else {
                     text(
                         language,
                         "Reset the settings on this screen",
                         "이 화면의 설정 초기화",
                     )
+                    .to_owned()
                 },
                 Hit::Reset(index),
+                false,
+            )],
+            Row::PluginTheme => {
+                let active_id = self
+                    .plugin_catalog
+                    .as_ref()
+                    .and_then(|c| c.active_resolved_theme())
+                    .map(|t| t.id);
+                let mut chips = vec![(
+                    text(language, "Default", "기본값").to_owned(),
+                    Hit::PluginTheme(index, String::new()),
+                    active_id.is_none(),
+                )];
+                if let Some(cat) = &self.plugin_catalog {
+                    for t in cat.all_themes() {
+                        let sel = active_id.as_deref() == Some(t.id.as_str());
+                        chips.push((t.name, Hit::PluginTheme(index, t.id), sel));
+                    }
+                }
+                chips
+            }
+            Row::PluginPanels => {
+                let mut chips = Vec::new();
+                if let Some(cat) = &self.plugin_catalog {
+                    for p in cat.active_plugins() {
+                        let Some(m) = &p.manifest else { continue };
+                        for panel in &m.panels {
+                            chips.push((
+                                panel.title.clone(),
+                                Hit::PluginOpenPanel(
+                                    index,
+                                    p.id.clone(),
+                                    panel.id.clone(),
+                                    panel.title.clone(),
+                                ),
+                                false,
+                            ));
+                        }
+                    }
+                }
+                chips
+            }
+            Row::PluginItem(idx) => {
+                let Some(p) = self
+                    .plugin_catalog
+                    .as_ref()
+                    .and_then(|c| c.plugins.get(idx))
+                else {
+                    return Vec::new();
+                };
+                vec![
+                    (
+                        text(language, "On", "켜기").to_owned(),
+                        Hit::PluginToggle(index, p.id.clone(), true),
+                        p.enabled,
+                    ),
+                    (
+                        text(language, "Off", "끄기").to_owned(),
+                        Hit::PluginToggle(index, p.id.clone(), false),
+                        !p.enabled,
+                    ),
+                ]
+            }
+            Row::PluginReload => vec![(
+                text(language, "Reload plugins", "플러그인 다시 불러오기").to_owned(),
+                Hit::PluginReload(index),
                 false,
             )],
         }
@@ -1195,7 +1609,7 @@ impl App {
                     frame,
                     inner.x + x,
                     chip_y as u16,
-                    label,
+                    &label,
                     hit,
                     selected,
                     inner,
@@ -1246,7 +1660,7 @@ fn known_sets(sets: &[(String, String)]) -> Result<Vec<(&'static Setting, &str)>
         .collect()
 }
 
-fn chip_widths(chips: &[(&str, Hit, bool)]) -> Vec<u16> {
+fn chip_widths(chips: &[(String, Hit, bool)]) -> Vec<u16> {
     chips
         .iter()
         .map(|(label, _, _)| cell_width(label) as u16 + 2)
@@ -1270,7 +1684,7 @@ fn flow(widths: &[u16], width: u16) -> (Vec<(u16, u16)>, u16) {
 }
 
 fn usage() -> String {
-    "usage: masil-agent settings [--socket MASIL_SOCKET] [--set KEY VALUE]... [--layer on|off] [--reset] [--get] | --reload-config".into()
+    "usage: masil-agent settings [--socket MASIL_SOCKET] [--group NAME] [--set KEY VALUE]... [--layer on|off] [--reset] [--get] | --reload-config".into()
 }
 
 /// Runs the settings screen, or applies choices without a screen when any
@@ -1279,6 +1693,7 @@ fn usage() -> String {
 /// prints only errors, for the masil menu's run-shell.
 pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     let mut socket = None;
+    let mut initial_group: Option<Group> = None;
     let mut sets = Vec::new();
     let mut layer = None;
     let mut reset = false;
@@ -1289,6 +1704,23 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
         match args[index].as_str() {
             "--socket" => {
                 socket = Some(args.get(index + 1).ok_or_else(usage)?.clone());
+                index += 2;
+            }
+            "--group" => {
+                let raw = args
+                    .get(index + 1)
+                    .ok_or_else(usage)?
+                    .trim()
+                    .to_ascii_lowercase();
+                initial_group = Some(match raw.as_str() {
+                    "bar" | "status" => Group::Bar,
+                    "panes" => Group::Panes,
+                    "input" => Group::Input,
+                    "look" | "appearance" => Group::Look,
+                    "plugins" | "plugin" => Group::Plugins,
+                    "layer" | "ui" => Group::Layer,
+                    _ => return Err(usage()),
+                });
                 index += 2;
             }
             "--set" => {
@@ -1381,6 +1813,11 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
     }
 
     let mut app = App::new(server);
+    if let Some(g) = initial_group
+        && let Some(pos) = Group::ALL.iter().position(|x| *x == g)
+    {
+        app.group = pos;
+    }
     let mut session = Session::open()?;
     while !app.quit {
         if app.dirty {
@@ -1419,7 +1856,9 @@ mod tests {
     fn every_group_has_rows_and_every_setting_a_group() {
         for group in Group::ALL {
             assert!(
-                group == Group::Layer || SETTINGS.iter().any(|setting| setting.group == group),
+                group == Group::Layer
+                    || group == Group::Plugins
+                    || SETTINGS.iter().any(|setting| setting.group == group),
                 "{group:?} is empty"
             );
             assert!(!group.label(Language::Korean).is_empty());
@@ -1497,6 +1936,7 @@ mod tests {
             layer_on: true,
             values: HashMap::new(),
             configured: HashMap::new(),
+            plugin_catalog: None,
             reset_armed: None,
             receipt: None,
             hits: Vec::new(),
@@ -1589,7 +2029,10 @@ mod tests {
         assert!(app.receipt.is_none());
         assert_eq!(app.reset_wait(at(1_500)), Some(Duration::from_secs(4)));
         let chips = app.row_chips(Row::Reset, 1);
-        assert_eq!((chips[0].0, &chips[0].1), ("Reset now", &Hit::Reset(1)));
+        assert_eq!(
+            (chips[0].0.as_str(), &chips[0].1),
+            ("Reset now", &Hit::Reset(1))
+        );
         // Any other key takes it back, and so does a click elsewhere.
         app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), at(600));
         assert_eq!((app.row, app.reset_armed), (0, None));

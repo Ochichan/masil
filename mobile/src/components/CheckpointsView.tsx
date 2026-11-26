@@ -13,7 +13,7 @@ import { useMasilTheme } from "../theme/ThemeProvider";
 import { ConfirmModal } from "./ConfirmModal";
 
 interface CheckpointRow {
-  id: string;
+  id: string | number;
   created_ms?: number;
   files?: number;
   label?: string;
@@ -37,7 +37,11 @@ export function CheckpointsView({ hostId, agent }: CheckpointsViewProps) {
     try {
       const res = await client.request<{ checkpoints?: CheckpointRow[] }>(
         "checkpoint.list.request",
-        { server_socket: agent.server_socket, target: agent.name || agent.pane }
+        {
+          server_socket: agent.server_socket,
+          pane: agent.pane,
+          target: agent.pane || agent.name,
+        }
       );
       setRows(res.checkpoints ?? []);
     } catch {
@@ -55,9 +59,10 @@ export function CheckpointsView({ hostId, agent }: CheckpointsViewProps) {
     try {
       await client.request("checkpoint.make.request", {
         server_socket: agent.server_socket,
-        target: agent.name || agent.pane,
+        pane: agent.pane,
+        target: agent.pane || agent.name,
       });
-      setMessage("Created checkpoint.");
+      setMessage(t("checkpointCreated"));
       await load();
     } catch (e) {
       setMessage(e instanceof Error ? e.message : String(e));
@@ -73,10 +78,11 @@ export function CheckpointsView({ hostId, agent }: CheckpointsViewProps) {
     try {
       await client.request("checkpoint.restore.request", {
         server_socket: agent.server_socket,
-        target: agent.name || agent.pane,
+        pane: agent.pane,
+        target: agent.pane || agent.name,
         checkpoint_id: cpId,
       });
-      setMessage(`Restored checkpoint ${cpId}.`);
+      setMessage(t("checkpointRestored", { id: cpId }));
     } catch (e) {
       setMessage(e instanceof Error ? e.message : String(e));
     }
@@ -90,7 +96,7 @@ export function CheckpointsView({ hostId, agent }: CheckpointsViewProps) {
           style={[styles.createBtn, { backgroundColor: palette.accent }]}
         >
           <Text style={{ color: palette.accentText, fontWeight: "700" }}>
-            + Create Checkpoint
+            {t("createCheckpoint")}
           </Text>
         </Pressable>
       </View>
@@ -101,10 +107,10 @@ export function CheckpointsView({ hostId, agent }: CheckpointsViewProps) {
       ) : null}
       <FlatList
         data={rows}
-        keyExtractor={(item) => item.id}
+        keyExtractor={(item) => String(item.id)}
         ListEmptyComponent={
           <Text style={{ color: palette.muted, padding: 16 }}>
-            No checkpoints saved for {agent.name}.
+            {t("noCheckpointsSaved", { name: agent.name })}
           </Text>
         }
         renderItem={({ item }) => (
@@ -116,21 +122,21 @@ export function CheckpointsView({ hostId, agent }: CheckpointsViewProps) {
           >
             <View style={{ flex: 1 }}>
               <Text style={[styles.id, { color: palette.text }]}>
-                {item.id}
+                #{String(item.id)}
               </Text>
               <Text style={{ color: palette.muted, fontSize: 12 }}>
-                {item.files ?? 0} files
+                {t("filesCount", { count: item.files ?? 0 })}
               </Text>
             </View>
             <Pressable
-              onPress={() => setRestoreTarget(item.id)}
+              onPress={() => setRestoreTarget(String(item.id))}
               style={[
                 styles.restoreBtn,
                 { borderColor: palette.danger, backgroundColor: palette.raised },
               ]}
             >
               <Text style={{ color: palette.danger, fontWeight: "600", fontSize: 12 }}>
-                Restore
+                {t("restore")}
               </Text>
             </Pressable>
           </View>

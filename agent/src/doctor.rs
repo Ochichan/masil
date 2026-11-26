@@ -262,7 +262,28 @@ async fn diagnose(options: &Options) -> Vec<Check> {
         options.socket.as_deref().filter(|_| server.is_some()),
     ));
     checks.push(callbacks_check());
+    checks.push(sandbox_check());
     checks
+}
+
+fn sandbox_check() -> Check {
+    let st = crate::sandbox::status();
+    Check {
+        id: "sandbox.backend",
+        status: if st.available {
+            Status::Ok
+        } else {
+            Status::Warn
+        },
+        summary: st.detail.clone(),
+        detail: json!({
+            "available": st.available,
+            "backend": st.backend,
+            "default_enabled": st.default_enabled,
+            "default_profile": st.default_profile,
+            "fail_closed": st.fail_closed,
+        }),
+    }
 }
 
 /// Integration callbacks refused in the last day because they did not come

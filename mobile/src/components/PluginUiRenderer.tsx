@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   ActivityIndicator,
   Alert,
@@ -158,17 +159,29 @@ function FormBlock({
   onAction?: (event: PluginActionEvent) => void;
   palette: MasilPalette;
 }) {
-  const [values, setValues] = useState<Record<string, string>>(() => {
+  const buildDefaults = React.useCallback(() => {
     const init: Record<string, string> = {};
     for (const f of block.fields) {
       init[f.name] = f.value ?? "";
     }
     return init;
-  });
+  }, [block.fields]);
+
+  const fieldsSig = block.fields
+    .map((f) => `${f.name}:${f.value ?? ""}`)
+    .join("\u0000");
+
+  const [values, setValues] = useState<Record<string, string>>(buildDefaults);
+
+  React.useEffect(() => {
+    setValues(buildDefaults());
+  }, [block.action, fieldsSig, buildDefaults]);
 
   const submit = () => {
     if (!onAction || busy) return;
-    onAction({ action: block.action, formValues: values });
+    const submitted = { ...values };
+    onAction({ action: block.action, formValues: submitted });
+    setValues(buildDefaults());
   };
 
   return (
@@ -229,6 +242,7 @@ export function PluginUiRenderer({
   onAction,
 }: PluginUiRendererProps) {
   const { palette } = useMasilTheme();
+  const { t } = useTranslation();
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const copyText = (key: string, text: string) => {
@@ -241,9 +255,9 @@ export function PluginUiRenderer({
     if (!onAction || busy) return;
     if (btn.confirm) {
       Alert.alert(btn.label, btn.confirm, [
-        { text: "취소", style: "cancel" },
+        { text: t("cancel"), style: "cancel" },
         {
-          text: "실행",
+          text: t("run"),
           style: btn.style === "danger" ? "destructive" : "default",
           onPress: () => onAction({ action: btn.action, payload: btn.payload }),
         },

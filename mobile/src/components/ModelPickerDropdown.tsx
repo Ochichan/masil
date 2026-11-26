@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   ActivityIndicator,
   FlatList,
@@ -29,21 +30,25 @@ export function ModelPickerDropdown({
   selectedModel,
   currentModel,
   loading = false,
-  placeholder = "기본값 (자동)",
+  placeholder,
   onSelect,
 }: ModelPickerDropdownProps) {
   const { palette } = useMasilTheme();
+  const { t } = useTranslation();
+  const resolvedPlaceholder = placeholder ?? t("defaultAuto");
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [customDraft, setCustomDraft] = useState("");
 
   const selectedLabel = useMemo(() => {
     if (!selectedModel) {
-      return currentModel ? `현재: ${currentModel}` : placeholder;
+      return currentModel
+        ? t("currentModelLabel", { model: currentModel })
+        : resolvedPlaceholder;
     }
     const found = models.find((m) => m.id === selectedModel);
     return found ? found.label : selectedModel;
-  }, [models, selectedModel, currentModel, placeholder]);
+  }, [models, selectedModel, currentModel, resolvedPlaceholder, t]);
 
   const filtered = useMemo(() => {
     if (!query.trim()) return models;
@@ -131,7 +136,7 @@ export function ModelPickerDropdown({
               ]}
             >
               <Text style={[styles.title, { color: palette.text }]}>
-                모델 선택
+                {t("selectModel")}
               </Text>
               <Pressable onPress={() => setOpen(false)} hitSlop={8}>
                 <X size={19} color={palette.muted} />
@@ -163,7 +168,7 @@ export function ModelPickerDropdown({
                         color: palette.muted,
                       }}
                     >
-                      모델 검색 (예: neon, opus, sonnet, gpt)
+                      {t("searchModelsPlaceholder")}
                     </Text>
                   ) : null}
                   <TextInput
@@ -209,7 +214,7 @@ export function ModelPickerDropdown({
                         fontSize: 13.5,
                       }}
                     >
-                      {placeholder}
+                      {resolvedPlaceholder}
                     </Text>
                     <Text
                       style={{
@@ -219,7 +224,7 @@ export function ModelPickerDropdown({
                         marginTop: 2,
                       }}
                     >
-                      CLI 기본 설정 모델을 사용합니다
+                      {t("useCliDefaultModel")}
                     </Text>
                   </View>
                   {!selectedModel ? (
@@ -238,8 +243,8 @@ export function ModelPickerDropdown({
                   }}
                 >
                   {loading
-                    ? "호스트에서 모델 목록을 불러오는 중..."
-                    : "일치하는 모델이 없습니다. 아래에서 직접 입력할 수 있습니다."}
+                    ? t("loadingModels")
+                    : t("noMatchingModels")}
                 </Text>
               }
               renderItem={({ item }) => {
@@ -289,7 +294,7 @@ export function ModelPickerDropdown({
                                 fontSize: 10.5,
                               }}
                             >
-                              현재
+                              {t("currentBadge")}
                             </Text>
                           </View>
                         ) : null}
@@ -323,7 +328,7 @@ export function ModelPickerDropdown({
               <TextInput
                 value={customDraft}
                 onChangeText={setCustomDraft}
-                placeholder="직접 모델 ID 입력..."
+                placeholder={t("customModelPlaceholder")}
                 placeholderTextColor={palette.muted}
                 autoCapitalize="none"
                 autoCorrect={false}
@@ -362,7 +367,7 @@ export function ModelPickerDropdown({
                     fontSize: 12.5,
                   }}
                 >
-                  적용
+                  {t("apply")}
                 </Text>
               </Pressable>
             </View>

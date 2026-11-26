@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   ActivityIndicator,
   FlatList,
@@ -68,6 +69,7 @@ export function DirectoryPickerModal({
   onClose,
 }: DirectoryPickerModalProps) {
   const { palette } = useMasilTheme();
+  const { t } = useTranslation();
   const [currentPath, setCurrentPath] = useState(initialPath ?? "");
   const [data, setData] = useState<BrowseDirsResponse | null>(null);
   const [quickDirs, setQuickDirs] = useState<DirEntryItem[]>([]);
@@ -83,7 +85,7 @@ export function DirectoryPickerModal({
     async (targetPath: string, includeQuick: boolean, hidden: boolean) => {
       const client = getHostClient(hostId);
       if (!client) {
-        setError("호스트에 연결되어 있지 않습니다.");
+        setError(t("hostNotConnected"));
         return;
       }
       setLoading(true);
@@ -108,7 +110,7 @@ export function DirectoryPickerModal({
         setLoading(false);
       }
     },
-    [hostId]
+    [hostId, t]
   );
 
   useEffect(() => {
@@ -187,13 +189,13 @@ export function DirectoryPickerModal({
           >
             <View style={{ flex: 1 }}>
               <Text style={[styles.title, { color: palette.text }]}>
-                작업 폴더 선택
+                {t("selectWorkingFolder")}
               </Text>
               <Text
                 numberOfLines={1}
                 style={{ color: palette.muted, fontSize: 11, marginTop: 2 }}
               >
-                {data?.display_current ?? (currentPath || "불러오는 중...")}
+                {data?.display_current ?? (currentPath || t("loadingEllipsis"))}
               </Text>
             </View>
             <Pressable
@@ -243,7 +245,7 @@ export function DirectoryPickerModal({
               <TextInput
                 value={newDirName}
                 onChangeText={setNewDirName}
-                placeholder="새 폴더 이름 (예: my-app)"
+                placeholder={t("newFolderPlaceholder")}
                 placeholderTextColor={palette.muted}
                 autoFocus
                 autoCapitalize="none"
@@ -270,7 +272,7 @@ export function DirectoryPickerModal({
                 ]}
               >
                 <Text style={{ color: palette.accentText, fontWeight: "700", fontSize: 12 }}>
-                  {mkdirBusy ? "생성 중" : "생성 후 선택"}
+                  {mkdirBusy ? t("creating") : t("createAndSelect")}
                 </Text>
               </Pressable>
             </View>
@@ -421,7 +423,7 @@ export function DirectoryPickerModal({
               <TextInput
                 value={query}
                 onChangeText={setQuery}
-                placeholder="현재 위치에서 폴더 검색 (초성 지원)"
+                placeholder={t("searchFoldersPlaceholder")}
                 placeholderTextColor={palette.muted}
                 autoCapitalize="none"
                 autoCorrect={false}
@@ -455,8 +457,8 @@ export function DirectoryPickerModal({
                 <View style={styles.emptyBox}>
                   <Text style={{ color: palette.muted, fontSize: 13 }}>
                     {query.trim()
-                      ? "검색 조건에 맞는 하위 폴더가 없습니다."
-                      : "하위 폴더가 없습니다. 아래 버튼으로 현재 폴더를 바로 선택할 수 있습니다."}
+                      ? t("noMatchingSubfolders")
+                      : t("noSubfoldersHint")}
                   </Text>
                 </View>
               }
@@ -519,7 +521,7 @@ export function DirectoryPickerModal({
                         fontWeight: "700",
                       }}
                     >
-                      선택
+                      {t("select")}
                     </Text>
                   </Pressable>
                 </View>
@@ -537,7 +539,7 @@ export function DirectoryPickerModal({
             <View style={{ flex: 1 }}>
               <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
                 <Text style={{ color: palette.muted, fontSize: 11, fontWeight: "600" }}>
-                  현재 위치
+                  {t("currentLocation")}
                 </Text>
                 {data?.current_is_git_repo ? (
                   <Text style={{ color: palette.accent, fontSize: 10, fontWeight: "800" }}>
@@ -562,7 +564,7 @@ export function DirectoryPickerModal({
             >
               <Check size={15} color={palette.accentText} />
               <Text style={{ color: palette.accentText, fontWeight: "700", fontSize: 13 }}>
-                이 폴더 선택
+                {t("selectThisFolder")}
               </Text>
             </Pressable>
           </View>

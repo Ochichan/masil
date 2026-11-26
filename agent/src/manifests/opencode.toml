@@ -20,6 +20,14 @@ any = [
 ]
 
 [[rules]]
+id = "reject_instruction"
+state = "blocked"
+priority = 200
+region = "bottom_non_empty_lines(10)"
+visible_blocker = true
+contains = ["tell opencode what to do differently", "esc cancel"]
+
+[[rules]]
 id = "interrupt_hint_working"
 state = "working"
 priority = 110

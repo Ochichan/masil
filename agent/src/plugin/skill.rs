@@ -56,13 +56,55 @@ fn codex_skill_dirs() -> Result<Vec<PathBuf>, String> {
 }
 
 fn agy_skill_dirs() -> Result<Vec<PathBuf>, String> {
+    let home = home_dir()?;
     Ok(vec![
-        home_dir()?
-            .join(".gemini")
+        home.join(".gemini")
             .join("config")
             .join("skills")
             .join(SKILL_NAME),
+        home.join(".agents").join("skills").join(SKILL_NAME),
     ])
+}
+
+fn dedicated_target_dirs(target: &str) -> Result<Vec<PathBuf>, String> {
+    match target {
+        "claude" | "claude-code" => claude_skill_dirs(),
+        "codex" => {
+            let home = home_dir()?;
+            let codex_base =
+                if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|s| !s.is_empty()) {
+                    PathBuf::from(dir)
+                } else {
+                    home.join(".codex")
+                };
+            Ok(vec![codex_base.join("skills").join(SKILL_NAME)])
+        }
+        "agy" | "antigravity" => Ok(vec![
+            home_dir()?
+                .join(".gemini")
+                .join("config")
+                .join("skills")
+                .join(SKILL_NAME),
+        ]),
+        other => Err(format!(
+            "unsupported skill target '{other}' (expected claude, codex, agy, or all)"
+        )),
+    }
+}
+
+fn shared_agents_skill_dir() -> Result<PathBuf, String> {
+    Ok(home_dir()?.join(".agents").join("skills").join(SKILL_NAME))
+}
+
+fn remove_skill_path(dir: &Path) -> Result<(), String> {
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() || meta.is_file() {
+        fs::remove_file(dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))
+    } else {
+        fs::remove_dir_all(dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))
+    }
 }
 
 fn target_dirs(target: &str) -> Result<Vec<PathBuf>, String> {
@@ -149,31 +191,67 @@ pub fn install_target(target: &str, force: bool) -> Result<Vec<String>, String> 
     } else {
         vec![target]
     };
+    let mut seen = std::collections::HashSet::new();
     let mut installed = Vec::new();
     for t in targets {
         for dir in target_dirs(t)? {
+            let key = dir.to_string_lossy().into_owned();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
             write_skill_bundle(&dir, force)?;
-            installed.push(dir.to_string_lossy().into_owned());
+            installed.push(key);
         }
     }
     Ok(installed)
 }
 
 pub fn uninstall_target(target: &str) -> Result<Vec<String>, String> {
-    let targets: Vec<&str> = if target == "all" {
-        vec!["claude", "codex", "agy"]
-    } else {
-        vec![target]
-    };
+    let mut seen = std::collections::HashSet::new();
     let mut removed = Vec::new();
-    for t in targets {
-        for dir in target_dirs(t)? {
-            let (exists, managed) = dir_has_skill(&dir);
-            if exists && managed {
-                fs::remove_dir_all(&dir)
-                    .map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
-                removed.push(dir.to_string_lossy().into_owned());
+    if target == "all" {
+        for t in ["claude", "codex", "agy"] {
+            for dir in target_dirs(t)? {
+                let key = dir.to_string_lossy().into_owned();
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                let (exists, managed) = dir_has_skill(&dir);
+                if exists && managed {
+                    remove_skill_path(&dir)?;
+                    removed.push(key);
+                }
             }
+        }
+        return Ok(removed);
+    }
+
+    for dir in dedicated_target_dirs(target)? {
+        let key = dir.to_string_lossy().into_owned();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let (exists, managed) = dir_has_skill(&dir);
+        if exists && managed {
+            remove_skill_path(&dir)?;
+            removed.push(key);
+        }
+    }
+
+    // Remove the shared `~/.agents/skills/masil-plugin` only when no other
+    // target still has its own managed skill (or symlink pointing to it).
+    if matches!(target, "codex" | "agy" | "antigravity")
+        && let Ok(shared) = shared_agents_skill_dir()
+    {
+        let other_active = ["claude", "codex", "agy"].iter().any(|t| {
+            dedicated_target_dirs(t)
+                .ok()
+                .is_some_and(|dirs| dirs.iter().any(|d| dir_has_skill(d).0))
+        });
+        let (exists, managed) = dir_has_skill(&shared);
+        if !other_active && exists && managed {
+            remove_skill_path(&shared)?;
+            removed.push(shared.to_string_lossy().into_owned());
         }
     }
     Ok(removed)
@@ -208,6 +286,22 @@ pub fn build_creator_prompt(goal: &str, plugin_id: Option<&str>, plugins_dir: &P
     )
 }
 
+/// Builds native CLI arguments that deliver an initial interactive prompt
+/// directly at process launch (avoiding brittle startup-sleep keystroke races).
+/// Returns `None` when the provider has no supported interactive prompt flag or
+/// the prompt exceeds safe argv bounds.
+pub fn creator_initial_prompt_args(provider: &str, prompt: &str) -> Option<Vec<String>> {
+    let compact = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() || compact.len() > 3500 || compact.chars().any(char::is_control) {
+        return None;
+    }
+    match provider {
+        "agy" | "antigravity" => Some(vec!["-i".into(), compact]),
+        "claude" | "claude-code" | "codex" => Some(vec![compact]),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +325,36 @@ mod tests {
         assert_eq!(dir_has_skill(&target_dir), (true, false));
         assert!(write_skill_bundle(&target_dir, false).is_err());
 
+        // Symlinked skill directory is unlinked cleanly without deleting target.
+        let link_dir = dir.join("symlink-skill");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target_dir, &link_dir).unwrap();
+            remove_skill_path(&link_dir).unwrap();
+            assert!(!link_dir.exists());
+            assert!(target_dir.join("SKILL.md").is_file());
+        }
+
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builds_native_creator_prompt_args_without_control_chars() {
+        let prompt = "Line one\n\nLine two\twith tabs";
+        assert_eq!(
+            creator_initial_prompt_args("agy", prompt),
+            Some(vec!["-i".into(), "Line one Line two with tabs".into()])
+        );
+        assert_eq!(
+            creator_initial_prompt_args("claude", prompt),
+            Some(vec!["Line one Line two with tabs".into()])
+        );
+        assert_eq!(
+            creator_initial_prompt_args("codex", prompt),
+            Some(vec!["Line one Line two with tabs".into()])
+        );
+        assert_eq!(creator_initial_prompt_args("opencode", prompt), None);
+        let huge = "a".repeat(4000);
+        assert_eq!(creator_initial_prompt_args("claude", &huge), None);
     }
 }

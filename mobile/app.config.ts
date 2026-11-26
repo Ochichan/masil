@@ -82,6 +82,12 @@ const config: ExpoConfig = {
       },
     ],
     [
+      "./modules/masil-live-pulse/plugin/withMasilLivePulse",
+      {
+        appGroup: `group.${variant.bundleId}`,
+      },
+    ],
+    [
       "expo-build-properties",
       {
         android: {

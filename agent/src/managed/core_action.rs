@@ -3093,8 +3093,24 @@ impl CoordinatorActions {
                 // Match the native path: a checkpoint follows durable
                 // admission, never a replay, refusal or unresolved receipt.
                 if checkpoint {
-                    crate::checkpoint::before_prompt(&current.cwd, &current.name, &current.run);
+                    crate::checkpoint::before_prompt(
+                        &current.cwd,
+                        &current.name,
+                        &current.run,
+                        &current.provider,
+                        &text_digest,
+                    );
                 }
+                crate::coordinator::publish_event(
+                    &self.socket,
+                    &crate::coordinator::CoordinatorEvent::TurnStarted {
+                        pane_id: current.pane_id.clone(),
+                        run_id: current.run.clone(),
+                        provider: current.provider.clone(),
+                        prompt_sha256: text_digest.clone(),
+                        at_ms: now_ms(),
+                    },
+                );
                 ticket
             }
             Admission::Recorded(record) => {

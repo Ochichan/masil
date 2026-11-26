@@ -59,6 +59,14 @@ pub fn default_masil_socket() -> Result<PathBuf, String> {
 }
 
 pub fn run_self_agent_json(socket: Option<&str>, args: &[String]) -> Result<Value, String> {
+    run_self_agent_json_env(socket, args, &[])
+}
+
+pub fn run_self_agent_json_env(
+    socket: Option<&str>,
+    args: &[String],
+    envs: &[(&str, &str)],
+) -> Result<Value, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find masil-agent: {e}"))?;
     let mut cmd = Command::new(exe);
     cmd.arg("agent");
@@ -66,6 +74,9 @@ pub fn run_self_agent_json(socket: Option<&str>, args: &[String]) -> Result<Valu
         cmd.arg("--socket").arg(sock);
     }
     cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     let output = cmd
         .output()
         .map_err(|e| format!("failed spawning masil-agent: {e}"))?;
@@ -98,57 +109,211 @@ pub fn run_self_agent_json(socket: Option<&str>, args: &[String]) -> Result<Valu
 pub fn list_all_host_agents() -> Vec<Value> {
     let mut combined = Vec::new();
     for server in discover_masil_servers() {
-        let Ok(val) = run_self_agent_json(Some(&server.socket), &["list".into()]) else {
-            continue;
-        };
-        let Some(rows) = val.get("agents").and_then(Value::as_array) else {
-            continue;
-        };
-        for row in rows {
-            let mut item = row.clone();
-            if let Some(obj) = item.as_object_mut() {
-                let pane = obj
-                    .get("pane_id")
-                    .or_else(|| obj.get("pane"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let id_fallback = obj
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let key_part = if !pane.is_empty() {
-                    pane.clone()
-                } else {
-                    id_fallback
-                };
-                let bound_sid = obj
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        obj.get("binding")
-                            .and_then(|b| b.get("session_id"))
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned)
-                    });
-                obj.insert("pane".into(), Value::String(pane.clone()));
-                obj.insert("pane_id".into(), Value::String(pane));
-                if let Some(sid) = bound_sid {
-                    obj.insert("session_id".into(), Value::String(sid));
-                }
-                obj.insert("server_name".into(), Value::String(server.name.clone()));
-                obj.insert("server_socket".into(), Value::String(server.socket.clone()));
+        combined.extend(list_agents_for_server(&server.name, &server.socket));
+    }
+    combined
+}
+
+/// Reads `@masil-sandbox` for every pane on `server_socket` in a single batched
+/// `list-panes` invocation so agent list enrichment stays O(1) subprocesses.
+fn read_server_sandbox_options(server_socket: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(masil) = crate::native_ui::native_executable() else {
+        return out;
+    };
+    let Ok(res) = Command::new(masil)
+        .arg("-S")
+        .arg(server_socket)
+        .args(["list-panes", "-a", "-F", "#{pane_id}\t#{@masil-sandbox}"])
+        .output()
+    else {
+        return out;
+    };
+    if !res.status.success() {
+        return out;
+    }
+    for line in String::from_utf8_lossy(&res.stdout).lines() {
+        if let Some((pane, val)) = line.split_once('\t')
+            && !pane.is_empty()
+            && !val.trim().is_empty()
+        {
+            out.insert(pane.to_owned(), val.trim().to_owned());
+        }
+    }
+    out
+}
+
+/// Lists all agents for one explicit masil server socket, enriched with Phase 1
+/// SQLite intelligence snapshots (`audit_summary`, `breaker`, `cache_warmth`, collisions).
+pub fn list_agents_for_server(server_name: &str, server_socket: &str) -> Vec<Value> {
+    let mut combined = Vec::new();
+    let Ok(val) = run_self_agent_json(Some(server_socket), &["list".into()]) else {
+        return combined;
+    };
+    let Some(rows) = val.get("agents").and_then(Value::as_array) else {
+        return combined;
+    };
+    // Load Phase 1 read-only intelligence snapshots once per server (zero extra subprocesses).
+    let now = crate::observation::now_ms();
+    let store = crate::managed::Store::open(Path::new(server_socket)).ok();
+    let breakers_map: std::collections::HashMap<String, crate::managed::CircuitBreakerRecord> =
+        store
+            .as_ref()
+            .and_then(|s| s.list_circuit_breakers().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.run_id.clone(), r))
+            .collect();
+    let warmth_map: std::collections::HashMap<String, crate::managed::CacheWarmthRecord> = store
+        .as_ref()
+        .and_then(|s| s.list_cache_warmth().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.run_id.clone(), r))
+        .collect();
+    let collisions: Vec<crate::collision::CollisionPair> = store
+        .as_ref()
+        .and_then(|s| s.list_collision_snapshots(None).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(crate::collision::CollisionPair::from_record)
+        .collect();
+    // Phase 3A: read `@masil-sandbox` pane options in a single batched call per server.
+    let sandbox_map = read_server_sandbox_options(server_socket);
+
+    for row in rows {
+        let mut item = row.clone();
+        if let Some(obj) = item.as_object_mut() {
+            let pane = obj
+                .get("pane_id")
+                .or_else(|| obj.get("pane"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let run_id = obj
+                .get("run")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let agent_name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let id_fallback = obj
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let key_part = if !pane.is_empty() {
+                pane.clone()
+            } else {
+                id_fallback
+            };
+            let bound_sid = obj
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    obj.get("binding")
+                        .and_then(|b| b.get("session_id"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                });
+            obj.insert("pane".into(), Value::String(pane.clone()));
+            obj.insert("pane_id".into(), Value::String(pane.clone()));
+            if let Some(sid) = bound_sid {
+                obj.insert("session_id".into(), Value::String(sid));
+            }
+            obj.insert("server_name".into(), Value::String(server_name.to_owned()));
+            obj.insert(
+                "server_socket".into(),
+                Value::String(server_socket.to_owned()),
+            );
+            obj.insert(
+                "remote_id".into(),
+                Value::String(format!("{server_name}::{key_part}")),
+            );
+
+            // Phase 1A: latest audit summary badge.
+            if let Some(ref s) = store
+                && let Ok(Some(rec)) = s.latest_turn_audit(
+                    (!run_id.is_empty()).then_some(run_id.as_str()),
+                    (!pane.is_empty()).then_some(pane.as_str()),
+                )
+            {
+                let report = crate::audit::AuditReport::from_record(rec);
+                obj.insert("audit_summary".into(), report.to_summary_json());
+            }
+
+            // Phase 1C: circuit breaker status & cache warmth gauge.
+            if let Some(br) = breakers_map.get(&run_id) {
                 obj.insert(
-                    "remote_id".into(),
-                    Value::String(format!("{}::{}", server.name, key_part)),
+                    "breaker".into(),
+                    crate::guard::breaker::record_to_json(br, None, false, None),
                 );
             }
-            combined.push(item);
+            if let Some(cw) = warmth_map.get(&run_id) {
+                let snap = crate::guard::cache_warmth::CacheWarmthSnapshot::from_record(cw, now);
+                obj.insert("cache_warmth".into(), snap.to_json());
+            }
+
+            // Phase 3A/3B: honest OS sandbox badge, DVR turn count, and latest policy audit pill.
+            if let Some(sb_badge) = sandbox_map.get(&pane) {
+                obj.insert("sandbox".into(), Value::String(sb_badge.clone()));
+            }
+            if let Some(ref s) = store
+                && !run_id.is_empty()
+            {
+                if let Ok(cnt) = s.count_dvr_turns(&run_id)
+                    && cnt > 0
+                {
+                    obj.insert("dvr_turn_count".into(), serde_json::json!(cnt));
+                }
+                if let Ok(logs) = s.list_permission_audit_log(Some(&run_id), 1)
+                    && let Some(last) = logs.into_iter().next()
+                {
+                    obj.insert(
+                        "last_policy_audit".into(),
+                        serde_json::to_value(last).unwrap_or(Value::Null),
+                    );
+                }
+            }
+
+            // Phase 1B: highest active collision severity involving this agent.
+            let mut worst = crate::collision::CollisionSeverity::Clean;
+            let mut peers = Vec::new();
+            for pair in &collisions {
+                if pair.severity == crate::collision::CollisionSeverity::Clean {
+                    continue;
+                }
+                let peer = if pair.agent_a == agent_name
+                    || (!pane.is_empty() && pair.pane_a == pane)
+                {
+                    Some(pair.agent_b.clone())
+                } else if pair.agent_b == agent_name || (!pane.is_empty() && pair.pane_b == pane) {
+                    Some(pair.agent_a.clone())
+                } else {
+                    None
+                };
+                if let Some(peer_name) = peer {
+                    worst = worst.max(pair.severity);
+                    if !peers.contains(&peer_name) {
+                        peers.push(peer_name);
+                    }
+                }
+            }
+            if worst != crate::collision::CollisionSeverity::Clean {
+                obj.insert(
+                    "collision_severity".into(),
+                    Value::String(worst.as_str().to_owned()),
+                );
+                obj.insert("collision_peers".into(), serde_json::json!(peers));
+            }
         }
+        combined.push(item);
     }
     combined
 }

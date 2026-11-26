@@ -5,6 +5,15 @@
   "initiator_to_responder_text_wire_b64": "AE7epC0WeP43ILvTFZ8jiNEVQxhQ9YbVKg3Tl98+vHYkzA7V7/VPvhjCCXOGRZG7zqhVnNE0fh/Kc+VbF4CXYK4d3tgEVPbn6Jf4Bn8c8G8=",
   "msg1_b64": "WGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpns1/MXibGOWGbELqQJdkn3mrSw=",
   "msg2_b64": "ZLEBsdC+WocEvQePmJUAH8A+jp+VIvGI3RKNmEbUhGaleAIRMGtgcbesnOF9nA4aM/M=",
+  "phase2_frames": {
+    "asset_chunk_b64": "MAAJiVBORw0KGgo=",
+    "asset_end_b64": "MQAJeyJhZ2VudF9pZCI6IiUxIiwibWltZSI6ImltYWdlL3BuZyIsImZpbGVuYW1lIjoibWFya3VwLnBuZyIsImRlbGl2ZXJ5X21vZGUiOiJxdWV1ZSIsInByb21wdCI6IkZpeCBwYWRkaW5nIiwibWV0YSI6eyJ1cmwiOiJodHRwOi8vbG9jYWxob3N0OjUxNzMvZGFzaGJvYXJkIiwidmlld3BvcnQiOiIzOTB4ODQ0IiwidGhlbWUiOiJkYXJrIiwiY29uc29sZV9lcnJvcnMiOlsiVHlwZUVycm9yOiBib29tIl0sIm5ldHdvcmtfZXJyb3JzIjpbIkdFVCAvYXBpIC0+IDUwMCJdLCJhbm5vdGF0aW9uc19jb3VudCI6Mn19",
+    "tunnel_close_b64": "IwAqeyJyZWFzb24iOiJlb2YifQ==",
+    "tunnel_data_b64": "IgAqR0VUIC8gSFRUUC8xLjENCkhvc3Q6IGxvY2FsaG9zdDo1MTczDQoNCg==",
+    "tunnel_open_ack_b64": "IQAqeyJvayI6dHJ1ZSwiaW5pdGlhbF93aW5kb3ciOjI2MjE0NH0=",
+    "tunnel_open_b64": "IAAqeyJ0YXJnZXRfcG9ydCI6NTE3MywiYWdlbnRfaWQiOiJkZWZhdWx0OjolMSJ9",
+    "tunnel_window_b64": "JAAqAAEAAA=="
+  },
   "prologue": "masil-remote-e2ee/1",
   "protocol_name": "Noise_NK_25519_ChaChaPoly_SHA256",
   "responder_ephemeral_secret_b64": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A=",

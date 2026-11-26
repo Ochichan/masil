@@ -113,7 +113,187 @@ const FEATURES: &[(&str, &str)] = &[
     ("operations_compaction", COMPACTION_SCHEMA),
     ("restore_plans", RESTORE_SCHEMA),
     ("view_preferences", VIEW_PREFERENCES_SCHEMA),
+    ("turn_audits", TURN_AUDITS_SCHEMA),
+    ("collision_snapshots", COLLISION_SNAPSHOTS_SCHEMA),
+    ("circuit_breakers", CIRCUIT_BREAKERS_SCHEMA),
+    ("cache_warmth", CACHE_WARMTH_SCHEMA),
+    ("focus_shield", FOCUS_SHIELD_SCHEMA),
+    ("permission_policies", PERMISSION_POLICIES_SCHEMA),
+    ("permission_audit_log", PERMISSION_AUDIT_LOG_SCHEMA),
+    ("arenas", ARENAS_SCHEMA),
+    ("dvr_turns", DVR_TURNS_SCHEMA),
 ];
+
+/// Phase 1A: deterministic per-turn audit reports & top risk-ranked hunks.
+const TURN_AUDITS_SCHEMA: &str = "
+CREATE TABLE turn_audits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pane_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  checkpoint_id TEXT,
+  prev_checkpoint_id TEXT,
+  verdict TEXT NOT NULL,
+  risk_score INTEGER NOT NULL,
+  claim_verified INTEGER,
+  findings_json TEXT NOT NULL,
+  hunks_json TEXT NOT NULL,
+  created_ms INTEGER NOT NULL
+);
+CREATE INDEX turn_audits_run ON turn_audits(run_id, created_ms DESC);
+";
+
+/// Phase 1B: live cross-worktree collision radar matrix snapshots.
+const COLLISION_SNAPSHOTS_SCHEMA: &str = "
+CREATE TABLE collision_snapshots (
+  repo_key TEXT NOT NULL,
+  agent_a TEXT NOT NULL,
+  agent_b TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  files_json TEXT NOT NULL,
+  details_json TEXT NOT NULL,
+  last_warned_ms INTEGER,
+  computed_ms INTEGER NOT NULL,
+  PRIMARY KEY (repo_key, agent_a, agent_b)
+);
+";
+
+/// Phase 1C: per-run oscillation and same-error circuit breaker state.
+const CIRCUIT_BREAKERS_SCHEMA: &str = "
+CREATE TABLE circuit_breakers (
+  run_id TEXT PRIMARY KEY,
+  pane_id TEXT NOT NULL,
+  recent_trees_json TEXT NOT NULL,
+  last_error_hash TEXT,
+  same_error_streak INTEGER NOT NULL DEFAULT 0,
+  no_progress_streak INTEGER NOT NULL DEFAULT 0,
+  tripped_reason TEXT,
+  tripped_at_ms INTEGER,
+  bypass_until_turn INTEGER NOT NULL DEFAULT 0,
+  updated_ms INTEGER NOT NULL
+);
+";
+
+/// Phase 1C: estimated prompt cache TTL tracking per run.
+const CACHE_WARMTH_SCHEMA: &str = "
+CREATE TABLE cache_warmth (
+  run_id TEXT PRIMARY KEY,
+  pane_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  ttl_secs INTEGER NOT NULL,
+  last_turn_at_ms INTEGER NOT NULL,
+  est_context_tokens INTEGER NOT NULL DEFAULT 0,
+  updated_ms INTEGER NOT NULL
+);
+";
+
+/// Phase 2B: deep-work Attention Shield state & held notification queue.
+const FOCUS_SHIELD_SCHEMA: &str = "
+CREATE TABLE focus_shield (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  active INTEGER NOT NULL DEFAULT 0,
+  started_ms INTEGER,
+  until_ms INTEGER,
+  reason TEXT,
+  updated_ms INTEGER NOT NULL
+);
+CREATE TABLE focus_held_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pane_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  summary_json TEXT,
+  created_ms INTEGER NOT NULL
+);
+CREATE INDEX focus_held_created ON focus_held_events(created_ms DESC);
+";
+
+/// Phase 3A: user-authored zero-trust permission firewall rules.
+const PERMISSION_POLICIES_SCHEMA: &str = "
+CREATE TABLE permission_policies (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  match_json TEXT NOT NULL,
+  max_risk TEXT NOT NULL,
+  action TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  source TEXT NOT NULL DEFAULT 'user',
+  created_ms INTEGER NOT NULL,
+  updated_ms INTEGER NOT NULL
+);
+";
+
+/// Phase 3A: durable audit trail for every automated or manual firewall decision.
+const PERMISSION_AUDIT_LOG_SCHEMA: &str = "
+CREATE TABLE permission_audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  pane_id TEXT NOT NULL,
+  rule_id TEXT,
+  provider TEXT NOT NULL,
+  command TEXT NOT NULL,
+  risk_tier TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  prompt_digest TEXT NOT NULL,
+  screen_excerpt TEXT,
+  revoked_ms INTEGER,
+  created_ms INTEGER NOT NULL
+);
+CREATE INDEX permission_audit_run ON permission_audit_log(run_id, created_ms DESC);
+";
+
+/// Phase 3B: multi-provider Best-of-N Agent Arena runs and racers.
+const ARENAS_SCHEMA: &str = "
+CREATE TABLE arenas (
+  id TEXT PRIMARY KEY,
+  repo_key TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  base_tree_oid TEXT,
+  prompt TEXT NOT NULL,
+  verify_cmd TEXT,
+  status TEXT NOT NULL,
+  winner_racer TEXT,
+  created_ms INTEGER NOT NULL,
+  updated_ms INTEGER NOT NULL
+);
+CREATE TABLE arena_racers (
+  arena_id TEXT NOT NULL REFERENCES arenas(id) ON DELETE CASCADE,
+  racer_name TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT,
+  worktree_id TEXT NOT NULL,
+  pane_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  elapsed_ms INTEGER,
+  verify_exit_code INTEGER,
+  audit_verdict TEXT,
+  files_changed INTEGER,
+  insertions INTEGER,
+  deletions INTEGER,
+  PRIMARY KEY (arena_id, racer_name)
+);
+";
+
+/// Phase 3B: cross-provider Time-Travel DVR turn index with pin protection.
+const DVR_TURNS_SCHEMA: &str = "
+CREATE TABLE dvr_turns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  pane_id TEXT NOT NULL,
+  turn_seq INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  prompt_preview TEXT,
+  checkpoint_id TEXT NOT NULL,
+  tree_oid TEXT NOT NULL,
+  audit_verdict TEXT,
+  files_changed INTEGER NOT NULL,
+  terminal_excerpt TEXT,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  pin_note TEXT,
+  created_ms INTEGER NOT NULL,
+  UNIQUE(run_id, turn_seq)
+);
+";
 
 const PROMPT_CORE_LEDGER_FEATURE: &[(&str, &str)] =
     &[("prompt_core_ledger", PROMPT_CORE_LEDGER_SCHEMA)];
@@ -197,7 +377,7 @@ const RESTORE_KEEP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// (`pending`, `started`, `ready`, `readiness_unconfirmed`,
 /// `resume_mismatch`, `exited`, `failed_not_started`, `unknown`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct RestoreTarget {
+pub(crate) struct RestoreTarget {
     pub index: usize,
     pub stage: String,
     pub boot: Option<String>,
@@ -479,7 +659,7 @@ const INBOX_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const INBOX_SUMMARY_BYTES: usize = 2048;
 
 /// One attention event as a producer reports it.
-pub(super) struct InboxEvent<'a> {
+pub(crate) struct InboxEvent<'a> {
     pub source: &'a str,
     pub source_ref: &'a str,
     pub provider: &'a str,
@@ -493,7 +673,7 @@ pub(super) struct InboxEvent<'a> {
 }
 
 #[derive(Debug)]
-pub(super) struct Store {
+pub(crate) struct Store {
     conn: Connection,
     path: PathBuf,
 }
@@ -503,7 +683,7 @@ const QUEUE_COLUMNS: &str = "id, run, pane, provider, position, body, attachment
 
 /// One queued prompt (docs/prompt-queue.md).
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct QueueItem {
+pub(crate) struct QueueItem {
     pub id: i64,
     pub run: String,
     pub pane: String,
@@ -522,7 +702,7 @@ pub(super) struct QueueItem {
 }
 
 /// A change of a staged queued prompt.
-pub(super) enum QueueChange {
+pub(crate) enum QueueChange {
     Body(String),
     Attachments(Value),
     /// 1-based place among the run's items.
@@ -601,7 +781,7 @@ impl QueueItem {
     }
 }
 
-pub(super) struct NewOperation<'a> {
+pub(crate) struct NewOperation<'a> {
     pub namespace: &'a str,
     pub action: &'a str,
     pub id: &'a str,
@@ -614,7 +794,7 @@ pub(super) struct NewOperation<'a> {
 }
 
 /// The queue row a prompt admission marks (`admit_with`).
-pub(super) struct QueuedPrompt<'a> {
+pub(crate) struct QueuedPrompt<'a> {
     pub item: i64,
     pub revision: i64,
     pub run: &'a str,
@@ -622,14 +802,14 @@ pub(super) struct QueuedPrompt<'a> {
 
 /// Permission to attempt the effect once, identified by `ticket`.
 #[derive(Clone, Debug)]
-pub(super) struct Ticket {
+pub(crate) struct Ticket {
     pub op: i64,
     pub key: String,
     pub ticket: String,
 }
 
 #[derive(Debug)]
-pub(super) enum Admission {
+pub(crate) enum Admission {
     Dispatch(Ticket),
     /// The key already has a result. Report it; never repeat the effect.
     Recorded(Record),
@@ -638,7 +818,7 @@ pub(super) enum Admission {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct Record {
+pub(crate) struct Record {
     #[serde(skip)]
     pub op: i64,
     pub operation_key: String,
@@ -708,7 +888,7 @@ fn prompt_persists_slot(state: &str) -> bool {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct ReceiptRow {
+pub(crate) struct ReceiptRow {
     pub ordinal: u32,
     pub stage: String,
     pub source: String,
@@ -1168,7 +1348,7 @@ impl Store {
         Self::open_path(path)
     }
 
-    fn open_path(path: &Path) -> Result<Self, String> {
+    pub(crate) fn open_path(path: &Path) -> Result<Self, String> {
         match fs::symlink_metadata(path) {
             Ok(metadata) => super::store::validate_private_metadata(&metadata, "operation store")?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3216,6 +3396,38 @@ impl Store {
         tx.commit().map_err(sql)
     }
 
+    /// Idempotently registers a coordinator feature (e.g. `auto_turn_checkpoint`,
+    /// `audit`, `collision`, `guard`). Returns true if the feature was newly added.
+    pub fn enable_coordinator_feature(&mut self, name: &str, now: u64) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let changed = tx
+            .execute(
+                "INSERT OR IGNORE INTO coordinator_features (name, enabled_ms) VALUES (?1, ?2)",
+                params![name, now as i64],
+            )
+            .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(changed > 0)
+    }
+
+    /// Removes a coordinator feature registration. Returns true if it was present.
+    pub fn disable_coordinator_feature(&mut self, name: &str) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        Self::check_reader_in(&tx)?;
+        let changed = tx
+            .execute("DELETE FROM coordinator_features WHERE name = ?1", [name])
+            .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(changed > 0)
+    }
+
     // Notifications.
 
     fn notify_enabled_in(conn: &Connection) -> Result<bool, String> {
@@ -4946,6 +5158,1255 @@ impl Store {
             "instance": self.instance()?,
         }))
     }
+
+    // ── Phase 1A: turn_audits CRUD ───────────────────────────────────────────
+
+    pub fn record_turn_audit(&mut self, record: &TurnAuditRecord) -> Result<i64, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let claim_val: Option<i64> = record.claim_verified.map(i64::from);
+        tx.execute(
+            "INSERT INTO turn_audits
+             (pane_id, run_id, checkpoint_id, prev_checkpoint_id, verdict, risk_score,
+              claim_verified, findings_json, hunks_json, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.pane_id,
+                record.run_id,
+                record.checkpoint_id,
+                record.prev_checkpoint_id,
+                record.verdict,
+                record.risk_score,
+                claim_val,
+                record.findings_json,
+                record.hunks_json,
+                record.created_ms as i64,
+            ],
+        )
+        .map_err(sql)?;
+        let id = tx.last_insert_rowid();
+        // Keep bounded history (newest 500 audits per server store).
+        tx.execute(
+            "DELETE FROM turn_audits WHERE id NOT IN (
+                 SELECT id FROM turn_audits ORDER BY id DESC LIMIT 500
+             )",
+            [],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(id)
+    }
+
+    pub fn turn_audit_by_id(&self, id: i64) -> Result<Option<TurnAuditRecord>, String> {
+        self.conn
+            .query_row(
+                "SELECT id, pane_id, run_id, checkpoint_id, prev_checkpoint_id, verdict,
+                        risk_score, claim_verified, findings_json, hunks_json, created_ms
+                 FROM turn_audits WHERE id = ?1",
+                params![id],
+                row_to_turn_audit,
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    pub fn latest_turn_audit(
+        &self,
+        run_id: Option<&str>,
+        pane_id: Option<&str>,
+    ) -> Result<Option<TurnAuditRecord>, String> {
+        if let Some(run) = run_id.filter(|s| !s.is_empty())
+            && let Some(found) = self
+                .conn
+                .query_row(
+                    "SELECT id, pane_id, run_id, checkpoint_id, prev_checkpoint_id, verdict,
+                            risk_score, claim_verified, findings_json, hunks_json, created_ms
+                     FROM turn_audits WHERE run_id = ?1
+                     ORDER BY created_ms DESC, id DESC LIMIT 1",
+                    params![run],
+                    row_to_turn_audit,
+                )
+                .optional()
+                .map_err(sql)?
+        {
+            return Ok(Some(found));
+        }
+        if let Some(pane) = pane_id.filter(|s| !s.is_empty()) {
+            return self
+                .conn
+                .query_row(
+                    "SELECT id, pane_id, run_id, checkpoint_id, prev_checkpoint_id, verdict,
+                            risk_score, claim_verified, findings_json, hunks_json, created_ms
+                     FROM turn_audits WHERE pane_id = ?1
+                     ORDER BY created_ms DESC, id DESC LIMIT 1",
+                    params![pane],
+                    row_to_turn_audit,
+                )
+                .optional()
+                .map_err(sql);
+        }
+        Ok(None)
+    }
+
+    pub fn list_turn_audits(
+        &self,
+        run_id: Option<&str>,
+        pane_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TurnAuditRecord>, String> {
+        let cap = limit.clamp(1, 200) as i64;
+        if let Some(run) = run_id.filter(|s| !s.is_empty()) {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, pane_id, run_id, checkpoint_id, prev_checkpoint_id, verdict,
+                            risk_score, claim_verified, findings_json, hunks_json, created_ms
+                     FROM turn_audits WHERE run_id = ?1
+                     ORDER BY created_ms DESC, id DESC LIMIT ?2",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params![run, cap], row_to_turn_audit)
+                .map_err(sql)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql)?;
+            return Ok(rows);
+        }
+        if let Some(pane) = pane_id.filter(|s| !s.is_empty()) {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, pane_id, run_id, checkpoint_id, prev_checkpoint_id, verdict,
+                            risk_score, claim_verified, findings_json, hunks_json, created_ms
+                     FROM turn_audits WHERE pane_id = ?1
+                     ORDER BY created_ms DESC, id DESC LIMIT ?2",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params![pane, cap], row_to_turn_audit)
+                .map_err(sql)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql)?;
+            return Ok(rows);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, pane_id, run_id, checkpoint_id, prev_checkpoint_id, verdict,
+                        risk_score, claim_verified, findings_json, hunks_json, created_ms
+                 FROM turn_audits
+                 ORDER BY created_ms DESC, id DESC LIMIT ?1",
+            )
+            .map_err(sql)?;
+        stmt.query_map(params![cap], row_to_turn_audit)
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)
+    }
+
+    // ── Phase 1B: collision_snapshots CRUD ───────────────────────────────────
+
+    pub fn upsert_collision_snapshot(
+        &mut self,
+        record: &CollisionSnapshotRecord,
+    ) -> Result<(), String> {
+        let (a, b) = canonical_pair(&record.agent_a, &record.agent_b);
+        self.conn
+            .execute(
+                "INSERT INTO collision_snapshots
+                 (repo_key, agent_a, agent_b, severity, files_json, details_json, last_warned_ms, computed_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(repo_key, agent_a, agent_b) DO UPDATE SET
+                   severity = excluded.severity,
+                   files_json = excluded.files_json,
+                   details_json = excluded.details_json,
+                   last_warned_ms = COALESCE(excluded.last_warned_ms, collision_snapshots.last_warned_ms),
+                   computed_ms = excluded.computed_ms",
+                params![
+                    record.repo_key,
+                    a,
+                    b,
+                    record.severity,
+                    record.files_json,
+                    record.details_json,
+                    record.last_warned_ms.map(|v| v as i64),
+                    record.computed_ms as i64,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn list_collision_snapshots(
+        &self,
+        repo_key: Option<&str>,
+    ) -> Result<Vec<CollisionSnapshotRecord>, String> {
+        if let Some(repo) = repo_key.filter(|s| !s.is_empty()) {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT repo_key, agent_a, agent_b, severity, files_json, details_json,
+                            last_warned_ms, computed_ms
+                     FROM collision_snapshots WHERE repo_key = ?1
+                     ORDER BY computed_ms DESC, agent_a ASC, agent_b ASC",
+                )
+                .map_err(sql)?;
+            return stmt
+                .query_map(params![repo], row_to_collision)
+                .map_err(sql)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT repo_key, agent_a, agent_b, severity, files_json, details_json,
+                        last_warned_ms, computed_ms
+                 FROM collision_snapshots
+                 ORDER BY computed_ms DESC, repo_key ASC, agent_a ASC, agent_b ASC",
+            )
+            .map_err(sql)?;
+        stmt.query_map([], row_to_collision)
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)
+    }
+
+    pub fn mark_collision_warned(
+        &mut self,
+        repo_key: &str,
+        agent_a: &str,
+        agent_b: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let (a, b) = canonical_pair(agent_a, agent_b);
+        self.conn
+            .execute(
+                "UPDATE collision_snapshots SET last_warned_ms = ?1
+                 WHERE repo_key = ?2 AND agent_a = ?3 AND agent_b = ?4",
+                params![now_ms as i64, repo_key, a, b],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn prune_collisions_for_repo(
+        &mut self,
+        repo_key: &str,
+        keep_pairs: &[(String, String)],
+    ) -> Result<(), String> {
+        let existing = self.list_collision_snapshots(Some(repo_key))?;
+        let keep: HashSet<(String, String)> = keep_pairs
+            .iter()
+            .map(|(a, b)| {
+                let (ca, cb) = canonical_pair(a, b);
+                (ca.to_owned(), cb.to_owned())
+            })
+            .collect();
+        for row in existing {
+            if !keep.contains(&(row.agent_a.clone(), row.agent_b.clone())) {
+                self.conn
+                    .execute(
+                        "DELETE FROM collision_snapshots
+                         WHERE repo_key = ?1 AND agent_a = ?2 AND agent_b = ?3",
+                        params![repo_key, row.agent_a, row.agent_b],
+                    )
+                    .map_err(sql)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ── Phase 1C: circuit_breakers & cache_warmth CRUD ───────────────────────
+
+    pub fn get_circuit_breaker(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<CircuitBreakerRecord>, String> {
+        self.conn
+            .query_row(
+                "SELECT run_id, pane_id, recent_trees_json, last_error_hash, same_error_streak,
+                        no_progress_streak, tripped_reason, tripped_at_ms, bypass_until_turn, updated_ms
+                 FROM circuit_breakers WHERE run_id = ?1",
+                params![run_id],
+                row_to_circuit_breaker,
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    pub fn upsert_circuit_breaker(&mut self, record: &CircuitBreakerRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO circuit_breakers
+                 (run_id, pane_id, recent_trees_json, last_error_hash, same_error_streak,
+                  no_progress_streak, tripped_reason, tripped_at_ms, bypass_until_turn, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                   pane_id = excluded.pane_id,
+                   recent_trees_json = excluded.recent_trees_json,
+                   last_error_hash = excluded.last_error_hash,
+                   same_error_streak = excluded.same_error_streak,
+                   no_progress_streak = excluded.no_progress_streak,
+                   tripped_reason = excluded.tripped_reason,
+                   tripped_at_ms = excluded.tripped_at_ms,
+                   bypass_until_turn = excluded.bypass_until_turn,
+                   updated_ms = excluded.updated_ms",
+                params![
+                    record.run_id,
+                    record.pane_id,
+                    record.recent_trees_json,
+                    record.last_error_hash,
+                    record.same_error_streak as i64,
+                    record.no_progress_streak as i64,
+                    record.tripped_reason,
+                    record.tripped_at_ms.map(|v| v as i64),
+                    record.bypass_until_turn as i64,
+                    record.updated_ms as i64,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn list_circuit_breakers(&self) -> Result<Vec<CircuitBreakerRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT run_id, pane_id, recent_trees_json, last_error_hash, same_error_streak,
+                        no_progress_streak, tripped_reason, tripped_at_ms, bypass_until_turn, updated_ms
+                 FROM circuit_breakers ORDER BY updated_ms DESC LIMIT 200",
+            )
+            .map_err(sql)?;
+        stmt.query_map([], row_to_circuit_breaker)
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)
+    }
+
+    pub fn get_cache_warmth(&self, run_id: &str) -> Result<Option<CacheWarmthRecord>, String> {
+        self.conn
+            .query_row(
+                "SELECT run_id, pane_id, provider, ttl_secs, last_turn_at_ms, est_context_tokens, updated_ms
+                 FROM cache_warmth WHERE run_id = ?1",
+                params![run_id],
+                row_to_cache_warmth,
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    pub fn upsert_cache_warmth(&mut self, record: &CacheWarmthRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO cache_warmth
+                 (run_id, pane_id, provider, ttl_secs, last_turn_at_ms, est_context_tokens, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                   pane_id = excluded.pane_id,
+                   provider = excluded.provider,
+                   ttl_secs = excluded.ttl_secs,
+                   last_turn_at_ms = excluded.last_turn_at_ms,
+                   est_context_tokens = excluded.est_context_tokens,
+                   updated_ms = excluded.updated_ms",
+                params![
+                    record.run_id,
+                    record.pane_id,
+                    record.provider,
+                    record.ttl_secs as i64,
+                    record.last_turn_at_ms as i64,
+                    record.est_context_tokens as i64,
+                    record.updated_ms as i64,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn list_cache_warmth(&self) -> Result<Vec<CacheWarmthRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT run_id, pane_id, provider, ttl_secs, last_turn_at_ms, est_context_tokens, updated_ms
+                 FROM cache_warmth ORDER BY updated_ms DESC LIMIT 200",
+            )
+            .map_err(sql)?;
+        stmt.query_map([], row_to_cache_warmth)
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2B: Attention Shield (`focus_shield` & `focus_held_events`)
+    // -------------------------------------------------------------------------
+
+    pub fn get_focus_shield(&self) -> Result<FocusShieldRecord, String> {
+        self.conn
+            .query_row(
+                "SELECT active, started_ms, until_ms, reason, updated_ms
+                 FROM focus_shield WHERE id = 1",
+                [],
+                row_to_focus_shield,
+            )
+            .optional()
+            .map_err(sql)
+            .map(|opt| opt.unwrap_or_default())
+    }
+
+    pub fn set_focus_shield(&mut self, record: &FocusShieldRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO focus_shield (id, active, started_ms, until_ms, reason, updated_ms)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                   active = excluded.active,
+                   started_ms = excluded.started_ms,
+                   until_ms = excluded.until_ms,
+                   reason = excluded.reason,
+                   updated_ms = excluded.updated_ms",
+                params![
+                    i64::from(record.active),
+                    record.started_ms.map(|v| v as i64),
+                    record.until_ms.map(|v| v as i64),
+                    record.reason,
+                    record.updated_ms as i64,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn record_focus_held_event(
+        &mut self,
+        pane_id: &str,
+        run_id: &str,
+        kind: &str,
+        summary_json: Option<&str>,
+        created_ms: u64,
+    ) -> Result<i64, String> {
+        self.conn
+            .execute(
+                "INSERT INTO focus_held_events (pane_id, run_id, kind, summary_json, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![pane_id, run_id, kind, summary_json, created_ms as i64],
+            )
+            .map_err(sql)?;
+        let id = self.conn.last_insert_rowid();
+        let _ = self.conn.execute(
+            "DELETE FROM focus_held_events WHERE id NOT IN (
+               SELECT id FROM focus_held_events ORDER BY id DESC LIMIT 500
+             )",
+            [],
+        );
+        Ok(id)
+    }
+
+    pub fn list_focus_held_events(
+        &self,
+        since_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<FocusHeldEventRecord>, String> {
+        let cap = limit.clamp(1, 500) as i64;
+        if let Some(since) = since_ms {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, pane_id, run_id, kind, summary_json, created_ms
+                     FROM focus_held_events WHERE created_ms >= ?1
+                     ORDER BY created_ms DESC, id DESC LIMIT ?2",
+                )
+                .map_err(sql)?;
+            stmt.query_map(params![since as i64, cap], row_to_focus_held_event)
+                .map_err(sql)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql)
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, pane_id, run_id, kind, summary_json, created_ms
+                     FROM focus_held_events
+                     ORDER BY created_ms DESC, id DESC LIMIT ?1",
+                )
+                .map_err(sql)?;
+            stmt.query_map(params![cap], row_to_focus_held_event)
+                .map_err(sql)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql)
+        }
+    }
+
+    pub fn count_focus_held_events(&self, since_ms: Option<u64>) -> Result<u64, String> {
+        let count: i64 = if let Some(since) = since_ms {
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM focus_held_events WHERE created_ms >= ?1",
+                    params![since as i64],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?
+        } else {
+            self.conn
+                .query_row("SELECT COUNT(*) FROM focus_held_events", [], |row| {
+                    row.get(0)
+                })
+                .map_err(sql)?
+        };
+        Ok(count.max(0) as u64)
+    }
+
+    #[cfg(test)]
+    pub fn clear_focus_held_events(&mut self) -> Result<usize, String> {
+        self.conn
+            .execute("DELETE FROM focus_held_events", [])
+            .map_err(sql)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3A: permission_policies & permission_audit_log
+    // ------------------------------------------------------------------
+
+    pub fn upsert_permission_policy(&mut self, rec: &PermissionPolicyRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO permission_policies
+                 (id, scope, match_json, max_risk, action, enabled, source, created_ms, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                   scope = excluded.scope,
+                   match_json = excluded.match_json,
+                   max_risk = excluded.max_risk,
+                   action = excluded.action,
+                   enabled = excluded.enabled,
+                   source = excluded.source,
+                   updated_ms = excluded.updated_ms",
+                params![
+                    rec.id,
+                    rec.scope,
+                    rec.match_json,
+                    rec.max_risk,
+                    rec.action,
+                    i64::from(rec.enabled),
+                    rec.source,
+                    rec.created_ms as i64,
+                    rec.updated_ms as i64,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn list_permission_policies(&self) -> Result<Vec<PermissionPolicyRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, scope, match_json, max_risk, action, enabled, source, created_ms, updated_ms
+                 FROM permission_policies ORDER BY created_ms ASC, id ASC",
+            )
+            .map_err(sql)?;
+        let rows = stmt.query_map([], row_to_permission_policy).map_err(sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(sql)?);
+        }
+        Ok(out)
+    }
+
+    pub fn remove_permission_policy(&mut self, id: &str) -> Result<bool, String> {
+        let n = self
+            .conn
+            .execute("DELETE FROM permission_policies WHERE id = ?1", params![id])
+            .map_err(sql)?;
+        Ok(n > 0)
+    }
+
+    pub fn set_permission_policy_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE permission_policies SET enabled = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![id, i64::from(enabled), now_ms as i64],
+            )
+            .map_err(sql)?;
+        Ok(n > 0)
+    }
+
+    pub fn record_permission_audit(&mut self, rec: &PermissionAuditRecord) -> Result<i64, String> {
+        self.conn
+            .execute(
+                "INSERT INTO permission_audit_log
+                 (run_id, pane_id, rule_id, provider, command, risk_tier, decision,
+                  prompt_digest, screen_excerpt, revoked_ms, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    rec.run_id,
+                    rec.pane_id,
+                    rec.rule_id,
+                    rec.provider,
+                    rec.command,
+                    rec.risk_tier,
+                    rec.decision,
+                    rec.prompt_digest,
+                    rec.screen_excerpt,
+                    rec.revoked_ms.map(|v| v as i64),
+                    rec.created_ms as i64,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_permission_audit_log(
+        &self,
+        run_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PermissionAuditRecord>, String> {
+        let cap = limit.clamp(1, 200) as i64;
+        let mut out = Vec::new();
+        if let Some(run) = run_id {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, run_id, pane_id, rule_id, provider, command, risk_tier, decision,
+                            prompt_digest, screen_excerpt, revoked_ms, created_ms
+                     FROM permission_audit_log
+                     WHERE run_id = ?1
+                     ORDER BY created_ms DESC, id DESC LIMIT ?2",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params![run, cap], row_to_permission_audit)
+                .map_err(sql)?;
+            for row in rows {
+                out.push(row.map_err(sql)?);
+            }
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, run_id, pane_id, rule_id, provider, command, risk_tier, decision,
+                            prompt_digest, screen_excerpt, revoked_ms, created_ms
+                     FROM permission_audit_log
+                     ORDER BY created_ms DESC, id DESC LIMIT ?1",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params![cap], row_to_permission_audit)
+                .map_err(sql)?;
+            for row in rows {
+                out.push(row.map_err(sql)?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn revoke_permission_rule_audit(
+        &mut self,
+        rule_id: &str,
+        now_ms: u64,
+    ) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "UPDATE permission_audit_log SET revoked_ms = ?2
+                 WHERE rule_id = ?1 AND revoked_ms IS NULL",
+                params![rule_id, now_ms as i64],
+            )
+            .map_err(sql)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3B: arenas & arena_racers
+    // ------------------------------------------------------------------
+
+    pub fn upsert_arena(&mut self, rec: &ArenaRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO arenas
+                 (id, repo_key, base_commit, base_tree_oid, prompt, verify_cmd, status,
+                  winner_racer, created_ms, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                   base_tree_oid = excluded.base_tree_oid,
+                   verify_cmd = excluded.verify_cmd,
+                   status = excluded.status,
+                   winner_racer = excluded.winner_racer,
+                   updated_ms = excluded.updated_ms",
+                params![
+                    rec.id,
+                    rec.repo_key,
+                    rec.base_commit,
+                    rec.base_tree_oid,
+                    rec.prompt,
+                    rec.verify_cmd,
+                    rec.status,
+                    rec.winner_racer,
+                    rec.created_ms as i64,
+                    rec.updated_ms as i64,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn get_arena(&self, id: &str) -> Result<Option<ArenaRecord>, String> {
+        self.conn
+            .query_row(
+                "SELECT id, repo_key, base_commit, base_tree_oid, prompt, verify_cmd, status,
+                        winner_racer, created_ms, updated_ms
+                 FROM arenas WHERE id = ?1",
+                params![id],
+                row_to_arena,
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    pub fn list_arenas(&self, limit: usize) -> Result<Vec<ArenaRecord>, String> {
+        let cap = limit.clamp(1, 100) as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, repo_key, base_commit, base_tree_oid, prompt, verify_cmd, status,
+                        winner_racer, created_ms, updated_ms
+                 FROM arenas ORDER BY created_ms DESC LIMIT ?1",
+            )
+            .map_err(sql)?;
+        let rows = stmt.query_map(params![cap], row_to_arena).map_err(sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(sql)?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_arena_racer(&mut self, rec: &ArenaRacerRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO arena_racers
+                 (arena_id, racer_name, provider, model, worktree_id, pane_id, run_id, status,
+                  elapsed_ms, verify_exit_code, audit_verdict, files_changed, insertions, deletions)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(arena_id, racer_name) DO UPDATE SET
+                   model = excluded.model,
+                   worktree_id = excluded.worktree_id,
+                   pane_id = excluded.pane_id,
+                   run_id = excluded.run_id,
+                   status = excluded.status,
+                   elapsed_ms = excluded.elapsed_ms,
+                   verify_exit_code = excluded.verify_exit_code,
+                   audit_verdict = excluded.audit_verdict,
+                   files_changed = excluded.files_changed,
+                   insertions = excluded.insertions,
+                   deletions = excluded.deletions",
+                params![
+                    rec.arena_id,
+                    rec.racer_name,
+                    rec.provider,
+                    rec.model,
+                    rec.worktree_id,
+                    rec.pane_id,
+                    rec.run_id,
+                    rec.status,
+                    rec.elapsed_ms.map(|v| v as i64),
+                    rec.verify_exit_code,
+                    rec.audit_verdict,
+                    rec.files_changed,
+                    rec.insertions,
+                    rec.deletions,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub fn list_arena_racers(&self, arena_id: &str) -> Result<Vec<ArenaRacerRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT arena_id, racer_name, provider, model, worktree_id, pane_id, run_id,
+                        status, elapsed_ms, verify_exit_code, audit_verdict,
+                        files_changed, insertions, deletions
+                 FROM arena_racers WHERE arena_id = ?1 ORDER BY racer_name ASC",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![arena_id], row_to_arena_racer)
+            .map_err(sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(sql)?);
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3B: dvr_turns (Time-Travel DVR with pin protection)
+    // ------------------------------------------------------------------
+
+    pub fn upsert_dvr_turn(&mut self, rec: &DvrTurnRecord) -> Result<i64, String> {
+        self.conn
+            .execute(
+                "INSERT INTO dvr_turns
+                 (run_id, pane_id, turn_seq, provider, prompt_preview, checkpoint_id, tree_oid,
+                  audit_verdict, files_changed, terminal_excerpt, pinned, pin_note, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(run_id, turn_seq) DO UPDATE SET
+                   pane_id = excluded.pane_id,
+                   prompt_preview = COALESCE(excluded.prompt_preview, dvr_turns.prompt_preview),
+                   checkpoint_id = excluded.checkpoint_id,
+                   tree_oid = excluded.tree_oid,
+                   audit_verdict = COALESCE(excluded.audit_verdict, dvr_turns.audit_verdict),
+                   files_changed = excluded.files_changed,
+                   terminal_excerpt = COALESCE(excluded.terminal_excerpt, dvr_turns.terminal_excerpt)",
+                params![
+                    rec.run_id,
+                    rec.pane_id,
+                    rec.turn_seq as i64,
+                    rec.provider,
+                    rec.prompt_preview,
+                    rec.checkpoint_id,
+                    rec.tree_oid,
+                    rec.audit_verdict,
+                    rec.files_changed as i64,
+                    rec.terminal_excerpt,
+                    i64::from(rec.pinned),
+                    rec.pin_note,
+                    rec.created_ms as i64,
+                ],
+            )
+            .map_err(sql)?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_dvr_turns(&self, run_id: &str, limit: usize) -> Result<Vec<DvrTurnRecord>, String> {
+        let cap = limit.clamp(1, 500) as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, run_id, pane_id, turn_seq, provider, prompt_preview, checkpoint_id,
+                        tree_oid, audit_verdict, files_changed, terminal_excerpt, pinned,
+                        pin_note, created_ms
+                 FROM dvr_turns
+                 WHERE run_id = ?1
+                 ORDER BY turn_seq ASC LIMIT ?2",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![run_id, cap], row_to_dvr_turn)
+            .map_err(sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(sql)?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_dvr_turn(
+        &self,
+        run_id: &str,
+        turn_seq: u64,
+    ) -> Result<Option<DvrTurnRecord>, String> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, pane_id, turn_seq, provider, prompt_preview, checkpoint_id,
+                        tree_oid, audit_verdict, files_changed, terminal_excerpt, pinned,
+                        pin_note, created_ms
+                 FROM dvr_turns
+                 WHERE run_id = ?1 AND turn_seq = ?2",
+                params![run_id, turn_seq as i64],
+                row_to_dvr_turn,
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    pub fn set_dvr_turn_pin(
+        &mut self,
+        run_id: &str,
+        turn_seq: u64,
+        pinned: bool,
+        pin_note: Option<&str>,
+    ) -> Result<bool, String> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE dvr_turns SET pinned = ?3, pin_note = ?4
+                 WHERE run_id = ?1 AND turn_seq = ?2",
+                params![run_id, turn_seq as i64, i64::from(pinned), pin_note],
+            )
+            .map_err(sql)?;
+        Ok(n > 0)
+    }
+
+    /// D-12: Prunes oldest unpinned DVR turns past `keep_unpinned` (default 100)
+    /// while permanently preserving every `pinned = 1` turn.
+    pub fn prune_unpinned_dvr_turns(
+        &mut self,
+        run_id: &str,
+        keep_unpinned: usize,
+    ) -> Result<usize, String> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM dvr_turns
+                 WHERE run_id = ?1
+                   AND pinned = 0
+                   AND id NOT IN (
+                     SELECT id FROM dvr_turns
+                     WHERE run_id = ?1 AND pinned = 0
+                     ORDER BY turn_seq DESC
+                     LIMIT ?2
+                   )",
+                params![run_id, keep_unpinned as i64],
+            )
+            .map_err(sql)?;
+        Ok(n)
+    }
+
+    pub fn count_dvr_turns(&self, run_id: &str) -> Result<u64, String> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dvr_turns WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        Ok(count.max(0) as u64)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct PermissionPolicyRecord {
+    pub(crate) id: String,
+    pub(crate) scope: String,
+    pub(crate) match_json: String,
+    pub(crate) max_risk: String,
+    pub(crate) action: String,
+    pub(crate) enabled: bool,
+    pub(crate) source: String,
+    pub(crate) created_ms: u64,
+    pub(crate) updated_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct PermissionAuditRecord {
+    pub(crate) id: i64,
+    pub(crate) run_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) rule_id: Option<String>,
+    pub(crate) provider: String,
+    pub(crate) command: String,
+    pub(crate) risk_tier: String,
+    pub(crate) decision: String,
+    pub(crate) prompt_digest: String,
+    pub(crate) screen_excerpt: Option<String>,
+    pub(crate) revoked_ms: Option<u64>,
+    pub(crate) created_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct ArenaRecord {
+    pub(crate) id: String,
+    pub(crate) repo_key: String,
+    pub(crate) base_commit: String,
+    pub(crate) base_tree_oid: Option<String>,
+    pub(crate) prompt: String,
+    pub(crate) verify_cmd: Option<String>,
+    pub(crate) status: String,
+    pub(crate) winner_racer: Option<String>,
+    pub(crate) created_ms: u64,
+    pub(crate) updated_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct ArenaRacerRecord {
+    pub(crate) arena_id: String,
+    pub(crate) racer_name: String,
+    pub(crate) provider: String,
+    pub(crate) model: Option<String>,
+    pub(crate) worktree_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) run_id: String,
+    pub(crate) status: String,
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) verify_exit_code: Option<i64>,
+    pub(crate) audit_verdict: Option<String>,
+    pub(crate) files_changed: Option<i64>,
+    pub(crate) insertions: Option<i64>,
+    pub(crate) deletions: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct DvrTurnRecord {
+    pub(crate) id: i64,
+    pub(crate) run_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) turn_seq: u64,
+    pub(crate) provider: String,
+    pub(crate) prompt_preview: Option<String>,
+    pub(crate) checkpoint_id: String,
+    pub(crate) tree_oid: String,
+    pub(crate) audit_verdict: Option<String>,
+    pub(crate) files_changed: u64,
+    pub(crate) terminal_excerpt: Option<String>,
+    pub(crate) pinned: bool,
+    pub(crate) pin_note: Option<String>,
+    pub(crate) created_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct TurnAuditRecord {
+    pub(crate) id: i64,
+    pub(crate) pane_id: String,
+    pub(crate) run_id: String,
+    pub(crate) checkpoint_id: Option<String>,
+    pub(crate) prev_checkpoint_id: Option<String>,
+    pub(crate) verdict: String,
+    pub(crate) risk_score: i64,
+    pub(crate) claim_verified: Option<bool>,
+    pub(crate) findings_json: String,
+    pub(crate) hunks_json: String,
+    pub(crate) created_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct CollisionSnapshotRecord {
+    pub(crate) repo_key: String,
+    pub(crate) agent_a: String,
+    pub(crate) agent_b: String,
+    pub(crate) severity: String,
+    pub(crate) files_json: String,
+    pub(crate) details_json: String,
+    pub(crate) last_warned_ms: Option<u64>,
+    pub(crate) computed_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct CircuitBreakerRecord {
+    pub(crate) run_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) recent_trees_json: String,
+    pub(crate) last_error_hash: Option<String>,
+    pub(crate) same_error_streak: u64,
+    pub(crate) no_progress_streak: u64,
+    pub(crate) tripped_reason: Option<String>,
+    pub(crate) tripped_at_ms: Option<u64>,
+    pub(crate) bypass_until_turn: u64,
+    pub(crate) updated_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct CacheWarmthRecord {
+    pub(crate) run_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) provider: String,
+    pub(crate) ttl_secs: u64,
+    pub(crate) last_turn_at_ms: u64,
+    pub(crate) est_context_tokens: u64,
+    pub(crate) updated_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct FocusShieldRecord {
+    pub(crate) active: bool,
+    pub(crate) started_ms: Option<u64>,
+    pub(crate) until_ms: Option<u64>,
+    pub(crate) reason: Option<String>,
+    pub(crate) updated_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct FocusHeldEventRecord {
+    pub(crate) id: i64,
+    pub(crate) pane_id: String,
+    pub(crate) run_id: String,
+    pub(crate) kind: String,
+    pub(crate) summary_json: Option<String>,
+    pub(crate) created_ms: u64,
+}
+
+fn canonical_pair<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+fn row_to_turn_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnAuditRecord> {
+    let claim: Option<i64> = row.get(7)?;
+    Ok(TurnAuditRecord {
+        id: row.get(0)?,
+        pane_id: row.get(1)?,
+        run_id: row.get(2)?,
+        checkpoint_id: row.get(3)?,
+        prev_checkpoint_id: row.get(4)?,
+        verdict: row.get(5)?,
+        risk_score: row.get(6)?,
+        claim_verified: claim.map(|v| v != 0),
+        findings_json: row.get(8)?,
+        hunks_json: row.get(9)?,
+        created_ms: row.get::<_, i64>(10)?.max(0) as u64,
+    })
+}
+
+fn row_to_collision(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollisionSnapshotRecord> {
+    let warned: Option<i64> = row.get(6)?;
+    Ok(CollisionSnapshotRecord {
+        repo_key: row.get(0)?,
+        agent_a: row.get(1)?,
+        agent_b: row.get(2)?,
+        severity: row.get(3)?,
+        files_json: row.get(4)?,
+        details_json: row.get(5)?,
+        last_warned_ms: warned.map(|v| v.max(0) as u64),
+        computed_ms: row.get::<_, i64>(7)?.max(0) as u64,
+    })
+}
+
+fn row_to_circuit_breaker(row: &rusqlite::Row<'_>) -> rusqlite::Result<CircuitBreakerRecord> {
+    let tripped_at: Option<i64> = row.get(7)?;
+    Ok(CircuitBreakerRecord {
+        run_id: row.get(0)?,
+        pane_id: row.get(1)?,
+        recent_trees_json: row.get(2)?,
+        last_error_hash: row.get(3)?,
+        same_error_streak: row.get::<_, i64>(4)?.max(0) as u64,
+        no_progress_streak: row.get::<_, i64>(5)?.max(0) as u64,
+        tripped_reason: row.get(6)?,
+        tripped_at_ms: tripped_at.map(|v| v.max(0) as u64),
+        bypass_until_turn: row.get::<_, i64>(8)?.max(0) as u64,
+        updated_ms: row.get::<_, i64>(9)?.max(0) as u64,
+    })
+}
+
+fn row_to_cache_warmth(row: &rusqlite::Row<'_>) -> rusqlite::Result<CacheWarmthRecord> {
+    Ok(CacheWarmthRecord {
+        run_id: row.get(0)?,
+        pane_id: row.get(1)?,
+        provider: row.get(2)?,
+        ttl_secs: row.get::<_, i64>(3)?.max(0) as u64,
+        last_turn_at_ms: row.get::<_, i64>(4)?.max(0) as u64,
+        est_context_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+        updated_ms: row.get::<_, i64>(6)?.max(0) as u64,
+    })
+}
+
+fn row_to_focus_shield(row: &rusqlite::Row<'_>) -> rusqlite::Result<FocusShieldRecord> {
+    let active: i64 = row.get(0)?;
+    let started: Option<i64> = row.get(1)?;
+    let until: Option<i64> = row.get(2)?;
+    Ok(FocusShieldRecord {
+        active: active != 0,
+        started_ms: started.map(|v| v.max(0) as u64),
+        until_ms: until.map(|v| v.max(0) as u64),
+        reason: row.get(3)?,
+        updated_ms: row.get::<_, i64>(4)?.max(0) as u64,
+    })
+}
+
+fn row_to_focus_held_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<FocusHeldEventRecord> {
+    Ok(FocusHeldEventRecord {
+        id: row.get(0)?,
+        pane_id: row.get(1)?,
+        run_id: row.get(2)?,
+        kind: row.get(3)?,
+        summary_json: row.get(4)?,
+        created_ms: row.get::<_, i64>(5)?.max(0) as u64,
+    })
+}
+
+fn row_to_permission_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<PermissionPolicyRecord> {
+    let enabled: i64 = row.get(5)?;
+    Ok(PermissionPolicyRecord {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        match_json: row.get(2)?,
+        max_risk: row.get(3)?,
+        action: row.get(4)?,
+        enabled: enabled != 0,
+        source: row.get(6)?,
+        created_ms: row.get::<_, i64>(7)?.max(0) as u64,
+        updated_ms: row.get::<_, i64>(8)?.max(0) as u64,
+    })
+}
+
+fn row_to_permission_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<PermissionAuditRecord> {
+    let revoked: Option<i64> = row.get(10)?;
+    Ok(PermissionAuditRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        pane_id: row.get(2)?,
+        rule_id: row.get(3)?,
+        provider: row.get(4)?,
+        command: row.get(5)?,
+        risk_tier: row.get(6)?,
+        decision: row.get(7)?,
+        prompt_digest: row.get(8)?,
+        screen_excerpt: row.get(9)?,
+        revoked_ms: revoked.map(|v| v.max(0) as u64),
+        created_ms: row.get::<_, i64>(11)?.max(0) as u64,
+    })
+}
+
+fn row_to_arena(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArenaRecord> {
+    Ok(ArenaRecord {
+        id: row.get(0)?,
+        repo_key: row.get(1)?,
+        base_commit: row.get(2)?,
+        base_tree_oid: row.get(3)?,
+        prompt: row.get(4)?,
+        verify_cmd: row.get(5)?,
+        status: row.get(6)?,
+        winner_racer: row.get(7)?,
+        created_ms: row.get::<_, i64>(8)?.max(0) as u64,
+        updated_ms: row.get::<_, i64>(9)?.max(0) as u64,
+    })
+}
+
+fn row_to_arena_racer(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArenaRacerRecord> {
+    let elapsed: Option<i64> = row.get(8)?;
+    Ok(ArenaRacerRecord {
+        arena_id: row.get(0)?,
+        racer_name: row.get(1)?,
+        provider: row.get(2)?,
+        model: row.get(3)?,
+        worktree_id: row.get(4)?,
+        pane_id: row.get(5)?,
+        run_id: row.get(6)?,
+        status: row.get(7)?,
+        elapsed_ms: elapsed.map(|v| v.max(0) as u64),
+        verify_exit_code: row.get(9)?,
+        audit_verdict: row.get(10)?,
+        files_changed: row.get(11)?,
+        insertions: row.get(12)?,
+        deletions: row.get(13)?,
+    })
+}
+
+fn row_to_dvr_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<DvrTurnRecord> {
+    let pinned: i64 = row.get(11)?;
+    Ok(DvrTurnRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        pane_id: row.get(2)?,
+        turn_seq: row.get::<_, i64>(3)?.max(0) as u64,
+        provider: row.get(4)?,
+        prompt_preview: row.get(5)?,
+        checkpoint_id: row.get(6)?,
+        tree_oid: row.get(7)?,
+        audit_verdict: row.get(8)?,
+        files_changed: row.get::<_, i64>(9)?.max(0) as u64,
+        terminal_excerpt: row.get(10)?,
+        pinned: pinned != 0,
+        pin_note: row.get(12)?,
+        created_ms: row.get::<_, i64>(13)?.max(0) as u64,
+    })
 }
 
 #[cfg(test)]
@@ -5936,15 +7397,24 @@ mod tests {
         assert_eq!(
             status["features"],
             json!([
+                "arenas",
+                "cache_warmth",
+                "circuit_breakers",
+                "collision_snapshots",
+                "dvr_turns",
                 "extensions",
+                "focus_shield",
                 "inbox",
                 "notify",
                 "operations_compaction",
+                "permission_audit_log",
+                "permission_policies",
                 "prompt_queue",
                 "provider_secrets",
                 "remote_links",
                 "restore_plans",
                 "schedules",
+                "turn_audits",
                 "view_preferences"
             ])
         );
@@ -6062,19 +7532,93 @@ mod tests {
         assert_eq!(
             store.status().unwrap()["features"],
             json!([
+                "arenas",
+                "cache_warmth",
+                "circuit_breakers",
+                "collision_snapshots",
+                "dvr_turns",
                 "extensions",
+                "focus_shield",
                 "inbox",
                 "later",
                 "notify",
                 "operations_compaction",
+                "permission_audit_log",
+                "permission_policies",
                 "prompt_queue",
                 "provider_secrets",
                 "remote_links",
                 "restore_plans",
                 "schedules",
+                "turn_audits",
                 "view_preferences"
             ])
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn phase0_additive_migrations_upgrade_existing_v2_store_without_raising_min_reader() {
+        let dir = temp();
+        let path = dir.join("ops.sqlite3");
+        // Simulate an existing pre-Phase-0 v2 database containing only the original 10 features.
+        let store = Store::open_path(&path).unwrap();
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        for table in [
+            "turn_audits",
+            "collision_snapshots",
+            "circuit_breakers",
+            "cache_warmth",
+            "focus_held_events",
+            "focus_shield",
+            "permission_policies",
+            "permission_audit_log",
+            "arena_racers",
+            "arenas",
+            "dvr_turns",
+        ] {
+            conn.execute(&format!("DROP TABLE {table}"), []).unwrap();
+        }
+        conn.execute(
+            "DELETE FROM schema_features WHERE name IN (
+                'turn_audits', 'collision_snapshots', 'circuit_breakers', 'cache_warmth',
+                'focus_shield', 'permission_policies', 'permission_audit_log', 'arenas', 'dvr_turns'
+            )",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Re-opening must cleanly apply all 9 additive migrations while keeping min_reader = 2.
+        let mut reopened = Store::open_path(&path).unwrap();
+        let status = reopened.status().unwrap();
+        assert_eq!(status["schema_version"], json!(2));
+        assert_eq!(status["min_reader"], json!(2));
+        assert_eq!(status["reader_generation"], json!(READER_GENERATION));
+        let features = status["features"].as_array().unwrap();
+        for expected in [
+            "turn_audits",
+            "collision_snapshots",
+            "circuit_breakers",
+            "cache_warmth",
+            "focus_shield",
+            "permission_policies",
+            "permission_audit_log",
+            "arenas",
+            "dvr_turns",
+        ] {
+            assert!(
+                features.iter().any(|v| v == expected),
+                "missing schema feature {expected}"
+            );
+        }
+
+        // Coordinator feature registration & removal work idempotently.
+        assert!(reopened.enable_coordinator_feature("audit", 100).unwrap());
+        assert!(!reopened.enable_coordinator_feature("audit", 200).unwrap());
+        assert!(reopened.disable_coordinator_feature("audit").unwrap());
+        assert!(!reopened.disable_coordinator_feature("audit").unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6179,17 +7723,26 @@ mod tests {
             store.status().unwrap()["features"],
             json!([
                 "alpha",
+                "arenas",
                 "beta",
+                "cache_warmth",
+                "circuit_breakers",
+                "collision_snapshots",
+                "dvr_turns",
                 "extensions",
+                "focus_shield",
                 "gamma",
                 "inbox",
                 "notify",
                 "operations_compaction",
+                "permission_audit_log",
+                "permission_policies",
                 "prompt_queue",
                 "provider_secrets",
                 "remote_links",
                 "restore_plans",
                 "schedules",
+                "turn_audits",
                 "view_preferences"
             ])
         );
@@ -6901,5 +8454,282 @@ mod tests {
         assert!(!valid_id("a/b"));
         assert!(!valid_id(&"a".repeat(65)));
         assert!(!valid_id("한"));
+    }
+
+    #[test]
+    fn phase1_tables_crud_roundtrip_and_cooldown_preservation() {
+        let dir = temp();
+        let mut store = Store::open_path(&dir.join("ops.sqlite3")).unwrap();
+
+        // turn_audits
+        let audit = TurnAuditRecord {
+            id: 0,
+            pane_id: "%1".into(),
+            run_id: "r1".into(),
+            checkpoint_id: Some("2".into()),
+            prev_checkpoint_id: Some("1".into()),
+            verdict: "flagged".into(),
+            risk_score: 85,
+            claim_verified: Some(false),
+            findings_json: r#"[{"id":"f1","rule_id":"T01"}]"#.into(),
+            hunks_json: r#"[]"#.into(),
+            created_ms: 1000,
+        };
+        let audit_id = store.record_turn_audit(&audit).unwrap();
+        assert!(audit_id > 0);
+        let fetched = store.turn_audit_by_id(audit_id).unwrap().unwrap();
+        assert_eq!(fetched.verdict, "flagged");
+        assert_eq!(fetched.risk_score, 85);
+        assert_eq!(fetched.claim_verified, Some(false));
+        let latest = store
+            .latest_turn_audit(Some("r1"), Some("%1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.id, audit_id);
+        let history = store.list_turn_audits(Some("r1"), Some("%1"), 10).unwrap();
+        assert_eq!(history.len(), 1);
+
+        // collision_snapshots (canonical pair ordering + preserves last_warned_ms)
+        let snap = CollisionSnapshotRecord {
+            repo_key: "/tmp/repo".into(),
+            agent_a: "wt-b".into(),
+            agent_b: "wt-a".into(),
+            severity: "hard".into(),
+            files_json: r#"["src/lib.rs"]"#.into(),
+            details_json: r#"{"lines":3}"#.into(),
+            last_warned_ms: None,
+            computed_ms: 2000,
+        };
+        store.upsert_collision_snapshot(&snap).unwrap();
+        let list = store.list_collision_snapshots(Some("/tmp/repo")).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].agent_a, "wt-a");
+        assert_eq!(list[0].agent_b, "wt-b");
+        assert_eq!(list[0].last_warned_ms, None);
+
+        store
+            .mark_collision_warned("/tmp/repo", "wt-b", "wt-a", 2500)
+            .unwrap();
+        // Upsert again with last_warned_ms: None should preserve 2500.
+        store
+            .upsert_collision_snapshot(&CollisionSnapshotRecord {
+                computed_ms: 3000,
+                ..snap.clone()
+            })
+            .unwrap();
+        let list2 = store.list_collision_snapshots(Some("/tmp/repo")).unwrap();
+        assert_eq!(list2[0].last_warned_ms, Some(2500));
+        assert_eq!(list2[0].computed_ms, 3000);
+        store.prune_collisions_for_repo("/tmp/repo", &[]).unwrap();
+        assert!(
+            store
+                .list_collision_snapshots(Some("/tmp/repo"))
+                .unwrap()
+                .is_empty()
+        );
+
+        // circuit_breakers
+        let cb = CircuitBreakerRecord {
+            run_id: "r1".into(),
+            pane_id: "%1".into(),
+            recent_trees_json: r#"["h1","h2","h1"]"#.into(),
+            last_error_hash: Some("deadbeef".into()),
+            same_error_streak: 4,
+            no_progress_streak: 2,
+            tripped_reason: Some("same_error".into()),
+            tripped_at_ms: Some(5000),
+            bypass_until_turn: 0,
+            updated_ms: 5000,
+        };
+        store.upsert_circuit_breaker(&cb).unwrap();
+        let got_cb = store.get_circuit_breaker("r1").unwrap().unwrap();
+        assert_eq!(got_cb.same_error_streak, 4);
+        assert_eq!(got_cb.tripped_reason.as_deref(), Some("same_error"));
+        assert_eq!(store.list_circuit_breakers().unwrap().len(), 1);
+
+        // cache_warmth
+        let cw = CacheWarmthRecord {
+            run_id: "r1".into(),
+            pane_id: "%1".into(),
+            provider: "claude".into(),
+            ttl_secs: 300,
+            last_turn_at_ms: 6000,
+            est_context_tokens: 45_000,
+            updated_ms: 6000,
+        };
+        store.upsert_cache_warmth(&cw).unwrap();
+        let got_cw = store.get_cache_warmth("r1").unwrap().unwrap();
+        assert_eq!(got_cw.est_context_tokens, 45_000);
+        assert_eq!(got_cw.ttl_secs, 300);
+        assert_eq!(store.list_cache_warmth().unwrap().len(), 1);
+
+        // focus_shield & focus_held_events (Phase 2B)
+        let default_focus = store.get_focus_shield().unwrap();
+        assert!(!default_focus.active);
+        store
+            .set_focus_shield(&FocusShieldRecord {
+                active: true,
+                started_ms: Some(10_000),
+                until_ms: Some(100_000),
+                reason: Some("deep work".into()),
+                updated_ms: 10_000,
+            })
+            .unwrap();
+        let got_focus = store.get_focus_shield().unwrap();
+        assert!(got_focus.active);
+        assert_eq!(got_focus.until_ms, Some(100_000));
+        assert_eq!(got_focus.reason.as_deref(), Some("deep work"));
+
+        let held_id = store
+            .record_focus_held_event(
+                "%1",
+                "r1",
+                "turn_completed",
+                Some(r#"{"agent":"builder"}"#),
+                12_000,
+            )
+            .unwrap();
+        assert!(held_id > 0);
+        assert_eq!(store.count_focus_held_events(Some(10_000)).unwrap(), 1);
+        assert_eq!(
+            store
+                .list_focus_held_events(Some(10_000), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.clear_focus_held_events().unwrap(), 1);
+        assert_eq!(store.count_focus_held_events(None).unwrap(), 0);
+
+        // Phase 3A: permission_policies & permission_audit_log
+        store
+            .upsert_permission_policy(&PermissionPolicyRecord {
+                id: "allow-tests".into(),
+                scope: "global".into(),
+                match_json: r#"{"match_command":["cargo test*"]}"#.into(),
+                max_risk: "low".into(),
+                action: "auto_approve".into(),
+                enabled: true,
+                source: "user".into(),
+                created_ms: 20_000,
+                updated_ms: 20_000,
+            })
+            .unwrap();
+        assert_eq!(store.list_permission_policies().unwrap().len(), 1);
+        let audit_entry_id = store
+            .record_permission_audit(&PermissionAuditRecord {
+                id: 0,
+                run_id: "r1".into(),
+                pane_id: "%1".into(),
+                rule_id: Some("allow-tests".into()),
+                provider: "claude".into(),
+                command: "cargo test".into(),
+                risk_tier: "low".into(),
+                decision: "auto_approved".into(),
+                prompt_digest: "abc123".into(),
+                screen_excerpt: Some("Allow cargo test?".into()),
+                revoked_ms: None,
+                created_ms: 21_000,
+            })
+            .unwrap();
+        assert!(audit_entry_id > 0);
+        assert_eq!(
+            store
+                .list_permission_audit_log(Some("r1"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .set_permission_policy_enabled("allow-tests", false, 22_000)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .revoke_permission_rule_audit("allow-tests", 22_000)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.list_permission_audit_log(Some("r1"), 10).unwrap()[0].revoked_ms,
+            Some(22_000)
+        );
+        assert!(store.remove_permission_policy("allow-tests").unwrap());
+
+        // Phase 3B: arenas & arena_racers
+        store
+            .upsert_arena(&ArenaRecord {
+                id: "arena-1".into(),
+                repo_key: "repo1".into(),
+                base_commit: "deadbeef".into(),
+                base_tree_oid: Some("cafebabe".into()),
+                prompt: "Implement feature X".into(),
+                verify_cmd: Some("cargo test".into()),
+                status: "running".into(),
+                winner_racer: None,
+                created_ms: 30_000,
+                updated_ms: 30_000,
+            })
+            .unwrap();
+        store
+            .upsert_arena_racer(&ArenaRacerRecord {
+                arena_id: "arena-1".into(),
+                racer_name: "claude".into(),
+                provider: "claude".into(),
+                model: Some("opus".into()),
+                worktree_id: "/tmp/wt-claude".into(),
+                pane_id: "%2".into(),
+                run_id: "r-claude".into(),
+                status: "completed".into(),
+                elapsed_ms: Some(12_000),
+                verify_exit_code: Some(0),
+                audit_verdict: Some("verified".into()),
+                files_changed: Some(3),
+                insertions: Some(40),
+                deletions: Some(5),
+            })
+            .unwrap();
+        assert_eq!(store.list_arenas(10).unwrap().len(), 1);
+        assert_eq!(
+            store.get_arena("arena-1").unwrap().unwrap().status,
+            "running"
+        );
+        assert_eq!(store.list_arena_racers("arena-1").unwrap().len(), 1);
+
+        // Phase 3B: dvr_turns & pin protection during pruning
+        for seq in 1..=5 {
+            store
+                .upsert_dvr_turn(&DvrTurnRecord {
+                    id: 0,
+                    run_id: "r-dvr".into(),
+                    pane_id: "%3".into(),
+                    turn_seq: seq,
+                    provider: "codex".into(),
+                    prompt_preview: Some(format!("Turn {seq}")),
+                    checkpoint_id: seq.to_string(),
+                    tree_oid: format!("tree-{seq}"),
+                    audit_verdict: Some("verified".into()),
+                    files_changed: 1,
+                    terminal_excerpt: Some("ok".into()),
+                    pinned: false,
+                    pin_note: None,
+                    created_ms: 40_000 + seq * 1000,
+                })
+                .unwrap();
+        }
+        assert!(
+            store
+                .set_dvr_turn_pin("r-dvr", 1, true, Some("clean baseline"))
+                .unwrap()
+        );
+        let pruned = store.prune_unpinned_dvr_turns("r-dvr", 2).unwrap();
+        assert_eq!(pruned, 2); // turns 2 & 3 pruned; turn 1 pinned, turns 4 & 5 newest unpinned
+        let remaining = store.list_dvr_turns("r-dvr", 20).unwrap();
+        let seqs: Vec<u64> = remaining.iter().map(|t| t.turn_seq).collect();
+        assert_eq!(seqs, vec![1, 4, 5]);
+        assert_eq!(store.count_dvr_turns("r-dvr").unwrap(), 3);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

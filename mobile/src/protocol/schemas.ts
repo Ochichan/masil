@@ -14,6 +14,107 @@ export const ApprovalOptionSchema = z.object({
   key_sequence: z.string().nullable().optional(),
 });
 
+export const InteractivePromptKindSchema = z.enum([
+  "permission",
+  "question",
+  "input",
+  "confirmation",
+]);
+export type InteractivePromptKind = z.infer<typeof InteractivePromptKindSchema>;
+
+export const InteractivePromptModeSchema = z.enum([
+  "structured_api",
+  "terminal_tui",
+]);
+export type InteractivePromptMode = z.infer<typeof InteractivePromptModeSchema>;
+
+export const InteractiveOptionSchema = z.object({
+  id: z.string(),
+  index: z.number(),
+  label: z.string(),
+  description: z.string().nullable().optional(),
+  selected: z.boolean().optional().default(false),
+  checked: z.boolean().nullable().optional(),
+  hotkey: z.string().nullable().optional(),
+  is_custom_input: z.boolean().optional().default(false),
+  is_destructive: z.boolean().optional().default(false),
+  disabled_reason: z.string().nullable().optional(),
+});
+export type InteractiveOption = z.infer<typeof InteractiveOptionSchema>;
+
+export const StructuredQuestionOptionSchema = z.object({
+  label: z.string(),
+  description: z.string().nullable().optional(),
+});
+export type StructuredQuestionOption = z.infer<
+  typeof StructuredQuestionOptionSchema
+>;
+
+export const StructuredQuestionSchema = z.object({
+  header: z.string().optional().default(""),
+  question: z.string(),
+  options: z.array(StructuredQuestionOptionSchema).optional().default([]),
+  custom: z.boolean().optional().default(true),
+  multiple: z.boolean().optional().default(false),
+});
+export type StructuredQuestion = z.infer<typeof StructuredQuestionSchema>;
+
+export const InteractivePromptSchema = z.object({
+  id: z.string(),
+  kind: InteractivePromptKindSchema,
+  mode: InteractivePromptModeSchema,
+  request_id: z.string().nullable().optional(),
+  title: z.string(),
+  body: z.string().optional().default(""),
+  step_label: z.string().nullable().optional(),
+  options: z.array(InteractiveOptionSchema).optional().default([]),
+  selected_index: z.number().optional().default(0),
+  multi_select: z.boolean().optional().default(false),
+  allows_free_text: z.boolean().optional().default(false),
+  free_text_only: z.boolean().optional().default(false),
+  allows_cancel: z.boolean().optional().default(true),
+  can_navigate_tabs: z.boolean().optional().default(false),
+  always_patterns: z.array(z.string()).optional().default([]),
+  session_peers_count: z.number().optional().default(0),
+  is_subagent: z.boolean().optional().default(false),
+  questions: z.array(StructuredQuestionSchema).optional().default([]),
+  screen_excerpt: z.string().nullable().optional(),
+  hint_line: z.string().nullable().optional(),
+  risk: z
+    .object({
+      tier: z.enum(["low", "medium", "high", "critical"]),
+      label: z.string(),
+      score: z.number(),
+      reasons: z.array(z.string()).optional().default([]),
+      command: z.string().nullable().optional(),
+      truncated: z.boolean().optional().default(false),
+      matched_rule_id: z.string().nullable().optional(),
+      matched_action: z.string().nullable().optional(),
+      batch_eligible: z.boolean().optional().default(false),
+      prompt_digest: z.string(),
+    })
+    .nullable()
+    .optional(),
+});
+export type InteractivePrompt = z.infer<typeof InteractivePromptSchema>;
+
+export const PromptRiskTierSchema = z.enum(["low", "medium", "high", "critical"]);
+export type PromptRiskTier = z.infer<typeof PromptRiskTierSchema>;
+
+export const PromptRiskAssessmentSchema = z.object({
+  tier: PromptRiskTierSchema,
+  label: z.string(),
+  score: z.number(),
+  reasons: z.array(z.string()).optional().default([]),
+  command: z.string().nullable().optional(),
+  truncated: z.boolean().optional().default(false),
+  matched_rule_id: z.string().nullable().optional(),
+  matched_action: z.string().nullable().optional(),
+  batch_eligible: z.boolean().optional().default(false),
+  prompt_digest: z.string(),
+});
+export type PromptRiskAssessment = z.infer<typeof PromptRiskAssessmentSchema>;
+
 export const TimelineItemSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("user_message"),
@@ -304,6 +405,108 @@ export interface PluginCommandOutcome {
   refresh_agents?: boolean;
 }
 
+export interface AuditSummary {
+  id: number;
+  verdict: string;
+  risk_score: number;
+  claim_verified?: boolean | null;
+  critical_count: number;
+  high_count: number;
+  warning_count: number;
+  info_count: number;
+  hunk_count: number;
+  checkpoint_id?: string | null;
+  prev_checkpoint_id?: string | null;
+  created_ms: number;
+}
+
+export interface AuditFinding {
+  id?: string;
+  rule_id: string;
+  category?: string;
+  severity: "critical" | "high" | "warning" | "info" | string;
+  title: string;
+  detail: string;
+  file?: string | null;
+  line?: number | null;
+  evidence?: string | null;
+}
+
+export interface RiskHunk {
+  id?: string;
+  file: string;
+  old_start: number;
+  new_start: number;
+  added: number;
+  removed: number;
+  risk_score: number;
+  reason: string;
+  diff: string;
+}
+
+export interface TurnAuditReport {
+  id: number;
+  pane_id: string;
+  run_id: string;
+  checkpoint_id?: string | null;
+  prev_checkpoint_id?: string | null;
+  verdict: string;
+  risk_score: number;
+  claim_verified?: boolean | null;
+  findings: AuditFinding[];
+  hunks: RiskHunk[];
+  created_ms: number;
+}
+
+export type CollisionSeverity =
+  | "clean"
+  | "overlap"
+  | "semantic_risk"
+  | "hard_conflict"
+  | "same_directory_race";
+
+export interface CollisionPair {
+  repo_key: string;
+  agent_a: string;
+  agent_b: string;
+  pane_a?: string;
+  pane_b?: string;
+  worktree_a?: string;
+  worktree_b?: string;
+  severity: CollisionSeverity;
+  files: string[];
+  details: string[];
+  last_warned_ms?: number | null;
+  computed_ms: number;
+}
+
+export interface CircuitBreakerState {
+  run_id: string;
+  pane_id: string;
+  tripped: boolean;
+  tripped_reason?: string | null;
+  tripped_at_ms?: number | null;
+  same_error_streak: number;
+  no_progress_streak: number;
+  bypass_until_turn: number;
+  pre_oscillation_checkpoint_id?: number | null;
+  pane_actively_focused?: boolean;
+  error_excerpt?: string | null;
+}
+
+export interface CacheWarmthState {
+  run_id: string;
+  pane_id: string;
+  provider: string;
+  ttl_secs: number;
+  last_turn_at_ms: number;
+  est_context_tokens: number;
+  warm_remaining_ms: number;
+  tier: "hot" | "expiring" | "cold" | string;
+  badge: string;
+  invalidate_warning: boolean;
+}
+
 export interface AgentRow {
   remote_id: string;
   server_name: string;
@@ -314,11 +517,29 @@ export interface AgentRow {
   provider: string;
   state: string;
   cwd: string;
+  workspace?: string;
   run?: string;
+  process?: string;
+  revision?: string;
+  seen?: boolean;
+  stale?: boolean;
+  returned_idle?: boolean;
   session_id?: string | null;
   summary?: string;
+  permission_count?: number;
+  question_count?: number;
+  subagent_count?: number;
   pending_approvals?: number;
   pending_questions?: number;
+  capabilities?: Record<string, unknown>;
+  audit_summary?: AuditSummary | null;
+  breaker?: CircuitBreakerState | null;
+  cache_warmth?: CacheWarmthState | null;
+  collision_severity?: CollisionSeverity | null;
+  collision_peers?: string[];
+  sandbox?: string | null;
+  dvr_turn_count?: number;
+  last_policy_audit?: PermissionAuditEntry | null;
 }
 
 export interface TimelinePage {
@@ -327,7 +548,18 @@ export interface TimelinePage {
   source_label: string;
   detected_model?: string | null;
   items: TimelineItem[];
+  active_prompts?: InteractivePrompt[];
   has_more: boolean;
+}
+
+export interface QueuedPromptItem {
+  id: number | string;
+  body?: string;
+  text?: string;
+  position?: number;
+  revision?: number;
+  attachments?: string[];
+  created_ms?: number;
 }
 
 export interface ProviderModelOption {
@@ -384,4 +616,194 @@ export interface SavedHost {
   deviceSecret: string;
   relayUrl?: string;
   directAddr?: string;
+  directAddrs?: string[];
+}
+
+export interface DetectedPort {
+  port: number;
+  url: string;
+  process: string;
+  pid?: number | null;
+  source: "process_tree" | "pty_url" | "host_loopback" | string;
+  recommended: boolean;
+  label?: string | null;
+}
+
+export interface TunnelPortDiscovery {
+  recommended: DetectedPort[];
+  host_ports: DetectedPort[];
+  denied_ports: number[];
+}
+
+export interface FocusShieldStatus {
+  active: boolean;
+  started_ms?: number | null;
+  until_ms?: number | null;
+  remaining_ms: number;
+  reason?: string | null;
+  held_count: number;
+  updated_ms: number;
+}
+
+export interface BriefingItem {
+  id: string;
+  agent_name: string;
+  remote_id: string;
+  pane: string;
+  server_socket: string;
+  provider: string;
+  title: string;
+  subtitle: string;
+  badge: string;
+  action: string;
+  bucket: "needs_decision" | "ready_to_merge" | "review_recommended" | string;
+}
+
+export interface BriefingMetrics {
+  completed_turns: number;
+  files_touched: number;
+  lines_changed: number;
+  breaker_interventions: number;
+  active_collisions: number;
+  held_notifications: number;
+  active_agents: number;
+}
+
+export interface BriefingReport {
+  generated_ms: number;
+  since_ms: number;
+  window_label: string;
+  focus?: FocusShieldStatus | null;
+  metrics: BriefingMetrics;
+  needs_decision: BriefingItem[];
+  ready_to_merge: BriefingItem[];
+  review_recommended: BriefingItem[];
+  ui: UiDocument;
+}
+
+export interface LivePulsePayload {
+  host_id: string;
+  host_name: string;
+  working_count: number;
+  blocked_count: number;
+  done_count: number;
+  alert_count: number;
+  top_agent_alias?: string | null;
+  top_event_kind?: string | null;
+  top_summary_line?: string | null;
+  deep_link: string;
+  updated_at: number;
+}
+
+export interface LivePulsePreferences {
+  enabled: boolean;
+  summaryEnabled: boolean;
+}
+
+export interface AssetUploadResultEvent {
+  upload_id: number;
+  ok: boolean;
+  agent_id?: string;
+  delivery_mode?: "send" | "queue" | "prefill" | string;
+  saved_path?: string;
+  prompt_path?: string;
+  in_git_worktree?: boolean;
+  size_bytes?: number;
+  structured_prompt?: string;
+  error?: string;
+}
+
+export interface PermissionPolicyRule {
+  id: string;
+  scope: string;
+  match_command?: string[];
+  match_path?: string[];
+  max_risk: string;
+  action: "auto_approve" | "suggest_batch" | "always_confirm" | "deny" | string;
+  enabled: boolean;
+  source?: string;
+}
+
+export interface PermissionAuditEntry {
+  id: number;
+  run_id: string;
+  pane_id: string;
+  rule_id?: string | null;
+  provider: string;
+  command: string;
+  risk_tier: PromptRiskTier | string;
+  decision: string;
+  prompt_digest: string;
+  screen_excerpt?: string | null;
+  revoked_ms?: number | null;
+  created_ms: number;
+}
+
+export interface SandboxStatus {
+  available: boolean;
+  default_enabled: boolean;
+  default_profile: string;
+  fail_closed: boolean;
+  backend: string;
+  detail: string;
+}
+
+export interface ArenaRecord {
+  id: string;
+  repo_key: string;
+  base_commit: string;
+  base_tree_oid?: string | null;
+  prompt: string;
+  verify_cmd?: string | null;
+  status: string;
+  winner_racer?: string | null;
+  created_ms: number;
+  updated_ms: number;
+}
+
+export interface ArenaRacerRecord {
+  arena_id: string;
+  racer_name: string;
+  provider: string;
+  model?: string | null;
+  worktree_id: string;
+  pane_id: string;
+  run_id: string;
+  status: string;
+  elapsed_ms?: number | null;
+  verify_exit_code?: number | null;
+  audit_verdict?: string | null;
+  files_changed?: number | null;
+  insertions?: number | null;
+  deletions?: number | null;
+}
+
+export interface ArenaListItem {
+  arena: ArenaRecord;
+  racers: ArenaRacerRecord[];
+}
+
+export interface DvrTurnRecord {
+  id: number;
+  run_id: string;
+  pane_id: string;
+  turn_seq: number;
+  provider: string;
+  prompt_preview?: string | null;
+  checkpoint_id: string;
+  tree_oid: string;
+  audit_verdict?: string | null;
+  files_changed: number;
+  terminal_excerpt?: string | null;
+  pinned: boolean;
+  pin_note?: string | null;
+  created_ms: number;
+}
+
+export interface DvrInspectResult {
+  turn: DvrTurnRecord;
+  prev_turn_seq?: number | null;
+  diff: string;
+  diff_files: number;
+  total_turns: number;
 }

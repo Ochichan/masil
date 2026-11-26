@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Modal,
@@ -17,6 +17,7 @@ import {
   FolderOpen,
   GitBranch,
   Play,
+  Shield,
   SlidersHorizontal,
   X,
 } from "lucide-react-native";
@@ -112,11 +113,13 @@ export function NewAgentSheet({
   const [selectedModel, setSelectedModel] = useState("");
   const [selectedEffort, setSelectedEffort] = useState("");
   const [selectedMode, setSelectedMode] = useState("");
+  const pendingPresetRef = useRef<PluginPresetDef | null>(null);
   const [showMoreProviders, setShowMoreProviders] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const [createWorktree, setCreateWorktree] = useState(false);
   const [branch, setBranch] = useState("");
+  const [sandboxEnabled, setSandboxEnabled] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -166,9 +169,14 @@ export function NewAgentSheet({
     if (!client) return;
     let cancelled = false;
     setLoadingModels(true);
-    setSelectedModel("");
-    setSelectedEffort("");
-    setSelectedMode("");
+    const pendingPreset =
+      pendingPresetRef.current && pendingPresetRef.current.provider === provider
+        ? pendingPresetRef.current
+        : null;
+    pendingPresetRef.current = null;
+    setSelectedModel(pendingPreset?.model ?? "");
+    setSelectedEffort(pendingPreset?.effort ?? "");
+    setSelectedMode(pendingPreset?.mode ?? "");
     client
       .request<ProviderModelsResponse>("host.models.list.request", {
         provider,
@@ -188,6 +196,7 @@ export function NewAgentSheet({
   }, [visible, hostId, provider]);
 
   const handleChooseProvider = (nextProvider: string) => {
+    pendingPresetRef.current = null;
     setActivePresetId(null);
     setPresetInitialPrompt(null);
     setProvider(nextProvider);
@@ -198,17 +207,23 @@ export function NewAgentSheet({
 
   const applyPreset = (preset: PluginPresetDef) => {
     setActivePresetId(`${preset.plugin_id}:${preset.id}`);
-    setProvider(preset.provider);
     setCreateWorktree(Boolean(preset.worktree));
     setPresetInitialPrompt(preset.initial_prompt ?? null);
+    if (preset.effort || preset.mode) {
+      setShowAdvanced(true);
+    }
     if (!nameEdited) {
       setName(suggestAgentName(selectedDir?.name, preset.id));
     }
-    setTimeout(() => {
-      if (preset.model) setSelectedModel(preset.model);
-      if (preset.effort) setSelectedEffort(preset.effort);
-      if (preset.mode) setSelectedMode(preset.mode);
-    }, 60);
+    if (preset.provider !== provider) {
+      pendingPresetRef.current = preset;
+      setProvider(preset.provider);
+    } else {
+      pendingPresetRef.current = null;
+      setSelectedModel(preset.model ?? "");
+      setSelectedEffort(preset.effort ?? "");
+      setSelectedMode(preset.mode ?? "");
+    }
   };
 
   const handleChooseDir = (dir: DirEntryItem) => {
@@ -228,7 +243,7 @@ export function NewAgentSheet({
   const launch = async () => {
     const client = getHostClient(hostId);
     if (!client) {
-      setError("호스트에 연결되어 있지 않습니다.");
+      setError(t("hostNotConnected"));
       return;
     }
     setBusy(true);
@@ -256,6 +271,9 @@ export function NewAgentSheet({
         model: selectedModel || undefined,
         effort: selectedEffort || undefined,
         mode: selectedMode || undefined,
+        sandbox: sandboxEnabled ? "worktree" : "off",
+        no_sandbox: !sandboxEnabled,
+        initial_prompt: presetInitialPrompt?.trim() || undefined,
       });
       await refreshHost(hostId, false);
 
@@ -273,19 +291,6 @@ export function NewAgentSheet({
       if (found) {
         selectAgent(hostId, found.remote_id);
         selectPanel("agent");
-        if (presetInitialPrompt?.trim()) {
-          const initialText = presetInitialPrompt.trim();
-          setTimeout(() => {
-            void client
-              .request("agent.prompt.request", {
-                server_socket: found.server_socket,
-                target: found.name || found.pane,
-                text: initialText,
-                force_keys: true,
-              })
-              .catch(() => {});
-          }, 2200);
-        }
       }
       onClose();
     } catch (e) {
@@ -330,7 +335,7 @@ export function NewAgentSheet({
             {presets.length > 0 ? (
               <View style={styles.section}>
                 <Text style={[styles.label, { color: palette.muted }]}>
-                  플러그인 프리셋
+                  {t("pluginPresets")}
                 </Text>
                 <View style={styles.chips}>
                   {presets.map((preset) => {
@@ -352,7 +357,7 @@ export function NewAgentSheet({
             <View style={styles.section}>
               <View style={styles.sectionHeader}>
                 <Text style={[styles.label, { color: palette.muted }]}>
-                  작업 폴더
+                  {t("workingFolder")}
                 </Text>
                 <Pressable
                   onPress={() => setShowPicker(true)}
@@ -361,7 +366,7 @@ export function NewAgentSheet({
                 >
                   <FolderOpen size={13} color={palette.accent} />
                   <Text style={[styles.browseText, { color: palette.accent }]}>
-                    폴더 찾아보기
+                    {t("browseFolders")}
                   </Text>
                 </Pressable>
               </View>
@@ -387,7 +392,7 @@ export function NewAgentSheet({
                       numberOfLines={1}
                       style={[styles.dirTitle, { color: palette.text }]}
                     >
-                      {selectedDir ? selectedDir.name : "폴더를 선택하세요"}
+                      {selectedDir ? selectedDir.name : t("chooseFolderPrompt")}
                     </Text>
                     {selectedDir?.is_git_repo ? (
                       <View
@@ -408,7 +413,7 @@ export function NewAgentSheet({
                   >
                     {selectedDir
                       ? selectedDir.display_path
-                      : "탭해서 Mac의 프로젝트 폴더를 탐색합니다"}
+                      : t("tapToBrowseHostFolders")}
                   </Text>
                 </View>
                 <ChevronRight size={16} color={palette.muted} />
@@ -447,14 +452,14 @@ export function NewAgentSheet({
             <View style={styles.section}>
               <View style={styles.sectionHeader}>
                 <Text style={[styles.label, { color: palette.muted }]}>
-                  에이전트 CLI
+                  {t("agentCli")}
                 </Text>
                 <Pressable
                   onPress={() => setShowMoreProviders((v) => !v)}
                   hitSlop={6}
                 >
                   <Text style={[styles.subAction, { color: palette.muted }]}>
-                    {showMoreProviders ? "기타 CLI 접기" : "기타 CLI 보기 ▾"}
+                    {showMoreProviders ? t("hideOtherClis") : t("showOtherClis")}
                   </Text>
                 </Pressable>
               </View>
@@ -485,13 +490,13 @@ export function NewAgentSheet({
             {/* 3. Model & Optional Effort/Mode (flat directly on sheet, zero nested cards) */}
             <View style={styles.section}>
               <Text style={[styles.label, { color: palette.muted }]}>
-                모델 (선택)
+                {t("modelOptional")}
               </Text>
               <ModelPickerDropdown
                 models={providerMeta?.models ?? []}
                 selectedModel={selectedModel}
                 loading={loadingModels}
-                placeholder="기본값 (자동)"
+                placeholder={t("defaultAuto")}
                 onSelect={setSelectedModel}
               />
 
@@ -513,7 +518,7 @@ export function NewAgentSheet({
                       numberOfLines={1}
                       style={[styles.advancedTitle, { color: palette.textSecondary }]}
                     >
-                      고급 옵션
+                      {t("advancedOptions")}
                     </Text>
                     <Text
                       numberOfLines={1}
@@ -526,7 +531,7 @@ export function NewAgentSheet({
                           ]
                             .filter(Boolean)
                             .join(" · ")
-                        : "추론 강도 · 실행 모드 (기본값)"}
+                        : t("advancedOptionsDefault")}
                     </Text>
                     {showAdvanced ? (
                       <ChevronDown size={15} color={palette.muted} />
@@ -540,11 +545,11 @@ export function NewAgentSheet({
                       {providerMeta.efforts.length > 0 ? (
                         <View style={styles.inlineOptionGroup}>
                           <Text style={[styles.subLabel, { color: palette.muted }]}>
-                            추론 강도
+                            {t("optionsReasoningEffort")}
                           </Text>
                           <View style={styles.chips}>
                             <SelectableChip
-                              label="기본값"
+                              label={t("defaultOption")}
                               selected={selectedEffort === ""}
                               onPress={() => setSelectedEffort("")}
                             />
@@ -565,11 +570,11 @@ export function NewAgentSheet({
                       {providerMeta.modes.length > 0 ? (
                         <View style={styles.inlineOptionGroup}>
                           <Text style={[styles.subLabel, { color: palette.muted }]}>
-                            실행 모드
+                            {t("optionsExecutionMode")}
                           </Text>
                           <View style={styles.chips}>
                             <SelectableChip
-                              label="기본값"
+                              label={t("defaultOption")}
                               selected={selectedMode === ""}
                               onPress={() => setSelectedMode("")}
                             />
@@ -595,7 +600,7 @@ export function NewAgentSheet({
             {/* 4. Session name & optional Git worktree */}
             <View style={styles.section}>
               <Text style={[styles.label, { color: palette.muted }]}>
-                세션 이름
+                {t("sessionName")}
               </Text>
               <TextInput
                 value={name}
@@ -617,18 +622,40 @@ export function NewAgentSheet({
               />
             </View>
 
+            <View style={styles.switchRow}>
+              <View style={[styles.switchLabel, { flex: 1, paddingRight: 10 }]}>
+                <Shield
+                  size={15}
+                  color={sandboxEnabled ? palette.success : palette.warning}
+                />
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.switchText, { color: palette.text }]}>
+                    {t("sandboxToggleLabel")}
+                  </Text>
+                  <Text style={[styles.subLabel, { color: palette.muted }]}>
+                    {t("sandboxToggleDesc")}
+                  </Text>
+                </View>
+              </View>
+              <CapsuleSwitch
+                value={sandboxEnabled}
+                onValueChange={setSandboxEnabled}
+                accessibilityLabel={t("sandboxToggleLabel")}
+              />
+            </View>
+
             {selectedDir?.is_git_repo ? (
               <View style={styles.switchRow}>
                 <View style={styles.switchLabel}>
                   <GitBranch size={15} color={palette.accent} />
                   <Text style={[styles.switchText, { color: palette.text }]}>
-                    새 Git 워크트리 브랜치에서 시작
+                    {t("startInNewWorktree")}
                   </Text>
                 </View>
                 <CapsuleSwitch
                   value={createWorktree}
                   onValueChange={setCreateWorktree}
-                  accessibilityLabel="새 Git 워크트리 브랜치에서 시작"
+                  accessibilityLabel={t("startInNewWorktree")}
                 />
               </View>
             ) : null}
@@ -636,7 +663,7 @@ export function NewAgentSheet({
             {createWorktree && selectedDir?.is_git_repo ? (
               <View style={styles.section}>
                 <Text style={[styles.label, { color: palette.muted }]}>
-                  새 브랜치 이름
+                  {t("newBranchName")}
                 </Text>
                 <TextInput
                   value={branch}
@@ -688,7 +715,7 @@ export function NewAgentSheet({
                 <>
                   <Play size={15} color={palette.accentText} fill={palette.accentText} />
                   <Text style={[styles.submitText, { color: palette.accentText }]}>
-                    {providerLabel} 시작
+                    {t("startProvider", { provider: providerLabel })}
                   </Text>
                 </>
               )}

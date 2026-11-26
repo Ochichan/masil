@@ -310,6 +310,16 @@ pub async fn invoke_raw(
     socket: Option<PathBuf>,
     timeout_override: Option<u64>,
 ) -> Result<Value, String> {
+    invoke_raw_mode(plugin, req, socket, timeout_override, true).await
+}
+
+pub async fn invoke_raw_mode(
+    plugin: &LoadedPlugin,
+    req: &PluginRequest,
+    socket: Option<PathBuf>,
+    timeout_override: Option<u64>,
+    persist: bool,
+) -> Result<Value, String> {
     let manifest = plugin
         .manifest
         .as_ref()
@@ -445,7 +455,8 @@ pub async fn invoke_raw(
         );
         format!("plugin '{}' returned invalid JSON: {e}", plugin.id)
     })?;
-    if let Some(patch) = parsed.get("storage_patch")
+    if persist
+        && let Some(patch) = parsed.get("storage_patch")
         && let Err(e) = apply_storage_patch(&plugin.id, patch)
     {
         append_log(&plugin.id, &format!("storage error: {e}"));
@@ -462,6 +473,30 @@ pub async fn invoke_panel(
     payload: Option<Value>,
     form_values: Map<String, Value>,
     socket: Option<PathBuf>,
+) -> Result<UiDocument, String> {
+    invoke_panel_mode(
+        plugin,
+        panel_id,
+        agent,
+        action,
+        payload,
+        form_values,
+        socket,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn invoke_panel_mode(
+    plugin: &LoadedPlugin,
+    panel_id: &str,
+    agent: Option<Value>,
+    action: Option<String>,
+    payload: Option<Value>,
+    form_values: Map<String, Value>,
+    socket: Option<PathBuf>,
+    persist: bool,
 ) -> Result<UiDocument, String> {
     let manifest = plugin
         .manifest
@@ -485,9 +520,13 @@ pub async fn invoke_panel(
         event: None,
         event_data: None,
         agent,
-        storage: load_storage(&plugin.id),
+        storage: if persist {
+            load_storage(&plugin.id)
+        } else {
+            json!({})
+        },
     };
-    let raw = invoke_raw(plugin, &req, socket, None).await?;
+    let raw = invoke_raw_mode(plugin, &req, socket, None, persist).await?;
     validate_ui_document(&raw).map_err(|errs| {
         format!(
             "plugin '{}' panel '{}' returned invalid UI: {}",
@@ -505,6 +544,32 @@ pub async fn invoke_command(
     agent: Option<Value>,
     socket: Option<PathBuf>,
 ) -> Result<CommandOutcome, String> {
+    invoke_command_full(
+        plugin,
+        command_id,
+        args,
+        agent,
+        None,
+        None,
+        Map::new(),
+        socket,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn invoke_command_full(
+    plugin: &LoadedPlugin,
+    command_id: &str,
+    args: String,
+    agent: Option<Value>,
+    action: Option<String>,
+    payload: Option<Value>,
+    form_values: Map<String, Value>,
+    socket: Option<PathBuf>,
+    persist: bool,
+) -> Result<CommandOutcome, String> {
     let manifest = plugin
         .manifest
         .as_ref()
@@ -520,16 +585,20 @@ pub async fn invoke_command(
         kind: "command".into(),
         handler: cmd.handler.clone(),
         plugin_id: plugin.id.clone(),
-        action: None,
-        payload: None,
-        form_values: Map::new(),
+        action,
+        payload,
+        form_values,
         args,
         event: None,
         event_data: None,
         agent: agent.clone(),
-        storage: load_storage(&plugin.id),
+        storage: if persist {
+            load_storage(&plugin.id)
+        } else {
+            json!({})
+        },
     };
-    let raw = invoke_raw(plugin, &req, socket, None).await?;
+    let raw = invoke_raw_mode(plugin, &req, socket.clone(), None, persist).await?;
 
     let toast = raw.get("toast").and_then(Value::as_str).map(str::to_owned);
     let draft = raw.get("draft").and_then(Value::as_str).map(str::to_owned);
@@ -553,7 +622,16 @@ pub async fn invoke_command(
     if let Some(card_val) = raw.get("timeline_card").filter(|v| !v.is_null()) {
         let card: TimelineCardInput = serde_json::from_value(card_val.clone())
             .map_err(|e| format!("invalid timeline_card: {e}"))?;
-        if let Some(key) = extract_agent_key(agent.as_ref()) {
+        let doc_val = json!({
+            "v": 1,
+            "title": card.title,
+            "subtitle": card.subtitle,
+            "blocks": card.blocks,
+        });
+        if let Err(errs) = validate_ui_document(&doc_val) {
+            return Err(format!("invalid timeline_card: {}", errs.join("; ")));
+        }
+        if persist && let Some(key) = extract_agent_key(agent.as_ref(), socket.as_deref()) {
             upsert_timeline_card(&key, &plugin.id, &card)?;
             timeline_card_saved = Some(true);
         }
@@ -568,9 +646,15 @@ pub async fn invoke_command(
     })
 }
 
-fn extract_agent_key(agent: Option<&Value>) -> Option<String> {
+fn extract_agent_key(agent: Option<&Value>, socket_fallback: Option<&Path>) -> Option<String> {
     let a = agent?;
-    let sock = a.get("server_socket").and_then(Value::as_str).unwrap_or("");
+    let sock = a
+        .get("server_socket")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| socket_fallback.map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_default();
     let pane = a
         .get("pane")
         .or_else(|| a.get("pane_id"))
@@ -626,7 +710,7 @@ pub async fn dispatch_hook_event_with_catalog(
                     if let Some(card_val) = raw.get("timeline_card").filter(|v| !v.is_null())
                         && let Ok(card) =
                             serde_json::from_value::<TimelineCardInput>(card_val.clone())
-                        && let Some(key) = extract_agent_key(agent.as_ref())
+                        && let Some(key) = extract_agent_key(agent.as_ref(), socket.as_deref())
                     {
                         let _ = upsert_timeline_card(&key, &plugin.id, &card);
                     }
@@ -813,6 +897,48 @@ else:
 
         let cards = load_timeline_cards("/tmp/sock::%9");
         assert_eq!(cards.len(), 1);
+
+        // Dry-run panel/command (`persist = false`) must not mutate storage or timeline cards.
+        let dry_doc = invoke_panel_mode(&loaded, "main", None, None, None, Map::new(), None, false)
+            .await
+            .unwrap();
+        assert_eq!(dry_doc.blocks.len(), 1);
+        let dry_cmd = invoke_command_full(
+            &loaded,
+            "ping",
+            "dry".into(),
+            Some(json!({"pane": "%10"})),
+            Some("btn_click".into()),
+            Some(json!({"k": 1})),
+            Map::new(),
+            Some(PathBuf::from("/tmp/sock2")),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dry_cmd.toast.as_deref(), Some("pong dry #1"));
+        assert_eq!(dry_cmd.timeline_card_saved, None);
+        assert_eq!(load_timeline_cards("/tmp/sock2::%10").len(), 0);
+        // Storage stayed at 2 because dry-run ran isolated without persisting.
+        assert_eq!(load_storage("py-test").get("count"), Some(&json!(2)));
+
+        // Live command with socket fallback (no server_socket in agent JSON) saves card under socket::pane.
+        let live_cmd = invoke_command_full(
+            &loaded,
+            "ping",
+            "live".into(),
+            Some(json!({"pane": "%10"})),
+            None,
+            None,
+            Map::new(),
+            Some(PathBuf::from("/tmp/sock2")),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(live_cmd.timeline_card_saved, Some(true));
+        assert_eq!(load_timeline_cards("/tmp/sock2::%10").len(), 1);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

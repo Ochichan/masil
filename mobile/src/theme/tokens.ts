@@ -167,3 +167,57 @@ export function expandPluginThemeToPalette(
     isDark,
   };
 }
+
+export interface ThemeLookupItem extends PluginThemeColorsInput {
+  id: string;
+}
+
+export interface ResolvedThemeSelection {
+  palette: MasilPalette;
+  preference: ThemePreference;
+  activeThemeId: string | null;
+}
+
+export function resolveThemeSelection(input: {
+  preference: ThemePreference;
+  systemScheme: string | null | undefined;
+  localPluginThemeId: string | null;
+  hostActiveTheme: string | null;
+  availablePluginThemes: ThemeLookupItem[];
+}): ResolvedThemeSelection {
+  const requestedThemeId = input.localPluginThemeId ?? input.hostActiveTheme;
+
+  if (
+    requestedThemeId &&
+    requestedThemeId !== "dark" &&
+    requestedThemeId !== "light" &&
+    requestedThemeId !== "system" &&
+    requestedThemeId !== "terminal"
+  ) {
+    const matched = input.availablePluginThemes.find(
+      (t) => t.id === requestedThemeId
+    );
+    if (matched) {
+      return {
+        palette: expandPluginThemeToPalette(matched),
+        preference: input.preference,
+        activeThemeId: matched.id,
+      };
+    }
+  }
+
+  const effectivePref: ThemePreference =
+    requestedThemeId === "light" ||
+    requestedThemeId === "dark" ||
+    requestedThemeId === "system"
+      ? requestedThemeId
+      : input.preference;
+  const isDark =
+    effectivePref === "dark" ||
+    (effectivePref === "system" && input.systemScheme !== "light");
+  return {
+    palette: isDark ? DARK_PALETTE : LIGHT_PALETTE,
+    preference: effectivePref,
+    activeThemeId: requestedThemeId,
+  };
+}

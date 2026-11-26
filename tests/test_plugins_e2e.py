@@ -139,6 +139,79 @@ class PluginPlatformE2ETest(unittest.TestCase):
         for path in expected_files:
             self.assertFalse(path.exists(), f"should be removed: {path}")
 
+    def test_check_is_dry_run_and_theme_syncs_to_live_masil_server(self) -> None:
+        self.run_plugin("init", "dry-theme", "--template", "full", "--lang", "python")
+        # Dry-run check should NOT create storage.json or timeline files.
+        checked = json.loads(self.run_plugin("check", "dry-theme", "--json").stdout)
+        self.assertTrue(checked["ok"], checked)
+        storage_file = self.xdg_state / "masil" / "plugins" / "storage" / "dry-theme.json"
+        timeline_dir = self.xdg_state / "masil" / "plugins" / "timeline"
+        self.assertFalse(storage_file.exists(), "plugin check must not mutate storage")
+        self.assertFalse(
+            timeline_dir.exists() and any(timeline_dir.iterdir()),
+            "plugin check must not write timeline cards",
+        )
+
+        # If native masil binary exists, verify plugin theme syncs @masil-c-accent live.
+        masil_bin = ROOT / "bin" / "masil"
+        if not masil_bin.is_file():
+            return
+        sock_dir = Path(tempfile.mkdtemp(prefix="mp-", dir="/tmp"))
+        uid_dir = sock_dir / f"masil-{os.getuid()}"
+        uid_dir.mkdir(parents=True)
+        sock = uid_dir / "default"
+        env_with_tmux = self.env.copy()
+        env_with_tmux["TMUX_TMPDIR"] = str(sock_dir)
+        env_with_tmux.pop("TMUX", None)
+        try:
+            subprocess.run(
+                [str(masil_bin), "-S", str(sock), "new-session", "-d", "-s", "theme-test"],
+                env=env_with_tmux,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [str(MASIL_AGENT), "plugin", "theme", "set", "dry-theme"],
+                env=env_with_tmux,
+                cwd=str(ROOT),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            accent = subprocess.run(
+                [str(masil_bin), "-S", str(sock), "show-options", "-gqv", "@masil-c-accent"],
+                env=env_with_tmux,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(accent, "#6cc4d4")
+
+            subprocess.run(
+                [str(MASIL_AGENT), "plugin", "theme", "reset"],
+                env=env_with_tmux,
+                cwd=str(ROOT),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            accent_after = subprocess.run(
+                [str(masil_bin), "-S", str(sock), "show-options", "-gqv", "@masil-c-accent"],
+                env=env_with_tmux,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(accent_after, "#5bb5c2")
+        finally:
+            subprocess.run(
+                [str(masil_bin), "-S", str(sock), "kill-server"],
+                env=env_with_tmux,
+                capture_output=True,
+            )
+            shutil.rmtree(sock_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

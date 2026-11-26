@@ -1,14 +1,23 @@
-import React, { createContext, useContext, useMemo, useState } from "react";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { useColorScheme } from "react-native";
 import { useHostRuntimeStore } from "../hosts/HostRuntimeController";
 import type { PluginThemeDef } from "../protocol/schemas";
 import {
   DARK_PALETTE,
-  LIGHT_PALETTE,
   MasilPalette,
   ThemePreference,
-  expandPluginThemeToPalette,
+  resolveThemeSelection,
 } from "./tokens";
+
+export { resolveThemeSelection } from "./tokens";
+export type { ResolvedThemeSelection } from "./tokens";
 
 interface ThemeContextValue {
   palette: MasilPalette;
@@ -30,7 +39,7 @@ const ThemeContext = createContext<ThemeContextValue>({
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const system = useColorScheme();
-  const [preference, setPreference] = useState<ThemePreference>("dark");
+  const [preference, setPreferenceState] = useState<ThemePreference>("dark");
   const [localPluginThemeId, setLocalPluginTheme] = useState<string | null>(
     null
   );
@@ -47,49 +56,32 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 
   const hostActiveTheme = hostPlugins?.active_theme ?? null;
 
+  // Whenever the host publishes a new active theme (from CLI, TUI, AI session,
+  // or another device) or the user switches hosts, drop any optimistic local
+  // override so the live host theme takes effect immediately.
+  useEffect(() => {
+    setLocalPluginTheme(null);
+  }, [hostActiveTheme, activeHostId]);
+
+  const handleSetPreference = useCallback((next: ThemePreference) => {
+    setLocalPluginTheme(null);
+    setPreferenceState(next);
+  }, []);
+
   const value = useMemo<ThemeContextValue>(() => {
-    const requestedThemeId = localPluginThemeId ?? hostActiveTheme;
-
-    if (
-      requestedThemeId &&
-      requestedThemeId !== "dark" &&
-      requestedThemeId !== "light" &&
-      requestedThemeId !== "system" &&
-      requestedThemeId !== "terminal"
-    ) {
-      const matched = availablePluginThemes.find(
-        (t) => t.id === requestedThemeId
-      );
-      if (matched) {
-        return {
-          palette: expandPluginThemeToPalette(matched),
-          preference,
-          activeThemeId: matched.id,
-          availablePluginThemes,
-          setPreference,
-          setLocalPluginTheme,
-        };
-      }
-    }
-
-    const effectivePref: ThemePreference =
-      requestedThemeId === "light" ||
-      requestedThemeId === "dark" ||
-      requestedThemeId === "system"
-        ? requestedThemeId
-        : preference;
-    const isDark =
-      effectivePref === "dark" ||
-      (effectivePref === "system" && system !== "light");
-    return {
-      palette: isDark ? DARK_PALETTE : LIGHT_PALETTE,
-      preference: effectivePref,
-      activeThemeId: requestedThemeId,
+    const resolved = resolveThemeSelection({
+      preference,
+      systemScheme: system,
+      localPluginThemeId,
+      hostActiveTheme,
       availablePluginThemes,
-      setPreference: (next) => {
-        setLocalPluginTheme(null);
-        setPreference(next);
-      },
+    });
+    return {
+      palette: resolved.palette,
+      preference: resolved.preference,
+      activeThemeId: resolved.activeThemeId,
+      availablePluginThemes,
+      setPreference: handleSetPreference,
       setLocalPluginTheme,
     };
   }, [
@@ -98,7 +90,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     localPluginThemeId,
     hostActiveTheme,
     availablePluginThemes,
-    activeHostId,
+    handleSetPreference,
   ]);
 
   return (

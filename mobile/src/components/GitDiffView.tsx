@@ -14,6 +14,7 @@ import {
   FolderOpen,
   RefreshCw,
 } from "lucide-react-native";
+import { useTranslation } from "react-i18next";
 import { getHostClient } from "../hosts/HostRuntimeController";
 import { useMasilTheme } from "../theme/ThemeProvider";
 import { FONTS, TABULAR_NUMS } from "../theme/typography";
@@ -33,6 +34,7 @@ interface GitDiffViewProps {
 
 export function GitDiffView({ hostId, cwd, onOpenFiles }: GitDiffViewProps) {
   const { palette } = useMasilTheme();
+  const { t } = useTranslation();
   const [files, setFiles] = useState<ChangedFile[]>([]);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [diffText, setDiffText] = useState<string>("");
@@ -68,7 +70,7 @@ export function GitDiffView({ hostId, cwd, onOpenFiles }: GitDiffViewProps) {
         "workspace.changes.diff.request",
         { cwd, path }
       );
-      setDiffText(res.diff ?? res.text ?? "(변경 내용 없음)");
+      setDiffText(res.diff ?? res.text ?? t("diffEmptyContent"));
     } catch (e) {
       setDiffText(e instanceof Error ? e.message : String(e));
     }
@@ -91,7 +93,7 @@ export function GitDiffView({ hostId, cwd, onOpenFiles }: GitDiffViewProps) {
           >
             <ChevronLeft size={16} color={palette.accent} />
             <Text style={[styles.backText, { color: palette.accent }]}>
-              목록
+              {t("backToList")}
             </Text>
           </Pressable>
           <Text
@@ -139,7 +141,7 @@ export function GitDiffView({ hostId, cwd, onOpenFiles }: GitDiffViewProps) {
       <View style={styles.emptyRoot}>
         <ActivityIndicator size="small" color={palette.accent} />
         <Text style={[styles.emptySub, { color: palette.muted }]}>
-          Git 변경 내역을 확인하는 중...
+          {t("loadingGitChanges")}
         </Text>
       </View>
     );
@@ -167,11 +169,10 @@ export function GitDiffView({ hostId, cwd, onOpenFiles }: GitDiffViewProps) {
               <CheckCircle2 size={24} color={palette.success} />
             </View>
             <Text style={[styles.emptyTitle, { color: palette.text }]}>
-              변경된 파일이 없습니다
+              {t("noChangedFilesTitle")}
             </Text>
             <Text style={[styles.emptySub, { color: palette.muted }]}>
-              현재 워킹 트리가 깨끗한 상태입니다. 에이전트가 파일을 수정하면
-              이곳에 실시간으로 Diff가 표시됩니다.
+              {t("noChangedFilesBody")}
             </Text>
             <View style={styles.emptyActions}>
               <Pressable
@@ -186,7 +187,7 @@ export function GitDiffView({ hostId, cwd, onOpenFiles }: GitDiffViewProps) {
               >
                 <RefreshCw size={14} color={palette.muted} />
                 <Text style={[styles.emptyBtnText, { color: palette.muted }]}>
-                  새로고침
+                  {t("refresh")}
                 </Text>
               </Pressable>
               {onOpenFiles ? (
@@ -202,7 +203,7 @@ export function GitDiffView({ hostId, cwd, onOpenFiles }: GitDiffViewProps) {
                 >
                   <FolderOpen size={14} color={palette.accent} />
                   <Text style={[styles.emptyBtnText, { color: palette.text }]}>
-                    파일 탐색기 보기
+                    {t("openFileExplorer")}
                   </Text>
                 </Pressable>
               ) : null}

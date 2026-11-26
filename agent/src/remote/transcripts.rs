@@ -8,7 +8,7 @@ use crate::remote::discovery::{
     ImportableSession, discover_agy_sessions, discover_claude_sessions, discover_codex_sessions,
     discover_opencode_sessions,
 };
-use masil_wire::rpc::{ApprovalMode, ApprovalOption, BindingConfidence, TimelineItem, ToolStatus};
+use masil_wire::rpc::{BindingConfidence, InteractivePrompt, TimelineItem, ToolStatus};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,13 +34,23 @@ struct CachedBindingEntry {
 }
 
 #[derive(Clone)]
+struct CachedTranscriptBody {
+    binding_confidence: BindingConfidence,
+    session_id: Option<String>,
+    source_label: String,
+    detected_model: Option<String>,
+    items: Vec<TimelineItem>,
+    has_more: bool,
+}
+
+#[derive(Clone)]
 struct CachedTimelineEntry {
     source_path: PathBuf,
     file_len: u64,
     mtime_ms: i64,
     session_id: Option<String>,
     confidence: BindingConfidence,
-    page: TimelinePage,
+    body: CachedTranscriptBody,
 }
 
 static BINDING_CACHE: OnceLock<Mutex<HashMap<String, CachedBindingEntry>>> = OnceLock::new();
@@ -149,7 +159,7 @@ fn find_latest_claude_session_for_cwd(home: &Path, cwd: &str) -> Option<(String,
     best.map(|(_, sid, path)| (sid, path))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TimelinePage {
     pub binding_confidence: BindingConfidence,
     pub session_id: Option<String>,
@@ -157,6 +167,8 @@ pub struct TimelinePage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detected_model: Option<String>,
     pub items: Vec<TimelineItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_prompts: Vec<InteractivePrompt>,
     pub has_more: bool,
 }
 
@@ -386,9 +398,10 @@ pub fn fetch_timeline(query: TimelineQuery<'_>) -> TimelinePage {
     let cap = limit.unwrap_or(DEFAULT_TIMELINE_LIMIT).clamp(20, 500);
     let binding = resolve_binding(agent_key, provider, cwd, reported_session_id);
 
-    let cache_key = format!("{agent_key}::{provider}::{state}::{cap}");
+    let cache_key = format!("{agent_key}::{provider}::{cap}");
     let source_stat = binding.source_path.as_deref().and_then(file_stat_sig);
-    if let (Some(src_path), Some((len, mtime_ms))) = (binding.source_path.as_deref(), source_stat)
+    let cached_body = if let (Some(src_path), Some((len, mtime_ms))) =
+        (binding.source_path.as_deref(), source_stat)
         && let Ok(guard) = TIMELINE_CACHE
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -399,94 +412,86 @@ pub fn fetch_timeline(query: TimelineQuery<'_>) -> TimelinePage {
         && entry.session_id == binding.session_id
         && entry.confidence == binding.confidence
     {
-        return attach_plugin_cards(entry.page.clone(), agent_key);
-    }
-
-    let mut items = match (binding.confidence, binding.source_path.as_deref()) {
-        (BindingConfidence::None, _) | (_, None) => Vec::new(),
-        (_, Some(path)) => match provider {
-            "claude" => parse_claude_jsonl(path, cap),
-            "codex" => parse_codex_jsonl(path, cap),
-            "agy" | "antigravity" => parse_agy_jsonl(path, cap),
-            "opencode" => binding
-                .session_id
-                .as_deref()
-                .map(|sid| parse_opencode_sqlite(path, sid, cap))
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        },
-    };
-
-    let (confidence, source_label) = if items.is_empty() {
-        items = build_pane_fallback_items(server_socket, pane_id);
-        (BindingConfidence::None, "pane_capture".to_owned())
+        Some(entry.body.clone())
     } else {
-        (binding.confidence, format!("{provider}_transcript"))
+        None
     };
 
-    // Append an interactive approval banner whenever the live pane is blocked so
-    // the mobile user sees an actionable card right inside the conversation view.
-    if state == "blocked" {
-        let next_seq = items.len() as u64 + 1;
-        let is_structured_api = matches!(provider, "opencode" | "kilo");
-        items.push(TimelineItem::ApprovalBanner {
-            id: format!("blocked-{pane_id}-{next_seq}"),
-            seq: next_seq,
-            ts_ms: crate::remote::config::now_ms(),
-            request_id: None,
-            prompt: "Agent is waiting for approval or input in the live terminal.".into(),
-            options: vec![
-                ApprovalOption {
-                    id: "allow".into(),
-                    label: "Allow / Enter".into(),
-                    key_sequence: Some("\r".into()),
-                },
-                ApprovalOption {
-                    id: "yes".into(),
-                    label: "Yes (y + Enter)".into(),
-                    key_sequence: Some("y\r".into()),
-                },
-                ApprovalOption {
-                    id: "deny".into(),
-                    label: "Cancel (Esc)".into(),
-                    key_sequence: Some("\x1b".into()),
-                },
-            ],
-            mode: if is_structured_api {
-                ApprovalMode::StructuredApi
-            } else {
-                ApprovalMode::TerminalConfirm
+    let body = if let Some(body) = cached_body {
+        body
+    } else {
+        let mut items = match (binding.confidence, binding.source_path.as_deref()) {
+            (BindingConfidence::None, _) | (_, None) => Vec::new(),
+            (_, Some(path)) => match provider {
+                "claude" => parse_claude_jsonl(path, cap),
+                "codex" => parse_codex_jsonl(path, cap),
+                "agy" | "antigravity" => parse_agy_jsonl(path, cap),
+                "opencode" => binding
+                    .session_id
+                    .as_deref()
+                    .map(|sid| parse_opencode_sqlite(path, sid, cap))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
             },
-        });
-    }
+        };
 
-    let detected_model = detect_latest_model(&items, binding.source_path.as_deref(), provider);
-    let has_more = items.len() >= cap;
+        let (confidence, source_label) = if items.is_empty() {
+            items = build_pane_fallback_items(server_socket, pane_id);
+            (BindingConfidence::None, "pane_capture".to_owned())
+        } else {
+            (binding.confidence, format!("{provider}_transcript"))
+        };
+
+        let detected_model = detect_latest_model(&items, binding.source_path.as_deref(), provider);
+        let has_more = items.len() >= cap;
+        let body = CachedTranscriptBody {
+            binding_confidence: confidence,
+            session_id: binding.session_id.clone(),
+            source_label,
+            detected_model,
+            items,
+            has_more,
+        };
+        if let (Some(src_path), Some((len, mtime_ms))) = (binding.source_path, source_stat)
+            && let Ok(mut guard) = TIMELINE_CACHE
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+        {
+            guard.insert(
+                cache_key,
+                CachedTimelineEntry {
+                    source_path: src_path,
+                    file_len: len,
+                    mtime_ms,
+                    session_id: binding.session_id,
+                    confidence: binding.confidence,
+                    body: body.clone(),
+                },
+            );
+        }
+        body
+    };
+
+    // Always collect live interactive prompts fresh (never cached by transcript mtime)
+    // so multi-step dialogs, cursor movements, and API request updates appear immediately.
+    let active_prompts = crate::remote::prompts::collect_live_prompts_with_cwd(
+        server_socket,
+        pane_id,
+        provider,
+        state,
+        (!cwd.is_empty()).then_some(cwd),
+        &body.items,
+    );
+
     let page = TimelinePage {
-        binding_confidence: confidence,
-        session_id: binding.session_id.clone(),
-        source_label,
-        detected_model,
-        items,
-        has_more,
+        binding_confidence: body.binding_confidence,
+        session_id: body.session_id,
+        source_label: body.source_label,
+        detected_model: body.detected_model,
+        items: body.items,
+        active_prompts,
+        has_more: body.has_more,
     };
-    if let (Some(src_path), Some((len, mtime_ms))) = (binding.source_path, source_stat)
-        && let Ok(mut guard) = TIMELINE_CACHE
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-    {
-        guard.insert(
-            cache_key,
-            CachedTimelineEntry {
-                source_path: src_path,
-                file_len: len,
-                mtime_ms,
-                session_id: binding.session_id,
-                confidence: binding.confidence,
-                page: page.clone(),
-            },
-        );
-    }
     attach_plugin_cards(page, agent_key)
 }
 
@@ -870,21 +875,38 @@ pub fn parse_codex_jsonl(path: &Path, limit: usize) -> Vec<TimelineItem> {
             Some("custom_tool_call_output" | "function_call_output") => {
                 let output = extract_value_text(p.get("output"));
                 if !output.is_empty() {
-                    seq += 1;
-                    out.push(TimelineItem::ToolCall {
-                        id: p
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .map(|id| format!("out-{id}"))
-                            .unwrap_or_else(|| format!("cto-{seq}")),
-                        seq,
-                        ts_ms,
-                        name: "tool_output".into(),
-                        summary: first_line_preview(&output, 80),
-                        args_json: None,
-                        output: Some(truncate_chars(&output, 4000)),
-                        status: ToolStatus::Completed,
-                    });
+                    let call_id = p.get("call_id").and_then(Value::as_str);
+                    let mut merged = false;
+                    if let Some(cid) = call_id {
+                        for prev in out.iter_mut().rev() {
+                            if let TimelineItem::ToolCall {
+                                id,
+                                output: prev_out,
+                                ..
+                            } = prev
+                                && id == cid
+                            {
+                                *prev_out = Some(truncate_chars(&output, 4000));
+                                merged = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !merged {
+                        seq += 1;
+                        out.push(TimelineItem::ToolCall {
+                            id: call_id
+                                .map(|id| format!("out-{id}"))
+                                .unwrap_or_else(|| format!("cto-{seq}")),
+                            seq,
+                            ts_ms,
+                            name: "tool_output".into(),
+                            summary: first_line_preview(&output, 80),
+                            args_json: None,
+                            output: Some(truncate_chars(&output, 4000)),
+                            status: ToolStatus::Completed,
+                        });
+                    }
                 }
             }
             _ => {}
@@ -1148,11 +1170,86 @@ fn keep_tail(mut items: Vec<TimelineItem>, limit: usize) -> Vec<TimelineItem> {
     items
 }
 
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn parse_iso8601_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Ok(num) = s.parse::<i64>() {
+        return Some(num);
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    if bytes[10] != b'T' && bytes[10] != b't' && bytes[10] != b' ' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[5..7].parse().ok()?;
+    let day: i64 = s[8..10].parse().ok()?;
+    let hour: i64 = s[11..13].parse().ok()?;
+    let minute: i64 = s[14..16].parse().ok()?;
+    let second: i64 = s[17..19].parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+    let mut rest = &s[19..];
+    let mut millis: i64 = 0;
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let digits_len = after_dot.bytes().take_while(|b| b.is_ascii_digit()).count();
+        let digits = &after_dot[..digits_len];
+        let mut mul = 100i64;
+        for b in digits.bytes().take(3) {
+            millis += i64::from(b - b'0') * mul;
+            mul /= 10;
+        }
+        rest = &after_dot[digits_len..];
+    }
+    let tz_offset_secs: i64 = if rest.is_empty() || rest == "Z" || rest == "z" {
+        0
+    } else if let Some(sign) = rest
+        .starts_with('+')
+        .then_some(1i64)
+        .or_else(|| rest.starts_with('-').then_some(-1i64))
+    {
+        let tz = &rest[1..];
+        let (tz_h, tz_m) = if tz.len() >= 5 && tz.as_bytes()[2] == b':' {
+            (tz[0..2].parse::<i64>().ok()?, tz[3..5].parse::<i64>().ok()?)
+        } else if tz.len() >= 4 {
+            (tz[0..2].parse::<i64>().ok()?, tz[2..4].parse::<i64>().ok()?)
+        } else {
+            return None;
+        };
+        sign * (tz_h * 3600 + tz_m * 60)
+    } else {
+        return None;
+    };
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - tz_offset_secs;
+    Some(secs * 1000 + millis)
+}
+
 fn parse_ts_ms(v: Option<&Value>) -> i64 {
     match v {
         Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
-        Some(Value::String(_)) => crate::remote::config::now_ms(),
-        _ => crate::remote::config::now_ms(),
+        Some(Value::String(s)) => parse_iso8601_ms(s).unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -1261,11 +1358,20 @@ mod tests {
         .unwrap();
         writeln!(
             f,
-            r#"{{"type":"response_item","timestamp":2002,"payload":{{"type":"message","role":"assistant","content":[{{"text":"All green"}}]}}}}"#
+            r#"{{"type":"response_item","timestamp":2002,"payload":{{"type":"custom_tool_call_output","call_id":"c1","output":"file1.rs"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"response_item","timestamp":2003,"payload":{{"type":"message","role":"assistant","content":[{{"text":"All green"}}]}}}}"#
         )
         .unwrap();
         let codex_items = parse_codex_jsonl(&codex_path, 50);
         assert_eq!(codex_items.len(), 3);
+        assert!(matches!(
+            &codex_items[1],
+            TimelineItem::ToolCall { id, output: Some(out), .. } if id == "c1" && out == "file1.rs"
+        ));
 
         // Antigravity (agy)
         let agy_path = dir.join("agy.jsonl");
@@ -1282,6 +1388,16 @@ mod tests {
         .unwrap();
         let agy_items = parse_agy_jsonl(&agy_path, 50);
         assert_eq!(agy_items.len(), 4);
+
+        assert_eq!(parse_iso8601_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_iso8601_ms("2026-11-24T01:00:00.25Z"),
+            Some(1_795_482_000_250)
+        );
+        assert_eq!(
+            parse_iso8601_ms("2026-11-24T10:00:00+09:00"),
+            Some(1_795_482_000_000)
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -18,9 +18,9 @@ Follow these steps in order and do not finish until step 6 succeeds:
    - New personal plugin: scaffold directly in `~/.config/masil/plugins/<id>` using `masil-agent plugin init <id> --template <theme|command|panel|hook|preset|full> --lang <node|python|bash>`.
    - Existing local repo or folder: edit the folder in place and register it with `masil-agent plugin install /abs/path/to/plugin --id <id>`.
 3. **Choose the smallest contribution set that solves the request.**
-   - **Theme (`[[themes]]` + `theme.toml`)**: Omarchy-style palette (`canvas`, `panel`, `text`, `accent` plus optional overrides). Zero code required.
-   - **Workspace panel (`[[panels]]`)**: Interactive tab in Mobile Workspace Tools and overlay in TUI Command Palette (`:`). Returns a Masil UI Spec v1 JSON document.
-   - **Slash command (`[[commands]]`)**: `/slash [args]` in Mobile composer and Command Palette action in TUI. Can return `toast`, `ui`, `draft`, or `timeline_card`.
+   - **Theme (`[[themes]]` + `theme.toml`)**: Omarchy-style palette (`canvas`, `panel`, `text`, `accent` plus optional overrides). Zero code required. Applies live to the `masil` terminal status bar/borders, Rust TUI desk, and Mobile app simultaneously.
+   - **Workspace panel (`[[panels]]`)**: Interactive tab in Mobile Workspace Tools (shown in the dedicated Plugin Panels strip) and live overlay in TUI Command Palette (`:`). Returns a Masil UI Spec v1 JSON document. Set `refresh_secs >= 3` if live polling is needed.
+   - **Slash command (`[[commands]]`)**: `/slash [args]` in Mobile composer and Command Palette action in TUI. Can return `toast`, interactive `ui`, composer `draft`, or inline `timeline_card`.
    - **Timeline card**: Returned as `timeline_card` from a command or hook, rendered inline inside the agent's conversation timeline.
    - **Lifecycle hook (`[[hooks]]`)**: Reacts to `agent.state_changed`, `agent.started`, `agent.closed`, `inbox.event`, `theme.changed`, or `prompt.before`.
    - **Agent preset (`[[presets]]`)**: One-tap launch profile (provider, model, effort, mode, worktree, initial prompt) in Mobile New Agent sheet.
@@ -31,7 +31,7 @@ Follow these steps in order and do not finish until step 6 succeeds:
    masil-agent plugin test <id> panel <panel-id> --cwd "$(pwd)"
    masil-agent plugin test <id> command <command-id> --args ""
    ```
-   Fix every schema, contrast, or runtime error before moving on.
+   `plugin check` runs in dry-run mode (without mutating production storage). Fix every schema, contrast, or runtime error before moving on.
 6. **Enable, reload, and verify live.**
    ```bash
    masil-agent plugin enable <id>
@@ -42,7 +42,7 @@ Follow these steps in order and do not finish until step 6 succeeds:
    ```bash
    masil-agent plugin theme set <theme-id>
    ```
-   Verify `masil-agent plugin ls` reports zero errors for `<id>`. If anything fails, inspect `masil-agent plugin logs <id>`, fix the root cause, and repeat steps 5 and 6.
+   Verify `masil-agent plugin ls` reports `running` with zero errors for `<id>`, and confirm all expected panels/commands/themes/hooks/presets appear in `masil-agent plugin ls --json`. If anything fails, inspect `masil-agent plugin logs <id>`, fix the root cause, and repeat steps 5 and 6.
 
 ## Handler contract summary
 

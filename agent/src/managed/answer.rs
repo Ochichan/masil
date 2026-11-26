@@ -1302,6 +1302,9 @@ pub(crate) enum Reply {
         message: Option<String>,
     },
     Answers(Vec<String>),
+    /// Multi-value answers per question (`--answers-json`), supporting
+    /// `multiple: true` questions cleanly while keeping `--answer` strict.
+    MultiAnswers(Vec<Vec<String>>),
     RejectQuestion,
 }
 
@@ -1317,6 +1320,10 @@ impl Reply {
                 .iter()
                 .flat_map(|answer| ["--answer".to_owned(), answer.clone()])
                 .collect(),
+            Self::MultiAnswers(answers) => vec![
+                "--answers-json".into(),
+                serde_json::to_string(answers).unwrap_or_else(|_| "[]".into()),
+            ],
             Self::RejectQuestion => vec!["--reject".into()],
         };
         if let Self::Reject {
@@ -1353,6 +1360,9 @@ impl Reply {
                     .collect::<Vec<_>>();
                 (format!("/question/{id}/reply"), json!({"answers": answers}))
             }
+            Self::MultiAnswers(answers) => {
+                (format!("/question/{id}/reply"), json!({"answers": answers}))
+            }
         }
     }
 
@@ -1384,6 +1394,43 @@ impl Reply {
                         return Err(format!(
                             "invalid_argument: {answer:?} is not one of the choices {labels:?}"
                         ));
+                    }
+                }
+                Ok(())
+            }
+            (Self::MultiAnswers(answers), "question") => {
+                let questions = request["questions"].as_array().cloned().unwrap_or_default();
+                if answers.len() != questions.len() {
+                    return Err(format!(
+                        "invalid_argument: this request has {} question(s); give one answer list each",
+                        questions.len()
+                    ));
+                }
+                for (chosen, question) in answers.iter().zip(&questions) {
+                    if chosen.is_empty() {
+                        return Err(
+                            "invalid_argument: each question needs at least one answer".into()
+                        );
+                    }
+                    if question["multiple"] != true && chosen.len() > 1 {
+                        return Err(
+                            "invalid_argument: single-choice question takes one answer".into()
+                        );
+                    }
+                    let labels = question["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|option| option["label"].as_str())
+                        .collect::<Vec<_>>();
+                    if question["custom"] == false {
+                        for answer in chosen {
+                            if !labels.contains(&answer.as_str()) {
+                                return Err(format!(
+                                    "invalid_argument: {answer:?} is not one of the choices {labels:?}"
+                                ));
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -1897,6 +1944,43 @@ mod tests {
         assert!(Reply::Answers(vec![]).request(&question).is_err());
         let several = json!({"id": "que_2", "_kind": "question", "questions": [{"question": "P", "multiple": true}]});
         assert!(Reply::Answers(vec!["a".into()]).request(&several).is_err());
+
+        // Multi-select question via Reply::MultiAnswers
+        let multi_q = json!({"id": "que_3", "_kind": "question", "questions": [
+            {"question": "Pick targets", "multiple": true, "custom": false,
+             "options": [{"label": "iOS"}, {"label": "Android"}, {"label": "Web"}]}
+        ]});
+        let (path, body) = Reply::MultiAnswers(vec![vec!["iOS".into(), "Web".into()]])
+            .request(&multi_q)
+            .unwrap();
+        assert_eq!(
+            (path.as_str(), body),
+            (
+                "/question/que_3/reply",
+                json!({"answers": [["iOS", "Web"]]})
+            )
+        );
+        // Rejects unknown option when custom=false
+        assert!(
+            Reply::MultiAnswers(vec![vec!["Desktop".into()]])
+                .request(&multi_q)
+                .is_err()
+        );
+        // Rejects multiple selections on single-select question
+        assert!(
+            Reply::MultiAnswers(vec![vec!["a".into(), "b".into()]])
+                .request(&question)
+                .is_err()
+        );
+        // Allows custom answers when custom=true
+        let multi_custom = json!({"id": "que_4", "_kind": "question", "questions": [
+            {"question": "Pick", "multiple": true, "custom": true, "options": [{"label": "a"}]}
+        ]});
+        let (_, body) = Reply::MultiAnswers(vec![vec!["a".into(), "custom".into()]])
+            .request(&multi_custom)
+            .unwrap();
+        assert_eq!(body, json!({"answers": [["a", "custom"]]}));
+
         assert!(not_found(br#"{"_tag":"PermissionNotFoundError"}"#));
         assert!(!not_found(br#"{"message":"route not found"}"#));
     }

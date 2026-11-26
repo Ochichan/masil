@@ -151,8 +151,31 @@ pub(crate) fn needed(verb: &str, args: &[String]) -> Option<Scope> {
             Some("restore") => Admin,
             _ => return None,
         },
+        "audit" => {
+            if args.iter().any(|arg| arg == "--challenge") {
+                Act
+            } else {
+                Read
+            }
+        }
+        "guard" => match word(1) {
+            None | Some("status") => Read,
+            Some("extend" | "dismiss") => Act,
+            _ => return None,
+        },
+        "dvr" => match word(0) {
+            Some("list" | "inspect") => Read,
+            Some("pin" | "unpin" | "snapshot") => Act,
+            Some("restore" | "fork") => Admin,
+            _ => return None,
+        },
+        "trace" => match word(0) {
+            Some("export") => Read,
+            _ => return None,
+        },
         "worktree" => match word(0) {
-            Some("list" | "jobs") => Read,
+            Some("list" | "jobs" | "conflicts") => Read,
+            Some("warn") => Act,
             _ => return None,
         },
         "notify" => match word(0) {
@@ -181,7 +204,19 @@ pub(crate) fn needed(verb: &str, args: &[String]) -> Option<Scope> {
             _ => return None,
         },
         // No provider arguments (`--` and after): a flag can skip approvals.
-        "start" if !args.iter().any(|arg| arg == "--") => Act,
+        // External API callers also cannot disable the OS micro-sandbox.
+        "start"
+            if !args.iter().any(|arg| arg == "--" || arg == "--no-sandbox")
+                && !args.windows(2).any(|w| {
+                    w[0] == "--sandbox"
+                        && matches!(
+                            w[1].to_ascii_lowercase().as_str(),
+                            "off" | "none" | "disabled"
+                        )
+                }) =>
+        {
+            Act
+        }
         "prompt" | "draft" => match word(1) {
             Some(text) if prompt_text(text) => Act,
             _ => return None,
@@ -238,7 +273,7 @@ pub(crate) fn allowed(scope: Scope, verb: &str, args: &[String]) -> Result<(), S
 }
 
 /// Every verb some scope may call, for the hello.
-const VERBS: [&str; 37] = [
+const VERBS: [&str; 41] = [
     "list",
     "get",
     "explain",
@@ -256,6 +291,10 @@ const VERBS: [&str; 37] = [
     "queue",
     "changes",
     "checkpoint",
+    "audit",
+    "guard",
+    "dvr",
+    "trace",
     "worktree",
     "notify",
     "schedule",
@@ -280,12 +319,13 @@ const VERBS: [&str; 37] = [
 
 /// The verbs a scope may call in some form.
 pub(crate) fn methods(scope: Scope) -> Vec<&'static str> {
-    let forms: [&[&str]; 10] = [
+    let forms: [&[&str]; 11] = [
         &[],
         &["x"],
         &["get"],
         &["list"],
         &["status"],
+        &["export"],
         &["x", "list"],
         &["x", "text"],
         &["x", "make"],
@@ -321,6 +361,8 @@ mod tests {
             ("send-keys", &["builder", "Enter"][..]),
             ("send-keys", &["builder", "y"][..]),
             ("start", &["x", "claude", "--", "--skip-permissions"][..]),
+            ("start", &["x", "claude", "--no-sandbox"][..]),
+            ("start", &["x", "claude", "--sandbox", "off"][..]),
             ("prompt", &["builder", "!rm -rf /"][..]),
             ("prompt", &["builder", "  /approve"][..]),
             ("draft", &["builder", "!ls"][..]),

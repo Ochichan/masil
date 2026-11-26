@@ -33,6 +33,7 @@ const QUIET: std::time::Duration = std::time::Duration::from_millis(400);
 enum Tab {
     Files,
     Checkpoints,
+    Audit,
 }
 
 #[derive(Clone)]
@@ -86,7 +87,8 @@ pub(super) struct ChangesWindow {
     files: Option<Value>,
     checkpoints: Option<Value>,
     since: Option<Value>,
-    selected: [usize; 3],
+    audit: Option<Value>,
+    selected: [usize; 4],
     /// The diff on show, with the path it belongs to.
     diff: Option<(String, String, bool)>,
     scroll: usize,
@@ -119,7 +121,8 @@ impl ChangesWindow {
             files: Some(files),
             checkpoints: None,
             since: None,
-            selected: [0; 3],
+            audit: None,
+            selected: [0; 4],
             diff: None,
             scroll: 0,
             pending: false,
@@ -161,9 +164,11 @@ impl ChangesWindow {
 
     fn list_index(&self) -> usize {
         match (self.tab, &self.mode) {
+            (Tab::Audit, Mode::Confirm { .. }) => 3,
             (_, Mode::Since { .. } | Mode::Confirm { .. }) => 2,
             (Tab::Files, _) => 0,
             (Tab::Checkpoints, _) => 1,
+            (Tab::Audit, _) => 3,
         }
     }
 
@@ -183,6 +188,7 @@ impl ChangesWindow {
                 .unwrap_or_default()
         }
         match (self.tab, &self.mode) {
+            (Tab::Audit, _) => array(&self.audit, "rows"),
             (_, Mode::Since { .. } | Mode::Confirm { .. }) => array(&self.since, "since.files"),
             (Tab::Files, _) => array(&self.files, "files"),
             (Tab::Checkpoints, _) => array(&self.checkpoints, "checkpoints"),
@@ -337,6 +343,20 @@ impl ChangesWindow {
                     self.word("Nothing was sent.", "보내지는 않았습니다.")
                 ));
             }
+            ChangesOp::AuditLatest => {
+                self.audit = Some(value);
+                self.clamp();
+            }
+            ChangesOp::AuditChallenge { finding_id } => {
+                let tag = finding_id.as_deref().unwrap_or("audit");
+                self.notice = Some(format!(
+                    "{} ({tag}).",
+                    self.word(
+                        "Audit challenge queued for agent",
+                        "Audit 추궁 프롬프트를 대기열에 넣었습니다"
+                    )
+                ));
+            }
         }
     }
 
@@ -348,6 +368,7 @@ impl ChangesWindow {
         match self.tab {
             Tab::Files if self.files.is_none() => Some(ChangesOp::List),
             Tab::Checkpoints if self.checkpoints.is_none() => Some(ChangesOp::Checkpoints),
+            Tab::Audit if self.audit.is_none() => Some(ChangesOp::AuditLatest),
             _ => None,
         }
     }
@@ -467,7 +488,11 @@ impl ChangesWindow {
                     run: Some(self.run.clone()),
                 }),
                 KeyCode::Esc => {
-                    self.mode = Mode::Since { id };
+                    self.mode = if self.tab == Tab::Audit {
+                        Mode::Browse
+                    } else {
+                        Mode::Since { id }
+                    };
                     self.diff = None;
                     ChangesOutcome::None
                 }
@@ -537,8 +562,17 @@ impl ChangesWindow {
             (_, KeyCode::Tab) => {
                 self.tab = match self.tab {
                     Tab::Files => Tab::Checkpoints,
-                    Tab::Checkpoints => Tab::Files,
+                    Tab::Checkpoints => Tab::Audit,
+                    Tab::Audit => Tab::Files,
                 };
+                self.diff = None;
+                match self.needs() {
+                    Some(op) => self.op(op),
+                    None => ChangesOutcome::None,
+                }
+            }
+            (_, KeyCode::Char('a')) => {
+                self.tab = Tab::Audit;
                 self.diff = None;
                 match self.needs() {
                     Some(op) => self.op(op),
@@ -549,6 +583,7 @@ impl ChangesWindow {
                 let op = match self.tab {
                     Tab::Files => ChangesOp::List,
                     Tab::Checkpoints => ChangesOp::Checkpoints,
+                    Tab::Audit => ChangesOp::AuditLatest,
                 };
                 self.op(op)
             }
@@ -587,6 +622,89 @@ impl ChangesWindow {
                 match self.current().and_then(|row| row["id"].as_u64()) {
                     Some(id) => self.op(ChangesOp::Show { id, path: None }),
                     None => ChangesOutcome::None,
+                }
+            }
+            (Tab::Audit, KeyCode::Enter) => {
+                if let Some(row) = self.current().cloned() {
+                    let kind = row["entry_kind"].as_str().unwrap_or("");
+                    if kind == "hunk" {
+                        let file = row["file"].as_str().unwrap_or("(file)").to_owned();
+                        let diff = row["diff"].as_str().unwrap_or("").to_owned();
+                        self.diff = Some((file, diff, false));
+                        self.scroll = 0;
+                    } else {
+                        let rule = row["rule_id"].as_str().unwrap_or("AUDIT");
+                        let sev = row["severity"].as_str().unwrap_or("info").to_uppercase();
+                        let title = row["title"].as_str().unwrap_or("");
+                        let detail = row["detail"].as_str().unwrap_or("");
+                        let evidence = row["evidence"].as_str().unwrap_or("");
+                        let file = row["file"].as_str().unwrap_or("(turn)");
+                        let mut text = format!("[{sev}] {rule}: {title}\n{detail}");
+                        if !evidence.is_empty() {
+                            text.push_str(&format!("\n\nEvidence:\n{evidence}"));
+                        }
+                        self.diff = Some((format!("{rule} · {file}"), text, false));
+                        self.scroll = 0;
+                    }
+                }
+                ChangesOutcome::None
+            }
+            (Tab::Audit, KeyCode::Char('c')) => {
+                let finding_id = self
+                    .current()
+                    .and_then(|row| row["finding_id"].as_str())
+                    .map(str::to_owned);
+                self.op(ChangesOp::AuditChallenge { finding_id })
+            }
+            (Tab::Audit, KeyCode::Char('r')) => {
+                if self.restarted {
+                    self.notice = Some(
+                        self.word(
+                            "The agent restarted; reopen the window to restore.",
+                            "agent가 다시 시작됐습니다. 창을 다시 열어 되돌리세요.",
+                        )
+                        .into(),
+                    );
+                    return ChangesOutcome::None;
+                }
+                let file = self
+                    .current()
+                    .and_then(|row| row["file"].as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let cp_id = self.audit.as_ref().and_then(|a| {
+                    a["audit"]["prev_checkpoint_id"]
+                        .as_str()
+                        .or_else(|| a["audit"]["checkpoint_id"].as_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                });
+                match (file, cp_id) {
+                    (Some(path), Some(id)) => self.op(ChangesOp::Restore {
+                        id,
+                        paths: vec![path],
+                        token: None,
+                        run: Some(self.run.clone()),
+                    }),
+                    (None, _) => {
+                        self.notice = Some(
+                            self.word(
+                                "Select a finding or hunk with a file path to rollback.",
+                                "파일 경로가 있는 항목을 선택해야 롤백할 수 있습니다.",
+                            )
+                            .into(),
+                        );
+                        ChangesOutcome::None
+                    }
+                    (_, None) => {
+                        self.notice = Some(
+                            self.word(
+                                "No pre-turn checkpoint recorded for rollback.",
+                                "롤백에 사용할 턴 이전 checkpoint가 없습니다.",
+                            )
+                            .into(),
+                        );
+                        ChangesOutcome::None
+                    }
                 }
             }
             _ => ChangesOutcome::None,
@@ -648,6 +766,29 @@ impl ChangesWindow {
 
     fn row(&self, row: &Value) -> String {
         match (self.tab, &self.mode) {
+            (Tab::Audit, _) => {
+                if row["entry_kind"].as_str() == Some("hunk") {
+                    let score = row["score"].as_u64().unwrap_or(0);
+                    let adds = row["additions"].as_u64().unwrap_or(0);
+                    let dels = row["deletions"].as_u64().unwrap_or(0);
+                    let file = plain(row["file"].as_str().unwrap_or_default());
+                    format!("[HUNK {:>3}] +{adds} -{dels}  {file}", score)
+                } else {
+                    let sev = row["severity"]
+                        .as_str()
+                        .unwrap_or("info")
+                        .to_ascii_uppercase();
+                    let rule = row["rule_id"].as_str().unwrap_or("AUDIT");
+                    let file = row["file"].as_str().unwrap_or("");
+                    let loc = match (file.is_empty(), row["line"].as_u64()) {
+                        (false, Some(line)) => format!("{file}:{line}  "),
+                        (false, None) => format!("{file}  "),
+                        _ => String::new(),
+                    };
+                    let title = plain(row["title"].as_str().unwrap_or_default());
+                    format!("[{sev:<8}] {rule:<4} {loc}{title}")
+                }
+            }
             (Tab::Checkpoints, Mode::Browse) => format!(
                 "#{:<4} {}{} {}",
                 row["id"],
@@ -719,6 +860,20 @@ impl ChangesWindow {
                 ),
                 None => self.word("Reading…", "읽는 중…").into(),
             },
+            (_, Tab::Audit) => match &self.audit {
+                Some(audit) => {
+                    let verdict = audit["summary"]["verdict"].as_str().unwrap_or("clean");
+                    let risk = audit["summary"]["risk_score"].as_u64().unwrap_or(0);
+                    let crit = audit["summary"]["critical_count"].as_u64().unwrap_or(0);
+                    let high = audit["summary"]["high_count"].as_u64().unwrap_or(0);
+                    format!(
+                        "Audit: {} · risk {risk}/100 · CRIT {crit} HIGH {high} · {}",
+                        verdict.to_ascii_uppercase(),
+                        self.word("c challenge · r rollback file", "c 추궁 · r 단일 파일 롤백")
+                    )
+                }
+                None => self.word("Auditing…", "감사 결과 읽는 중…").into(),
+            },
         }
     }
 
@@ -751,12 +906,26 @@ impl ChangesWindow {
                 ),
                 (label("Enter", self.word("Diff", "diff")), KeyCode::Enter),
             ],
+            Mode::Browse if self.tab == Tab::Audit => vec![
+                (label("Esc", self.word("Close", "닫기")), KeyCode::Esc),
+                (label("Tab", self.word("Tabs", "탭 전환")), KeyCode::Tab),
+                (
+                    label("c", self.word("Challenge", "추궁")),
+                    KeyCode::Char('c'),
+                ),
+                (
+                    label("r", self.word("Rollback", "파일 롤백")),
+                    KeyCode::Char('r'),
+                ),
+                (label("Enter", self.word("Inspect", "보기")), KeyCode::Enter),
+            ],
             Mode::Browse => vec![
                 (label("Esc", self.word("Close", "닫기")), KeyCode::Esc),
                 (
-                    label("Tab", self.word("Files/Checkpoints", "파일/checkpoint")),
+                    label("Tab", self.word("Files/Ckpt/Audit", "파일/ckpt/감사")),
                     KeyCode::Tab,
                 ),
+                (label("a", self.word("Audit", "감사")), KeyCode::Char('a')),
                 (
                     label("m", self.word("Checkpoint", "checkpoint")),
                     KeyCode::Char('m'),
@@ -852,6 +1021,16 @@ impl ChangesWindow {
                     .add_modifier(Modifier::BOLD)
             } else if hovered {
                 Style::default().fg(text).bg(palette.raised_fill())
+            } else if self.tab == Tab::Audit && row.starts_with("[CRITICAL]") {
+                Style::default()
+                    .fg(palette.danger)
+                    .bg(panel)
+                    .add_modifier(Modifier::BOLD)
+            } else if self.tab == Tab::Audit && row.starts_with("[HIGH") {
+                Style::default()
+                    .fg(palette.warning)
+                    .bg(panel)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(text).bg(panel)
             };
@@ -1161,7 +1340,7 @@ mod tests {
             rect.y,
         ));
         window.handle(mouse(MouseEventKind::Up(MouseButton::Left), rect.x, rect.y));
-        assert_eq!(window.selected, [0, 1, 1]);
+        assert_eq!(window.selected, [0, 1, 1, 0]);
         // Enter still confirms the file the preview was made for.
         match window.handle(key(KeyCode::Enter)) {
             ChangesOutcome::Op(ChangesOp::Restore {
@@ -1334,5 +1513,81 @@ mod tests {
         }
         assert!(saw_add && saw_del && saw_hunk, "{all_text}");
         assert!(all_text.contains("L1/4"), "{all_text}");
+    }
+
+    #[test]
+    fn audit_tab_shows_findings_challenges_and_rolls_back_file() {
+        let mut window = ChangesWindow::new(1, Language::English, agent(), vec![], files());
+        assert!(matches!(
+            window.handle(key(KeyCode::Char('a'))),
+            ChangesOutcome::Op(ChangesOp::AuditLatest)
+        ));
+        window.receive(
+            &ChangesOp::AuditLatest,
+            Ok(json!({
+                "audit": {
+                    "prev_checkpoint_id": "2",
+                    "checkpoint_id": "3"
+                },
+                "summary": {
+                    "verdict": "flagged",
+                    "risk_score": 82,
+                    "critical_count": 1,
+                    "high_count": 0
+                },
+                "rows": [
+                    {
+                        "entry_kind": "finding",
+                        "finding_id": "T01",
+                        "severity": "critical",
+                        "rule_id": "T01",
+                        "title": "Test skipped",
+                        "detail": "Added .skip marker",
+                        "evidence": "+test.skip('auth', ...)",
+                        "file": "src/auth.test.ts",
+                        "line": 12
+                    }
+                ]
+            })),
+        );
+        settle(&mut window);
+        let text = drawn(&mut window, 90, 24);
+        assert!(text.contains("[CRITICAL]"), "{text}");
+        assert!(text.contains("src/auth.test.ts:12"), "{text}");
+
+        // Inspect with Enter opens detail pane.
+        assert!(matches!(
+            window.handle(key(KeyCode::Enter)),
+            ChangesOutcome::None
+        ));
+        assert!(window.diff.is_some());
+
+        // `c` queues AuditChallenge.
+        match window.handle(key(KeyCode::Char('c'))) {
+            ChangesOutcome::Op(ChangesOp::AuditChallenge { finding_id }) => {
+                assert_eq!(finding_id.as_deref(), Some("T01"));
+            }
+            _ => panic!("expected AuditChallenge"),
+        }
+        window.receive(
+            &ChangesOp::AuditChallenge {
+                finding_id: Some("T01".into()),
+            },
+            Ok(json!({"stage": "queued"})),
+        );
+        settle(&mut window);
+
+        // `r` previews single-file rollback against prev_checkpoint_id.
+        match window.handle(key(KeyCode::Char('r'))) {
+            ChangesOutcome::Op(ChangesOp::Restore {
+                id: 2,
+                paths,
+                token: None,
+                ..
+            }) => {
+                assert_eq!(paths, vec!["src/auth.test.ts".to_owned()]);
+            }
+            _ => panic!("expected single-file Restore preview"),
+        }
     }
 }

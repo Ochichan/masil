@@ -34,7 +34,7 @@ export default function PairScreen() {
       const trimmed = uri.trim();
       setBusy(true);
       setError(null);
-      setStatusNote("QR 인식됨 · E2EE 페어링 중...");
+      setStatusNote(t("qrRecognizedPairing"));
       setScanning(false);
       setUriInput(trimmed);
       try {
@@ -49,7 +49,7 @@ export default function PairScreen() {
         setBusy(false);
       }
     },
-    [busy, pairFromUri, router]
+    [busy, pairFromUri, router, t]
   );
 
   const handleScannedData = useCallback(
@@ -58,10 +58,10 @@ export default function PairScreen() {
       if (data.startsWith("masil://pair?")) {
         void completePairing(data);
       } else if (data.length > 0) {
-        setStatusNote(`masil QR이 아닙니다 (${data.slice(0, 28)}...)`);
+        setStatusNote(t("qrNotMasil", { preview: data.slice(0, 28) }));
       }
     },
-    [completePairing]
+    [completePairing, t]
   );
 
   useEffect(() => {
@@ -123,7 +123,7 @@ export default function PairScreen() {
               />
               <View style={styles.statusPill}>
                 <Text style={styles.statusPillText}>
-                  {statusNote ?? "QR 코드를 사각형 안에 맞춰주세요"}
+                  {statusNote ?? t("qrAlignInBox")}
                 </Text>
               </View>
             </View>
@@ -131,8 +131,7 @@ export default function PairScreen() {
         ) : (
           <View style={styles.permBox}>
             <Text style={{ color: palette.muted, textAlign: "center" }}>
-              `masil-agent remote setup` QR 코드를 스캔하려면 카메라 권한이
-              필요합니다.
+              {t("cameraPermissionNeeded")}
             </Text>
             <Pressable
               onPress={() => void requestPermission()}
@@ -161,7 +160,7 @@ export default function PairScreen() {
             ]}
           >
             <Text style={{ color: palette.accent, fontWeight: "700" }}>
-              시스템 고정밀 QR 스캐너 열기 (자동 줌)
+              {t("openSystemQrScanner")}
             </Text>
           </Pressable>
         ) : null}
@@ -202,7 +201,7 @@ export default function PairScreen() {
             ]}
           >
             <Text style={{ color: palette.text, fontWeight: "600" }}>
-              붙여넣기
+              {t("paste")}
             </Text>
           </Pressable>
           <Pressable
@@ -221,7 +220,7 @@ export default function PairScreen() {
               <ActivityIndicator size="small" color={palette.accentText} />
             ) : (
               <Text style={{ color: palette.accentText, fontWeight: "700" }}>
-                연결
+                {t("connect")}
               </Text>
             )}
           </Pressable>

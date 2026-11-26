@@ -64,6 +64,9 @@ core/etc/
 !/tests/test_managed_agents.py
 !/tests/test_managed_restore.py
 !/tests/test_performance_compare.py
+!/tests/test_phase1.py
+!/tests/test_phase2.py
+!/tests/test_phase3.py
 !/tests/test_management_probe.py
 !/tests/test_plugins_e2e.py
 !/tests/test_remote_e2e.py

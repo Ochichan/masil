@@ -26,7 +26,10 @@ usage: masil-agent worktree create REPO BRANCH [--from REF] [--name NAME] [--set
        masil-agent worktree setup WORKTREE [--repo DIR] [--key KEY] [--no-wait]
        masil-agent worktree trust REPO [--confirm SHA256] | untrust REPO
        masil-agent worktree jobs [JOB]
-       masil-agent worktree cancel JOB [--no-wait]";
+       masil-agent worktree cancel JOB [--no-wait]
+       masil-agent worktree conflicts [REPO] [--socket PATH] [--json]
+       masil-agent worktree shadow-check WORKTREE_A WORKTREE_B --cmd CMD [--repo DIR]
+       masil-agent worktree warn TARGET --about SIBLING [--socket PATH]";
 /// Jobs `worktree jobs` shows.
 const JOB_LIST: usize = 50;
 /// Output lines a failed job's error shows.
@@ -47,6 +50,9 @@ pub(crate) fn run(args: &[String]) -> Result<i32, String> {
         Some("setup") => setup_command(&args[1..]),
         Some("trust") => trust(&args[1..]),
         Some("untrust") => untrust(&args[1..]),
+        Some("conflicts") => conflicts(&args[1..]),
+        Some("shadow-check") => shadow_check(&args[1..]),
+        Some("warn") => warn_sibling(&args[1..]),
         Some("job-run") => match &args[1..] {
             [id] => helper::run(job_id(id)?),
             _ => Err(format!("usage: {HELP}")),
@@ -669,5 +675,159 @@ fn untrust(args: &[String]) -> Result<i32, String> {
     let mut registry = Registry::open()?;
     let removed = registry.untrust(&repo.common_dir)?;
     print(&json!({"untrusted": repo.root, "was_trusted": removed}))?;
+    Ok(0)
+}
+
+fn default_socket_opt(explicit: Option<String>) -> Option<PathBuf> {
+    explicit
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("TMUX")
+                .ok()
+                .and_then(|v| v.rsplitn(3, ',').last().map(PathBuf::from))
+        })
+        .or_else(|| std::env::var("MASIL_AGENT_SOCKET").ok().map(PathBuf::from))
+        .or_else(|| crate::remote::discovery::default_masil_socket().ok())
+}
+
+fn conflicts(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(args, &["--socket"], &["--json"])?;
+    let repo_filter = match parsed.positional.as_slice() {
+        [] => None,
+        [repo] => crate::collision::resolve_repo_identity(Path::new(repo)).map(|(k, _)| k),
+        _ => return Err(format!("usage: {HELP}")),
+    };
+    let socket = default_socket_opt(parsed.value("--socket"));
+    let mut active = Vec::new();
+    let sockets: Vec<String> = match &socket {
+        Some(p) => vec![p.to_string_lossy().into_owned()],
+        None => crate::remote::discovery::discover_masil_servers()
+            .into_iter()
+            .map(|s| s.socket)
+            .collect(),
+    };
+    for sock in &sockets {
+        let Ok(val) = crate::remote::discovery::run_self_agent_json(Some(sock), &["list".into()])
+        else {
+            continue;
+        };
+        let Some(rows) = val.get("agents").and_then(Value::as_array) else {
+            continue;
+        };
+        for row in rows {
+            let state = row["state"].as_str().unwrap_or("");
+            let cwd = row["cwd"].as_str().unwrap_or("");
+            if state == "exited" || cwd.is_empty() {
+                continue;
+            }
+            let (repo_key, repo_root) = crate::collision::resolve_repo_identity(Path::new(cwd))
+                .unwrap_or_else(|| (format!("dir:{cwd}"), cwd.to_owned()));
+            let changed_files = if repo_key.starts_with("dir:") {
+                Vec::new()
+            } else {
+                crate::collision::changed_files_in_worktree(Path::new(&repo_root))
+            };
+            active.push(crate::collision::ActiveWorktreeAgent {
+                name: row["name"].as_str().unwrap_or("").to_owned(),
+                pane_id: row["pane_id"]
+                    .as_str()
+                    .or_else(|| row["pane"].as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                run_id: row["run"].as_str().unwrap_or("").to_owned(),
+                state: state.to_owned(),
+                cwd: cwd.to_owned(),
+                repo_key,
+                repo_root,
+                changed_files,
+            });
+        }
+    }
+    let at_ms = now_ms();
+    let pairs = crate::collision::compute_matrix(&active, repo_filter.as_deref(), at_ms);
+    if let Some(sock) = &socket
+        && let Ok(mut store) = crate::managed::Store::open(sock)
+    {
+        for p in &pairs {
+            let _ = store.upsert_collision_snapshot(&p.to_record());
+        }
+    }
+    print(&json!({
+        "pairs": pairs,
+        "computed_ms": at_ms,
+        "agents_checked": active.len(),
+    }))?;
+    Ok(0)
+}
+
+fn shadow_check(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(args, &["--cmd", "--repo"], &[])?;
+    let [a, b] = parsed.positional.as_slice() else {
+        return Err(format!("usage: {HELP}"));
+    };
+    let cmd = parsed
+        .value("--cmd")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("usage: worktree shadow-check WORKTREE_A WORKTREE_B --cmd CMD")?;
+    let repo_hint = parsed.value("--repo").map(PathBuf::from);
+    let path_a = crate::collision::resolve_worktree_path(a, repo_hint.as_deref())?;
+    let path_b = crate::collision::resolve_worktree_path(b, repo_hint.as_deref())?;
+    let report = crate::collision::shadow::run_shadow_check(
+        a,
+        &path_a,
+        b,
+        &path_b,
+        &cmd,
+        std::time::Duration::from_secs(60),
+    )?;
+    print(&serde_json::to_value(&report).map_err(|e| e.to_string())?)?;
+    Ok(0)
+}
+
+fn warn_sibling(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(args, &["--about", "--socket"], &[])?;
+    let [target] = parsed.positional.as_slice() else {
+        return Err(format!("usage: {HELP}"));
+    };
+    let sibling = parsed
+        .value("--about")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("usage: worktree warn TARGET --about SIBLING [--socket PATH]")?;
+    let socket = default_socket_opt(parsed.value("--socket"))
+        .ok_or("usage: specify --socket PATH or run inside masil")?;
+    let mut matched_pair: Option<crate::collision::CollisionPair> = None;
+    if let Ok(store) = crate::managed::Store::open(&socket)
+        && let Ok(rows) = store.list_collision_snapshots(None)
+    {
+        for rec in rows {
+            let p = crate::collision::CollisionPair::from_record(rec);
+            let same = (p.agent_a == *target && p.agent_b == sibling)
+                || (p.agent_b == *target && p.agent_a == sibling)
+                || (p.pane_a == *target && p.agent_b == sibling)
+                || (p.pane_b == *target && p.agent_a == sibling);
+            if same {
+                matched_pair = Some(p);
+                break;
+            }
+        }
+    }
+    let message = match &matched_pair {
+        Some(pair) => crate::collision::format_sibling_warning(pair, target, &sibling),
+        None => format!(
+            "[masil Collision Radar] Heads up `{target}`: sibling agent `{sibling}` may be editing overlapping files in the same repository. Please check interfaces and coordinate before making overlapping changes."
+        ),
+    };
+    let queued = crate::collision::warn_agent_via_queue(&socket, target, &message)?;
+    if let Some(pair) = &matched_pair
+        && let Ok(mut store) = crate::managed::Store::open(&socket)
+    {
+        let _ = store.mark_collision_warned(&pair.repo_key, &pair.agent_a, &pair.agent_b, now_ms());
+    }
+    print(&json!({
+        "warned": target,
+        "about": sibling,
+        "message": message,
+        "queue_result": queued,
+    }))?;
     Ok(0)
 }

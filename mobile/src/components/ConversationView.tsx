@@ -10,6 +10,7 @@ import {
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { Check, ChevronDown, ChevronRight, Copy, Wrench } from "lucide-react-native";
+import { useTranslation } from "react-i18next";
 import type {
   AgentRow,
   TimelineItem,
@@ -97,7 +98,10 @@ interface ActivitySummaryParts {
   failedCount: number;
 }
 
-function summarizeActivityGroup(items: ActivitySubItem[]): ActivitySummaryParts {
+function summarizeActivityGroup(
+  items: ActivitySubItem[],
+  t: (key: string, opts?: Record<string, unknown>) => string
+): ActivitySummaryParts {
   const toolCounts = new Map<string, number>();
   let totalTools = 0;
   let failedTools = 0;
@@ -120,13 +124,19 @@ function summarizeActivityGroup(items: ActivitySubItem[]): ActivitySummaryParts 
       .map(([name, count]) => (count > 1 ? `${name}×${count}` : name))
       .join(", ");
     return {
-      headline: `도구 ${totalTools}회 실행`,
-      detail: failedTools > 0 ? `${topNames} · 실패 ${failedTools}` : topNames,
+      headline: t("activityToolsRan", { count: totalTools }),
+      detail:
+        failedTools > 0
+          ? t("activityFailedCount", { detail: topNames, count: failedTools })
+          : topNames,
       failedCount: failedTools,
     };
   }
   return {
-    headline: thinkingCount > 1 ? `생각 ${thinkingCount}단계` : "생각 과정",
+    headline:
+      thinkingCount > 1
+        ? t("activityThinkingSteps", { count: thinkingCount })
+        : t("activityThinkingProcess"),
     detail: "",
     failedCount: 0,
   };
@@ -134,8 +144,9 @@ function summarizeActivityGroup(items: ActivitySubItem[]): ActivitySummaryParts 
 
 function ActivitySummaryRow({ items }: { items: ActivitySubItem[] }) {
   const { palette } = useMasilTheme();
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
-  const summary = useMemo(() => summarizeActivityGroup(items), [items]);
+  const summary = useMemo(() => summarizeActivityGroup(items, t), [items, t]);
   const hasFailed = summary.failedCount > 0;
 
   return (
@@ -366,8 +377,17 @@ export function ConversationView({
   onOpenTerminal,
 }: ConversationViewProps) {
   const { palette } = useMasilTheme();
+  const { t } = useTranslation();
   const items = page?.items ?? [];
-  const entries = useMemo(() => buildDisplayEntries(items), [items]);
+  const hasDockedPrompts = (page?.active_prompts?.length ?? 0) > 0;
+  const visibleItems = useMemo(
+    () =>
+      hasDockedPrompts
+        ? items.filter((item) => item.kind !== "approval_banner")
+        : items,
+    [items, hasDockedPrompts]
+  );
+  const entries = useMemo(() => buildDisplayEntries(visibleItems), [visibleItems]);
   const listRef = useRef<FlatList<DisplayEntry>>(null);
   const prevCount = useRef(0);
 
@@ -507,7 +527,7 @@ export function ConversationView({
         <View style={styles.emptyBox}>
           <ActivityIndicator size="small" color={palette.accent} />
           <Text style={[styles.emptyText, { color: palette.muted }]}>
-            {agent.name}의 대화를 동기화하는 중입니다...
+            {t("syncingConversation", { name: agent.name })}
           </Text>
         </View>
       }

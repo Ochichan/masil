@@ -5,7 +5,8 @@ use masil_relay::{RelayConfig, RelayState, build_router};
 use masil_wire::noise::{HandshakeParams, InitiatorHandshake, Keypair, ResponderHandshake};
 use masil_wire::record::{RecordKind, open_record, seal_record};
 use masil_wire::rpc::{
-    HandshakeEnvelope, PushDeviceToken, PushNotificationRequest, RelayControlMessage,
+    HandshakeEnvelope, LiveActivityEventKind, LiveActivityPayload, PushDeviceToken,
+    PushNotificationRequest, RelayControlMessage,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -145,7 +146,9 @@ async fn e2ee_noise_nk_roundtrip_through_relay_and_hijack_rejected() {
             tokens: vec![PushDeviceToken {
                 platform: "ios".into(),
                 token: "dummy-apns-token".into(),
+                push_type: None,
             }],
+            live_activity: None,
         })
         .send()
         .await
@@ -156,4 +159,109 @@ async fn e2ee_noise_nk_roundtrip_through_relay_and_hijack_rejected() {
     assert_eq!(body["sent"], 0);
     assert_eq!(body["skipped"], 1);
     assert_eq!(body["configured"], false);
+
+    // 7. Live Activity minimal-metadata push accepts whitelisted fields and rejects
+    //    any smuggled prompt/code fields (D-09 zero-code-leak schema assertion).
+    let live_resp = http
+        .post(format!("http://{addr}/v1/push"))
+        .bearer_auth(host_token)
+        .json(&PushNotificationRequest {
+            host_id: "mac-dev".into(),
+            host_name: "Mac".into(),
+            agent_id: "%0".into(),
+            agent_name: "builder".into(),
+            event_kind: "approval_requested".into(),
+            occurred_ms: 1790000000100,
+            tokens: vec![
+                PushDeviceToken {
+                    platform: "ios".into(),
+                    token: "live-act-token".into(),
+                    push_type: Some("liveactivity".into()),
+                },
+                PushDeviceToken {
+                    platform: "android".into(),
+                    token: "fcm-ongoing-token".into(),
+                    push_type: Some("android_ongoing".into()),
+                },
+            ],
+            live_activity: Some(LiveActivityPayload {
+                host_id: "mac-dev".into(),
+                host_name: "Mac".into(),
+                working_count: 2,
+                blocked_count: 1,
+                done_count: 0,
+                alert_count: 1,
+                top_agent_alias: Some("builder".into()),
+                top_event_kind: Some(LiveActivityEventKind::ApprovalRequested),
+                top_summary_line: None,
+                deep_link: "masil://host/mac-dev/agent/%250".into(),
+                updated_at: 1790000000,
+            }),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live_resp.status(), 200);
+    let live_body: serde_json::Value = live_resp.json().await.unwrap();
+    assert_eq!(live_body["ok"], true);
+    assert_eq!(live_body["skipped"], 2);
+
+    // Smuggling prompt/code into live_activity must be rejected with 422.
+    let smuggled_resp = http
+        .post(format!("http://{addr}/v1/push"))
+        .bearer_auth(host_token)
+        .json(&serde_json::json!({
+            "host_id": "mac-dev",
+            "host_name": "Mac",
+            "agent_id": "%0",
+            "agent_name": "builder",
+            "event_kind": "approval_requested",
+            "occurred_ms": 1790000000200i64,
+            "tokens": [],
+            "live_activity": {
+                "host_id": "mac-dev",
+                "host_name": "Mac",
+                "working_count": 1,
+                "blocked_count": 0,
+                "done_count": 0,
+                "alert_count": 0,
+                "deep_link": "masil://host/mac-dev",
+                "raw_prompt": "sk-secret-must-never-cross-relay"
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(smuggled_resp.status(), 422);
+
+    // Oversized summary (>60 chars) must be rejected with 400.
+    let bad_summary_resp = http
+        .post(format!("http://{addr}/v1/push"))
+        .bearer_auth(host_token)
+        .json(&PushNotificationRequest {
+            host_id: "mac-dev".into(),
+            host_name: "Mac".into(),
+            agent_id: "%0".into(),
+            agent_name: "builder".into(),
+            event_kind: "approval_requested".into(),
+            occurred_ms: 1790000000300,
+            tokens: vec![],
+            live_activity: Some(LiveActivityPayload {
+                host_id: "mac-dev".into(),
+                host_name: "Mac".into(),
+                working_count: 1,
+                blocked_count: 0,
+                done_count: 0,
+                alert_count: 0,
+                top_agent_alias: Some("builder".into()),
+                top_event_kind: Some(LiveActivityEventKind::TurnFinished),
+                top_summary_line: Some("a".repeat(65)),
+                deep_link: "masil://host/mac-dev".into(),
+                updated_at: 1790000000,
+            }),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_summary_resp.status(), 400);
 }

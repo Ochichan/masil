@@ -2,15 +2,19 @@
 //! multi-socket discovery, `-C` terminal streaming, and 4-provider live
 //! transcripts.
 
+pub mod assets;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
 pub mod files;
 pub mod hooks;
+pub mod ports;
+pub mod prompts;
 pub mod rpc;
 pub mod service;
 pub mod terminal_stream;
 pub mod transcripts;
+pub mod tunnel;
 pub mod voice;
 
 use crate::remote::config::{
@@ -127,6 +131,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
                         "host_name": offer.host_name,
                         "relay_url": offer.relay_url,
                         "direct_addr": offer.direct_addr,
+                        "direct_addrs": offer.all_direct_addrs(),
                         "qr_html": qr_html.as_ref().map(|p| p.display().to_string()),
                         "expires_in_seconds": 300,
                     }))

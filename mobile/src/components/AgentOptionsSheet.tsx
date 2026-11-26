@@ -8,8 +8,13 @@ import {
   Text,
   View,
 } from "react-native";
-import { Check, SlidersHorizontal, X } from "lucide-react-native";
+import { AlertTriangle, Check, SlidersHorizontal, X } from "lucide-react-native";
+import { useTranslation } from "react-i18next";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import {
+  formatCacheWarmthCompact,
+  shouldWarnCacheInvalidation,
+} from "../agents/phase1-helpers";
 import { getHostClient } from "../hosts/HostRuntimeController";
 import type { AgentRow, ProviderModelsResponse } from "../protocol/schemas";
 import { useMasilTheme } from "../theme/ThemeProvider";
@@ -53,6 +58,7 @@ export function AgentOptionsSheet({
   onApplied,
 }: AgentOptionsSheetProps) {
   const { palette } = useMasilTheme();
+  const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const [meta, setMeta] = useState<ProviderModelsResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -104,20 +110,23 @@ export function AgentOptionsSheet({
   );
 
   const sheetTitle = hasLiveMode
-    ? "모델 · 추론 강도 · 모드 설정"
+    ? t("optionsTitleModelEffortMode")
     : hasLiveEffort
-      ? "모델 · 추론 강도 설정"
-      : "모델 설정";
+      ? t("optionsTitleModelEffort")
+      : t("optionsTitleModel");
 
   const effectiveEffort = selectedEffort || inferredEffort;
   const effortChanged =
     Boolean(selectedEffort) && selectedEffort !== inferredEffort;
   const hasChanges = Boolean(selectedModel || effortChanged || selectedMode);
+  const showCacheInvalidateWarning =
+    hasChanges && shouldWarnCacheInvalidation(agent.cache_warmth);
+  const warmthBadge = formatCacheWarmthCompact(agent.cache_warmth);
 
   const apply = async () => {
     const client = getHostClient(hostId);
     if (!client) {
-      setError("호스트에 연결되어 있지 않습니다.");
+      setError(t("hostNotConnected"));
       return;
     }
     if (!hasChanges) return;
@@ -129,6 +138,7 @@ export function AgentOptionsSheet({
         "agent.configure.request",
         {
           server_socket: agent.server_socket,
+          pane: agent.pane,
           target: agent.pane || agent.name,
           provider: agent.provider,
           model: selectedModel || undefined,
@@ -137,7 +147,7 @@ export function AgentOptionsSheet({
         }
       );
       const cmds = res.applied ?? [];
-      setFeedback(`전송 완료: ${cmds.join(" · ")}`);
+      setFeedback(t("optionsApplied", { commands: cmds.join(" · ") }));
       onApplied();
       setTimeout(onClose, 500);
     } catch (e) {
@@ -200,14 +210,14 @@ export function AgentOptionsSheet({
 
           <ScrollView contentContainerStyle={styles.body}>
             <Text style={[styles.label, { color: palette.muted }]}>
-              모델 선택
+              {t("optionsSelectModel")}
             </Text>
             <ModelPickerDropdown
               models={meta?.models ?? []}
               selectedModel={selectedModel}
               currentModel={detectedModel}
               loading={loading}
-              placeholder="변경할 모델 선택..."
+              placeholder={t("optionsSelectModelPlaceholder")}
               onSelect={setSelectedModel}
             />
 
@@ -215,11 +225,13 @@ export function AgentOptionsSheet({
               <View style={styles.section}>
                 <View style={styles.sectionRow}>
                   <Text style={[styles.label, { color: palette.muted }]}>
-                    추론 강도
+                    {t("optionsReasoningEffort")}
                   </Text>
                   {inferredEffort ? (
                     <Text style={[styles.hintTag, { color: palette.muted }]}>
-                      현재 {formatEffortLabel(inferredEffort)}
+                      {t("optionsCurrentValue", {
+                        value: formatEffortLabel(inferredEffort),
+                      })}
                     </Text>
                   ) : null}
                 </View>
@@ -241,7 +253,7 @@ export function AgentOptionsSheet({
             {hasLiveMode && meta ? (
               <View style={styles.section}>
                 <Text style={[styles.label, { color: palette.muted }]}>
-                  실행 모드
+                  {t("optionsExecutionMode")}
                 </Text>
                 <View style={styles.chips}>
                   {meta.modes.map((md) => (
@@ -255,6 +267,30 @@ export function AgentOptionsSheet({
                     />
                   ))}
                 </View>
+              </View>
+            ) : null}
+
+            {showCacheInvalidateWarning ? (
+              <View
+                style={[
+                  styles.cacheWarnBox,
+                  {
+                    backgroundColor: palette.warningSoft,
+                    borderColor: palette.warning,
+                  },
+                ]}
+              >
+                <AlertTriangle size={15} color={palette.warning} />
+                <Text
+                  style={[styles.cacheWarnText, { color: palette.warning }]}
+                >
+                  {t("cacheInvalidateWarning", {
+                    badge: warmthBadge ?? "",
+                    tokens: Math.round(
+                      (agent.cache_warmth?.est_context_tokens ?? 0) / 1000
+                    ),
+                  })}
+                </Text>
               </View>
             ) : null}
 
@@ -291,7 +327,7 @@ export function AgentOptionsSheet({
                       { color: palette.accentText },
                     ]}
                   >
-                    라이브 세션에 적용
+                    {t("optionsApplyLive")}
                   </Text>
                 </>
               )}
@@ -390,6 +426,21 @@ const styles = StyleSheet.create({
     fontSize: 11.5,
   },
   chips: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  cacheWarnBox: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    marginTop: 4,
+  },
+  cacheWarnText: {
+    flex: 1,
+    fontFamily: FONTS.semi,
+    fontSize: 12,
+    lineHeight: 17,
+  },
   feedbackText: {
     fontFamily: FONTS.semi,
     fontSize: 12.5,

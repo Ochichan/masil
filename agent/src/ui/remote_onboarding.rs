@@ -9,7 +9,7 @@ use super::terminal::Session;
 use super::view::Palette;
 use crate::remote::config::{
     DeviceStore, HostIdentity, PairedDevice, RemoteConfig, render_terminal_qr,
-    resolve_advertised_direct, write_qr_html_preview,
+    resolve_advertised_direct_addrs, write_qr_html_preview,
 };
 use crate::remote::hooks::{self, HookProviderStatus};
 use crate::remote::{read_daemon_pid, service};
@@ -888,9 +888,17 @@ impl App {
                     ),
                     (
                         self.t("Direct address", "직접 접속 주소"),
-                        resolve_advertised_direct(&self.config)
-                            .or_else(|| self.config.listen_addr.clone())
-                            .unwrap_or_else(|| self.t("Disabled", "비활성").to_owned()),
+                        {
+                            let addrs = resolve_advertised_direct_addrs(&self.config);
+                            if !addrs.is_empty() {
+                                addrs.join(" → ")
+                            } else {
+                                self.config
+                                    .listen_addr
+                                    .clone()
+                                    .unwrap_or_else(|| self.t("Disabled", "비활성").to_owned())
+                            }
+                        },
                         true,
                     ),
                     (
@@ -1188,9 +1196,17 @@ impl App {
 
         let installed = self.hooks.iter().filter(|h| h.hook_installed).count();
         let total = self.hooks.len();
-        let direct = resolve_advertised_direct(&self.config)
-            .or_else(|| self.config.listen_addr.clone())
-            .unwrap_or_else(|| self.t("Unconfigured", "미설정").to_owned());
+        let direct = {
+            let addrs = resolve_advertised_direct_addrs(&self.config);
+            if !addrs.is_empty() {
+                addrs.join(" → ")
+            } else {
+                self.config
+                    .listen_addr
+                    .clone()
+                    .unwrap_or_else(|| self.t("Unconfigured", "미설정").to_owned())
+            }
+        };
 
         let section = |title: &str| -> Line<'static> {
             let used = UnicodeWidthStr::width(title) + 1;

@@ -7,7 +7,10 @@ import { KeyboardProvider } from "react-native-keyboard-controller";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { useHostRuntimeStore } from "../hosts/HostRuntimeController";
 import { initI18n } from "../i18n";
-import { subscribeNotificationDeepLinks } from "../notifications/push-manager";
+import {
+  setupNotificationSystem,
+  subscribeNotificationDeepLinks,
+} from "../notifications/push-manager";
 import { ThemeProvider } from "../theme/ThemeProvider";
 
 initI18n("ko");
@@ -23,6 +26,7 @@ export default function RootLayout() {
   });
 
   useEffect(() => {
+    void setupNotificationSystem();
     void bootstrap();
     return subscribeNotificationDeepLinks();
   }, [bootstrap]);

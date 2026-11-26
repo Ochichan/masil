@@ -25,6 +25,10 @@ fn usage() -> String {
        enable <id> | disable <id> | reload [id] | remove <id>\n  \
        logs <id> [--tail N]\n  \
        theme list | set <theme-id> | reset [--json]\n  \
+       sync-theme [--socket PATH]\n  \
+       open <plugin-id> [panel-id] [--socket PATH]\n  \
+       run-cmd <plugin-id> <command-id> [--args TEXT] [--socket PATH]\n  \
+       menu [--socket PATH] [--client CLIENT]\n  \
        skill status | install [--target claude|codex|agy|all] [--force] | uninstall [--target ...]\n  \
        schema [--json]\n  \
        create-prompt <goal> [--id ID]"
@@ -152,6 +156,10 @@ pub fn set_active_theme(theme_id: Option<&str>) -> Result<Value, String> {
     cfg.bump_reload();
     cfg.save()?;
 
+    if let Ok(catalog) = load_catalog() {
+        sync_theme_to_masil_servers(&catalog);
+    }
+
     // Fire `theme.changed` hooks asynchronously in a short-lived runtime if called outside tokio.
     let theme_val = next.clone().unwrap_or_else(|| "dark".into());
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -177,6 +185,215 @@ pub fn set_active_theme(theme_id: Option<&str>) -> Result<Value, String> {
     }
 
     Ok(json!({ "active_theme": next, "reload_nonce": cfg.reload_nonce }))
+}
+
+struct MasilBarColors<'a> {
+    panel: &'a str,
+    raised: &'a str,
+    text: &'a str,
+    muted: &'a str,
+    accent: &'a str,
+    accent_text: &'a str,
+    warning: &'a str,
+    track: &'a str,
+}
+
+fn builtin_bar_colors(theme: &str) -> MasilBarColors<'static> {
+    match theme {
+        "light" => MasilBarColors {
+            panel: "#fafbfb",
+            raised: "#dce3e6",
+            text: "#192229",
+            muted: "#54646f",
+            accent: "#00707f",
+            accent_text: "#ffffff",
+            warning: "#905400",
+            track: "#becacf",
+        },
+        "terminal" => MasilBarColors {
+            panel: "default",
+            raised: "brightblack",
+            text: "default",
+            muted: "white",
+            accent: "cyan",
+            accent_text: "black",
+            warning: "yellow",
+            track: "brightblack",
+        },
+        _ => MasilBarColors {
+            panel: "#141a22",
+            raised: "#1f2731",
+            text: "#e6ebf1",
+            muted: "#9ba8b6",
+            accent: "#5bb5c2",
+            accent_text: "#051316",
+            warning: "#ebb85c",
+            track: "#303a45",
+        },
+    }
+}
+
+fn is_temp_config_isolated() -> bool {
+    let Ok(cfg_root) = manifest::config_root() else {
+        return false;
+    };
+    let tmp = std::env::temp_dir();
+    let s = cfg_root.to_string_lossy();
+    cfg_root.starts_with(&tmp) || s.starts_with("/tmp/") || s.starts_with("/private/tmp/")
+}
+
+/// Applies the active plugin theme (or restores built-in colors on reset) live
+/// to running `masil` servers whose UI layer is enabled and not in `tmux` mode.
+pub fn sync_theme_to_masil_servers(catalog: &manifest::PluginCatalog) {
+    if std::env::var_os("MASIL_NO_SERVER_THEME_SYNC").is_some() {
+        return;
+    }
+    let Ok(masil_bin) = crate::native_ui::native_executable() else {
+        return;
+    };
+    if !masil_bin.is_file() {
+        return;
+    }
+
+    let mut sockets: Vec<String> = Vec::new();
+    let isolated_temp = is_temp_config_isolated();
+    let has_custom_tmux_dir = std::env::var_os("TMUX_TMPDIR").is_some_and(|v| !v.is_empty());
+
+    if let Some(cur) = crate::api::current_socket() {
+        let s = cur.to_string_lossy().into_owned();
+        if !sockets.contains(&s) {
+            sockets.push(s);
+        }
+    }
+    if !isolated_temp || has_custom_tmux_dir {
+        for srv in crate::remote::discovery::discover_masil_servers() {
+            if !sockets.contains(&srv.socket) {
+                sockets.push(srv.socket);
+            }
+        }
+    }
+    if sockets.is_empty() {
+        return;
+    }
+
+    for sock in sockets {
+        sync_theme_to_socket(&masil_bin, &sock, catalog, false);
+    }
+}
+
+pub fn sync_theme_to_socket(
+    masil_bin: &std::path::Path,
+    sock: &str,
+    catalog: &manifest::PluginCatalog,
+    only_if_plugin_theme: bool,
+) {
+    let resolved = catalog.active_resolved_theme();
+    if only_if_plugin_theme && resolved.is_none() {
+        return;
+    }
+    let active_builtin = catalog.active_theme.as_deref().and_then(|t| match t {
+        "dark" | "light" | "terminal" => Some(t),
+        "system" => Some("dark"),
+        _ => None,
+    });
+    let read_opt = |opt: &str| -> Option<String> {
+        let out = std::process::Command::new(masil_bin)
+            .arg("-S")
+            .arg(sock)
+            .args(["show-options", "-gqv", opt])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let val = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (!val.is_empty()).then_some(val)
+    };
+    if read_opt("@masil-ui").as_deref() == Some("off") {
+        return;
+    }
+    let server_theme = read_opt("@masil-theme");
+    if server_theme.as_deref() == Some("tmux") {
+        return;
+    }
+
+    let colors = if let Some(ref t) = resolved {
+        MasilBarColors {
+            panel: &t.panel,
+            raised: &t.raised,
+            text: &t.text,
+            muted: &t.muted,
+            accent: &t.accent,
+            accent_text: &t.accent_text,
+            warning: &t.warning,
+            track: &t.track,
+        }
+    } else {
+        let fallback = active_builtin.or(server_theme.as_deref()).unwrap_or("dark");
+        builtin_bar_colors(fallback)
+    };
+
+    let status_style = format!("bg={},fg={}", colors.panel, colors.muted);
+    let win_style = format!("fg={}", colors.muted);
+    let win_cur_style = format!("bg={},fg={},bold", colors.raised, colors.text);
+    let win_act_style = format!("fg={}", colors.warning);
+    let win_bell_style = format!("fg={},bold", colors.warning);
+    let msg_style = format!("bg={},fg={}", colors.raised, colors.text);
+    let msg_cmd_style = format!("bg={},fg={}", colors.raised, colors.accent);
+    let mode_style = format!("bg={},fg={}", colors.accent, colors.accent_text);
+    let border_style = format!("fg={}", colors.track);
+    let active_border_style = format!("fg={}", colors.accent);
+    let menu_style = format!("bg={},fg={}", colors.panel, colors.text);
+    let menu_sel_style = format!("bg={},fg={}", colors.accent, colors.accent_text);
+    let menu_border_style = format!("fg={}", colors.accent);
+
+    let mut args: Vec<&str> = Vec::new();
+    let push_set = |k: &'static str, v: &str, buf: &mut Vec<String>| {
+        if !buf.is_empty() {
+            buf.push(";".into());
+        }
+        buf.push("set-option".into());
+        buf.push("-g".into());
+        buf.push(k.into());
+        buf.push(v.to_owned());
+    };
+    let mut cmd_buf: Vec<String> = Vec::new();
+    if let Some(builtin) = active_builtin {
+        push_set("@masil-theme", builtin, &mut cmd_buf);
+    }
+    push_set("@masil-c-panel", colors.panel, &mut cmd_buf);
+    push_set("@masil-c-raised", colors.raised, &mut cmd_buf);
+    push_set("@masil-c-text", colors.text, &mut cmd_buf);
+    push_set("@masil-c-muted", colors.muted, &mut cmd_buf);
+    push_set("@masil-c-accent", colors.accent, &mut cmd_buf);
+    push_set("@masil-c-accent-text", colors.accent_text, &mut cmd_buf);
+    push_set("@masil-c-warning", colors.warning, &mut cmd_buf);
+    push_set("@masil-c-track", colors.track, &mut cmd_buf);
+    push_set("status-style", &status_style, &mut cmd_buf);
+    push_set("window-status-style", &win_style, &mut cmd_buf);
+    push_set("window-status-current-style", &win_cur_style, &mut cmd_buf);
+    push_set("window-status-activity-style", &win_act_style, &mut cmd_buf);
+    push_set("window-status-bell-style", &win_bell_style, &mut cmd_buf);
+    push_set("message-style", &msg_style, &mut cmd_buf);
+    push_set("message-command-style", &msg_cmd_style, &mut cmd_buf);
+    push_set("mode-style", &mode_style, &mut cmd_buf);
+    push_set("pane-border-style", &border_style, &mut cmd_buf);
+    push_set(
+        "pane-active-border-style",
+        &active_border_style,
+        &mut cmd_buf,
+    );
+    push_set("menu-style", &menu_style, &mut cmd_buf);
+    push_set("menu-selected-style", &menu_sel_style, &mut cmd_buf);
+    push_set("menu-border-style", &menu_border_style, &mut cmd_buf);
+    push_set("clock-mode-colour", colors.accent, &mut cmd_buf);
+    args.extend(cmd_buf.iter().map(String::as_str));
+
+    let _ = std::process::Command::new(masil_bin)
+        .arg("-S")
+        .arg(sock)
+        .args(&args)
+        .output();
 }
 
 pub fn run(args: &[String]) -> Result<i32, String> {
@@ -205,6 +422,10 @@ pub fn run(args: &[String]) -> Result<i32, String> {
         "remove" | "rm" => cmd_remove(&args[1..], json_flag),
         "logs" => cmd_logs(&args[1..], json_flag),
         "theme" => cmd_theme(&args[1..], json_flag),
+        "sync-theme" => cmd_sync_theme(&args[1..]),
+        "open" => cmd_open(&args[1..]),
+        "run-cmd" => cmd_run_cmd(&args[1..]),
+        "menu" => cmd_menu(&args[1..]),
         "skill" => cmd_skill(&args[1..], json_flag),
         "create-prompt" => cmd_create_prompt(&args[1..]),
         _ => Err(usage()),
@@ -426,7 +647,7 @@ fn cmd_check(args: &[String], as_json: bool) -> Result<i32, String> {
             "server_socket": ""
         });
         for panel in &manifest.panels {
-            match rt.block_on(runner::invoke_panel(
+            match rt.block_on(runner::invoke_panel_mode(
                 &plugin,
                 &panel.id,
                 Some(sample_agent.clone()),
@@ -434,6 +655,7 @@ fn cmd_check(args: &[String], as_json: bool) -> Result<i32, String> {
                 None,
                 Map::new(),
                 None,
+                false,
             )) {
                 Ok(doc) => checked_handlers.push(json!({
                     "kind": "panel",
@@ -445,12 +667,16 @@ fn cmd_check(args: &[String], as_json: bool) -> Result<i32, String> {
             }
         }
         for cmd in &manifest.commands {
-            match rt.block_on(runner::invoke_command(
+            match rt.block_on(runner::invoke_command_full(
                 &plugin,
                 &cmd.id,
                 String::new(),
                 Some(sample_agent.clone()),
                 None,
+                None,
+                Map::new(),
+                None,
+                false,
             )) {
                 Ok(_) => checked_handlers.push(json!({
                     "kind": "command",
@@ -561,12 +787,16 @@ fn cmd_test(args: &[String]) -> Result<i32, String> {
             serde_json::to_value(doc).map_err(|e| e.to_string())?
         }
         "command" => {
-            let out = rt.block_on(runner::invoke_command(
+            let out = rt.block_on(runner::invoke_command_full(
                 &plugin,
                 pos[2],
                 cmd_args,
                 Some(agent),
+                action,
+                None,
+                Map::new(),
                 socket,
+                true,
             ))?;
             serde_json::to_value(out).map_err(|e| e.to_string())?
         }
@@ -618,6 +848,9 @@ fn cmd_toggle(args: &[String], enabled: bool, as_json: bool) -> Result<i32, Stri
     let mut cfg = PluginsConfig::load()?;
     cfg.set_plugin_enabled(id, enabled);
     cfg.save()?;
+    if let Ok(updated) = load_catalog() {
+        sync_theme_to_masil_servers(&updated);
+    }
     if as_json {
         println!(
             "{}",
@@ -654,6 +887,7 @@ fn cmd_reload(args: &[String], as_json: bool) -> Result<i32, String> {
             ));
         }
     }
+    sync_theme_to_masil_servers(&catalog);
     if as_json {
         println!(
             "{}",
@@ -675,13 +909,25 @@ fn cmd_remove(args: &[String], as_json: bool) -> Result<i32, String> {
         .iter()
         .find(|a| !a.starts_with('-'))
         .ok_or("usage: masil-agent plugin remove <id>")?;
+    let existing = load_catalog().ok();
+    let existing_plugin = existing.as_ref().and_then(|c| c.find_plugin(id)).cloned();
     let mut cfg = PluginsConfig::load()?;
     let was_linked = cfg.linked.remove(id).is_some();
     cfg.disabled.retain(|x| x != id);
-    if cfg.active_theme.as_deref() == Some(id) {
+    let owned_active_theme = cfg.active_theme.as_deref().is_some_and(|active_id| {
+        active_id == id
+            || existing_plugin
+                .as_ref()
+                .is_some_and(|p| p.themes.iter().any(|t| t.id == active_id))
+    });
+    if owned_active_theme {
         cfg.active_theme = None;
     }
-    let managed_dir = plugins_dir()?.join(id);
+    let managed_dir = existing_plugin
+        .as_ref()
+        .filter(|p| p.source == "installed")
+        .map(|p| p.dir.clone())
+        .unwrap_or_else(|| plugins_dir().unwrap_or_default().join(id));
     let removed_dir = if !was_linked && managed_dir.is_dir() {
         fs::remove_dir_all(&managed_dir)
             .map_err(|e| format!("cannot remove {}: {e}", managed_dir.display()))?;
@@ -694,6 +940,9 @@ fn cmd_remove(args: &[String], as_json: bool) -> Result<i32, String> {
     }
     cfg.bump_reload();
     cfg.save()?;
+    if owned_active_theme && let Ok(updated) = load_catalog() {
+        sync_theme_to_masil_servers(&updated);
+    }
     if as_json {
         println!(
             "{}",
@@ -927,5 +1176,268 @@ fn cmd_create_prompt(args: &[String]) -> Result<i32, String> {
         "{}",
         skill::build_creator_prompt(&goal, plugin_id.as_deref(), &dir)
     );
+    Ok(0)
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn cmd_sync_theme(args: &[String]) -> Result<i32, String> {
+    let mut socket: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => {
+                socket = Some(args.get(i + 1).ok_or("--socket requires a path")?.clone());
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    let catalog = load_catalog()?;
+    if let Some(sock) = socket {
+        if let Ok(masil_bin) = crate::native_ui::native_executable()
+            && masil_bin.is_file()
+        {
+            sync_theme_to_socket(&masil_bin, &sock, &catalog, true);
+        }
+    } else if catalog.active_resolved_theme().is_some() {
+        sync_theme_to_masil_servers(&catalog);
+    }
+    Ok(0)
+}
+
+fn cmd_open(args: &[String]) -> Result<i32, String> {
+    let mut socket: Option<String> = None;
+    let mut pos: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => {
+                socket = Some(args.get(i + 1).ok_or("--socket requires a path")?.clone());
+                i += 2;
+            }
+            val if !val.starts_with('-') => {
+                pos.push(val);
+                i += 1;
+            }
+            other => return Err(format!("unknown option '{other}'")),
+        }
+    }
+    let plugin_id = pos
+        .first()
+        .copied()
+        .ok_or("usage: masil-agent plugin open <plugin-id> [panel-id] [--socket PATH]")?;
+    let panel_id = pos.get(1).copied();
+    crate::ui::plugin_view::run_standalone_panel(plugin_id, panel_id, socket.as_deref())
+}
+
+fn cmd_run_cmd(args: &[String]) -> Result<i32, String> {
+    let mut socket: Option<String> = None;
+    let mut cmd_args = String::new();
+    let mut pos: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => {
+                socket = Some(args.get(i + 1).ok_or("--socket requires a path")?.clone());
+                i += 2;
+            }
+            "--args" => {
+                cmd_args = args.get(i + 1).ok_or("--args requires text")?.clone();
+                i += 2;
+            }
+            val if !val.starts_with('-') => {
+                pos.push(val);
+                i += 1;
+            }
+            other => return Err(format!("unknown option '{other}'")),
+        }
+    }
+    if pos.len() < 2 {
+        return Err(
+            "usage: masil-agent plugin run-cmd <plugin-id> <command-id> [--args TEXT] [--socket PATH]"
+                .into(),
+        );
+    }
+    crate::ui::plugin_view::run_standalone_command(pos[0], pos[1], &cmd_args, socket.as_deref())
+}
+
+fn cmd_menu(args: &[String]) -> Result<i32, String> {
+    let mut socket: Option<String> = None;
+    let mut client: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => {
+                socket = Some(args.get(i + 1).ok_or("--socket requires a path")?.clone());
+                i += 2;
+            }
+            "--client" => {
+                client = Some(args.get(i + 1).ok_or("--client requires a name")?.clone());
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    let sock = socket
+        .or_else(|| crate::api::current_socket().map(|p| p.to_string_lossy().into_owned()))
+        .ok_or("usage: masil-agent plugin menu --socket PATH [--client NAME]")?;
+    let masil_bin = crate::native_ui::native_executable()?;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate masil-agent: {e}"))?;
+    let exe_str = exe.to_string_lossy().into_owned();
+
+    let ko = std::process::Command::new(&masil_bin)
+        .arg("-S")
+        .arg(&sock)
+        .args(["show-options", "-gqv", "@masil-lang"])
+        .output()
+        .ok()
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "ko");
+    let tr = |en: &'static str, k: &'static str| if ko { k } else { en };
+
+    let catalog = load_catalog()?;
+    let mut menu_args: Vec<String> = vec!["display-menu".into(), "-M".into()];
+    if let Some(c) = client.as_deref().filter(|s| !s.is_empty()) {
+        menu_args.push("-c".into());
+        menu_args.push(c.to_owned());
+        menu_args.push("-t".into());
+        menu_args.push(c.to_owned());
+    }
+    menu_args.extend([
+        "-x".into(),
+        "C".into(),
+        "-y".into(),
+        "C".into(),
+        "-T".into(),
+        format!("#[align=centre]{}", tr("Plugins", "플러그인")),
+    ]);
+
+    let mut hotkey_n = 1usize;
+    let mut has_panels = false;
+    for plugin in catalog.active_plugins() {
+        let Some(m) = &plugin.manifest else { continue };
+        for panel in &m.panels {
+            has_panels = true;
+            let label = format!("{}: {} ({})", tr("Panel", "패널"), panel.title, plugin.id)
+                .replace('#', "##");
+            let key = if hotkey_n <= 9 {
+                let k = hotkey_n.to_string();
+                hotkey_n += 1;
+                k
+            } else {
+                String::new()
+            };
+            let shell_cmd = format!(
+                "{} plugin open {} {} --socket {}",
+                sh_quote(&exe_str),
+                sh_quote(&plugin.id),
+                sh_quote(&panel.id),
+                sh_quote(&sock)
+            );
+            let title_q = sh_quote(&panel.title);
+            let cmd = format!(
+                "new-pane -x 52% -y 58% -T {title_q} {}",
+                sh_quote(&shell_cmd)
+            );
+            menu_args.push(label);
+            menu_args.push(key);
+            menu_args.push(cmd);
+        }
+    }
+
+    let mut has_cmds = false;
+    for plugin in catalog.active_plugins() {
+        let Some(m) = &plugin.manifest else { continue };
+        for c in &m.commands {
+            if !has_cmds && has_panels {
+                menu_args.push(String::new());
+            }
+            has_cmds = true;
+            let slash = format!("/{}", c.slash.trim_start_matches('/'));
+            let label = format!("{slash} — {} ({})", c.title, plugin.id).replace('#', "##");
+            let shell_cmd = format!(
+                "{} plugin run-cmd {} {} --socket {}",
+                sh_quote(&exe_str),
+                sh_quote(&plugin.id),
+                sh_quote(&c.id),
+                sh_quote(&sock)
+            );
+            let cmd = format!(
+                "new-pane -O -K -x 66% -y 66% -X 17% -Y 17% {}",
+                sh_quote(&shell_cmd)
+            );
+            menu_args.push(label);
+            menu_args.push(String::new());
+            menu_args.push(cmd);
+        }
+    }
+
+    let themes = catalog.all_themes();
+    if !themes.is_empty() || catalog.active_resolved_theme().is_some() {
+        if has_panels || has_cmds {
+            menu_args.push(String::new());
+        }
+        for t in &themes {
+            let active = catalog.active_theme.as_deref() == Some(t.id.as_str());
+            let mark = if active { "● " } else { "" };
+            let label = format!("{mark}{}: {}", tr("Theme", "테마"), t.name).replace('#', "##");
+            let cmd = format!(
+                "run-shell -b {}",
+                sh_quote(&format!(
+                    "{} plugin theme set {}",
+                    sh_quote(&exe_str),
+                    sh_quote(&t.id)
+                ))
+            );
+            menu_args.push(label);
+            menu_args.push(String::new());
+            menu_args.push(cmd);
+        }
+        if catalog.active_resolved_theme().is_some() {
+            let label = tr("Theme: Reset default", "테마: 기본값 복원").to_owned();
+            let cmd = format!(
+                "run-shell -b {}",
+                sh_quote(&format!("{} plugin theme reset", sh_quote(&exe_str)))
+            );
+            menu_args.push(label);
+            menu_args.push(String::new());
+            menu_args.push(cmd);
+        }
+    }
+
+    if !has_panels && !has_cmds && themes.is_empty() {
+        menu_args.push(format!(
+            "-{}",
+            tr("No active plugins", "활성 플러그인 없음")
+        ));
+        menu_args.push(String::new());
+        menu_args.push(String::new());
+    }
+
+    menu_args.push(String::new());
+    let settings_shell = format!("{} settings --group plugins", sh_quote(&exe_str));
+    menu_args.push(tr("Manage plugins (Settings)", "플러그인 관리 (설정)").to_owned());
+    menu_args.push("s".into());
+    menu_args.push(format!(
+        "new-pane -O -K -x 90% -y 90% -X 5% -Y 5% {}",
+        sh_quote(&settings_shell)
+    ));
+
+    let reload_shell = format!("{} plugin reload", sh_quote(&exe_str));
+    menu_args.push(tr("Reload plugins", "플러그인 다시 불러오기").to_owned());
+    menu_args.push("r".into());
+    menu_args.push(format!("run-shell -b {}", sh_quote(&reload_shell)));
+
+    let out = std::process::Command::new(&masil_bin)
+        .arg("-S")
+        .arg(&sock)
+        .args(&menu_args)
+        .output()
+        .map_err(|e| format!("failed opening plugin menu: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+    }
     Ok(0)
 }

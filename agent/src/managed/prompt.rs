@@ -770,8 +770,24 @@ impl Manager {
                     // A new delivery only, never a replay; started and left
                     // to run, so the prompt does not wait (docs/checkpoints.md).
                     if checkpoint {
-                        crate::checkpoint::before_prompt(&agent.cwd, &agent.name, &agent.run);
+                        crate::checkpoint::before_prompt(
+                            &agent.cwd,
+                            &agent.name,
+                            &agent.run,
+                            &agent.provider,
+                            &digest,
+                        );
                     }
+                    crate::coordinator::publish_event(
+                        &self.native.socket,
+                        &crate::coordinator::CoordinatorEvent::TurnStarted {
+                            pane_id: agent.pane_id.clone(),
+                            run_id: agent.run.clone(),
+                            provider: agent.provider.clone(),
+                            prompt_sha256: digest.clone(),
+                            at_ms: now_ms(),
+                        },
+                    );
                     ticket
                 }
                 Admission::Recorded(record) => {

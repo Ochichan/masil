@@ -76,6 +76,13 @@ pub(super) fn run(socket: &str, args: &[String], sidebar: bool) -> Result<i32, S
         return Err("native socket path contains control characters".into());
     }
     let options = Options::parse(args, sidebar)?;
+    // D-01: entering agent management (`agent ui` / `agent sidebar`) enables
+    // default intelligence features and ensures the coordinator runs without
+    // delaying UI startup.
+    let bg_socket = PathBuf::from(socket);
+    std::thread::spawn(move || {
+        crate::coordinator::ensure_default_intelligence_features(&bg_socket);
+    });
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -125,13 +132,19 @@ enum DialogKind {
     Interrupt(Agent),
     Close(Agent),
     CreatePluginWithAi,
+    PluginCommandArgs {
+        plugin_id: String,
+        command_id: String,
+        title: String,
+        agent: Option<Value>,
+    },
 }
 
 impl DialogKind {
     /// The agent a dialog acts on. The start dialog has none.
     fn agent(&self) -> Option<&Agent> {
         match self {
-            Self::Start { .. } | Self::CreatePluginWithAi => None,
+            Self::Start { .. } | Self::CreatePluginWithAi | Self::PluginCommandArgs { .. } => None,
             Self::Resume(agent)
             | Self::Rename(agent)
             | Self::Draft(agent)
@@ -473,6 +486,43 @@ impl Dialog {
                 ),
             ],
             focus: 1,
+            hits: Vec::new(),
+            hover: None,
+            pressed: None,
+        }
+    }
+
+    fn plugin_command_args(
+        language: Language,
+        plugin_id: String,
+        command_id: String,
+        slash: &str,
+        title: String,
+        hint: &str,
+        agent: Option<Value>,
+    ) -> Self {
+        Self {
+            language,
+            kind: DialogKind::PluginCommandArgs {
+                plugin_id: plugin_id.clone(),
+                command_id,
+                title: title.clone(),
+                agent,
+            },
+            title: format!("/{} — {title}", slash.trim_start_matches('/')),
+            note: message(
+                language,
+                format!("Plugin {plugin_id} · Argument hint: {hint}"),
+                format!("플러그인 {plugin_id} · 인자 안내: {hint}"),
+            ),
+            notice: None,
+            submit: word(language, "Run command", "커맨드 실행"),
+            fields: vec![Field::new(
+                word(language, "Arguments (optional)", "인자 (선택)"),
+                String::new(),
+                512,
+            )],
+            focus: 0,
             hits: Vec::new(),
             hover: None,
             pressed: None,
@@ -1211,6 +1261,8 @@ enum Work {
     /// A plugin slash command completed.
     PluginCommand {
         plugin_id: String,
+        command_id: String,
+        args: String,
         title: String,
         agent: Option<Value>,
         result: Result<crate::plugin::runner::CommandOutcome, String>,
@@ -1485,9 +1537,8 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     let mut plugin_view: Option<PluginViewOverlay> = None;
     let mut plugin_fp = crate::plugin::manifest::catalog_fingerprint();
     let mut plugin_catalog = crate::plugin::manifest::load_catalog().ok();
-    if let Some(cat) = &plugin_catalog {
-        super::view::set_plugin_palette(cat.active_resolved_theme().as_ref());
-    }
+    apply_plugin_catalog_theme(&mut app, plugin_catalog.as_ref(), options.theme.is_none());
+    let mut last_pref_theme = app.theme;
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|error| error.to_string())?;
@@ -1529,13 +1580,45 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                     if next_fp != plugin_fp {
                         plugin_fp = next_fp;
                         plugin_catalog = crate::plugin::manifest::load_catalog().ok();
-                        super::view::set_plugin_palette(
-                            plugin_catalog
-                                .as_ref()
-                                .and_then(|c| c.active_resolved_theme())
-                                .as_ref(),
-                        );
+                        apply_plugin_catalog_theme(&mut app, plugin_catalog.as_ref(), true);
+                        last_pref_theme = app.theme;
                         app.inspector_cache = None;
+                        if let Some(view) = &mut plugin_view
+                            && let Some(panel_id) = view.panel_id.clone()
+                        {
+                            if let Some(cat) = &plugin_catalog
+                                && let Some(p) = cat.find_plugin(&view.plugin_id)
+                                && let Some(m) = &p.manifest
+                                && let Some(panel_def) = m.panels.iter().find(|pd| pd.id == panel_id)
+                            {
+                                view.refresh_secs = panel_def.refresh_secs;
+                            }
+                            view.mark_refresh_started(Instant::now());
+                            spawn_plugin_panel(
+                                &mut tasks,
+                                view.plugin_id.clone(),
+                                panel_id,
+                                view.agent.clone(),
+                                None,
+                                None,
+                                Some(fleet.local.native.socket.clone()),
+                            );
+                        }
+                        app.dirty = true;
+                    } else if let Some(view) = &mut plugin_view
+                        && view.should_auto_refresh(Instant::now())
+                        && let Some(panel_id) = view.panel_id.clone()
+                    {
+                        view.mark_refresh_started(Instant::now());
+                        spawn_plugin_panel(
+                            &mut tasks,
+                            view.plugin_id.clone(),
+                            panel_id,
+                            view.agent.clone(),
+                            None,
+                            None,
+                            Some(fleet.local.native.socket.clone()),
+                        );
                         app.dirty = true;
                     }
                     poll_pending = true;
@@ -1600,6 +1683,7 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         &mut plugin_catalog,
                                         &mut plugin_fp,
                                     ));
+                                    last_pref_theme = app.theme;
                                 }
                             }
                         } else if let Some(active) = &mut plugin_view {
@@ -1620,24 +1704,52 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                             None,
                                             Some(fleet.local.native.socket.clone()),
                                         );
+                                    } else if let Some(command_id) = active.command_id.clone() {
+                                        spawn_plugin_command(
+                                            &mut tasks,
+                                            active.plugin_id.clone(),
+                                            command_id,
+                                            active.command_args.clone(),
+                                            active.title.clone(),
+                                            active.agent.clone(),
+                                            None,
+                                            None,
+                                            Some(fleet.local.native.socket.clone()),
+                                        );
                                     }
                                     app.dirty = true;
                                 }
                                 PluginViewOutcome::Invoke {
                                     plugin_id,
                                     panel_id,
+                                    command_id,
+                                    command_args,
                                     action,
                                     payload,
                                 } => {
-                                    spawn_plugin_panel(
-                                        &mut tasks,
-                                        plugin_id,
-                                        panel_id,
-                                        active.agent.clone(),
-                                        Some(action),
-                                        payload,
-                                        Some(fleet.local.native.socket.clone()),
-                                    );
+                                    if let Some(panel_id) = panel_id {
+                                        spawn_plugin_panel(
+                                            &mut tasks,
+                                            plugin_id,
+                                            panel_id,
+                                            active.agent.clone(),
+                                            Some(action),
+                                            payload,
+                                            Some(fleet.local.native.socket.clone()),
+                                        );
+                                    } else if let Some(command_id) = command_id {
+                                        spawn_plugin_command(
+                                            &mut tasks,
+                                            plugin_id,
+                                            command_id,
+                                            command_args,
+                                            active.title.clone(),
+                                            active.agent.clone(),
+                                            Some(action),
+                                            payload,
+                                            Some(fleet.local.native.socket.clone()),
+                                        );
+                                    }
                                     app.dirty = true;
                                 }
                             }
@@ -1905,6 +2017,8 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                         }
                         Ok(Work::PluginCommand {
                             plugin_id,
+                            command_id,
+                            args,
                             title,
                             agent,
                             result,
@@ -1915,14 +2029,24 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         app.notify(toast);
                                     }
                                     if let Some(doc) = out.ui {
-                                        plugin_view = Some(PluginViewOverlay::with_document(
-                                            app.language,
-                                            plugin_id,
-                                            None,
-                                            title,
-                                            agent,
-                                            doc,
-                                        ));
+                                        if let Some(view) = &mut plugin_view
+                                            && view.plugin_id == plugin_id
+                                            && view.command_id.as_deref() == Some(command_id.as_str())
+                                        {
+                                            view.set_document(Ok(doc));
+                                        } else {
+                                            plugin_view = Some(
+                                                PluginViewOverlay::with_command_document(
+                                                    app.language,
+                                                    plugin_id,
+                                                    command_id,
+                                                    args,
+                                                    title,
+                                                    agent,
+                                                    doc,
+                                                ),
+                                            );
+                                        }
                                     } else if let Some(draft) = out.draft
                                         && let Some(selected) = selected_agent(&app, &agents)
                                     {
@@ -1934,7 +2058,15 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                                         dialog = Some(d);
                                     }
                                 }
-                                Err(err) => app.notify(format!("Plugin error: {err}")),
+                                Err(err) => {
+                                    if let Some(view) = &mut plugin_view
+                                        && view.plugin_id == plugin_id
+                                        && view.command_id.as_deref() == Some(command_id.as_str())
+                                    {
+                                        view.set_document(Err(err.clone()));
+                                    }
+                                    app.notify(format!("Plugin error: {err}"));
+                                }
                             }
                             app.dirty = true;
                         }
@@ -1964,6 +2096,43 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                             .or_else(|| list.first())
                             .map(agent_identity);
                         let next_agents = list.into_iter().map(|agent| (agent.id.clone(), agent)).collect::<HashMap<_, _>>();
+                        if plugin_catalog
+                            .as_ref()
+                            .is_some_and(|c| c.has_hooks_for("agent.state_changed"))
+                            && crate::remote::read_daemon_pid().is_none()
+                        {
+                            let sock = fleet.local.native.socket.clone();
+                            for (id, next_agent) in &next_agents {
+                                if !(next_agent.endpoint_id.is_empty()
+                                    || next_agent.endpoint_id == "local")
+                                {
+                                    continue;
+                                }
+                                if let Some(prev_agent) = agents.get(id)
+                                    && prev_agent.state != next_agent.state
+                                {
+                                    let prev_state = prev_agent.state.clone();
+                                    let next_state = next_agent.state.clone();
+                                    let agent_val = agent_to_plugin_json(next_agent, &sock);
+                                    let sock_clone = sock.clone();
+                                    tokio::spawn(async move {
+                                        crate::plugin::runner::dispatch_hook_event(
+                                            "agent.state_changed",
+                                            json!({
+                                                "previous_state": prev_state,
+                                                "state": next_state,
+                                                "name": agent_val.get("name"),
+                                                "pane": agent_val.get("pane"),
+                                                "provider": agent_val.get("provider"),
+                                            }),
+                                            Some(agent_val),
+                                            Some(sock_clone),
+                                        )
+                                        .await;
+                                    });
+                                }
+                            }
+                        }
                         let identity_changed = previous_selected_identity != next_selected_identity;
                         let app_epoch = next_selected_identity
                             .clone()
@@ -2084,6 +2253,20 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
             for effect in effects {
                 if matches!(effect, Effect::Quit) { return Ok(0); }
                 if let Effect::Preferences { language, theme } = effect {
+                    if theme != last_pref_theme {
+                        last_pref_theme = theme;
+                        if plugin_catalog
+                            .as_ref()
+                            .and_then(|c| c.active_resolved_theme())
+                            .is_some()
+                        {
+                            let _ = crate::plugin::set_active_theme(Some(theme.as_str()));
+                            plugin_fp = crate::plugin::manifest::catalog_fingerprint();
+                            plugin_catalog = crate::plugin::manifest::load_catalog().ok();
+                            super::view::set_plugin_palette(None);
+                            app.inspector_cache = None;
+                        }
+                    }
                     if let Err(error) = preferences.save(language, theme) { app.notify(error); }
                     continue;
                 }
@@ -2198,6 +2381,7 @@ fn palette_items(
                         plugin_id: plugin.id.clone(),
                         panel_id: panel.id.clone(),
                         title: panel.title.clone(),
+                        refresh_secs: panel.refresh_secs,
                     },
                     enabled: true,
                     pane: None,
@@ -2213,7 +2397,9 @@ fn palette_items(
                     target: palette::Target::PluginCommand {
                         plugin_id: plugin.id.clone(),
                         command_id: cmd.id.clone(),
+                        slash: cmd.slash.clone(),
                         title: cmd.title.clone(),
+                        argument_hint: cmd.argument_hint.clone(),
                     },
                     enabled: true,
                     pane: None,
@@ -2255,6 +2441,143 @@ fn palette_items(
         }
     }
     items.push(palette::Item {
+        kind: palette::Kind::Action,
+        label: word(
+            app.language,
+            "Open 90-Second Fleet Briefing",
+            "90초 플릿 브리핑 열기",
+        )
+        .into(),
+        detail: word(
+            app.language,
+            "Needs decision · Ready to merge · Review recommended",
+            "의사결정 필요 · 머지 준비 완료 · 리뷰 권장 요약",
+        )
+        .into(),
+        hint: "briefing".into(),
+        target: palette::Target::OpenBriefing,
+        enabled: true,
+        pane: None,
+    });
+    items.push(palette::Item {
+        kind: palette::Kind::Action,
+        label: word(
+            app.language,
+            "Focus Shield: ON (25m)",
+            "딥워크 포커스 방패 켜기 (25분)",
+        )
+        .into(),
+        detail: word(
+            app.language,
+            "Hold routine alerts; only breaker / hard conflict / critical break through",
+            "일반 알림 보류 (서킷 브레이커 · 충돌 · 위험 권한만 즉시 돌파)",
+        )
+        .into(),
+        hint: "focus 25m".into(),
+        target: palette::Target::FocusToggle {
+            duration: Some("25m".into()),
+        },
+        enabled: true,
+        pane: None,
+    });
+    items.push(palette::Item {
+        kind: palette::Kind::Action,
+        label: word(
+            app.language,
+            "Focus Shield: ON (60m)",
+            "딥워크 포커스 방패 켜기 (60분)",
+        )
+        .into(),
+        detail: word(
+            app.language,
+            "Deep work session for 60 minutes",
+            "60분 집중 모드",
+        )
+        .into(),
+        hint: "focus 60m".into(),
+        target: palette::Target::FocusToggle {
+            duration: Some("60m".into()),
+        },
+        enabled: true,
+        pane: None,
+    });
+    items.push(palette::Item {
+        kind: palette::Kind::Action,
+        label: word(
+            app.language,
+            "Focus Shield: OFF & Briefing",
+            "딥워크 포커스 방패 끄기 · 브리핑",
+        )
+        .into(),
+        detail: word(
+            app.language,
+            "End focus shield and summarize held alerts",
+            "포커스 종료 및 보류 알림 브리핑 보기",
+        )
+        .into(),
+        hint: "focus off".into(),
+        target: palette::Target::FocusToggle { duration: None },
+        enabled: true,
+        pane: None,
+    });
+    items.push(palette::Item {
+        kind: palette::Kind::Action,
+        label: word(
+            app.language,
+            "Zero-Trust Permission Firewall",
+            "제로트러스트 권한 방화벽 & 감사 로그",
+        )
+        .into(),
+        detail: word(
+            app.language,
+            "Low-risk auto-approve rules, 4-guard safety & audit log",
+            "저위험 자동 승인 규칙 · 4중 가드 감사 로그 확인",
+        )
+        .into(),
+        hint: "policy".into(),
+        target: palette::Target::OpenPolicyFirewall,
+        enabled: true,
+        pane: None,
+    });
+    items.push(palette::Item {
+        kind: palette::Kind::Action,
+        label: word(
+            app.language,
+            "Agent Arena Scorecard (Best-of-N)",
+            "에이전트 아레나 스코어카드 (Best-of-N)",
+        )
+        .into(),
+        detail: word(
+            app.language,
+            "Compare parallel racers, verification exit codes & safe promote",
+            "병렬 레이서 검증 결과 · BS 감사 · 안전 승격",
+        )
+        .into(),
+        hint: "arena".into(),
+        target: palette::Target::OpenArena,
+        enabled: true,
+        pane: None,
+    });
+    items.push(palette::Item {
+        kind: palette::Kind::Action,
+        label: word(
+            app.language,
+            "Time-Travel DVR Timeline",
+            "타임트래블 DVR 타임라인",
+        )
+        .into(),
+        detail: word(
+            app.language,
+            "Inspect turns, pin milestones, restore or fork worktree",
+            "턴별 스냅샷 탐색 · 핀 보호 · 복원/포크",
+        )
+        .into(),
+        hint: "dvr".into(),
+        target: palette::Target::OpenDvr,
+        enabled: app.selected_id.is_some(),
+        pane: None,
+    });
+    items.push(palette::Item {
         kind: palette::Kind::Plugin,
         label: word(
             app.language,
@@ -2283,6 +2606,31 @@ fn palette_items(
         pane: None,
     });
     items
+}
+
+fn apply_plugin_catalog_theme(
+    app: &mut App,
+    catalog: Option<&crate::plugin::manifest::PluginCatalog>,
+    sync_builtin_theme: bool,
+) {
+    if let Some(t) = catalog.and_then(|c| c.active_resolved_theme()) {
+        super::view::set_plugin_palette(Some(&t));
+        app.theme = if t.appearance == "light" {
+            Theme::Light
+        } else {
+            Theme::Dark
+        };
+    } else {
+        super::view::set_plugin_palette(None);
+        if sync_builtin_theme {
+            match catalog.and_then(|c| c.active_theme.as_deref()) {
+                Some("dark") => app.theme = Theme::Dark,
+                Some("light") => app.theme = Theme::Light,
+                Some("terminal") => app.theme = Theme::Terminal,
+                _ => {}
+            }
+        }
+    }
 }
 
 fn agent_to_plugin_json(agent: &Agent, socket: &std::path::Path) -> Value {
@@ -2334,6 +2682,56 @@ fn spawn_plugin_panel(
             Err(e) => Err(e.to_string()),
         };
         Work::PluginPanel(res)
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_plugin_command(
+    tasks: &mut JoinSet<Work>,
+    plugin_id: String,
+    command_id: String,
+    args: String,
+    title: String,
+    agent: Option<Value>,
+    action: Option<String>,
+    payload: Option<Value>,
+    socket: Option<PathBuf>,
+) {
+    tasks.spawn(async move {
+        let pid = plugin_id.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let cat = crate::plugin::manifest::load_catalog()?;
+            cat.find_plugin(&pid)
+                .cloned()
+                .ok_or_else(|| format!("plugin '{pid}' not found"))
+        })
+        .await;
+        let result = match loaded {
+            Ok(Ok(plugin)) => {
+                crate::plugin::runner::invoke_command_full(
+                    &plugin,
+                    &command_id,
+                    args.clone(),
+                    agent.clone(),
+                    action,
+                    payload,
+                    serde_json::Map::new(),
+                    socket,
+                    true,
+                )
+                .await
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(e.to_string()),
+        };
+        Work::PluginCommand {
+            plugin_id,
+            command_id,
+            args,
+            title,
+            agent,
+            result,
+        }
     });
 }
 
@@ -2407,6 +2805,7 @@ fn activate_palette(
             plugin_id,
             panel_id,
             title,
+            refresh_secs,
         } => {
             let agent_json = selected_agent(app, agents)
                 .map(|a| agent_to_plugin_json(a, &fleet.local.native.socket));
@@ -2414,6 +2813,7 @@ fn activate_palette(
                 app.language,
                 plugin_id.clone(),
                 Some(panel_id.clone()),
+                refresh_secs,
                 title,
                 agent_json.clone(),
             ));
@@ -2431,41 +2831,35 @@ fn activate_palette(
         palette::Target::PluginCommand {
             plugin_id,
             command_id,
+            slash,
             title,
+            argument_hint,
         } => {
             let agent_json = selected_agent(app, agents)
                 .map(|a| agent_to_plugin_json(a, &fleet.local.native.socket));
-            let sock = Some(fleet.local.native.socket.clone());
-            tasks.spawn(async move {
-                let pid = plugin_id.clone();
-                let loaded = tokio::task::spawn_blocking(move || {
-                    let cat = crate::plugin::manifest::load_catalog()?;
-                    cat.find_plugin(&pid)
-                        .cloned()
-                        .ok_or_else(|| format!("plugin '{pid}' not found"))
-                })
-                .await;
-                let result = match loaded {
-                    Ok(Ok(plugin)) => {
-                        crate::plugin::runner::invoke_command(
-                            &plugin,
-                            &command_id,
-                            String::new(),
-                            agent_json.clone(),
-                            sock,
-                        )
-                        .await
-                    }
-                    Ok(Err(e)) => Err(e),
-                    Err(e) => Err(e.to_string()),
-                };
-                Work::PluginCommand {
+            if let Some(hint) = argument_hint.filter(|h| !h.trim().is_empty()) {
+                *dialog = Some(Dialog::plugin_command_args(
+                    app.language,
                     plugin_id,
+                    command_id,
+                    &slash,
                     title,
-                    agent: agent_json,
-                    result,
-                }
-            });
+                    &hint,
+                    agent_json,
+                ));
+                return Vec::new();
+            }
+            spawn_plugin_command(
+                tasks,
+                plugin_id,
+                command_id,
+                String::new(),
+                title,
+                agent_json,
+                None,
+                None,
+                Some(fleet.local.native.socket.clone()),
+            );
             Vec::new()
         }
         palette::Target::PluginTheme { theme_id, name } => {
@@ -2473,12 +2867,7 @@ fn activate_palette(
                 Ok(_) => {
                     *plugin_fp = crate::plugin::manifest::catalog_fingerprint();
                     *plugin_catalog = crate::plugin::manifest::load_catalog().ok();
-                    super::view::set_plugin_palette(
-                        plugin_catalog
-                            .as_ref()
-                            .and_then(|c| c.active_resolved_theme())
-                            .as_ref(),
-                    );
+                    apply_plugin_catalog_theme(app, plugin_catalog.as_ref(), true);
                     app.inspector_cache = None;
                     app.notify(message(
                         language,
@@ -2497,12 +2886,10 @@ fn activate_palette(
             }
             *plugin_fp = crate::plugin::manifest::catalog_fingerprint();
             *plugin_catalog = crate::plugin::manifest::load_catalog().ok();
-            super::view::set_plugin_palette(
-                plugin_catalog
-                    .as_ref()
-                    .and_then(|c| c.active_resolved_theme())
-                    .as_ref(),
-            );
+            if let Some(cat) = plugin_catalog.as_ref() {
+                crate::plugin::sync_theme_to_masil_servers(cat);
+            }
+            apply_plugin_catalog_theme(app, plugin_catalog.as_ref(), true);
             app.inspector_cache = None;
             let count = plugin_catalog
                 .as_ref()
@@ -2517,6 +2904,124 @@ fn activate_palette(
         }
         palette::Target::CreatePluginWithAi => {
             *dialog = Some(Dialog::create_plugin_with_ai(app.language));
+            Vec::new()
+        }
+        palette::Target::FocusToggle { duration } => {
+            let sock = &fleet.local.native.socket;
+            if let Some(dur) = duration {
+                match crate::briefing::shield::enable(sock, &dur, None) {
+                    Ok(st) => {
+                        let mins = st.remaining_ms / 60_000;
+                        app.notify(message(
+                            language,
+                            format!("Focus Shield ON ({mins}m remaining)"),
+                            format!("포커스 방패 ON ({mins}분 남음)"),
+                        ));
+                    }
+                    Err(e) => app.notify(format!("Focus error: {e}")),
+                }
+            } else {
+                match crate::briefing::shield::disable(sock) {
+                    Ok((_st, held)) => {
+                        app.notify(message(
+                            language,
+                            format!("Focus Shield OFF ({} held)", held.len()),
+                            format!("포커스 방패 OFF (보류 {}건)", held.len()),
+                        ));
+                        if let Ok(report) =
+                            crate::briefing::digest::generate_briefing(Some(sock), "8h")
+                        {
+                            *plugin_view = Some(PluginViewOverlay::with_command_document(
+                                app.language,
+                                "masil-briefing".into(),
+                                "briefing".into(),
+                                String::new(),
+                                word(app.language, "90-Second Fleet Briefing", "90초 플릿 브리핑")
+                                    .into(),
+                                None,
+                                report.ui,
+                            ));
+                        }
+                    }
+                    Err(e) => app.notify(format!("Focus error: {e}")),
+                }
+            }
+            Vec::new()
+        }
+        palette::Target::OpenBriefing => {
+            let sock = &fleet.local.native.socket;
+            match crate::briefing::digest::generate_briefing(Some(sock), "8h") {
+                Ok(report) => {
+                    *plugin_view = Some(PluginViewOverlay::with_command_document(
+                        app.language,
+                        "masil-briefing".into(),
+                        "briefing".into(),
+                        String::new(),
+                        word(app.language, "90-Second Fleet Briefing", "90초 플릿 브리핑").into(),
+                        None,
+                        report.ui,
+                    ));
+                }
+                Err(e) => app.notify(format!("Briefing error: {e}")),
+            }
+            Vec::new()
+        }
+        palette::Target::OpenPolicyFirewall => {
+            let sock = &fleet.local.native.socket;
+            let doc = crate::policy::build_policy_ui_document(Some(sock));
+            *plugin_view = Some(PluginViewOverlay::with_command_document(
+                app.language,
+                "masil-policy".into(),
+                "policy".into(),
+                String::new(),
+                word(
+                    app.language,
+                    "Zero-Trust Permission Firewall",
+                    "제로트러스트 권한 방화벽",
+                )
+                .into(),
+                None,
+                doc,
+            ));
+            Vec::new()
+        }
+        palette::Target::OpenArena => {
+            let sock = &fleet.local.native.socket;
+            let doc = crate::arena::build_latest_arena_ui_document(Some(sock));
+            *plugin_view = Some(PluginViewOverlay::with_command_document(
+                app.language,
+                "masil-arena".into(),
+                "arena".into(),
+                String::new(),
+                word(
+                    app.language,
+                    "Agent Arena Scorecard",
+                    "에이전트 아레나 스코어카드",
+                )
+                .into(),
+                None,
+                doc,
+            ));
+            Vec::new()
+        }
+        palette::Target::OpenDvr => {
+            let sock = &fleet.local.native.socket;
+            if let Some(agent) = selected_agent(app, agents) {
+                let doc = crate::dvr::build_dvr_ui_document(sock, &agent.name, &agent.run);
+                *plugin_view = Some(PluginViewOverlay::with_command_document(
+                    app.language,
+                    "masil-dvr".into(),
+                    "dvr".into(),
+                    String::new(),
+                    format!(
+                        "{} · {}",
+                        word(app.language, "Time-Travel DVR", "타임트래블 DVR"),
+                        agent.name
+                    ),
+                    None,
+                    doc,
+                ));
+            }
             Vec::new()
         }
     }
@@ -3383,38 +3888,68 @@ fn submit_dialog(
                     let sock = fleet.local.native.socket.clone();
                     let cwd = plugins_root.to_string_lossy().into_owned();
                     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                    let sock_str = sock.to_string_lossy().into_owned();
+                    let mut start_args = vec![
+                        "agent".into(),
+                        "--socket".into(),
+                        sock_str.clone(),
+                        "start".into(),
+                        agent_name.clone(),
+                        provider.clone(),
+                        "--cwd".into(),
+                        cwd,
+                    ];
+                    let native_prompt_args =
+                        crate::plugin::skill::creator_initial_prompt_args(&provider, &prompt);
+                    let used_native = native_prompt_args.is_some();
+                    if let Some(prompt_args) = native_prompt_args {
+                        start_args.push("--".into());
+                        start_args.extend(prompt_args);
+                    }
                     let out = tokio::process::Command::new(&exe)
-                        .args([
-                            "agent",
-                            "--socket",
-                            &sock.to_string_lossy(),
-                            "start",
-                            &agent_name,
-                            &provider,
-                            "--cwd",
-                            &cwd,
-                        ])
+                        .args(&start_args)
                         .output()
                         .await
                         .map_err(|e| e.to_string())?;
                     if !out.status.success() {
                         return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
                     }
-                    let name_for_prompt = agent_name.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(2400)).await;
-                        let _ = tokio::process::Command::new(&exe)
-                            .args([
-                                "agent",
-                                "--socket",
-                                &sock.to_string_lossy(),
-                                "prompt",
-                                &name_for_prompt,
-                                &prompt,
-                            ])
-                            .output()
-                            .await;
-                    });
+                    if !used_native {
+                        let name_for_prompt = agent_name.clone();
+                        tokio::spawn(async move {
+                            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+                            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                            while Instant::now() < deadline {
+                                if let Ok(get_out) = tokio::process::Command::new(&exe)
+                                    .args(["agent", "--socket", &sock_str, "get", &name_for_prompt])
+                                    .output()
+                                    .await
+                                    && get_out.status.success()
+                                    && let Ok(val) =
+                                        serde_json::from_slice::<Value>(&get_out.stdout)
+                                {
+                                    let st = val.get("state").and_then(Value::as_str).unwrap_or("");
+                                    if st == "idle" {
+                                        let _ = tokio::process::Command::new(&exe)
+                                            .args([
+                                                "agent",
+                                                "--socket",
+                                                &sock_str,
+                                                "prompt",
+                                                &name_for_prompt,
+                                                &prompt,
+                                            ])
+                                            .output()
+                                            .await;
+                                        return;
+                                    } else if st == "exited" {
+                                        return;
+                                    }
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                            }
+                        });
+                    }
                     Ok(ActionResult::Receipt(message(
                         language,
                         format!("Started AI plugin creator '{agent_name}' ({provider})"),
@@ -3424,6 +3959,25 @@ fn submit_dialog(
                 .await;
                 action_message(epoch, None, res)
             });
+        }
+        DialogKind::PluginCommandArgs {
+            plugin_id,
+            command_id,
+            title,
+            agent,
+        } => {
+            let cmd_args = values.into_iter().next().unwrap_or_default();
+            spawn_plugin_command(
+                tasks,
+                plugin_id,
+                command_id,
+                cmd_args,
+                title,
+                agent,
+                None,
+                None,
+                Some(fleet.local.native.socket.clone()),
+            );
         }
     }
 }

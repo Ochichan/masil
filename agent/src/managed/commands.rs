@@ -70,7 +70,7 @@ pub(crate) const VERBS: &[Verb] = &[
     },
     Verb {
         name: "start",
-        usage: "masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER [--cwd DIR] [--worktree NAME|PATH (local only)] [--split %N] [--session ID] [--answers] [--boot BOOT --operation ID] [-- ARGS...]",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] start NAME PROVIDER [--cwd DIR] [--worktree NAME|PATH (local only)] [--sandbox worktree|strict|net-off | --no-sandbox] [--split %N] [--session ID] [--answers] [--boot BOOT --operation ID] [-- ARGS...]",
         remote: true,
     },
     Verb {
@@ -156,6 +156,26 @@ pub(crate) const VERBS: &[Verb] = &[
     Verb {
         name: "checkpoint",
         usage: "masil-agent agent [--socket MASIL_SOCKET] checkpoint TARGET make [--reason TEXT] | list | show ID [--file PATH] | restore ID PATH... [--confirm TOKEN]",
+        remote: false,
+    },
+    Verb {
+        name: "audit",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] audit TARGET [--turn latest|ID] [--history] [--challenge FINDING_ID] [--json]",
+        remote: false,
+    },
+    Verb {
+        name: "guard",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] guard TARGET [status | extend [--turns N] | dismiss]",
+        remote: false,
+    },
+    Verb {
+        name: "dvr",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] dvr list|inspect|snapshot|pin|unpin|restore|fork TARGET [--turn N] [--note TEXT] [--branch NAME] [--json]",
+        remote: false,
+    },
+    Verb {
+        name: "trace",
+        usage: "masil-agent agent [--socket MASIL_SOCKET] trace export TARGET --out FILE [--redact-strict]",
         remote: false,
     },
     Verb {

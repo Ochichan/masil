@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["MasilLivePulseModule"]
+  },
+  "android": {
+    "modules": ["dev.masil.livepulse.MasilLivePulseModule"]
+  }
+}

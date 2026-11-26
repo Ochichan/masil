@@ -1,13 +1,16 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use masil_wire::frames::{
-    BinaryFrame, BinaryOpcode, ResizeMode, TerminalResizePayload, TerminalSnapshotMeta,
+    AssetDeliveryMode, AssetUploadEndPayload, AssetUploadMeta, BinaryFrame, BinaryOpcode,
+    ResizeMode, TUNNEL_INITIAL_WINDOW_BYTES, TerminalResizePayload, TerminalSnapshotMeta,
+    TunnelClosePayload, TunnelOpenAckPayload, TunnelOpenPayload, TunnelWindowPayload,
 };
 use masil_wire::noise::{
     HandshakeParams, InitiatorHandshake, Keypair, NoiseError, ResponderHandshake,
 };
 use masil_wire::pairing::PairingOffer;
 use masil_wire::record::{MAX_CHUNK_DATA, RecordError, RecordKind, open_record, seal_record};
+use masil_wire::rpc::{LiveActivityEventKind, LiveActivityPayload};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -118,11 +121,38 @@ fn pairing_uri_roundtrip() {
         pair_token: "tok_abc-123".into(),
         relay_url: Some("wss://relay.example.com/v1".into()),
         direct_addr: Some("100.64.0.10:7767".into()),
+        direct_fallback_addrs: Vec::new(),
         host_name: "Ochi MacBook".into(),
     };
     let uri = offer.to_uri().unwrap();
     let parsed = PairingOffer::parse_uri(&uri).unwrap();
     assert_eq!(parsed, offer);
+}
+
+#[test]
+fn pairing_uri_roundtrip_with_tailscale_fallback() {
+    let offer = PairingOffer {
+        version: 1,
+        host_id: "macbook-pro".into(),
+        host_pub: [0x42; 32],
+        pair_token: "tok_abc-123".into(),
+        relay_url: None,
+        direct_addr: Some("192.168.0.15:7767".into()),
+        direct_fallback_addrs: vec!["100.97.190.15:7767".into()],
+        host_name: "Ochi MacBook".into(),
+    };
+    let uri = offer.to_uri().unwrap();
+    assert!(uri.contains("direct=192.168.0.15%3A7767"));
+    assert!(uri.contains("direct_alt=100.97.190.15%3A7767"));
+    let parsed = PairingOffer::parse_uri(&uri).unwrap();
+    assert_eq!(parsed, offer);
+    assert_eq!(
+        parsed.all_direct_addrs(),
+        vec![
+            "192.168.0.15:7767".to_owned(),
+            "100.97.190.15:7767".to_owned(),
+        ]
+    );
 }
 
 #[test]
@@ -175,6 +205,79 @@ fn cross_language_vectors_match_checked_in_fixture() {
     assert_eq!(k2, RecordKind::Binary);
     assert_eq!(d2, bin_plain);
 
+    // Phase 2A cross-language binary frame bit vectors (`0x20..0x31`).
+    let tunnel_open_frame = BinaryFrame::new(
+        BinaryOpcode::TunnelOpen,
+        42,
+        serde_json::to_vec(&TunnelOpenPayload {
+            target_port: 5173,
+            agent_id: Some("default::%1".into()),
+        })
+        .unwrap(),
+    )
+    .encode();
+    let tunnel_open_ack_frame = BinaryFrame::new(
+        BinaryOpcode::TunnelOpenAck,
+        42,
+        serde_json::to_vec(&TunnelOpenAckPayload {
+            ok: true,
+            initial_window: TUNNEL_INITIAL_WINDOW_BYTES,
+            error: None,
+        })
+        .unwrap(),
+    )
+    .encode();
+    let tunnel_data_frame = BinaryFrame::new(
+        BinaryOpcode::TunnelData,
+        42,
+        b"GET / HTTP/1.1\r\nHost: localhost:5173\r\n\r\n".to_vec(),
+    )
+    .encode();
+    let tunnel_close_frame = BinaryFrame::new(
+        BinaryOpcode::TunnelClose,
+        42,
+        serde_json::to_vec(&TunnelClosePayload {
+            reason: Some("eof".into()),
+        })
+        .unwrap(),
+    )
+    .encode();
+    let tunnel_window_frame = BinaryFrame::new(
+        BinaryOpcode::TunnelWindow,
+        42,
+        TunnelWindowPayload { credit: 65_536 }.encode().to_vec(),
+    )
+    .encode();
+    let asset_chunk_frame = BinaryFrame::new(
+        BinaryOpcode::AssetUploadChunk,
+        9,
+        vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+    )
+    .encode();
+    let asset_end_frame = BinaryFrame::new(
+        BinaryOpcode::AssetUploadEnd,
+        9,
+        serde_json::to_vec(&AssetUploadEndPayload {
+            agent_id: "%1".into(),
+            mime: "image/png".into(),
+            filename: "markup.png".into(),
+            delivery_mode: AssetDeliveryMode::Queue,
+            prompt: Some("Fix padding".into()),
+            meta: AssetUploadMeta {
+                url: Some("http://localhost:5173/dashboard".into()),
+                viewport: Some("390x844".into()),
+                theme: Some("dark".into()),
+                server_socket: None,
+                cwd: None,
+                console_errors: vec!["TypeError: boom".into()],
+                network_errors: vec!["GET /api -> 500".into()],
+                annotations_count: 2,
+            },
+        })
+        .unwrap(),
+    )
+    .encode();
+
     let vector = json!({
         "protocol_name": "Noise_NK_25519_ChaChaPoly_SHA256",
         "prologue": "masil-remote-e2ee/1",
@@ -189,6 +292,15 @@ fn cross_language_vectors_match_checked_in_fixture() {
         "initiator_to_responder_text_wire_b64": STANDARD.encode(&text_wire),
         "responder_to_initiator_binary_plain_b64": STANDARD.encode(&bin_plain),
         "responder_to_initiator_binary_wire_b64": STANDARD.encode(&bin_wire),
+        "phase2_frames": {
+            "tunnel_open_b64": STANDARD.encode(&tunnel_open_frame),
+            "tunnel_open_ack_b64": STANDARD.encode(&tunnel_open_ack_frame),
+            "tunnel_data_b64": STANDARD.encode(&tunnel_data_frame),
+            "tunnel_close_b64": STANDARD.encode(&tunnel_close_frame),
+            "tunnel_window_b64": STANDARD.encode(&tunnel_window_frame),
+            "asset_chunk_b64": STANDARD.encode(&asset_chunk_frame),
+            "asset_end_b64": STANDARD.encode(&asset_end_frame),
+        },
     });
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors.json");
@@ -220,4 +332,162 @@ fn timeline_plugin_card_roundtrip() {
     assert!(encoded.contains("\"kind\":\"plugin_card\""));
     let decoded: masil_wire::rpc::TimelineItem = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, item);
+}
+
+#[test]
+fn interactive_prompt_roundtrip() {
+    use masil_wire::rpc::{
+        InteractiveOption, InteractivePrompt, InteractivePromptKind, InteractivePromptMode,
+        PromptRiskAssessment, PromptRiskTier, StructuredQuestion, StructuredQuestionOption,
+    };
+
+    let prompt = InteractivePrompt {
+        id: "api-q-que_1".into(),
+        kind: InteractivePromptKind::Question,
+        mode: InteractivePromptMode::StructuredApi,
+        request_id: Some("que_1".into()),
+        title: "Question".into(),
+        body: "Pick a color".into(),
+        step_label: Some("1/2".into()),
+        options: vec![InteractiveOption {
+            id: "opt-0".into(),
+            index: 0,
+            label: "Blue".into(),
+            description: Some("Cool tone".into()),
+            selected: true,
+            checked: Some(false),
+            hotkey: Some("1".into()),
+            is_custom_input: false,
+            is_destructive: false,
+            disabled_reason: None,
+        }],
+        selected_index: 0,
+        multi_select: true,
+        allows_free_text: true,
+        free_text_only: false,
+        allows_cancel: true,
+        can_navigate_tabs: true,
+        always_patterns: vec![],
+        session_peers_count: 0,
+        is_subagent: false,
+        questions: vec![StructuredQuestion {
+            header: "Color".into(),
+            question: "Pick a color".into(),
+            options: vec![StructuredQuestionOption {
+                label: "Blue".into(),
+                description: Some("Cool tone".into()),
+            }],
+            custom: true,
+            multiple: true,
+        }],
+        screen_excerpt: None,
+        hint_line: Some("↑/↓ Navigate · enter Confirm".into()),
+        risk: Some(PromptRiskAssessment {
+            tier: PromptRiskTier::Low,
+            label: "SAFE READ".into(),
+            score: 10,
+            reasons: vec!["safe test command".into()],
+            command: Some("cargo test".into()),
+            truncated: false,
+            matched_rule_id: Some("allow-repo-tests".into()),
+            matched_action: Some("auto_approve".into()),
+            batch_eligible: true,
+            prompt_digest: "deadbeef".into(),
+        }),
+    };
+    let encoded = serde_json::to_string(&prompt).unwrap();
+    let decoded: InteractivePrompt = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, prompt);
+}
+
+#[test]
+fn phase2_tunnel_and_asset_frames_roundtrip() {
+    let win = TunnelWindowPayload { credit: 262_144 };
+    let wf = BinaryFrame::new(BinaryOpcode::TunnelWindow, 77, win.encode().to_vec());
+    let decoded = BinaryFrame::decode(&wf.encode()).unwrap();
+    assert_eq!(decoded.opcode, BinaryOpcode::TunnelWindow);
+    assert_eq!(decoded.channel_id, 77);
+    assert_eq!(TunnelWindowPayload::decode(&decoded.payload).unwrap(), win);
+    assert!(TunnelWindowPayload::decode(&[1, 2, 3]).is_err());
+
+    let open = TunnelOpenPayload {
+        target_port: 3000,
+        agent_id: Some("a1".into()),
+    };
+    let of = BinaryFrame::new(
+        BinaryOpcode::TunnelOpen,
+        5,
+        serde_json::to_vec(&open).unwrap(),
+    );
+    let of_dec = BinaryFrame::decode(&of.encode()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<TunnelOpenPayload>(&of_dec.payload).unwrap(),
+        open
+    );
+
+    let end = AssetUploadEndPayload {
+        agent_id: "%2".into(),
+        mime: "image/png".into(),
+        filename: "shot.png".into(),
+        delivery_mode: AssetDeliveryMode::Prefill,
+        prompt: Some("fix button".into()),
+        meta: AssetUploadMeta::default(),
+    };
+    let ef = BinaryFrame::new(
+        BinaryOpcode::AssetUploadEnd,
+        12,
+        serde_json::to_vec(&end).unwrap(),
+    );
+    let ef_dec = BinaryFrame::decode(&ef.encode()).unwrap();
+    assert_eq!(ef_dec.opcode, BinaryOpcode::AssetUploadEnd);
+    assert_eq!(
+        serde_json::from_slice::<AssetUploadEndPayload>(&ef_dec.payload).unwrap(),
+        end
+    );
+}
+
+#[test]
+fn live_activity_payload_rejects_unknown_fields_and_oversized_text() {
+    let smuggled = r#"{
+        "host_id": "mac",
+        "host_name": "Mac",
+        "working_count": 1,
+        "blocked_count": 0,
+        "done_count": 0,
+        "alert_count": 0,
+        "deep_link": "masil://host/mac",
+        "prompt": "secret source code must be rejected"
+    }"#;
+    assert!(serde_json::from_str::<LiveActivityPayload>(smuggled).is_err());
+
+    let valid = LiveActivityPayload {
+        host_id: "mac".into(),
+        host_name: "Mac".into(),
+        working_count: 2,
+        blocked_count: 1,
+        done_count: 3,
+        alert_count: 1,
+        top_agent_alias: Some("builder".into()),
+        top_event_kind: Some(LiveActivityEventKind::ApprovalRequested),
+        top_summary_line: Some("Run tests".into()),
+        deep_link: "masil://host/mac/agent/%251".into(),
+        updated_at: 100,
+    };
+    assert!(valid.validate().is_ok());
+
+    let too_long = LiveActivityPayload {
+        top_summary_line: Some("x".repeat(61)),
+        ..valid.clone()
+    };
+    assert!(too_long.validate().is_err());
+    assert!(too_long.sanitized().validate().is_ok());
+    assert_eq!(
+        too_long
+            .sanitized()
+            .top_summary_line
+            .unwrap()
+            .chars()
+            .count(),
+        60
+    );
 }

@@ -32,7 +32,12 @@ mod view;
 use crate::{detection::Engine, native_ui, observation::now_ms, provider_support, providers};
 pub(crate) use cli::run;
 use evidence::Evidence;
-pub(crate) use operations::{NotifyEvent, Through, private_directory};
+pub(crate) use operations::{
+    ArenaRacerRecord, ArenaRecord, CacheWarmthRecord, CircuitBreakerRecord,
+    CollisionSnapshotRecord, DvrTurnRecord, FocusHeldEventRecord, FocusShieldRecord, NotifyEvent,
+    PermissionAuditRecord, PermissionPolicyRecord, Store, Through, TurnAuditRecord,
+    private_directory,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -370,6 +375,8 @@ struct PreparedLaunch {
     core_path: bool,
     /// The masil worktree the directory is in; its start takes a lease.
     worktree: Option<crate::worktree::Found>,
+    /// Phase 3A (D-11): OS micro-sandbox profile applied in `exec-managed`.
+    sandbox: crate::sandbox::SandboxProfile,
 }
 
 enum PreparedEvidence {
@@ -2536,6 +2543,7 @@ impl Manager {
             answers: false,
             core_path: false,
             worktree,
+            sandbox: crate::sandbox::SandboxProfile::Worktree,
         })
     }
 
@@ -2558,6 +2566,7 @@ impl Manager {
             answers,
             core_path,
             worktree: _,
+            sandbox,
         } = prepared;
         let run = ticket.ticket.as_str();
         let operation_key = ticket.key.as_str();
@@ -2610,6 +2619,7 @@ impl Manager {
                     cwd.to_string_lossy()
                 ),
             ),
+            (LAUNCH_SANDBOX, sandbox.as_str().to_owned()),
         ] {
             launch_env.push((key.to_owned(), value.clone()));
             command.extend(["-e".into(), format!("{key}={value}").into()]);
@@ -3799,6 +3809,28 @@ pub(crate) fn coordinator_features(base: &Path, socket: &Path) -> Result<Vec<Str
     operations::Store::enabled_features(base, socket)
 }
 
+/// Synchronizes a set of coordinator feature flags for `socket` in its
+/// operation store. Returns true if any feature row was added or removed.
+pub(crate) fn sync_coordinator_features(
+    socket: &Path,
+    all: &[&str],
+    enabled: &[&str],
+    now: u64,
+) -> Result<bool, String> {
+    let mut store = operations::Store::open(socket)?;
+    let mut changed = false;
+    for &feature in all {
+        if enabled.contains(&feature) {
+            if store.enable_coordinator_feature(feature, now)? {
+                changed = true;
+            }
+        } else if store.disable_coordinator_feature(feature)? {
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 impl Agent {
     /// A pane with either durable management marker needs an explicit bridge
     /// screen scope. This mirrors the resident signature's META/TRACKED
@@ -3931,7 +3963,9 @@ pub(crate) fn provider_declarations<'a>(
 /// `exec-managed` reads the directory it must run in from this variable
 /// (`<dev>:<ino>:<path>`) and writes its verdict to this pane option.
 pub(super) const LAUNCH_CWD: &str = "MASIL_AGENT_CWD";
+pub(super) const LAUNCH_SANDBOX: &str = "MASIL_AGENT_SANDBOX";
 pub(super) const LAUNCH_VERDICT: &str = "@masil-agent-launch";
+pub(crate) const SANDBOX_OPTION: &str = "@masil-sandbox";
 
 pub(super) enum LaunchVerdict {
     Ok,

@@ -43,6 +43,10 @@ pub(crate) enum Outcome {
 }
 
 impl Server {
+    pub(crate) fn socket_path(&self) -> &Path {
+        &self.socket
+    }
+
     /// Uses --socket when given, else the server of the surrounding masil.
     pub(crate) fn locate(socket: Option<&str>) -> Result<Self, String> {
         let socket = match socket {

@@ -42,11 +42,14 @@ pub(super) enum Target {
         plugin_id: String,
         panel_id: String,
         title: String,
+        refresh_secs: Option<u64>,
     },
     PluginCommand {
         plugin_id: String,
         command_id: String,
+        slash: String,
         title: String,
+        argument_hint: Option<String>,
     },
     PluginTheme {
         theme_id: Option<String>,
@@ -54,6 +57,13 @@ pub(super) enum Target {
     },
     ReloadPlugins,
     CreatePluginWithAi,
+    FocusToggle {
+        duration: Option<String>,
+    },
+    OpenBriefing,
+    OpenPolicyFirewall,
+    OpenArena,
+    OpenDvr,
 }
 
 #[derive(Clone, Debug)]

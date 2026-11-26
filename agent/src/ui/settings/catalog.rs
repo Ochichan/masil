@@ -9,12 +9,19 @@ pub(crate) enum Group {
     Panes,
     Input,
     Look,
+    Plugins,
     Layer,
 }
 
 impl Group {
-    pub(crate) const ALL: [Self; 5] =
-        [Self::Bar, Self::Panes, Self::Input, Self::Look, Self::Layer];
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Bar,
+        Self::Panes,
+        Self::Input,
+        Self::Look,
+        Self::Plugins,
+        Self::Layer,
+    ];
 
     pub(crate) fn label(self, language: Language) -> &'static str {
         match (self, language) {
@@ -26,6 +33,8 @@ impl Group {
             (Self::Input, Language::Korean) => "마우스와 입력",
             (Self::Look, Language::English) => "Appearance",
             (Self::Look, Language::Korean) => "모양",
+            (Self::Plugins, Language::English) => "Plugins",
+            (Self::Plugins, Language::Korean) => "플러그인",
             (Self::Layer, Language::English) => "masil UI",
             (Self::Layer, Language::Korean) => "masil UI",
         }

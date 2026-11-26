@@ -8,6 +8,18 @@ import {
 } from "./noise-nk";
 import { RecordKind, openRecord, sealRecord } from "./records";
 import { base64ToBytes, bytesToBase64, parsePairingUri } from "./pairing";
+import {
+  BinaryOpcode,
+  TUNNEL_INITIAL_WINDOW_BYTES,
+  decodeBinaryFrame,
+  decodeJsonPayload,
+  decodeTunnelWindowPayload,
+  encodeBinaryFrame,
+  encodeJsonPayload,
+  encodeTunnelCloseFrame,
+  encodeTunnelOpenFrame,
+  encodeTunnelWindowFrame,
+} from "../protocol/binary-frames";
 
 describe("Cross-language Noise NK & record parity with crates/masil-wire", () => {
   it("matches crates/masil-wire/tests/vectors.json bit-for-bit", () => {
@@ -48,6 +60,95 @@ describe("Cross-language Noise NK & record parity with crates/masil-wire", () =>
 
     // Replay of binWire must throw.
     expect(() => openRecord(transport, binWire)).toThrow();
+  });
+
+  it("matches crates/masil-wire Phase 2 binary opcodes 0x20..0x31 bit-for-bit", () => {
+    const vectorPath = path.resolve(
+      __dirname,
+      "../../../crates/masil-wire/tests/vectors.json"
+    );
+    const v = JSON.parse(fs.readFileSync(vectorPath, "utf8")) as {
+      phase2_frames: Record<string, string>;
+    };
+    const p2 = v.phase2_frames;
+
+    const openBytes = encodeTunnelOpenFrame(42, {
+      target_port: 5173,
+      agent_id: "default::%1",
+    });
+    expect(bytesToBase64(openBytes)).toBe(p2.tunnel_open_b64);
+
+    const openAckFrame = decodeBinaryFrame(base64ToBytes(p2.tunnel_open_ack_b64!));
+    expect(openAckFrame.opcode).toBe(BinaryOpcode.TunnelOpenAck);
+    expect(openAckFrame.channelId).toBe(42);
+    const openAck = decodeJsonPayload<{
+      ok: boolean;
+      initial_window: number;
+    }>(openAckFrame.payload);
+    expect(openAck.ok).toBe(true);
+    expect(openAck.initial_window).toBe(TUNNEL_INITIAL_WINDOW_BYTES);
+
+    const dataBytes = encodeBinaryFrame({
+      opcode: BinaryOpcode.TunnelData,
+      channelId: 42,
+      payload: new TextEncoder().encode(
+        "GET / HTTP/1.1\r\nHost: localhost:5173\r\n\r\n"
+      ),
+    });
+    expect(bytesToBase64(dataBytes)).toBe(p2.tunnel_data_b64);
+
+    const closeBytes = encodeTunnelCloseFrame(42, "eof");
+    expect(bytesToBase64(closeBytes)).toBe(p2.tunnel_close_b64);
+
+    const winBytes = encodeTunnelWindowFrame(42, 65_536);
+    expect(bytesToBase64(winBytes)).toBe(p2.tunnel_window_b64);
+    const winDecoded = decodeBinaryFrame(winBytes);
+    expect(winDecoded.opcode).toBe(BinaryOpcode.TunnelWindow);
+    expect(decodeTunnelWindowPayload(winDecoded.payload)).toBe(65_536);
+
+    const chunkBytes = encodeBinaryFrame({
+      opcode: BinaryOpcode.AssetUploadChunk,
+      channelId: 9,
+      payload: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    });
+    expect(bytesToBase64(chunkBytes)).toBe(p2.asset_chunk_b64);
+
+    const endFrame = decodeBinaryFrame(base64ToBytes(p2.asset_end_b64!));
+    expect(endFrame.opcode).toBe(BinaryOpcode.AssetUploadEnd);
+    expect(endFrame.channelId).toBe(9);
+    const endPayload = decodeJsonPayload<{
+      agent_id: string;
+      mime: string;
+      delivery_mode: string;
+      meta: { url: string; annotations_count: number };
+    }>(endFrame.payload);
+    expect(endPayload.agent_id).toBe("%1");
+    expect(endPayload.mime).toBe("image/png");
+    expect(endPayload.delivery_mode).toBe("queue");
+    expect(endPayload.meta.url).toBe("http://localhost:5173/dashboard");
+    expect(endPayload.meta.annotations_count).toBe(2);
+
+    // Re-encoding the exact same JSON matches byte-for-byte.
+    const reencodedEnd = encodeBinaryFrame({
+      opcode: BinaryOpcode.AssetUploadEnd,
+      channelId: 9,
+      payload: encodeJsonPayload({
+        agent_id: "%1",
+        mime: "image/png",
+        filename: "markup.png",
+        delivery_mode: "queue",
+        prompt: "Fix padding",
+        meta: {
+          url: "http://localhost:5173/dashboard",
+          viewport: "390x844",
+          theme: "dark",
+          console_errors: ["TypeError: boom"],
+          network_errors: ["GET /api -> 500"],
+          annotations_count: 2,
+        },
+      }),
+    });
+    expect(bytesToBase64(reencodedEnd)).toBe(p2.asset_end_b64);
   });
 
   it("parses masil://pair URIs strictly", () => {

@@ -38,14 +38,20 @@ pub(crate) fn now_ms() -> u64 {
     crate::observation::now_ms()
 }
 
+/// Default soft cap for the sidecar checkpoint repository (1 GiB, D-12).
+const DEFAULT_MAX_STORE_MB: u64 = 1024;
+
 /// `~/.config/masil/checkpoints.toml`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Settings {
     #[serde(default)]
-    pub(crate) before_prompt: bool,
+    pub(crate) before_prompt: Option<bool>,
+    #[serde(default)]
+    pub(crate) auto_after_turn: Option<bool>,
     max_file_mb: Option<u64>,
     max_total_mb: Option<u64>,
+    max_store_mb: Option<u64>,
     auto_timeout_s: Option<u64>,
 }
 
@@ -101,11 +107,35 @@ impl Settings {
             .map_err(|error| format!("invalid_argument: {}: {error}", path.display()))
     }
 
+    /// Whether automatic pre-prompt checkpoints are active (D-01: default true
+    /// when agent management is used; explicitly set `before_prompt = false`
+    /// in `~/.config/masil/checkpoints.toml` to disable).
+    pub(crate) fn before_prompt_enabled(&self) -> bool {
+        self.before_prompt.unwrap_or(true)
+    }
+
+    /// Whether automatic post-turn checkpoints are active (D-01: default true).
+    pub(crate) fn auto_after_turn_enabled(&self) -> bool {
+        self.auto_after_turn.unwrap_or(true)
+    }
+
+    /// True only when the user explicitly disabled both automatic turn checkpoints.
+    pub(crate) fn auto_turn_checkpoint_disabled(&self) -> bool {
+        self.before_prompt == Some(false) && self.auto_after_turn == Some(false)
+    }
+
     fn limits(&self) -> Limits {
         Limits {
             file: self.max_file_mb.unwrap_or(10).saturating_mul(MIB),
             total: self.max_total_mb.unwrap_or(512).saturating_mul(MIB),
         }
+    }
+
+    pub(crate) fn max_store_bytes(&self) -> u64 {
+        self.max_store_mb
+            .unwrap_or(DEFAULT_MAX_STORE_MB)
+            .max(16)
+            .saturating_mul(MIB)
     }
 
     fn auto_time(&self) -> Duration {
@@ -119,6 +149,10 @@ impl Settings {
 pub(crate) struct Limits {
     file: u64,
     total: u64,
+}
+
+pub(crate) fn default_limits() -> Limits {
+    Settings::load().unwrap_or_default().limits()
 }
 
 /// The working tree as a tree object in the checkpoint repository.
@@ -348,7 +382,15 @@ fn sync_index(store: &Store, included: &[Vec<u8>], deadline: Instant) -> Result<
 pub(crate) struct Request<'a> {
     pub(crate) reason: &'a str,
     pub(crate) auto: bool,
+    pub(crate) trigger: &'a str,
     pub(crate) agent: Option<(&'a str, &'a str)>,
+    pub(crate) provider: Option<&'a str>,
+    pub(crate) turn_seq: Option<u64>,
+    pub(crate) prompt_sha256: Option<&'a str>,
+    pub(crate) pinned: bool,
+    /// When true, reuses the newest checkpoint without creating a new commit
+    /// if the resulting working tree OID matches the newest checkpoint's tree.
+    pub(crate) skip_if_unchanged: bool,
     /// Paths saved whatever the limits and ignore rules say.
     pub(crate) force: &'a [String],
     /// For an automatic checkpoint: when its prompt was sent.
@@ -361,6 +403,7 @@ pub(crate) struct Made {
     pub(crate) snapshot: Snapshot,
     pub(crate) started_ms: u64,
     pub(crate) finished_ms: u64,
+    pub(crate) reused: bool,
 }
 
 impl Made {
@@ -368,6 +411,8 @@ impl Made {
         json!({
             "id": self.id,
             "commit": self.commit,
+            "tree_oid": self.snapshot.tree,
+            "reused": self.reused,
             "files": self.snapshot.files,
             "bytes": self.snapshot.bytes,
             "excluded_count": self.snapshot.excluded.len(),
@@ -465,6 +510,24 @@ fn numbers_with_metadata(
     Ok(found)
 }
 
+/// The newest checkpoint's `(id, commit_oid, working_tree_oid)` for fast dedup.
+fn latest_tree(store: &Store, deadline: Instant) -> Option<(u64, String, String)> {
+    let existing = numbers(store, deadline).ok()?;
+    let (id, commit) = existing.into_iter().next()?;
+    let tree = run(
+        store,
+        false,
+        &["rev-parse", "--verify", "-q", &format!("{commit}:w")],
+        None,
+        deadline,
+        4096,
+    )
+    .ok()
+    .map(text)
+    .filter(|oid| !oid.is_empty())?;
+    Some((id, commit, tree))
+}
+
 /// Makes a checkpoint. The caller holds the store's locks (shared
 /// repository lock and this working tree's lock).
 pub(crate) fn make(
@@ -477,6 +540,19 @@ pub(crate) fn make(
     store.clear_stale_locks();
     let result = (|| -> Result<Made, String> {
         let snapshot = snapshot(store, limits, request.force, deadline)?;
+        if request.skip_if_unchanged
+            && let Some((latest_id, latest_commit, latest_tree_oid)) = latest_tree(store, deadline)
+            && latest_tree_oid == snapshot.tree
+        {
+            return Ok(Made {
+                id: latest_id,
+                commit: latest_commit,
+                snapshot,
+                started_ms,
+                finished_ms: now_ms(),
+                reused: true,
+            });
+        }
         let mut excluded = Vec::new();
         for (why, path) in &snapshot.excluded {
             excluded.extend_from_slice(why.as_bytes());
@@ -502,11 +578,18 @@ pub(crate) fn make(
         )?);
         let finished_ms = now_ms();
         let metadata = json!({
-            "version": 1,
+            "version": 2,
             "worktree": store.root,
             "reason": request.reason,
             "auto": request.auto,
+            "trigger": request.trigger,
             "agent": request.agent.map(|(name, run)| json!({"name": name, "run": run})),
+            "run_id": request.agent.map(|(_, run)| run),
+            "provider": request.provider,
+            "turn_seq": request.turn_seq,
+            "prompt_sha256": request.prompt_sha256,
+            "tree_oid": snapshot.tree,
+            "pinned": request.pinned,
             "head": head(&store.root, deadline),
             "files": snapshot.files,
             "bytes": snapshot.bytes,
@@ -554,6 +637,7 @@ pub(crate) fn make(
             snapshot,
             started_ms,
             finished_ms,
+            reused: false,
         })
     })();
     if let Err(error) = &result
@@ -566,9 +650,36 @@ pub(crate) fn make(
     result
 }
 
-/// Drops checkpoints past the newest [`KEEP`] of this working tree and lets
-/// git tidy up, only when no checkpoint is being made in the repository.
+/// Recursively sums file sizes under `dir` (best-effort, no symlink following).
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if meta.file_type().is_dir() {
+            total = total.saturating_add(dir_bytes(&entry.path()));
+        } else if meta.file_type().is_file() {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// Drops unpinned checkpoints past the newest [`KEEP`] of this working tree,
+/// enforces the sidecar repository soft cap (`max_store_bytes`, D-12), and lets
+/// git tidy up only when no checkpoint is being made in the repository.
 pub(crate) fn tidy(store: &Store) {
+    let max_store_bytes = Settings::load()
+        .map(|s| s.max_store_bytes())
+        .unwrap_or(DEFAULT_MAX_STORE_MB * MIB);
+    tidy_with_cap(store, max_store_bytes);
+}
+
+pub(crate) fn tidy_with_cap(store: &Store, max_store_bytes: u64) {
     let Ok((_repo, _)) = store.lock(true, Duration::from_secs(1)) else {
         return;
     };
@@ -577,9 +688,52 @@ pub(crate) fn tidy(store: &Store) {
     // left from one that was killed, and would stop every deletion.
     let _ = fs::remove_file(store.repo.join("packed-refs.lock"));
     store.clear_ref_locks();
-    if let Ok(numbers) = numbers(store, deadline) {
-        for (number, _) in numbers.iter().skip(KEEP) {
-            let _ = run(
+    let entries = match numbers_with_metadata(store, deadline) {
+        Ok(listed) => listed,
+        Err(_) => numbers(store, deadline)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, oid)| {
+                let meta = metadata_of(store, &oid, deadline);
+                (id, oid, meta)
+            })
+            .collect(),
+    };
+    let mut unpinned: Vec<u64> = Vec::new();
+    for (number, _, meta) in &entries {
+        let pinned = meta.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+        if !pinned {
+            unpinned.push(*number);
+        }
+    }
+    let mut deleted = false;
+    for number in unpinned.iter().skip(KEEP) {
+        if run(
+            store,
+            false,
+            &[
+                "update-ref",
+                "-d",
+                &format!("{}{number:010}", store.ref_prefix()),
+            ],
+            None,
+            deadline,
+            4096,
+        )
+        .is_ok()
+        {
+            deleted = true;
+        }
+    }
+    // Enforce the repository soft cap by trimming oldest unpinned refs while
+    // always keeping at least the newest unpinned checkpoint.
+    let repo_bytes = dir_bytes(&store.repo.join("objects"));
+    if repo_bytes > max_store_bytes {
+        let kept_unpinned: Vec<u64> = unpinned.into_iter().take(KEEP).collect();
+        // Drop the oldest half of unpinned refs (keeping index 0, the newest).
+        let drop_count = (kept_unpinned.len().saturating_sub(1)).div_ceil(2);
+        for number in kept_unpinned.iter().rev().take(drop_count) {
+            if run(
                 store,
                 false,
                 &[
@@ -590,23 +744,25 @@ pub(crate) fn tidy(store: &Store) {
                 None,
                 deadline,
                 4096,
-            );
+            )
+            .is_ok()
+            {
+                deleted = true;
+            }
         }
     }
-    let _ = run(
-        store,
-        false,
+    let gc_args: &[&str] = if deleted && repo_bytes > max_store_bytes {
+        &["-c", "gc.pruneExpire=now", "gc", "--auto", "--quiet"]
+    } else {
         &[
             "-c",
             "gc.pruneExpire=2.weeks.ago",
             "gc",
             "--auto",
             "--quiet",
-        ],
-        None,
-        deadline,
-        64 * 1024,
-    );
+        ]
+    };
+    let _ = run(store, false, gc_args, None, deadline, 64 * 1024);
 }
 
 /// The checkpoint `id` of this working tree.
@@ -941,7 +1097,13 @@ pub(crate) fn command_in(
                     &Request {
                         reason: &reason,
                         auto: false,
+                        trigger: "manual",
                         agent: Some(agent),
+                        provider: None,
+                        turn_seq: None,
+                        prompt_sha256: None,
+                        pinned: false,
+                        skip_if_unchanged: false,
                         force: &[],
                         prompt_ms: None,
                     },
@@ -960,13 +1122,13 @@ pub(crate) fn command_in(
     }
 }
 
-/// Starts an automatic checkpoint before a prompt, if the user asked for
-/// them, without waiting for it. Never fails the prompt.
-pub(crate) fn before_prompt(cwd: &str, name: &str, run: &str) {
+/// Starts an automatic checkpoint before a prompt, unless disabled in
+/// `~/.config/masil/checkpoints.toml`, without waiting for it. Never fails the prompt.
+pub(crate) fn before_prompt(cwd: &str, name: &str, run: &str, provider: &str, prompt_sha256: &str) {
     let Ok(settings) = Settings::load() else {
         return;
     };
-    if !settings.before_prompt {
+    if !settings.before_prompt_enabled() {
         return;
     }
     let Ok(executable) = crate::worktree::git::current_executable() else {
@@ -974,7 +1136,15 @@ pub(crate) fn before_prompt(cwd: &str, name: &str, run: &str) {
     };
     let mut command = std::process::Command::new(executable);
     command
-        .args(["checkpoint-auto", cwd, name, run, &now_ms().to_string()])
+        .args([
+            "checkpoint-auto",
+            cwd,
+            name,
+            run,
+            &now_ms().to_string(),
+            provider,
+            prompt_sha256,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -989,11 +1159,383 @@ pub(crate) fn before_prompt(cwd: &str, name: &str, run: &str) {
     }
 }
 
-/// `masil-agent checkpoint-auto CWD NAME RUN PROMPT_MS`: the automatic
-/// checkpoint itself. Whatever stops it is recorded as skipped.
+/// Takes a post-turn checkpoint synchronously (intended to be called from
+/// `spawn_blocking` by the coordinator). Skips creating a duplicate commit when
+/// the working tree matches the previous checkpoint's tree OID.
+pub(crate) fn after_turn(
+    cwd: &str,
+    name: &str,
+    run: &str,
+    provider: &str,
+    turn_seq: u64,
+    prompt_sha256: Option<&str>,
+) -> Option<Made> {
+    let settings = Settings::load().ok()?;
+    if !settings.auto_after_turn_enabled() {
+        return None;
+    }
+    let root = crate::changes::root_of(Path::new(cwd)).ok()?;
+    let deadline = Instant::now() + settings.auto_time();
+    let store = Store::open(&root, deadline).ok()?;
+    let made = match store.lock(false, LOCK_WAIT) {
+        Err(error) => {
+            record_skip(&store, "busy", &error);
+            return None;
+        }
+        Ok((_repo, _worktree)) => {
+            restore::clean_interrupted(&store);
+            make(
+                &store,
+                &Request {
+                    reason: "after turn",
+                    auto: true,
+                    trigger: "after_turn",
+                    agent: Some((name, run)),
+                    provider: Some(provider),
+                    turn_seq: Some(turn_seq),
+                    prompt_sha256,
+                    pinned: false,
+                    skip_if_unchanged: true,
+                    force: &[],
+                    prompt_ms: None,
+                },
+                settings.limits(),
+                deadline,
+            )
+            .map_err(|error| {
+                let why = if timed_out(&error) {
+                    "timeout"
+                } else if error.starts_with("checkpoint_too_large") {
+                    "too_large"
+                } else {
+                    "error"
+                };
+                (why, error)
+            })
+        }
+    };
+    match made {
+        Ok(made) => {
+            if !made.reused {
+                tidy(&store);
+            }
+            Some(made)
+        }
+        Err((why, error)) => {
+            record_skip(&store, why, &error);
+            None
+        }
+    }
+}
+
+/// Takes a synchronous safety checkpoint (e.g. before DVR restore or Arena squash
+/// promotion on a dirty working tree, D-12).
+pub(crate) fn make_safety_checkpoint(cwd: &Path, reason: &str) -> Result<Made, String> {
+    let settings = Settings::load().unwrap_or_default();
+    let root = crate::changes::root_of(cwd)?;
+    let deadline = Instant::now() + MAKE_TIME;
+    let store = Store::open(&root, deadline)?;
+    let (_repo, _worktree) = store.lock(false, LOCK_WAIT)?;
+    restore::clean_interrupted(&store);
+    make(
+        &store,
+        &Request {
+            reason,
+            auto: true,
+            trigger: "pre_restore",
+            agent: None,
+            provider: None,
+            turn_seq: None,
+            prompt_sha256: None,
+            pinned: false,
+            skip_if_unchanged: false,
+            force: &[],
+            prompt_ms: None,
+        },
+        settings.limits(),
+        deadline,
+    )
+}
+
+/// Marks or unmarks checkpoint `id` as `pinned` in its sidecar commit metadata
+/// so [`tidy_with_cap`] permanently protects it from both the 100-turn limit and
+/// the 1 GiB soft cap (D-12).
+pub(crate) fn set_pinned(store: &Store, id: u64, pinned: bool) -> Result<(), String> {
+    let deadline = Instant::now() + MAKE_TIME;
+    let (_repo, _worktree) = store.lock(false, LOCK_WAIT)?;
+    store.clear_stale_locks();
+    let commit = commit_of(store, id, deadline)?;
+    let root_tree = text(run(
+        store,
+        false,
+        &["rev-parse", "--verify", &format!("{commit}^{{tree}}")],
+        None,
+        deadline,
+        4096,
+    )?);
+    let subject = text(run(
+        store,
+        false,
+        &["log", "-1", "--format=%s", &commit],
+        None,
+        deadline,
+        4096,
+    )?);
+    let mut meta = metadata_of(store, &commit, deadline);
+    if !meta.is_object() {
+        meta = json!({});
+    }
+    meta["pinned"] = json!(pinned);
+    let new_commit = text(run(
+        store,
+        false,
+        &["commit-tree", &root_tree],
+        Some(format!("{subject}\n\n{meta}\n").into_bytes()),
+        deadline,
+        4096,
+    )?);
+    run(
+        store,
+        false,
+        &[
+            "update-ref",
+            &format!("{}{id:010}", store.ref_prefix()),
+            &new_commit,
+            &commit,
+        ],
+        None,
+        deadline,
+        4096,
+    )?;
+    Ok(())
+}
+
+/// Computes a unified diff between two tree OIDs stored in the sidecar checkpoint repo.
+pub(crate) fn diff_trees(
+    store: &Store,
+    prev_tree: Option<&str>,
+    curr_tree: &str,
+) -> Result<(String, usize), String> {
+    let deadline = Instant::now() + MAKE_TIME;
+    let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let base = prev_tree.filter(|t| !t.is_empty()).unwrap_or(empty_tree);
+    let names = run(
+        store,
+        false,
+        &["diff-tree", "-r", "--name-only", base, curr_tree],
+        None,
+        deadline,
+        LIST_LIMIT,
+    )?;
+    let file_count = String::from_utf8_lossy(&names.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    let patch = run(
+        store,
+        false,
+        &[
+            "diff-tree",
+            "-r",
+            "-p",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            base,
+            curr_tree,
+        ],
+        None,
+        deadline,
+        DIFF_LIMIT,
+    )?;
+    Ok((
+        String::from_utf8_lossy(&patch.stdout).into_owned(),
+        file_count,
+    ))
+}
+
+/// Full working-tree restore to a sidecar `tree_oid` (D-12 Time-Travel DVR):
+/// takes a `pre_restore` safety checkpoint first, then restores all tracked and
+/// untracked files (including undoing Bash side effects created or deleted after
+/// that turn).
+pub(crate) fn restore_tree(
+    store: &Store,
+    target_tree_oid: &str,
+    limits: Limits,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + MAKE_TIME;
+    let (_repo, _worktree) = store.lock(false, LOCK_WAIT)?;
+    store.clear_stale_locks();
+    restore::clean_interrupted(store);
+
+    // 1. Always take a safety snapshot before mutating the working tree.
+    let before = make(
+        store,
+        &Request {
+            reason: "pre DVR restore",
+            auto: true,
+            trigger: "pre_restore",
+            agent: None,
+            provider: None,
+            turn_seq: None,
+            prompt_sha256: None,
+            pinned: false,
+            skip_if_unchanged: false,
+            force: &[],
+            prompt_ms: None,
+        },
+        limits,
+        deadline,
+    )?;
+
+    // 2. Determine files present now vs target tree so Bash-created files are removed.
+    let current_files = list_tree_paths(store, &before.snapshot.tree, deadline)?;
+    let target_files = list_tree_paths(store, target_tree_oid, deadline)?;
+    let target_set: BTreeSet<&str> = target_files.iter().map(String::as_str).collect();
+
+    let mut removed = Vec::new();
+    for rel in &current_files {
+        if !target_set.contains(rel.as_str()) {
+            let full = store.root.join(rel);
+            if full.exists() || fs::symlink_metadata(&full).is_ok() {
+                let _ = fs::remove_file(&full);
+                prune_empty_parents(&full, &store.root);
+                removed.push(rel.clone());
+            }
+        }
+    }
+
+    // 3. Materialize target tree directly into the working tree using the sidecar index.
+    run(
+        store,
+        true,
+        &["read-tree", target_tree_oid],
+        None,
+        deadline,
+        64 * 1024,
+    )?;
+    run(
+        store,
+        true,
+        &["checkout-index", "-a", "-f"],
+        None,
+        deadline,
+        64 * 1024,
+    )?;
+
+    Ok(json!({
+        "stage": "restored",
+        "safety_checkpoint_id": before.id,
+        "target_tree_oid": target_tree_oid,
+        "restored_files": target_files.len(),
+        "removed_files": removed,
+    }))
+}
+
+/// Exports a sidecar `tree_oid` cleanly into `target_dir` (for `dvr fork`).
+pub(crate) fn materialize_tree_into(
+    store: &Store,
+    tree_oid: &str,
+    target_dir: &Path,
+) -> Result<usize, String> {
+    let deadline = Instant::now() + MAKE_TIME;
+    let (_repo, _worktree) = store.lock(false, LOCK_WAIT)?;
+    let target_files = list_tree_paths(store, tree_oid, deadline)?;
+
+    // Clear existing tracked/untracked files inside `target_dir` (leaving `.git` intact).
+    if let Ok(entries) = fs::read_dir(target_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let p = entry.path();
+            if p.is_dir() {
+                let _ = fs::remove_dir_all(&p);
+            } else {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+
+    let tmp_index = store.repo.join(format!("masil-index/fork-{}", now_ms()));
+    let mut read_cmd = store.git(false);
+    read_cmd
+        .env("GIT_WORK_TREE", target_dir)
+        .env("GIT_INDEX_FILE", &tmp_index)
+        .args(["read-tree", tree_oid]);
+    git::run_within(read_cmd, None, &[0], deadline, 64 * 1024, TIMEOUT)?;
+
+    let mut checkout_cmd = store.git(false);
+    checkout_cmd
+        .env("GIT_WORK_TREE", target_dir)
+        .env("GIT_INDEX_FILE", &tmp_index)
+        .args(["checkout-index", "-a", "-f"]);
+    let res = git::run_within(checkout_cmd, None, &[0], deadline, 64 * 1024, TIMEOUT);
+    let _ = fs::remove_file(&tmp_index);
+    res?;
+    Ok(target_files.len())
+}
+
+fn list_tree_paths(
+    store: &Store,
+    tree_oid: &str,
+    deadline: Instant,
+) -> Result<Vec<String>, String> {
+    let out = run(
+        store,
+        false,
+        &["ls-tree", "-r", "-z", "--name-only", tree_oid],
+        None,
+        deadline,
+        LIST_LIMIT,
+    )?;
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
+}
+
+fn prune_empty_parents(file: &Path, stop_at: &Path) {
+    let mut cur = file.parent();
+    while let Some(dir) = cur {
+        if dir == stop_at || !dir.starts_with(stop_at) {
+            break;
+        }
+        if fs::remove_dir(dir).is_err() {
+            break;
+        }
+        cur = dir.parent();
+    }
+}
+
+/// `masil-agent checkpoint-auto CWD NAME RUN PROMPT_MS [PROVIDER [PROMPT_SHA256]]`:
+/// the automatic pre-prompt checkpoint itself. Whatever stops it is recorded as skipped.
 pub(crate) fn auto(args: &[String]) -> Result<i32, String> {
-    let [cwd, name, run, prompt_ms] = args else {
-        return Err("usage: checkpoint-auto CWD NAME RUN PROMPT_MS".into());
+    let (cwd, name, run, prompt_ms, provider, prompt_sha256) = match args {
+        [cwd, name, run, prompt_ms] => (cwd, name, run, prompt_ms, None, None),
+        [cwd, name, run, prompt_ms, provider] => (
+            cwd,
+            name,
+            run,
+            prompt_ms,
+            (!provider.is_empty()).then_some(provider.as_str()),
+            None,
+        ),
+        [cwd, name, run, prompt_ms, provider, sha] => (
+            cwd,
+            name,
+            run,
+            prompt_ms,
+            (!provider.is_empty()).then_some(provider.as_str()),
+            (!sha.is_empty()).then_some(sha.as_str()),
+        ),
+        _ => {
+            return Err(
+                "usage: checkpoint-auto CWD NAME RUN PROMPT_MS [PROVIDER [PROMPT_SHA256]]".into(),
+            );
+        }
     };
     let Ok(root) = crate::changes::root_of(Path::new(cwd)) else {
         // Not a git working tree: nothing to save.
@@ -1012,7 +1554,13 @@ pub(crate) fn auto(args: &[String]) -> Result<i32, String> {
                 &Request {
                     reason: "before prompt",
                     auto: true,
+                    trigger: "before_prompt",
                     agent: Some((name, run)),
+                    provider,
+                    turn_seq: None,
+                    prompt_sha256,
+                    pinned: false,
+                    skip_if_unchanged: provider.is_some() || prompt_sha256.is_some(),
                     force: &[],
                     prompt_ms: prompt_ms.parse().ok(),
                 },
@@ -1032,7 +1580,11 @@ pub(crate) fn auto(args: &[String]) -> Result<i32, String> {
         }
     };
     match made {
-        Ok(_) => tidy(&store),
+        Ok(made) => {
+            if !made.reused {
+                tidy(&store);
+            }
+        }
         Err((why, error)) => record_skip(&store, why, &error),
     }
     Ok(0)
@@ -1101,5 +1653,178 @@ pub(crate) fn finish_restore(prepared: Prepared, deadline: Instant) -> Result<Va
     match prepared {
         Prepared::Preview(preview) => Ok(preview),
         Prepared::Ready(ready) => restore::write(*ready, deadline),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn settings_default_to_enabled_and_support_explicit_opt_out() {
+        let defaults = Settings::default();
+        assert!(defaults.before_prompt_enabled());
+        assert!(defaults.auto_after_turn_enabled());
+        assert!(!defaults.auto_turn_checkpoint_disabled());
+        assert_eq!(defaults.max_store_bytes(), 1024 * MIB);
+
+        let parsed: Settings = toml::from_str(
+            "before_prompt = false\nauto_after_turn = false\nmax_store_mb = 256\nmax_file_mb = 5\nauto_timeout_s = 15\n",
+        )
+        .unwrap();
+        assert!(!parsed.before_prompt_enabled());
+        assert!(!parsed.auto_after_turn_enabled());
+        assert!(parsed.auto_turn_checkpoint_disabled());
+        assert_eq!(parsed.max_store_bytes(), 256 * MIB);
+        assert_eq!(parsed.limits().file, 5 * MIB);
+        assert_eq!(parsed.auto_time(), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn unchanged_working_tree_reuses_previous_checkpoint_and_pinned_survives_tidy() {
+        let base = std::env::temp_dir().join(format!(
+            "masil-ckpt-p0-{}",
+            crate::managed::nonce().unwrap()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+
+        let bare = base.join("store.git");
+        let store = Store::open_in_repo(&repo, &bare, Instant::now() + MAKE_TIME).unwrap();
+        let limits = Settings::default().limits();
+        let deadline = Instant::now() + MAKE_TIME;
+
+        let first = {
+            let (_r, _w) = store.lock(false, LOCK_WAIT).unwrap();
+            make(
+                &store,
+                &Request {
+                    reason: "after turn",
+                    auto: true,
+                    trigger: "after_turn",
+                    agent: Some(("cx", "run-1")),
+                    provider: Some("codex"),
+                    turn_seq: Some(1),
+                    prompt_sha256: Some("abc123"),
+                    pinned: true,
+                    skip_if_unchanged: true,
+                    force: &[],
+                    prompt_ms: None,
+                },
+                limits,
+                deadline,
+            )
+            .unwrap()
+        };
+        assert_eq!(first.id, 1);
+        assert!(!first.reused);
+
+        // Repeating with identical working tree reuses checkpoint 1 without creating a new commit.
+        let skipped = {
+            let (_r, _w) = store.lock(false, LOCK_WAIT).unwrap();
+            make(
+                &store,
+                &Request {
+                    reason: "after turn",
+                    auto: true,
+                    trigger: "after_turn",
+                    agent: Some(("cx", "run-1")),
+                    provider: Some("codex"),
+                    turn_seq: Some(2),
+                    prompt_sha256: Some("def456"),
+                    pinned: false,
+                    skip_if_unchanged: true,
+                    force: &[],
+                    prompt_ms: None,
+                },
+                limits,
+                deadline,
+            )
+            .unwrap()
+        };
+        assert_eq!(skipped.id, first.id);
+        assert_eq!(skipped.commit, first.commit);
+        assert_eq!(skipped.snapshot.tree, first.snapshot.tree);
+        assert!(skipped.reused);
+
+        // Modifying a file creates checkpoint 2 with full v2 metadata.
+        fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        let second = {
+            let (_r, _w) = store.lock(false, LOCK_WAIT).unwrap();
+            make(
+                &store,
+                &Request {
+                    reason: "after turn",
+                    auto: true,
+                    trigger: "after_turn",
+                    agent: Some(("cx", "run-1")),
+                    provider: Some("codex"),
+                    turn_seq: Some(2),
+                    prompt_sha256: Some("def456"),
+                    pinned: false,
+                    skip_if_unchanged: true,
+                    force: &[],
+                    prompt_ms: None,
+                },
+                limits,
+                deadline,
+            )
+            .unwrap()
+        };
+        assert_eq!(second.id, 2);
+        assert!(!second.reused);
+        assert_ne!(second.snapshot.tree, first.snapshot.tree);
+
+        let listed = list(&store).unwrap();
+        let cps = listed["checkpoints"].as_array().unwrap();
+        assert_eq!(cps.len(), 2);
+        assert_eq!(cps[0]["trigger"], json!("after_turn"));
+        assert_eq!(cps[0]["provider"], json!("codex"));
+        assert_eq!(cps[0]["turn_seq"], json!(2));
+        assert_eq!(cps[0]["prompt_sha256"], json!("def456"));
+        assert_eq!(cps[0]["tree_oid"], json!(second.snapshot.tree));
+        assert_eq!(cps[0]["pinned"], json!(false));
+        assert_eq!(cps[1]["pinned"], json!(true));
+
+        // Even under a tiny store cap, pinned checkpoint #1 is never pruned.
+        tidy_with_cap(&store, 0);
+        let after_tidy = list(&store).unwrap();
+        let ids: Vec<u64> = after_tidy["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["id"].as_u64())
+            .collect();
+        assert!(
+            ids.contains(&1),
+            "pinned checkpoint #1 must survive tidy: {ids:?}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
     }
 }

@@ -921,7 +921,13 @@ pub(crate) fn prepare(
         &Request {
             reason: &format!("before restore of {}", plan.id),
             auto: false,
+            trigger: "pre_restore",
             agent: Some(agent),
+            provider: None,
+            turn_seq: None,
+            prompt_sha256: None,
+            pinned: false,
+            skip_if_unchanged: false,
             force: &targets,
             prompt_ms: None,
         },

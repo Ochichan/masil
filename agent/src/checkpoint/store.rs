@@ -85,6 +85,24 @@ impl Store {
         Ok(store)
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_in_repo(
+        root: &Path,
+        repo: &Path,
+        deadline: Instant,
+    ) -> Result<Self, String> {
+        let root_text = root
+            .to_str()
+            .ok_or("changes_unavailable: the working tree path is not UTF-8")?;
+        let store = Self {
+            root: root.to_path_buf(),
+            worktree_key: key(root_text),
+            repo: repo.to_path_buf(),
+        };
+        store.ensure(deadline)?;
+        Ok(store)
+    }
+
     /// Makes the repository on first use: no template (so no hooks from
     /// `init.templateDir`), owner-only, with its attributes.
     fn ensure(&self, deadline: Instant) -> Result<(), String> {

@@ -35,6 +35,12 @@ pub(crate) enum ChangesOp {
     Handoff {
         reviewer: String,
     },
+    /// Latest BS Detector turn audit (hybrid findings + top-5 risk hunks).
+    AuditLatest,
+    /// Queue a structured challenge ("추궁") prompt for a turn audit finding.
+    AuditChallenge {
+        finding_id: Option<String>,
+    },
 }
 
 const RESTORE_TIME: Duration = Duration::from_secs(120);
@@ -114,6 +120,139 @@ impl Manager {
                     .queue_add(&reviewer, &text, &[root_text], &root)
                     .await?;
                 Ok(json!({"stage": "queued", "reviewer": reviewer.name, "item": item}))
+            }
+            ChangesOp::AuditLatest => {
+                let socket = self.native.socket.clone();
+                let run_id = agent.run.clone();
+                let pane_id = agent.pane_id.clone();
+                let cwd = agent.cwd.clone();
+                let root_for_audit = root.clone();
+                blocking(move || {
+                    let store = super::Store::open(&socket)?;
+                    let report = match store.latest_turn_audit(Some(&run_id), Some(&pane_id))? {
+                        Some(rec) => crate::audit::AuditReport::from_record(rec),
+                        None => {
+                            let repo_cfg = crate::audit::config::RepoAuditConfig::load_for_repo(
+                                &root_for_audit,
+                            );
+                            let (prev_cp, cur_cp, diff) =
+                                crate::audit::capture_turn_diff(Path::new(&cwd), None);
+                            crate::audit::audit_turn(&crate::audit::TurnAuditInput {
+                                pane_id: &pane_id,
+                                run_id: &run_id,
+                                checkpoint_id: cur_cp.as_deref(),
+                                prev_checkpoint_id: prev_cp.as_deref(),
+                                unified_diff: &diff,
+                                transcript_slice: &[],
+                                pane_tail: "",
+                                last_user_prompt: None,
+                                repo_cfg: &repo_cfg,
+                            })
+                        }
+                    };
+                    let mut rows = Vec::new();
+                    // D-03 Hybrid order: CRITICAL/HIGH findings first -> top-5 hunks -> WARNING/INFO.
+                    for finding in report.findings.iter().filter(|f| {
+                        matches!(
+                            f.severity,
+                            crate::audit::Severity::Critical | crate::audit::Severity::High
+                        )
+                    }) {
+                        rows.push(json!({
+                            "entry_kind": "finding",
+                            "finding_id": finding.id,
+                            "severity": finding.severity.as_str(),
+                            "rule_id": finding.rule_id,
+                            "title": finding.title,
+                            "detail": finding.detail,
+                            "evidence": finding.evidence,
+                            "file": finding.file,
+                            "line": finding.line,
+                        }));
+                    }
+                    for hunk in &report.hunks {
+                        rows.push(json!({
+                            "entry_kind": "hunk",
+                            "score": hunk.risk_score,
+                            "file": hunk.file,
+                            "header": format!("@@ -{} +{} @@", hunk.old_start, hunk.new_start),
+                            "reason": hunk.reason,
+                            "diff": hunk.diff,
+                            "additions": hunk.added,
+                            "deletions": hunk.removed,
+                        }));
+                    }
+                    for finding in report.findings.iter().filter(|f| {
+                        !matches!(
+                            f.severity,
+                            crate::audit::Severity::Critical | crate::audit::Severity::High
+                        )
+                    }) {
+                        rows.push(json!({
+                            "entry_kind": "finding",
+                            "finding_id": finding.id,
+                            "severity": finding.severity.as_str(),
+                            "rule_id": finding.rule_id,
+                            "title": finding.title,
+                            "detail": finding.detail,
+                            "evidence": finding.evidence,
+                            "file": finding.file,
+                            "line": finding.line,
+                        }));
+                    }
+                    Ok(json!({
+                        "audit": report,
+                        "summary": report.to_summary_json(),
+                        "has_critical": report.has_critical(),
+                        "rows": rows,
+                    }))
+                })
+                .await
+            }
+            ChangesOp::AuditChallenge { finding_id } => {
+                let socket = self.native.socket.clone();
+                let run_id = agent.run.clone();
+                let pane_id = agent.pane_id.clone();
+                let cwd = agent.cwd.clone();
+                let root_for_audit = root.clone();
+                let finding_for_prompt = finding_id.clone();
+                let prompt = blocking(move || -> Result<String, String> {
+                    let store = super::Store::open(&socket)?;
+                    let report = match store.latest_turn_audit(Some(&run_id), Some(&pane_id))? {
+                        Some(rec) => crate::audit::AuditReport::from_record(rec),
+                        None => {
+                            let repo_cfg = crate::audit::config::RepoAuditConfig::load_for_repo(
+                                &root_for_audit,
+                            );
+                            let (prev_cp, cur_cp, diff) =
+                                crate::audit::capture_turn_diff(Path::new(&cwd), None);
+                            crate::audit::audit_turn(&crate::audit::TurnAuditInput {
+                                pane_id: &pane_id,
+                                run_id: &run_id,
+                                checkpoint_id: cur_cp.as_deref(),
+                                prev_checkpoint_id: prev_cp.as_deref(),
+                                unified_diff: &diff,
+                                transcript_slice: &[],
+                                pane_tail: "",
+                                last_user_prompt: None,
+                                repo_cfg: &repo_cfg,
+                            })
+                        }
+                    };
+                    Ok(crate::audit::ui_card::build_challenge_prompt(
+                        &report,
+                        finding_for_prompt.as_deref(),
+                        None,
+                    ))
+                })
+                .await?;
+                let item = self.queue_add(agent, &prompt, &[], &root).await?;
+                Ok(json!({
+                    "stage": "queued",
+                    "finding_id": finding_id,
+                    "prompt": prompt,
+                    "item": item,
+                }))
             }
         }
     }

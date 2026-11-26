@@ -4,8 +4,11 @@ import { ChevronLeft, Sparkles } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { CheckpointsView } from "../components/CheckpointsView";
+import { CollisionRadarView } from "../components/CollisionRadarView";
+import { DvrScrubberView } from "../components/DvrScrubberView";
 import { FileExplorerView } from "../components/FileExplorerView";
 import { GitDiffView } from "../components/GitDiffView";
+import { LocalhostPreviewView } from "../components/LocalhostPreviewView";
 import { PluginCreatorSheet } from "../components/PluginCreatorSheet";
 import { PluginPanelView } from "../components/PluginPanelView";
 import { SchedulesView } from "../components/SchedulesView";
@@ -30,6 +33,9 @@ export function WorkspaceToolsPanel({
   const [tab, setTab] = useState<string>("changes");
   const [showCreator, setShowCreator] = useState(false);
   const selectPanel = useMobilePanelsStore((s) => s.selectPanel);
+  const isWorkspaceToolsVisible = useMobilePanelsStore(
+    (s) => s.target === "workspace-tools"
+  );
   const plugins = useHostRuntimeStore((s) =>
     hostId ? s.hosts[hostId]?.plugins ?? null : null
   );
@@ -39,18 +45,18 @@ export function WorkspaceToolsPanel({
     [plugins]
   );
 
-  const tabs = useMemo(() => {
-    const base: Array<{ id: string; label: string }> = [
+  const coreTabs = useMemo(
+    () => [
       { id: "changes", label: t("changes") },
       { id: "files", label: t("files") },
+      { id: "preview", label: t("preview") },
+      { id: "dvr", label: t("dvrTab") },
       { id: "checkpoints", label: t("checkpoints") },
+      { id: "conflicts", label: t("conflicts") },
       { id: "schedules", label: t("schedules") },
-    ];
-    for (const p of pluginPanels) {
-      base.push({ id: `plugin:${p.plugin_id}:${p.id}`, label: p.title });
-    }
-    return base;
-  }, [pluginPanels, t]);
+    ],
+    [t]
+  );
 
   const activePluginPanel = useMemo(() => {
     if (!tab.startsWith("plugin:")) return null;
@@ -113,11 +119,51 @@ export function WorkspaceToolsPanel({
 
         <View style={styles.segmentRow}>
           <SegmentedTabs
-            options={tabs}
-            value={effectiveTab}
+            options={coreTabs}
+            value={activePluginPanel ? "" : effectiveTab}
             onChange={setTab}
           />
         </View>
+
+        {pluginPanels.length > 0 ? (
+          <View style={styles.pluginStrip}>
+            {pluginPanels.map((p) => {
+              const panelKey = `plugin:${p.plugin_id}:${p.id}`;
+              const active = effectiveTab === panelKey;
+              return (
+                <Pressable
+                  key={panelKey}
+                  onPress={() => setTab(panelKey)}
+                  style={[
+                    styles.pluginChip,
+                    {
+                      backgroundColor: active ? palette.accent : palette.raised,
+                      borderColor: active ? palette.accent : palette.hairline,
+                    },
+                  ]}
+                >
+                  <Sparkles
+                    size={11}
+                    color={active ? palette.accentText : palette.accent}
+                  />
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.pluginChipText,
+                      {
+                        color: active
+                          ? palette.accentText
+                          : palette.textSecondary,
+                      },
+                    ]}
+                  >
+                    {p.title}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        ) : null}
       </View>
 
       {activePluginPanel && hostId ? (
@@ -125,11 +171,12 @@ export function WorkspaceToolsPanel({
           hostId={hostId}
           agent={agent}
           panel={activePluginPanel}
+          visible={isWorkspaceToolsVisible}
         />
       ) : !hostId || !agent ? (
         <View style={styles.emptyRoot}>
           <Text style={[styles.emptyText, { color: palette.muted }]}>
-            에이전트를 선택하면 변경 내역, 파일, 체크포인트, 예약을 확인할 수 있습니다.
+            {t("workspaceToolsEmpty")}
           </Text>
         </View>
       ) : effectiveTab === "changes" ? (
@@ -140,8 +187,14 @@ export function WorkspaceToolsPanel({
         />
       ) : effectiveTab === "files" ? (
         <FileExplorerView hostId={hostId} cwd={agent.cwd} />
+      ) : effectiveTab === "preview" ? (
+        <LocalhostPreviewView hostId={hostId} agent={agent} />
+      ) : effectiveTab === "dvr" ? (
+        <DvrScrubberView hostId={hostId} agent={agent} />
       ) : effectiveTab === "checkpoints" ? (
         <CheckpointsView hostId={hostId} agent={agent} />
+      ) : effectiveTab === "conflicts" ? (
+        <CollisionRadarView hostId={hostId} agent={agent} />
       ) : (
         <SchedulesView hostId={hostId} serverSocket={agent.server_socket} />
       )}
@@ -197,6 +250,27 @@ const styles = StyleSheet.create({
   segmentRow: {
     paddingHorizontal: 14,
     paddingBottom: 10,
+  },
+  pluginStrip: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    paddingHorizontal: 14,
+    paddingBottom: 10,
+  },
+  pluginChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    maxWidth: "48%",
+  },
+  pluginChipText: {
+    fontFamily: FONTS.semi,
+    fontSize: 12,
   },
   emptyRoot: {
     flex: 1,

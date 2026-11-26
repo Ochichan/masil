@@ -16,7 +16,13 @@ import {
   useWindowDimensions,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
-import { Maximize2, Minimize2, ZoomIn, ZoomOut } from "lucide-react-native";
+import {
+  Maximize2,
+  Minimize2,
+  RefreshCw,
+  ZoomIn,
+  ZoomOut,
+} from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import {
   HeadlessTerminalEngine,
@@ -26,6 +32,7 @@ import {
 import {
   getHostClient,
   subscribeHostBinary,
+  useHostRuntimeStore,
 } from "../hosts/HostRuntimeController";
 import { useBlockMobilePanelOpenGestures } from "../mobile-panels/gestures";
 import {
@@ -45,15 +52,20 @@ const EXTRA_KEYS: Array<{ label: string; bytes: string }> = [
   { label: "Esc", bytes: "\x1b" },
   { label: "Ctrl-C", bytes: "\x03" },
   { label: "Tab", bytes: "\t" },
+  { label: "S-Tab", bytes: "\x1b[Z" },
+  { label: "Space", bytes: " " },
   { label: "↑", bytes: "\x1b[A" },
   { label: "↓", bytes: "\x1b[B" },
   { label: "←", bytes: "\x1b[D" },
   { label: "→", bytes: "\x1b[C" },
   { label: "Enter", bytes: "\r" },
-  { label: "y", bytes: "y\r" },
-  { label: "n", bytes: "n\r" },
-  { label: "1", bytes: "1\r" },
-  { label: "2", bytes: "2\r" },
+  { label: "Bksp", bytes: "\x7f" },
+  { label: "y", bytes: "y" },
+  { label: "n", bytes: "n" },
+  { label: "1", bytes: "1" },
+  { label: "2", bytes: "2" },
+  { label: "3", bytes: "3" },
+  { label: "4", bytes: "4" },
 ];
 
 function hexToArgb(hex: string): number {
@@ -73,6 +85,10 @@ export function LiveTerminalTab({ hostId, agent, active }: LiveTerminalTabProps)
   });
   const [desktopSize, setDesktopSize] = useState({ cols: 120, rows: 36 });
   const [rawInput, setRawInput] = useState("");
+  const [attachSeq, setAttachSeq] = useState(0);
+  const hostConnection = useHostRuntimeStore(
+    (s) => s.hosts[hostId]?.connection ?? "disconnected"
+  );
   const channelId = 1;
 
   // Block side-panel swipe-open gestures while panning a desktop-width terminal.
@@ -121,7 +137,7 @@ export function LiveTerminalTab({ hostId, agent, active }: LiveTerminalTabProps)
     });
 
     const client = getHostClient(hostId);
-    if (client && client.connectionState === "connected") {
+    if (client && hostConnection === "connected") {
       void client
         .request("terminal.attach.request", {
           channel_id: channelId,
@@ -141,12 +157,26 @@ export function LiveTerminalTab({ hostId, agent, active }: LiveTerminalTabProps)
       engine.dispose();
       engineRef.current = null;
     };
-  }, [active, hostId, agent.server_socket, agent.pane, theme]);
+  }, [
+    active,
+    hostId,
+    hostConnection,
+    attachSeq,
+    agent.server_socket,
+    agent.pane,
+    theme,
+  ]);
 
   const sendBytes = (str: string) => {
     const client = getHostClient(hostId);
     if (!client) return;
     client.sendTerminalInput(channelId, new TextEncoder().encode(str));
+  };
+
+  const sendLinePaced = (line: string) => {
+    if (!line) return;
+    sendBytes(line);
+    setTimeout(() => sendBytes("\r"), 75);
   };
 
   const toggleFit = () => {
@@ -192,6 +222,13 @@ export function LiveTerminalTab({ hostId, agent, active }: LiveTerminalTabProps)
           {fitMode ? t("fitToPhone") : t("desktopSizePreserved")}
         </Text>
         <View style={styles.toolbarActions}>
+          <Pressable
+            onPress={() => setAttachSeq((n) => n + 1)}
+            style={[styles.toolBtn, { backgroundColor: palette.raised }]}
+            accessibilityLabel={t("terminalReattaching")}
+          >
+            <RefreshCw size={14} color={palette.text} />
+          </Pressable>
           <Pressable
             onPress={() => setFontSize((s) => Math.max(9, s - 1))}
             style={[styles.toolBtn, { backgroundColor: palette.raised }]}
@@ -293,7 +330,7 @@ export function LiveTerminalTab({ hostId, agent, active }: LiveTerminalTabProps)
             placeholderTextColor={palette.muted}
             onSubmitEditing={() => {
               if (!rawInput) return;
-              sendBytes(`${rawInput}\r`);
+              sendLinePaced(rawInput);
               setRawInput("");
             }}
             style={[
@@ -308,7 +345,7 @@ export function LiveTerminalTab({ hostId, agent, active }: LiveTerminalTabProps)
           <Pressable
             onPress={() => {
               if (!rawInput) return;
-              sendBytes(`${rawInput}\r`);
+              sendLinePaced(rawInput);
               setRawInput("");
             }}
             style={[styles.sendKey, { backgroundColor: palette.accent }]}

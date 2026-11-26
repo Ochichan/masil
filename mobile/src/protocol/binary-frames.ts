@@ -1,6 +1,10 @@
 /**
  * Binary application frame codec matching `crates/masil-wire/src/frames.rs`.
  */
+export const TUNNEL_MAX_CHUNK_BYTES = 32 * 1024;
+export const TUNNEL_INITIAL_WINDOW_BYTES = 256 * 1024;
+export const ASSET_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
 export const BinaryOpcode = {
   TerminalOutput: 0x01,
   TerminalInput: 0x02,
@@ -8,6 +12,13 @@ export const BinaryOpcode = {
   TerminalSnapshot: 0x04,
   AudioChunk: 0x10,
   AudioEnd: 0x11,
+  TunnelOpen: 0x20,
+  TunnelOpenAck: 0x21,
+  TunnelData: 0x22,
+  TunnelClose: 0x23,
+  TunnelWindow: 0x24,
+  AssetUploadChunk: 0x30,
+  AssetUploadEnd: 0x31,
 } as const;
 
 export type BinaryOpcodeValue =
@@ -27,6 +38,43 @@ export interface TerminalSnapshotMeta {
   desktop_cols: number;
   desktop_rows: number;
   fit_active: boolean;
+}
+
+export interface TunnelOpenPayload {
+  target_port: number;
+  agent_id?: string;
+}
+
+export interface TunnelOpenAckPayload {
+  ok: boolean;
+  initial_window: number;
+  error?: string;
+}
+
+export interface TunnelClosePayload {
+  reason?: string;
+}
+
+export type AssetDeliveryMode = "send" | "queue" | "prefill";
+
+export interface AssetUploadMeta {
+  url?: string;
+  viewport?: string;
+  theme?: string;
+  server_socket?: string;
+  cwd?: string;
+  console_errors?: string[];
+  network_errors?: string[];
+  annotations_count?: number;
+}
+
+export interface AssetUploadEndPayload {
+  agent_id: string;
+  mime: string;
+  filename: string;
+  delivery_mode: AssetDeliveryMode;
+  prompt?: string;
+  meta: AssetUploadMeta;
 }
 
 export function encodeBinaryFrame(frame: BinaryFrame): Uint8Array {
@@ -49,6 +97,67 @@ export function decodeBinaryFrame(bytes: Uint8Array): BinaryFrame {
     channelId,
     payload: bytes.subarray(3),
   };
+}
+
+export function encodeJsonPayload(value: unknown): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify(value));
+}
+
+export function decodeJsonPayload<T>(payload: Uint8Array): T {
+  return JSON.parse(new TextDecoder().decode(payload)) as T;
+}
+
+export function encodeTunnelWindowPayload(credit: number): Uint8Array {
+  const out = new Uint8Array(4);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, credit >>> 0, false);
+  return out;
+}
+
+export function decodeTunnelWindowPayload(payload: Uint8Array): number {
+  if (payload.length !== 4) {
+    throw new Error(`tunnel window must be 4 bytes, got ${payload.length}`);
+  }
+  const view = new DataView(
+    payload.buffer,
+    payload.byteOffset,
+    payload.byteLength
+  );
+  return view.getUint32(0, false);
+}
+
+export function encodeTunnelOpenFrame(
+  streamId: number,
+  payload: TunnelOpenPayload
+): Uint8Array {
+  return encodeBinaryFrame({
+    opcode: BinaryOpcode.TunnelOpen,
+    channelId: streamId,
+    payload: encodeJsonPayload(payload),
+  });
+}
+
+export function encodeTunnelWindowFrame(
+  streamId: number,
+  credit: number
+): Uint8Array {
+  return encodeBinaryFrame({
+    opcode: BinaryOpcode.TunnelWindow,
+    channelId: streamId,
+    payload: encodeTunnelWindowPayload(credit),
+  });
+}
+
+export function encodeTunnelCloseFrame(
+  streamId: number,
+  reason?: string
+): Uint8Array {
+  const body: TunnelClosePayload = reason ? { reason } : {};
+  return encodeBinaryFrame({
+    opcode: BinaryOpcode.TunnelClose,
+    channelId: streamId,
+    payload: encodeJsonPayload(body),
+  });
 }
 
 export function decodeTerminalSnapshot(payload: Uint8Array): {

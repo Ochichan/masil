@@ -17,7 +17,7 @@ mod managed;
 pub(crate) mod model;
 mod network;
 mod palette;
-mod plugin_view;
+pub(crate) mod plugin_view;
 mod preferences;
 mod queue;
 pub(crate) mod remote_onboarding;
@@ -182,6 +182,23 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
     if let Some(warning) = &preferences.warning {
         app.notify(warning.clone());
     }
+    let mut plugin_fp = crate::plugin::manifest::catalog_fingerprint();
+    let mut plugin_theme_active = false;
+    if options.theme.is_none()
+        && let Ok(cat) = crate::plugin::manifest::load_catalog()
+    {
+        if let Some(t) = cat.active_resolved_theme() {
+            view::set_plugin_palette(Some(&t));
+            app.theme = if t.appearance == "light" {
+                Theme::Light
+            } else {
+                Theme::Dark
+            };
+            plugin_theme_active = true;
+        } else {
+            view::set_plugin_palette(None);
+        }
+    }
     let native = options.native.map(|socket| crate::native_ui::Context {
         socket,
         client: options.client,
@@ -230,6 +247,31 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                     match rx.borrow_and_update().clone() {
                         network::Update::Snapshot {value, boot: next_boot} => {
                             boot = next_boot;
+                            let next_fp = crate::plugin::manifest::catalog_fingerprint();
+                            if next_fp != plugin_fp {
+                                plugin_fp = next_fp;
+                                if let Ok(cat) = crate::plugin::manifest::load_catalog() {
+                                    if let Some(t) = cat.active_resolved_theme() {
+                                        view::set_plugin_palette(Some(&t));
+                                        app.theme = if t.appearance == "light" {
+                                            Theme::Light
+                                        } else {
+                                            Theme::Dark
+                                        };
+                                        plugin_theme_active = true;
+                                    } else {
+                                        view::set_plugin_palette(None);
+                                        plugin_theme_active = false;
+                                        match cat.active_theme.as_deref() {
+                                            Some("dark") => app.theme = Theme::Dark,
+                                            Some("light") => app.theme = Theme::Light,
+                                            Some("terminal") => app.theme = Theme::Terminal,
+                                            _ => {}
+                                        }
+                                    }
+                                    app.dirty = true;
+                                }
+                            }
                             app.apply_snapshot(value);
                             app.set_connection(true, None);
                             app.set_native_available(native.is_some() && boot.is_some());
@@ -291,6 +333,12 @@ async fn desk(socket: PathBuf, options: Options) -> Result<i32, String> {
                         app.set_native_available(false); boot = None; retry.notify_one();
                     },
                     Effect::Preferences { language, theme } => {
+                        if plugin_theme_active {
+                            let _ = crate::plugin::set_active_theme(Some(theme.as_str()));
+                            view::set_plugin_palette(None);
+                            plugin_theme_active = false;
+                            plugin_fp = crate::plugin::manifest::catalog_fingerprint();
+                        }
                         if let Err(message) = preferences.save(language, theme) { app.notify(message); }
                     },
                     effect => {

@@ -2575,5 +2575,26 @@ contains = ["x"]
             "",
         );
         assert_ne!(quoted["state"], "blocked");
+
+        // Interactive question & reject instruction dialogs detected cleanly.
+        let agy_q = "Question 1/2\nWhich deployment target should we use?\n> 1. (Recommended) Production\n  2. Staging\n  3. Other\n  ↑/↓ Navigate · enter Confirm · esc Cancel\n";
+        let explained = engine.explain("agy", agy_q, "");
+        assert_eq!(explained["state"], "blocked", "{explained}");
+        assert_eq!(explained["matched_rule"]["id"], "question_or_select_dialog");
+
+        let agy_multi = "Select all features to enable\n> [ ] 1. Auth\n  [✓] 2. Cache\n  Space to toggle · Enter to submit · Esc to cancel\n";
+        let explained = engine.explain("agy", agy_multi, "");
+        assert_eq!(explained["state"], "blocked", "{explained}");
+
+        let claude_q = format!(
+            "{rule}\nQuestion 1/2\n❯ [ ] 1. Option A\n  [ ] 2. Option B\nSpace to select · Tab/Arrow keys to navigate · Enter to submit · Esc to cancel\n"
+        );
+        assert_eq!(engine.explain("claude", &claude_q, "")["state"], "blocked");
+
+        let oc_reject = "  ┃  △ Reject permission\n  ┃  Tell OpenCode what to do differently\n  ┃  enter confirm  esc cancel\n";
+        assert_eq!(
+            engine.explain("opencode", oc_reject, "")["state"],
+            "blocked"
+        );
     }
 }

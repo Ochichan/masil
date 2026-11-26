@@ -507,6 +507,18 @@ pub(crate) struct WatchControl {
     /// The core connection the badge publishes through when the core takes
     /// summaries. None leaves the badge on its server option.
     pub actions: Option<Arc<super::core_action::CoordinatorActions>>,
+    /// 512-slot coordinator internal event bus (Gen 6).
+    pub event_bus: Arc<crate::coordinator::CoordinatorEventBus>,
+    /// Whether post-turn automatic checkpoints are active (D-01).
+    pub auto_turn_checkpoint: AtomicBool,
+    /// Phase 1A: deterministic post-turn audit enabled (D-01, D-02).
+    pub audit_enabled: AtomicBool,
+    /// Phase 1B: cross-worktree collision radar enabled (D-01, D-04).
+    pub collision_enabled: AtomicBool,
+    /// Phase 1C: circuit breaker & cache warmth guard enabled (D-01, D-05, D-06).
+    pub guard_enabled: AtomicBool,
+    /// Timestamp (ms) of the last debounced collision scan (3s debounce).
+    pub last_collision_scan_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Consume both inbox-change sources every iteration. These must be separate
@@ -1238,6 +1250,10 @@ pub(crate) async fn watch(
     let observer = super::Observer::current();
     let mut notifier = crate::notify::Notifier::new(manager.native.clone());
     let mut next_tick: Option<tokio::time::Instant> = None;
+    let mut last_agent_states: HashMap<String, AgentWatchState> = HashMap::new();
+    let mut turn_seqs: HashMap<String, u64> = HashMap::new();
+    let mut states_seeded = false;
+    let mut hook_inbox_seq: Option<i64> = None;
     loop {
         let interval = if busy || now_ms() < hot_until {
             (base / 2).max(Duration::from_millis(100))
@@ -1632,6 +1648,15 @@ pub(crate) async fn watch(
             if let Some(pane) = targeted_pane {
                 match manager.resident_collect_pane(&pane).await {
                     Ok((agents, inbox_effects)) => {
+                        emit_pass_events(
+                            &manager,
+                            &control,
+                            &agents,
+                            false,
+                            &mut last_agent_states,
+                            &mut turn_seqs,
+                            &mut states_seeded,
+                        );
                         reports.replace_pane(&pane, &agents);
                         observers
                             .sync_pane(&manager, &pane, &agents, &updates)
@@ -1653,6 +1678,15 @@ pub(crate) async fn watch(
             } else {
                 match manager.resident_list().await {
                     Ok((agents, bridge_scope, core_boot_id, inbox_effects)) => {
+                        emit_pass_events(
+                            &manager,
+                            &control,
+                            &agents,
+                            true,
+                            &mut last_agent_states,
+                            &mut turn_seqs,
+                            &mut states_seeded,
+                        );
                         retry = false;
                         reports.panes = agents
                             .iter()
@@ -1718,6 +1752,10 @@ pub(crate) async fn watch(
         }
         if inbox_actions.signal {
             control.inbox_changed.notify_one();
+            dispatch_local_inbox_hooks(&manager.native.socket, &mut hook_inbox_seq).await;
+        }
+        if poked || inbox_changed {
+            dispatch_local_inbox_hooks(&manager.native.socket, &mut hook_inbox_seq).await;
         }
         if inbox_actions.notify
             && let Err(error) = notify(&manager, &mut notifier).await
@@ -1817,6 +1855,503 @@ pub(crate) async fn watch(
             report.last_stood_back = last;
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct AgentWatchState {
+    run: String,
+    state: String,
+    returned_idle: bool,
+}
+
+fn prompt_block_digest(agent: &Agent) -> String {
+    use sha2::{Digest, Sha256};
+    let raw = format!(
+        "{}:{}:{}:{}",
+        agent.run, agent.revision, agent.permission_count, agent.question_count
+    );
+    Sha256::digest(raw.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Phase 3A (D-10): evaluates user-authored `auto_approve` policy rules against
+/// a newly blocked pane using all 4 misfire guards (hard `Low` cap, no truncated
+/// command, re-verified `(run_id, pane_output_generation, prompt_digest)` + explicit
+/// non-destructive Allow option, and durable SQLite audit log).
+fn try_four_guard_auto_approve(socket: &std::path::Path, agent: &Agent) {
+    let (allow_tui, rules) = crate::policy::load_effective_rules(Some(socket));
+    let has_auto = rules
+        .iter()
+        .any(|r| r.enabled && r.action == crate::policy::rules::PolicyAction::AutoApprove);
+    if !has_auto {
+        return;
+    }
+    let sock_str = socket.to_string_lossy();
+    let prompts = crate::remote::prompts::collect_live_prompts_with_cwd(
+        &sock_str,
+        &agent.pane_id,
+        &agent.provider,
+        "blocked",
+        Some(&agent.cwd),
+        &[],
+    );
+    let Some(prompt) = prompts.first() else {
+        return;
+    };
+    let Some(assessment) = prompt.risk.as_ref() else {
+        return;
+    };
+    let matched = crate::policy::rules::evaluate_rules(&rules, assessment, Some(&agent.cwd));
+    let Some(matched_policy) = matched else {
+        return;
+    };
+
+    // Guard #3 re-verification immediately prior to delivery: re-read pane_output_generation
+    // and live prompt digest directly from tmux.
+    let Ok(masil_bin) = crate::native_ui::native_executable() else {
+        return;
+    };
+    let cur_gen = std::process::Command::new(&masil_bin)
+        .arg("-S")
+        .arg(socket)
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &agent.pane_id,
+            "#{pane_output_generation}",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or(u64::MAX);
+
+    let rechecked_prompts = crate::remote::prompts::collect_live_prompts_with_cwd(
+        &sock_str,
+        &agent.pane_id,
+        &agent.provider,
+        "blocked",
+        Some(&agent.cwd),
+        &[],
+    );
+    let current_digest = rechecked_prompts
+        .first()
+        .map(crate::policy::risk::compute_prompt_digest)
+        .unwrap_or_default();
+
+    let decision = crate::policy::guard::evaluate_auto_approve_guards(
+        &crate::policy::guard::AutoApproveContext {
+            run_id: &agent.run,
+            pane_id: &agent.pane_id,
+            provider: &agent.provider,
+            prompt,
+            assessment,
+            matched_rule: Some(&matched_policy.rule),
+            allow_tui_rule_auto_approve: allow_tui,
+            observed_output_generation: agent.output_generation,
+            current_output_generation: cur_gen,
+            current_prompt_digest: &current_digest,
+        },
+    );
+
+    if let crate::policy::guard::GuardDecision::Allow {
+        rule_id,
+        hotkey,
+        mode,
+        ..
+    } = decision
+    {
+        let delivered = if mode == "structured_api" {
+            if let Some(req_id) = prompt.request_id.as_deref() {
+                crate::remote::discovery::run_self_agent_json(
+                    Some(&sock_str),
+                    &[
+                        "answer".into(),
+                        agent.pane_id.clone(),
+                        req_id.to_owned(),
+                        "--choice".into(),
+                        "once".into(),
+                    ],
+                )
+                .is_ok()
+            } else {
+                false
+            }
+        } else if let Some(hk) = hotkey
+            .as_deref()
+            .filter(|h| !h.is_empty() && *h != "\r" && *h != "\n")
+        {
+            let mut cmd = std::process::Command::new(&masil_bin);
+            cmd.arg("-S")
+                .arg(socket)
+                .args(["send-keys", "-H", "-t", &agent.pane_id]);
+            for b in hk.as_bytes() {
+                cmd.arg(format!("{b:02x}"));
+            }
+            cmd.output().is_ok_and(|o| o.status.success())
+        } else {
+            false
+        };
+
+        if delivered && let Ok(mut store) = Store::open(socket) {
+            let _ = crate::policy::guard::record_decision_audit(
+                &mut store,
+                &agent.run,
+                &agent.pane_id,
+                Some(&rule_id),
+                &agent.provider,
+                assessment,
+                "auto_approved",
+                prompt.screen_excerpt.as_deref(),
+                now_ms(),
+            );
+        }
+    }
+}
+
+/// Emits internal `CoordinatorEvent`s on the 512-slot bus, triggers post-turn
+/// automatic checkpoints (`after_turn`), and dispatches local `agent.state_changed`
+/// plugin hooks so desktop-only users get the same lifecycle hooks as remote users.
+fn emit_pass_events(
+    manager: &Manager,
+    control: &Arc<WatchControl>,
+    agents: &[Agent],
+    full_pass: bool,
+    last_states: &mut HashMap<String, AgentWatchState>,
+    turn_seqs: &mut HashMap<String, u64>,
+    seeded: &mut bool,
+) {
+    let at_ms = now_ms();
+    if !*seeded {
+        for agent in agents {
+            last_states.insert(
+                agent.pane_id.clone(),
+                AgentWatchState {
+                    run: agent.run.clone(),
+                    state: agent.state.clone(),
+                    returned_idle: agent.returned_idle,
+                },
+            );
+        }
+        if full_pass {
+            *seeded = true;
+        }
+        return;
+    }
+
+    let mut state_changes: Vec<(String, String, Agent)> = Vec::new();
+    let mut completed_turns: Vec<(Agent, u64)> = Vec::new();
+
+    for agent in agents {
+        let prev = last_states.get(&agent.pane_id);
+        if let Some(prev) = prev {
+            let same_run = prev.run == agent.run;
+            if prev.state != agent.state {
+                control
+                    .event_bus
+                    .publish(crate::coordinator::CoordinatorEvent::StateChanged {
+                        pane_id: agent.pane_id.clone(),
+                        run_id: agent.run.clone(),
+                        prev: prev.state.clone(),
+                        next: agent.state.clone(),
+                        at_ms,
+                    });
+                state_changes.push((prev.state.clone(), agent.state.clone(), agent.clone()));
+                if agent.state == "blocked" {
+                    control.event_bus.publish(
+                        crate::coordinator::CoordinatorEvent::PromptBlocked {
+                            pane_id: agent.pane_id.clone(),
+                            run_id: agent.run.clone(),
+                            prompt_digest: prompt_block_digest(agent),
+                            at_ms,
+                        },
+                    );
+                    // Phase 3A (D-10): 4-guard automatic approval for explicit user low-risk rules.
+                    let sock_for_policy = manager.native.socket.clone();
+                    let blocked_agent = agent.clone();
+                    tokio::spawn(async move {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            try_four_guard_auto_approve(&sock_for_policy, &blocked_agent);
+                        })
+                        .await;
+                    });
+                }
+            }
+            if same_run
+                && agent.state == "idle"
+                && (matches!(prev.state.as_str(), "working" | "retrying")
+                    || (!prev.returned_idle && agent.returned_idle))
+            {
+                let seq = turn_seqs.entry(agent.run.clone()).or_insert(0);
+                *seq += 1;
+                completed_turns.push((agent.clone(), *seq));
+            }
+        }
+        last_states.insert(
+            agent.pane_id.clone(),
+            AgentWatchState {
+                run: agent.run.clone(),
+                state: agent.state.clone(),
+                returned_idle: agent.returned_idle,
+            },
+        );
+    }
+
+    if full_pass {
+        let active_panes: HashSet<&str> = agents.iter().map(|a| a.pane_id.as_str()).collect();
+        last_states.retain(|pane, _| active_panes.contains(pane.as_str()));
+    }
+
+    let had_state_changes = !state_changes.is_empty();
+    if had_state_changes {
+        let socket = manager.native.socket.clone();
+        tokio::spawn(async move {
+            let has_hooks = tokio::task::spawn_blocking(|| {
+                crate::plugin::manifest::load_catalog()
+                    .is_ok_and(|c| c.has_hooks_for("agent.state_changed"))
+            })
+            .await
+            .unwrap_or(false);
+            if !has_hooks {
+                return;
+            }
+            for (prev_state, next_state, agent) in state_changes {
+                let agent_val = json!({
+                    "name": agent.name,
+                    "pane": agent.pane_id,
+                    "pane_id": agent.pane_id,
+                    "provider": agent.provider,
+                    "state": next_state,
+                    "cwd": agent.cwd,
+                    "run": agent.run,
+                    "session_id": agent.session_id,
+                    "server_socket": socket.to_string_lossy(),
+                });
+                crate::plugin::runner::dispatch_hook_event(
+                    "agent.state_changed",
+                    json!({
+                        "previous_state": prev_state,
+                        "state": next_state,
+                        "name": agent.name,
+                        "pane": agent.pane_id,
+                        "provider": agent.provider,
+                    }),
+                    Some(agent_val),
+                    Some(socket.clone()),
+                )
+                .await;
+            }
+        });
+    }
+
+    let auto_ckpt = control.auto_turn_checkpoint.load(Ordering::SeqCst);
+    let audit_on = control.audit_enabled.load(Ordering::SeqCst);
+    let guard_on = control.guard_enabled.load(Ordering::SeqCst);
+    let collision_on = control.collision_enabled.load(Ordering::SeqCst);
+    let had_activity = !completed_turns.is_empty() || had_state_changes;
+
+    for (agent, turn_seq) in completed_turns {
+        let bus = control.event_bus.clone();
+        let socket = manager.native.socket.clone();
+        tokio::spawn(async move {
+            let (checkpoint_id, tree_oid) = if auto_ckpt {
+                let cwd = agent.cwd.clone();
+                let name = agent.name.clone();
+                let run = agent.run.clone();
+                let provider = agent.provider.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::checkpoint::after_turn(&cwd, &name, &run, &provider, turn_seq, None)
+                        .map(|made| (made.id, made.snapshot.tree))
+                })
+                .await
+                .ok()
+                .flatten()
+                .map_or((None, None), |(id, tree)| (Some(id), Some(tree)))
+            } else {
+                (None, None)
+            };
+            bus.publish(crate::coordinator::CoordinatorEvent::TurnCompleted {
+                pane_id: agent.pane_id.clone(),
+                run_id: agent.run.clone(),
+                provider: agent.provider.clone(),
+                checkpoint_id,
+                tree_oid: tree_oid.clone(),
+                at_ms: now_ms(),
+            });
+
+            if audit_on || guard_on {
+                let pane_id = agent.pane_id.clone();
+                let run_id = agent.run.clone();
+                let provider = agent.provider.clone();
+                let cwd = agent.cwd.clone();
+                let session_id = agent.session_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let socket_str = socket.to_string_lossy();
+                    let pane_tail =
+                        crate::remote::prompts::capture_visible_pane(&socket_str, &pane_id)
+                            .unwrap_or_default();
+                    let mut audit_verdict: Option<String> = None;
+                    if audit_on
+                        && let Some(report) = crate::audit::run_and_persist_turn_audit(
+                            &socket,
+                            &pane_id,
+                            &run_id,
+                            &provider,
+                            &cwd,
+                            session_id.as_deref(),
+                            checkpoint_id,
+                            &pane_tail,
+                        )
+                    {
+                        audit_verdict = Some(report.verdict);
+                    }
+                    // Phase 3B: record completed turn into Time-Travel DVR (`dvr_turns`).
+                    if let (Some(ckpt_id), Some(tree)) = (checkpoint_id, tree_oid.as_deref()) {
+                        let _ = crate::dvr::record_turn(
+                            &socket,
+                            &run_id,
+                            &pane_id,
+                            turn_seq,
+                            &provider,
+                            None,
+                            ckpt_id,
+                            tree,
+                            audit_verdict.as_deref(),
+                            0,
+                            (!pane_tail.is_empty()).then_some(pane_tail.as_str()),
+                        );
+                    }
+                    if guard_on {
+                        let guard_cfg = crate::guard::config::GuardConfig::load();
+                        if guard_cfg.circuit_breaker.enabled {
+                            let _ = crate::guard::breaker::record_and_evaluate_turn(
+                                &socket,
+                                &run_id,
+                                &pane_id,
+                                turn_seq,
+                                tree_oid.as_deref(),
+                                checkpoint_id,
+                                &pane_tail,
+                                &guard_cfg.circuit_breaker,
+                            );
+                        }
+                        if guard_cfg.cache_warmth.enabled {
+                            let agent_key = format!("{socket_str}::{pane_id}");
+                            let page = crate::remote::transcripts::fetch_timeline(
+                                crate::remote::transcripts::TimelineQuery {
+                                    server_socket: &socket_str,
+                                    pane_id: &pane_id,
+                                    agent_key: &agent_key,
+                                    provider: &provider,
+                                    cwd: &cwd,
+                                    reported_session_id: session_id.as_deref(),
+                                    state: "idle",
+                                    limit: Some(80),
+                                },
+                            );
+                            let est_tokens =
+                                crate::guard::cache_warmth::estimate_context_tokens(&page.items);
+                            let _ = crate::guard::cache_warmth::record_turn_warmth(
+                                &socket, &run_id, &pane_id, &provider, est_tokens, &guard_cfg,
+                            );
+                        }
+                    }
+                })
+                .await;
+            }
+        });
+    }
+
+    // Phase 1B: 3-second debounced cross-worktree collision scan on agent activity.
+    if collision_on && had_activity && agents.len() >= 2 {
+        let prev_scan = control.last_collision_scan_ms.load(Ordering::Relaxed);
+        if at_ms.saturating_sub(prev_scan) >= 3_000
+            && control
+                .last_collision_scan_ms
+                .compare_exchange(prev_scan, at_ms, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+        {
+            let socket = manager.native.socket.clone();
+            let snapshot_agents = agents.to_vec();
+            tokio::spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let cfg = crate::guard::config::GuardConfig::load();
+                    crate::collision::scan_and_persist_socket(&socket, &snapshot_agents, &cfg);
+                })
+                .await;
+            });
+        }
+    }
+}
+
+/// Dispatches local `inbox.event` plugin hooks for newly recorded inbox items.
+/// Costs one catalog check when no inbox hooks are installed.
+async fn dispatch_local_inbox_hooks(socket: &std::path::Path, cursor: &mut Option<i64>) {
+    let has_hooks = tokio::task::spawn_blocking(|| {
+        crate::plugin::manifest::load_catalog().is_ok_and(|c| c.has_hooks_for("inbox.event"))
+    })
+    .await
+    .unwrap_or(false);
+    if !has_hooks {
+        return;
+    }
+    let sock = socket.to_path_buf();
+    let after = *cursor;
+    let Ok(Ok(Some((items, next)))) =
+        tokio::task::spawn_blocking(move || Store::inbox_since(&sock, after)).await
+    else {
+        return;
+    };
+    *cursor = Some(next);
+    if items.is_empty() {
+        return;
+    }
+    let sock = socket.to_path_buf();
+    let server_name = sock
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("default")
+        .to_owned();
+    tokio::spawn(async move {
+        for mut item in items {
+            let pane = item
+                .get("pane")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let provider = item
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("server_name".into(), json!(server_name));
+                obj.insert("server_socket".into(), json!(sock.to_string_lossy()));
+            }
+            let hook_agent = json!({
+                "name": pane,
+                "pane": pane,
+                "pane_id": pane,
+                "provider": provider,
+                "server_socket": sock.to_string_lossy(),
+            });
+            crate::plugin::runner::dispatch_hook_event(
+                "inbox.event",
+                item,
+                Some(hook_agent),
+                Some(sock.clone()),
+            )
+            .await;
+        }
+    });
 }
 
 /// Reports from `--answers` OpenCode servers, written at most once a second

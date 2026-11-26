@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   ActivityIndicator,
   RefreshControl,
@@ -7,7 +8,10 @@ import {
   Text,
   View,
 } from "react-native";
-import { getHostClient } from "../hosts/HostRuntimeController";
+import {
+  getHostClient,
+  useHostRuntimeStore,
+} from "../hosts/HostRuntimeController";
 import type {
   AgentRow,
   PluginPanelDef,
@@ -21,14 +25,20 @@ interface PluginPanelViewProps {
   hostId: string;
   agent: AgentRow | null;
   panel: PluginPanelDef;
+  visible?: boolean;
 }
 
 export function PluginPanelView({
   hostId,
   agent,
   panel,
+  visible = true,
 }: PluginPanelViewProps) {
   const { palette } = useMasilTheme();
+  const { t } = useTranslation();
+  const reloadNonce = useHostRuntimeStore(
+    (s) => s.hosts[hostId]?.plugins?.reload_nonce ?? 0
+  );
   const [doc, setDoc] = useState<UiDocument | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -38,7 +48,7 @@ export function PluginPanelView({
     async (actionEvent?: PluginActionEvent, silent = false) => {
       const client = getHostClient(hostId);
       if (!client) {
-        setError("호스트에 연결되어 있지 않습니다.");
+        setError(t("hostNotConnected"));
         setLoading(false);
         return;
       }
@@ -80,28 +90,38 @@ export function PluginPanelView({
         setBusy(false);
       }
     },
-    [hostId, panel.plugin_id, panel.id, agent?.remote_id, agent?.cwd, agent?.state]
+    [
+      hostId,
+      panel.plugin_id,
+      panel.id,
+      reloadNonce,
+      agent?.remote_id,
+      agent?.cwd,
+      agent?.state,
+      t,
+    ]
   );
 
   useEffect(() => {
-    void fetchPanel(undefined, false);
-  }, [fetchPanel]);
+    if (!visible) return;
+    void fetchPanel(undefined, Boolean(doc));
+  }, [fetchPanel, visible]);
 
   useEffect(() => {
-    if (!panel.refresh_secs || panel.refresh_secs < 3) return;
+    if (!visible || !panel.refresh_secs || panel.refresh_secs <= 0) return;
     const ms = Math.max(3, panel.refresh_secs) * 1000;
     const timer = setInterval(() => {
       void fetchPanel(undefined, true);
     }, ms);
     return () => clearInterval(timer);
-  }, [fetchPanel, panel.refresh_secs]);
+  }, [fetchPanel, panel.refresh_secs, visible]);
 
   if (loading && !doc) {
     return (
       <View style={styles.center}>
         <ActivityIndicator size="small" color={palette.accent} />
         <Text style={[styles.hint, { color: palette.muted }]}>
-          {panel.title} 불러오는 중...
+          {t("loadingNamed", { title: panel.title })}
         </Text>
       </View>
     );

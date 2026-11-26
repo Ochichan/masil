@@ -13,6 +13,7 @@ pub struct PairingOffer {
     pub pair_token: String,
     pub relay_url: Option<String>,
     pub direct_addr: Option<String>,
+    pub direct_fallback_addrs: Vec<String>,
     pub host_name: String,
 }
 
@@ -94,9 +95,32 @@ fn pct_decode(input: &str) -> Result<String, PairingError> {
     String::from_utf8(out).map_err(|_| PairingError::InvalidPercentEncoding)
 }
 
+fn push_unique_direct(list: &mut Vec<String>, raw: &str) {
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() && !list.iter().any(|existing| existing == trimmed) {
+            list.push(trimmed.to_owned());
+        }
+    }
+}
+
 impl PairingOffer {
+    /// Returns all unique direct endpoints in priority order (primary first,
+    /// followed by fallback addresses such as Tailscale).
+    pub fn all_direct_addrs(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(ref primary) = self.direct_addr {
+            push_unique_direct(&mut out, primary);
+        }
+        for alt in &self.direct_fallback_addrs {
+            push_unique_direct(&mut out, alt);
+        }
+        out
+    }
+
     pub fn to_uri(&self) -> Result<String, PairingError> {
-        if self.relay_url.is_none() && self.direct_addr.is_none() {
+        let direct_list = self.all_direct_addrs();
+        if self.relay_url.is_none() && direct_list.is_empty() {
             return Err(PairingError::NoEndpoint);
         }
         let pub_b64 = URL_SAFE_NO_PAD.encode(self.host_pub);
@@ -110,8 +134,11 @@ impl PairingOffer {
         if let Some(ref relay) = self.relay_url {
             parts.push(format!("relay={}", pct_encode(relay)));
         }
-        if let Some(ref direct) = self.direct_addr {
-            parts.push(format!("direct={}", pct_encode(direct)));
+        if let Some((first, rest)) = direct_list.split_first() {
+            parts.push(format!("direct={}", pct_encode(first)));
+            for alt in rest {
+                parts.push(format!("direct_alt={}", pct_encode(alt)));
+            }
         }
         Ok(format!("masil://pair?{}", parts.join("&")))
     }
@@ -126,7 +153,7 @@ impl PairingOffer {
         let mut host_pub: Option<[u8; KEY_LEN]> = None;
         let mut pair_token: Option<String> = None;
         let mut relay_url: Option<String> = None;
-        let mut direct_addr: Option<String> = None;
+        let mut direct_list: Vec<String> = Vec::new();
         let mut host_name: Option<String> = None;
 
         for pair in query.split('&') {
@@ -161,7 +188,9 @@ impl PairingOffer {
                 }
                 "pair" if !decoded.is_empty() => pair_token = Some(decoded),
                 "relay" if !decoded.is_empty() => relay_url = Some(decoded),
-                "direct" if !decoded.is_empty() => direct_addr = Some(decoded),
+                "direct" | "direct_alt" if !decoded.is_empty() => {
+                    push_unique_direct(&mut direct_list, &decoded);
+                }
                 "name" if !decoded.is_empty() => host_name = Some(decoded),
                 _ => {}
             }
@@ -172,6 +201,12 @@ impl PairingOffer {
         let host_pub = host_pub.ok_or(PairingError::MissingField("pub"))?;
         let pair_token = pair_token.ok_or(PairingError::MissingField("pair"))?;
         let host_name = host_name.unwrap_or_else(|| host_id.clone());
+        let direct_addr = direct_list.first().cloned();
+        let direct_fallback_addrs = if direct_list.len() > 1 {
+            direct_list[1..].to_vec()
+        } else {
+            Vec::new()
+        };
         if relay_url.is_none() && direct_addr.is_none() {
             return Err(PairingError::NoEndpoint);
         }
@@ -182,6 +217,7 @@ impl PairingOffer {
             pair_token,
             relay_url,
             direct_addr,
+            direct_fallback_addrs,
             host_name,
         })
     }

@@ -121,6 +121,8 @@ export function MobileComposer({
       await onSend(text);
       setDraft("");
       setAttachment(null);
+    } catch {
+      // Error feedback is shown by parent; preserve draft so user can retry.
     } finally {
       setBusy(false);
     }
@@ -136,6 +138,8 @@ export function MobileComposer({
       try {
         await onPluginCommand(cmd, "");
         setDraft("");
+      } catch {
+        // Handled by parent toast.
       } finally {
         setBusy(false);
       }
@@ -150,6 +154,20 @@ export function MobileComposer({
       await onQueueAdd(text);
       setDraft("");
       setAttachment(null);
+    } catch {
+      // Preserve draft on failure.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleInterrupt = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await onInterrupt();
+    } catch {
+      // Handled by parent toast.
     } finally {
       setBusy(false);
     }
@@ -173,7 +191,7 @@ export function MobileComposer({
             <ActivityIndicator size="small" color={palette.success} />
           </View>
           <Text style={[styles.workingLabel, { color: palette.textSecondary }]}>
-            작업 중
+            {t("working")}
           </Text>
         </View>
       ) : null}
@@ -314,18 +332,24 @@ export function MobileComposer({
 
         {isWorking && !hasText ? (
           <Pressable
-            onPress={() => void onInterrupt()}
+            onPress={() => void handleInterrupt()}
+            disabled={busy}
             style={[
               styles.primaryBtn,
               {
                 backgroundColor: palette.raised,
                 borderWidth: 1,
                 borderColor: palette.borderSubtle,
+                opacity: busy ? 0.6 : 1,
               },
             ]}
             accessibilityLabel={t("interrupt")}
           >
-            <Square size={12} color="#ffffff" fill="#ffffff" />
+            {busy ? (
+              <ActivityIndicator size="small" color={palette.text} />
+            ) : (
+              <Square size={12} color="#ffffff" fill="#ffffff" />
+            )}
           </Pressable>
         ) : (
           <Pressable

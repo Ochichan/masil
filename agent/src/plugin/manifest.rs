@@ -386,6 +386,14 @@ impl PluginCatalog {
     pub fn find_plugin(&self, id: &str) -> Option<&LoadedPlugin> {
         self.plugins.iter().find(|p| p.id == id)
     }
+
+    pub fn has_hooks_for(&self, event: &str) -> bool {
+        self.active_plugins().any(|p| {
+            p.manifest
+                .as_ref()
+                .is_some_and(|m| m.hooks.iter().any(|h| h.event == event))
+        })
+    }
 }
 
 pub fn parse_hex_rgb(hex: &str) -> Option<(u8, u8, u8)> {
@@ -985,7 +993,41 @@ fn file_mtime_token(path: &Path) -> String {
     }
 }
 
+fn dir_fingerprint(dir: &Path, depth: usize, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        out.push("missing".into());
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.')
+            || matches!(
+                name,
+                "node_modules" | "__pycache__" | "target" | ".git" | "dist"
+            )
+        {
+            continue;
+        }
+        if path.is_file() {
+            out.push(format!("{name}={}", file_mtime_token(&path)));
+        } else if depth > 0 && path.is_dir() {
+            let mut sub = Vec::new();
+            dir_fingerprint(&path, depth - 1, &mut sub);
+            if !sub.is_empty() {
+                out.push(format!("{name}/[{}]", sub.join(",")));
+            }
+        }
+    }
+}
+
 /// Fast fingerprint for hot-reloading in remote daemon and TUI.
+/// Covers `plugins.toml`, every file inside linked and installed plugin
+/// folders (up to 1 subdirectory deep, including custom theme TOMLs and
+/// handler scripts), and AI skill installation status.
 pub fn catalog_fingerprint() -> String {
     let mut parts = Vec::new();
     if let Ok(cfg_path) = plugins_config_path() {
@@ -993,18 +1035,17 @@ pub fn catalog_fingerprint() -> String {
     }
     if let Ok(cfg) = PluginsConfig::load() {
         parts.push(format!(
-            "n={}:e={}:t={}",
+            "n={}:e={}:t={}:dis={}",
             cfg.reload_nonce,
             cfg.enabled,
-            cfg.active_theme.as_deref().unwrap_or("")
+            cfg.active_theme.as_deref().unwrap_or(""),
+            cfg.disabled.join(",")
         ));
         for (id, raw) in &cfg.linked {
             let p = Path::new(raw);
-            parts.push(format!(
-                "l:{id}={},{}",
-                file_mtime_token(&p.join("masil-plugin.toml")),
-                file_mtime_token(&p.join("theme.toml"))
-            ));
+            let mut files = Vec::new();
+            dir_fingerprint(p, 1, &mut files);
+            parts.push(format!("l:{id}=[{}]", files.join(",")));
         }
     }
     if let Ok(root) = plugins_dir()
@@ -1018,13 +1059,19 @@ pub fn catalog_fingerprint() -> String {
         names.sort();
         for dir in names {
             let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            parts.push(format!(
-                "d:{name}={},{}",
-                file_mtime_token(&dir.join("masil-plugin.toml")),
-                file_mtime_token(&dir.join("theme.toml"))
-            ));
+            if name.starts_with('.') {
+                continue;
+            }
+            let mut files = Vec::new();
+            dir_fingerprint(&dir, 1, &mut files);
+            parts.push(format!("d:{name}=[{}]", files.join(",")));
         }
     }
+    let skills_fp: Vec<String> = super::skill::inspect_all()
+        .into_iter()
+        .map(|s| format!("{}:{}", s.id, u8::from(s.skill_installed)))
+        .collect();
+    parts.push(format!("sk={}", skills_fp.join(",")));
     parts.join("|")
 }
 
@@ -1097,6 +1144,40 @@ file = "../etc/passwd"
         let loaded = load_plugin_dir(&dir, None, "test", &HashSet::new());
         assert!(!loaded.errors.is_empty());
         assert!(loaded.errors[0].contains("escapes plugin directory"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_fingerprint_tracks_handler_scripts_and_custom_theme_files() {
+        let dir = std::env::temp_dir().join(format!("masil-fp-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("themes")).unwrap();
+        fs::write(dir.join("masil-plugin.toml"), "id = \"demo\"\n").unwrap();
+        fs::write(dir.join("plugin.mjs"), "console.log('v1');\n").unwrap();
+        fs::write(dir.join("themes/nord.toml"), "accent = \"#88c0d0\"\n").unwrap();
+
+        let mut fp1 = Vec::new();
+        dir_fingerprint(&dir, 1, &mut fp1);
+        assert!(fp1.iter().any(|s| s.starts_with("plugin.mjs=")), "{fp1:?}");
+        assert!(
+            fp1.iter().any(|s| s.starts_with("themes/[nord.toml=")),
+            "{fp1:?}"
+        );
+
+        fs::write(dir.join("plugin.mjs"), "console.log('v2-longer');\n").unwrap();
+        let mut fp2 = Vec::new();
+        dir_fingerprint(&dir, 1, &mut fp2);
+        assert_ne!(fp1, fp2);
+
+        fs::write(
+            dir.join("themes/nord.toml"),
+            "accent = \"#81a1c1-updated\"\n",
+        )
+        .unwrap();
+        let mut fp3 = Vec::new();
+        dir_fingerprint(&dir, 1, &mut fp3);
+        assert_ne!(fp2, fp3);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

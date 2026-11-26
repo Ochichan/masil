@@ -1,5 +1,29 @@
 import { describe, expect, it } from "vitest";
-import { expandPluginThemeToPalette } from "./tokens";
+import {
+  DARK_PALETTE,
+  LIGHT_PALETTE,
+  expandPluginThemeToPalette,
+  resolveThemeSelection,
+} from "./tokens";
+import type { PluginThemeDef } from "../protocol/schemas";
+
+const SAMPLE_THEME: PluginThemeDef = {
+  id: "tokyo-night",
+  plugin_id: "tokyo-night",
+  name: "Tokyo Night",
+  appearance: "dark",
+  canvas: "#1a1b26",
+  panel: "#16161e",
+  raised: "#24283b",
+  text: "#c0caf5",
+  muted: "#565f89",
+  accent: "#7aa2f7",
+  accent_text: "#15161e",
+  warning: "#e0af68",
+  danger: "#f7768e",
+  success: "#9ece6a",
+  track: "#3b4261",
+};
 
 describe("expandPluginThemeToPalette", () => {
   it("expands a dark plugin theme into a full MasilPalette", () => {
@@ -44,5 +68,40 @@ describe("expandPluginThemeToPalette", () => {
     expect(palette.isDark).toBe(false);
     expect(palette.segmentThumb).toBe("#ffffff");
     expect(palette.accentSoft).toBe("rgba(136, 57, 239, 0.1)");
+  });
+});
+
+describe("resolveThemeSelection", () => {
+  it("applies host-published plugin theme when no local override is set", () => {
+    const res = resolveThemeSelection({
+      preference: "dark",
+      systemScheme: "dark",
+      localPluginThemeId: null,
+      hostActiveTheme: "tokyo-night",
+      availablePluginThemes: [SAMPLE_THEME],
+    });
+    expect(res.activeThemeId).toBe("tokyo-night");
+    expect(res.palette.accent).toBe("#7aa2f7");
+  });
+
+  it("falls back to light/dark built-in palette when host resets theme", () => {
+    const res = resolveThemeSelection({
+      preference: "dark",
+      systemScheme: "dark",
+      localPluginThemeId: null,
+      hostActiveTheme: "light",
+      availablePluginThemes: [SAMPLE_THEME],
+    });
+    expect(res.palette).toBe(LIGHT_PALETTE);
+    expect(res.preference).toBe("light");
+
+    const backDark = resolveThemeSelection({
+      preference: "dark",
+      systemScheme: "dark",
+      localPluginThemeId: null,
+      hostActiveTheme: null,
+      availablePluginThemes: [SAMPLE_THEME],
+    });
+    expect(backDark.palette).toBe(DARK_PALETTE);
   });
 });

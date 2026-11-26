@@ -34,6 +34,27 @@ pub fn is_installed() -> bool {
     service_file_path().is_ok_and(|p| p.is_file())
 }
 
+fn xml_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn captured_service_env() -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    for key in ["PATH", "HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"] {
+        if let Ok(val) = std::env::var(key)
+            && !val.trim().is_empty()
+        {
+            vars.push((key.to_owned(), val));
+        }
+    }
+    vars
+}
+
 pub fn install() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate masil-agent: {e}"))?;
     let exe_str = exe.to_string_lossy().into_owned();
@@ -42,11 +63,27 @@ pub fn install() -> Result<String, String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
+    let env_vars = captured_service_env();
 
     if cfg!(target_os = "macos") {
         let log_dir = crate::remote::config::state_dir()?;
         crate::remote::config::ensure_private_dir(&log_dir)?;
         let log_path = log_dir.join("remote.log");
+        let env_block = if env_vars.is_empty() {
+            String::new()
+        } else {
+            let entries: String = env_vars
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "    <key>{}</key>\n    <string>{}</string>\n",
+                        xml_escape(k),
+                        xml_escape(v)
+                    )
+                })
+                .collect();
+            format!("  <key>EnvironmentVariables</key>\n  <dict>\n{entries}  </dict>\n")
+        };
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -56,11 +93,11 @@ pub fn install() -> Result<String, String> {
   <string>{LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{exe_str}</string>
+    <string>{}</string>
     <string>remote</string>
     <string>daemon</string>
   </array>
-  <key>RunAtLoad</key>
+{env_block}  <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
@@ -71,8 +108,9 @@ pub fn install() -> Result<String, String> {
 </dict>
 </plist>
 "#,
-            log_path.display(),
-            log_path.display()
+            xml_escape(&exe_str),
+            xml_escape(&log_path.display().to_string()),
+            xml_escape(&log_path.display().to_string())
         );
         fs::write(&path, plist).map_err(|e| format!("cannot write plist: {e}"))?;
         let uid = unsafe { libc::getuid() };
@@ -96,9 +134,16 @@ pub fn install() -> Result<String, String> {
             path.display()
         ))
     } else {
+        let env_lines: String = env_vars
+            .iter()
+            .map(|(k, v)| {
+                let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("Environment=\"{k}={escaped}\"\n")
+            })
+            .collect();
         let unit = format!(
             "[Unit]\nDescription=masil remote gateway daemon\nAfter=network-online.target\n\n\
-             [Service]\nExecStart={exe_str} remote daemon\nRestart=on-failure\nRestartSec=3\n\n\
+             [Service]\n{env_lines}ExecStart={exe_str} remote daemon\nRestart=on-failure\nRestartSec=3\n\n\
              [Install]\nWantedBy=default.target\n"
         );
         fs::write(&path, unit).map_err(|e| format!("cannot write systemd unit: {e}"))?;

@@ -96,12 +96,17 @@ visible_blocker = true
 contains = ["esc to cancel"]
 any = [
   { contains = ["enter to confirm"] },
+  { contains = ["enter to submit"] },
   { contains = ["enter to select"], any = [
     { contains = ["tab/arrow keys to navigate"] },
     { contains = ["arrow keys to navigate"] },
     { contains = ["arrows to navigate"] },
     { contains = ["↑/↓ to navigate"] },
     { contains = ["↑↓ to navigate"] },
+  ] },
+  { contains = ["space to select"], any = [
+    { contains = ["enter to"] },
+    { contains = ["navigate"] },
   ] },
 ]
 

@@ -69,8 +69,10 @@ region = "after_last_prompt_marker"
 visible_blocker = true
 any = [
   { contains = ["press enter to confirm or esc to cancel"] },
+  { contains = ["enter to confirm", "esc to cancel"] },
   { contains = ["enter to submit answer"] },
   { contains = ["enter to submit all"] },
+  { contains = ["press enter to submit"] },
   { contains = ["allow command?"] },
   { contains = ["All Results", "Filesystem Only", "Plugins"] },
 ]

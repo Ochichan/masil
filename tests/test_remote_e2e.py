@@ -50,7 +50,7 @@ class RemoteGatewayE2E(unittest.TestCase):
             if not bin_path.exists():
                 self.fail(f"missing built binary {bin_path}; run `make all && make relay`")
 
-        self.tmp = Path(tempfile.mkdtemp(prefix="masil-remote-e2e-")).resolve()
+        self.tmp = Path(tempfile.mkdtemp(prefix="masil-remote-e2e-", dir="/tmp")).resolve()
         self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
 
         self.home = self.tmp / "home"
@@ -137,6 +137,42 @@ class RemoteGatewayE2E(unittest.TestCase):
         # Seed synthetic transcripts for Claude, Codex, and Antigravity (agy).
         self._seed_transcripts()
 
+        # Prepare mock interactive TUI (`agy`) and mock OpenCode (`--answers`) binaries.
+        self.mock_bin = self.tmp / "mock-bin"
+        self.mock_bin.mkdir(parents=True, exist_ok=True)
+        self.agy_log = self.tmp / "agy-e2e.jsonl"
+        self.oc_state = self.tmp / "oc-mock-state"
+        self.oc_state.mkdir(parents=True, exist_ok=True)
+        self.oc_cwd = self.tmp / "oc-cwd"
+        self.oc_cwd.mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(ROOT / "tests/faults/opencode_mock.py", self.mock_bin / "opencode")
+        (self.mock_bin / "opencode").chmod(0o755)
+        subprocess.run(
+            ["cc", str(ROOT / "tests/faults/node_launcher.c"), "-o", str(self.mock_bin / "node")],
+            check=True,
+            capture_output=True,
+        )
+        self._write_mock_agy_script(self.mock_bin / "agy")
+
+        # Prepend mock_bin to PATH in agent/masil env (keep clean PATH for Node/Vitest).
+        self.clean_path = self.env["PATH"]
+        self.env["PATH"] = f"{self.mock_bin}:{self.clean_path}"
+        self.env["MOCK_OPENCODE_STATE"] = str(self.oc_state)
+        self.env["MOCK_AGY_LOG"] = str(self.agy_log)
+        for k, v in (
+            ("PATH", self.env["PATH"]),
+            ("MOCK_OPENCODE_STATE", str(self.oc_state)),
+            ("MOCK_AGY_LOG", str(self.agy_log)),
+            ("XDG_CONFIG_HOME", str(self.xdg_config)),
+            ("XDG_STATE_HOME", str(self.xdg_state)),
+        ):
+            subprocess.run(
+                [str(MASIL), "-S", str(self.socket), "set-environment", "-g", k, v],
+                env=self.env,
+                check=True,
+            )
+
         # Create a mock host STT script so E2EE voice upload works offline.
         self.stt_script = self.tmp / "mock-stt.sh"
         self.stt_script.write_text(
@@ -161,6 +197,128 @@ class RemoteGatewayE2E(unittest.TestCase):
             for stream in (p.stdin, p.stdout, p.stderr):
                 if stream is not None:
                     stream.close()
+
+    def _write_mock_agy_script(self, path: Path):
+        path.write_text(
+            r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+import termios
+import tty
+
+LOG_PATH = os.environ.get("MOCK_AGY_LOG", "")
+
+def log(obj):
+    if not LOG_PATH:
+        return
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
+
+def draw_menu(title, body, options, selected):
+    sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.write(f"{title}\r\n")
+    if body:
+        sys.stdout.write(f"{body}\r\n")
+    sys.stdout.write("\r\n")
+    for idx, label in enumerate(options):
+        prefix = "❯ " if idx == selected else "  "
+        sys.stdout.write(f"{prefix}{idx + 1}. {label}\r\n")
+    sys.stdout.write("\r\n↑/↓ to navigate · Enter to confirm · Esc to cancel\r\n")
+    sys.stdout.flush()
+
+def read_key(fd):
+    b = os.read(fd, 1)
+    if not b:
+        return ""
+    if b == b"\x1b":
+        # Check for CSI arrow sequence
+        import select
+        if select.select([fd], [], [], 0.05)[0]:
+            b2 = os.read(fd, 1)
+            if b2 == b"[" and select.select([fd], [], [], 0.05)[0]:
+                b3 = os.read(fd, 1)
+                return "\x1b[" + b3.decode("latin1")
+        return "\x1b"
+    return b.decode("utf-8", "replace")
+
+def read_line_raw(fd):
+    buf = bytearray()
+    while True:
+        b = os.read(fd, 1)
+        if not b or b in (b"\r", b"\n"):
+            break
+        if b in (b"\x7f", b"\x08"):
+            if buf:
+                buf.pop()
+            continue
+        buf.extend(b)
+    return buf.decode("utf-8", "replace")
+
+def main():
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        # Phase 1: Question menu
+        opts1 = ["Staging (Recommended)", "Production", "Other"]
+        sel = 0
+        draw_menu("Deployment Mode", "Pick deployment mode", opts1, sel)
+        while True:
+            k = read_key(fd)
+            if k == "\x1b[B":
+                sel = min(len(opts1) - 1, sel + 1)
+                draw_menu("Deployment Mode", "Pick deployment mode", opts1, sel)
+            elif k == "\x1b[A":
+                sel = max(0, sel - 1)
+                draw_menu("Deployment Mode", "Pick deployment mode", opts1, sel)
+            elif k in ("\r", "\n"):
+                log({"phase": 1, "selected": sel, "label": opts1[sel]})
+                break
+
+        # Phase 2: Permission / Custom-other dialog
+        opts2 = ["Allow once", "Always allow", "Other"]
+        sel = 0
+        draw_menu("Run command?", "Command: rm -rf dist", opts2, sel)
+        while True:
+            k = read_key(fd)
+            if k == "\x1b[B":
+                sel = min(len(opts2) - 1, sel + 1)
+                draw_menu("Run command?", "Command: rm -rf dist", opts2, sel)
+            elif k == "\x1b[A":
+                sel = max(0, sel - 1)
+                draw_menu("Run command?", "Command: rm -rf dist", opts2, sel)
+            elif k in ("\r", "\n"):
+                if sel == 2:
+                    sys.stdout.write("\x1b[2J\x1b[HTell agent what to do instead:\r\n> ")
+                    sys.stdout.flush()
+                    text = read_line_raw(fd)
+                    log({"phase": 2, "selected": sel, "custom_text": text})
+                else:
+                    log({"phase": 2, "selected": sel, "label": opts2[sel]})
+                break
+
+        # Phase 3: Idle composer matching antigravity.toml idle rule
+        sys.stdout.write("\x1b[2J\x1b[H")
+        sys.stdout.write("────────────────────────────────────────\r\n")
+        sys.stdout.write("> \r\n")
+        sys.stdout.write("────────────────────────────────────────\r\n")
+        sys.stdout.write("? for shortcuts    Gemini 4 Neon · xhigh\r\n")
+        sys.stdout.flush()
+        while True:
+            line = read_line_raw(fd)
+            if line:
+                log({"phase": 3, "line": line})
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+if __name__ == "__main__":
+    main()
+''',
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
 
     def _git(self, *args: str):
         subprocess.run(
@@ -521,11 +679,105 @@ class RemoteGatewayE2E(unittest.TestCase):
             any(s["socket"] == str(self.socket) for s in status["masil_servers"])
         )
 
+        # Start managed interactive mock agents inside the isolated masil server:
+        # 1) agy-e2e (agent name != tmux session "desk") running interactive TUI dialogs
+        # 2) oc-e2e running OpenCode --answers HTTP API mock server
+        agy_start = json.loads(
+            subprocess.check_output(
+                [
+                    str(AGENT),
+                    "agent",
+                    "--socket",
+                    str(self.socket),
+                    "start",
+                    "agy-e2e",
+                    "agy",
+                    "--cwd",
+                    str(self.repo),
+                    "--no-sandbox",
+                ],
+                env=self.env,
+                text=True,
+            )
+        )
+        agy_pane = agy_start["pane_id"]
+        wait_until(
+            lambda: "Pick deployment mode"
+            in subprocess.check_output(
+                [str(MASIL), "-S", str(self.socket), "capture-pane", "-p", "-t", agy_pane],
+                env=self.env,
+                text=True,
+            ),
+            timeout=10,
+        )
+
+        oc_start = json.loads(
+            subprocess.check_output(
+                [
+                    str(AGENT),
+                    "agent",
+                    "--socket",
+                    str(self.socket),
+                    "start",
+                    "oc-e2e",
+                    "opencode",
+                    "--cwd",
+                    str(self.oc_cwd),
+                    "--answers",
+                    "--no-sandbox",
+                ],
+                env=self.env,
+                text=True,
+            )
+        )
+        oc_pane = oc_start["pane_id"]
+        self.assertEqual(oc_start.get("answer_channel"), "ready")
+        (self.oc_state / "permissions.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "per_e2e_1",
+                        "sessionID": "ses_e2e",
+                        "permission": "bash",
+                        "patterns": ["git status"],
+                        "always": ["git *"],
+                        "metadata": {"command": "git status"},
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (self.oc_state / "questions.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "que_e2e_1",
+                        "sessionID": "ses_e2e",
+                        "questions": [
+                            {
+                                "header": "Targets",
+                                "question": "Which platforms should we ship?",
+                                "multiple": True,
+                                "custom": True,
+                                "options": [
+                                    {"label": "iOS", "description": "Apple mobile"},
+                                    {"label": "Android", "description": "Android mobile"},
+                                    {"label": "Web", "description": "Browser"},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
         # Run real TypeScript MasilRemoteClient E2E test over live sockets.
         if not (MOBILE_DIR / "node_modules/.bin/vitest").exists():
             self.skipTest("mobile/node_modules not installed; skipped TS client step")
 
         ts_env = self.env.copy()
+        ts_env["PATH"] = self.clean_path
         ts_env.update(
             {
                 "MASIL_E2E_PAIR_URI": pair_uri,
@@ -534,6 +786,12 @@ class RemoteGatewayE2E(unittest.TestCase):
                 "MASIL_E2E_SOCKET": str(self.socket),
                 "MASIL_E2E_PANE": self.pane_id,
                 "MASIL_E2E_REPO": str(self.repo),
+                "MASIL_E2E_AGY_PANE": agy_pane,
+                "MASIL_E2E_AGY_NAME": "agy-e2e",
+                "MASIL_E2E_AGY_LOG": str(self.agy_log),
+                "MASIL_E2E_OC_PANE": oc_pane,
+                "MASIL_E2E_OC_NAME": "oc-e2e",
+                "MASIL_E2E_OC_STATE": str(self.oc_state),
             }
         )
         res = subprocess.run(

@@ -8,6 +8,7 @@ export interface PairingOffer {
   pairToken: string;
   relayUrl?: string;
   directAddr?: string;
+  directAddrs: string[];
   hostName: string;
 }
 
@@ -26,6 +27,15 @@ export function base64ToBytes(b64: string): Uint8Array {
   return toByteArray(b64);
 }
 
+function pushUniqueDirect(list: string[], raw: string): void {
+  for (const part of raw.split(",")) {
+    const trimmed = part.trim();
+    if (trimmed && !list.includes(trimmed)) {
+      list.push(trimmed);
+    }
+  }
+}
+
 export function parsePairingUri(uri: string): PairingOffer {
   const trimmed = uri.trim();
   if (!trimmed.startsWith("masil://pair?")) {
@@ -33,13 +43,19 @@ export function parsePairingUri(uri: string): PairingOffer {
   }
   const query = trimmed.slice("masil://pair?".length);
   const params = new Map<string, string>();
+  const directAddrs: string[] = [];
+
   for (const part of query.split("&")) {
     if (!part) continue;
     const eq = part.indexOf("=");
     if (eq <= 0) continue;
     const k = part.slice(0, eq);
     const v = decodeURIComponent(part.slice(eq + 1));
-    params.set(k, v);
+    if (k === "direct" || k === "direct_alt") {
+      pushUniqueDirect(directAddrs, v);
+    } else {
+      params.set(k, v);
+    }
   }
   const vRaw = params.get("v");
   if (vRaw !== "1") {
@@ -56,8 +72,8 @@ export function parsePairingUri(uri: string): PairingOffer {
     throw new Error("Host public key must be 32 bytes");
   }
   const relayUrl = params.get("relay") || undefined;
-  const directAddr = params.get("direct") || undefined;
-  if (!relayUrl && !directAddr) {
+  const directAddr = directAddrs[0];
+  if (!relayUrl && directAddrs.length === 0) {
     throw new Error("Pairing URI must specify relay or direct address");
   }
   return {
@@ -67,6 +83,7 @@ export function parsePairingUri(uri: string): PairingOffer {
     pairToken,
     relayUrl,
     directAddr,
+    directAddrs,
     hostName: params.get("name") || hostId,
   };
 }

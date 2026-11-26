@@ -291,7 +291,21 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
         Some(Err(reason)) => format!("{run} cwd_rejected {reason}"),
         _ => format!("{run} ok"),
     };
-    let environment = tokio::runtime::Builder::new_current_thread()
+    // Phase 3A (D-11): resolve requested OS micro-sandbox profile before the
+    // registration handshake so `@masil-sandbox` is stamped atomically alongside
+    // `LAUNCH_VERDICT` (zero race when `agent start` returns) and uses `native`.
+    let sandbox_profile = match std::env::var(super::LAUNCH_SANDBOX) {
+        Ok(raw) if !raw.trim().is_empty() => crate::sandbox::SandboxProfile::parse(&raw)
+            .unwrap_or(crate::sandbox::SandboxProfile::Off),
+        _ => crate::sandbox::SandboxProfile::Off,
+    };
+    let initial_sandbox_badge = crate::sandbox::expected_badge(sandbox_profile);
+    let launch_cwd_path = match &checked {
+        Some(Ok(path)) => PathBuf::from(path),
+        _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    let guard_cfg = crate::guard::config::GuardConfig::load();
+    let (wrapped, environment) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
@@ -313,12 +327,15 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
                 return Err(format!("cwd_rejected: {reason}; the agent was not started"));
             }
             let mut first = true;
-            tokio::time::timeout(Duration::from_secs(5), async {
+            let registered_provider = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    // The verdict goes with the first read of the registration.
+                    // The verdict and initial sandbox badge go atomically with the first read.
                     let mut read: Vec<&str> = Vec::new();
                     if first && checked.is_some() {
-                        read.extend(["set-option", "-p", "-t", &pane, super::LAUNCH_VERDICT, &verdict, ";"]);
+                        read.extend([
+                            "set-option", "-p", "-t", &pane, super::SANDBOX_OPTION, &initial_sandbox_badge, ";",
+                            "set-option", "-p", "-t", &pane, super::LAUNCH_VERDICT, &verdict, ";",
+                        ]);
                     }
                     first = false;
                     read.extend(["show-options", "-pqv", "-t", &pane, super::META]);
@@ -336,32 +353,64 @@ fn launch_registered(socket: &str, args: &[String]) -> Result<i32, String> {
                             return Err("identity_mismatch: managed launch registration does not match this process"
                                 .to_string());
                         }
-                        return Ok(());
+                        return Ok(meta.provider);
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
             .map_err(|_| "wait_timeout: managed launch registration timed out".to_string())??;
-            let Some(profile) = answers else {
-                return Ok(Vec::new());
+            let env_vars = match answers {
+                Some(profile) => {
+                    super::answer::prepare_exec(
+                        profile,
+                        &native,
+                        std::path::Path::new(socket),
+                        &run,
+                        &mut argv,
+                    )
+                    .await
+                }
+                None => Vec::new(),
             };
-            Ok::<_, String>(
-                super::answer::prepare_exec(
-                    profile,
-                    &native,
-                    std::path::Path::new(socket),
-                    &run,
-                    &mut argv,
+            let sandbox_spec = crate::sandbox::build_spec(
+                sandbox_profile,
+                &launch_cwd_path,
+                &registered_provider,
+                &run,
+                Some(std::path::Path::new(socket)),
+            )?;
+            let wrapped = crate::sandbox::wrap_command(
+                &sandbox_spec,
+                program,
+                &argv[1..],
+                guard_cfg.sandbox.fail_closed,
+            )?;
+            // Confirm authoritative sandbox badge via `native` (covers `checked.is_none()` too).
+            let _ = native
+                .tmux(
+                    [
+                        "set-option",
+                        "-p",
+                        "-t",
+                        &pane,
+                        super::SANDBOX_OPTION,
+                        &wrapped.badge,
+                    ]
+                    .iter()
+                    .map(std::ffi::OsString::from),
+                    None,
                 )
-                .await,
-            )
+                .await;
+            Ok::<_, String>((wrapped, env_vars))
         })?;
-    let mut command = std::process::Command::new(program);
+    let mut command = std::process::Command::new(&wrapped.program);
     command
-        .args(&argv[1..])
+        .args(&wrapped.args)
         .envs(environment)
-        .env_remove(super::LAUNCH_CWD);
+        .envs(wrapped.extra_env)
+        .env_remove(super::LAUNCH_CWD)
+        .env_remove(super::LAUNCH_SANDBOX);
     if let Some(Ok(path)) = &checked {
         command.env("PWD", path);
     }
@@ -454,9 +503,33 @@ pub(super) async fn launch(
     key: Option<super::durable::ClientKey<'_>>,
     answers: bool,
 ) -> Result<Value, String> {
+    let guard_cfg = crate::guard::config::GuardConfig::load();
+    let sandbox = crate::sandbox::resolve_start_profile(None, false, &guard_cfg.sandbox)?;
+    launch_with_sandbox(
+        manager, name, provider, cwd, extra, session, split, key, answers, sandbox,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn launch_with_sandbox(
+    manager: &Manager,
+    name: &str,
+    provider: &str,
+    cwd: &std::path::Path,
+    extra: &[String],
+    session: Option<&str>,
+    split: Option<&str>,
+    key: Option<super::durable::ClientKey<'_>>,
+    answers: bool,
+    sandbox: crate::sandbox::SandboxProfile,
+) -> Result<Value, String> {
     let mut outcome = manager
-        .start_with_operation(name, provider, cwd, extra, session, split, key, answers)
+        .start_with_operation_and_sandbox(
+            name, provider, cwd, extra, session, split, key, answers, sandbox,
+        )
         .await?;
+    outcome["sandbox_profile"] = json!(sandbox.as_str());
     // The channel is only used once the server refuses requests without its
     // password; one that does not is stopped.
     if answers && let Some(pane) = outcome["pane_id"].as_str() {
@@ -469,15 +542,17 @@ pub(super) async fn launch(
     }
     let socket = manager.native.socket.clone();
     let problem = tokio::task::spawn_blocking(move || {
+        // D-01: entering agent management automatically registers enabled
+        // intelligence features and ensures the coordinator runs without blocking.
+        crate::coordinator::ensure_default_intelligence_features(&socket);
+        // A running coordinator looks at the new pane now.
+        crate::coordinator::poke(&socket);
         let enabled = super::state_base()
             .and_then(|base| super::coordinator_features(&base, &socket))
             .is_ok_and(|features| !features.is_empty());
         if !enabled {
             return None;
         }
-        crate::coordinator::spawn_detached(&socket);
-        // A running one looks at the new pane now.
-        crate::coordinator::poke(&socket);
         crate::coordinator::listen_problem(&socket)
     })
     .await
@@ -487,6 +562,27 @@ pub(super) async fn launch(
     if let Some(problem) = problem.filter(|_| answers) {
         outcome["warning"] = json!(format!("coordinator_unavailable: {problem}"));
     }
+    if crate::plugin::manifest::load_catalog().is_ok_and(|cat| cat.has_hooks_for("agent.started")) {
+        let mut hook_agent = outcome.clone();
+        if let Some(obj) = hook_agent.as_object_mut() {
+            obj.insert(
+                "server_socket".into(),
+                json!(manager.native.socket.to_string_lossy()),
+            );
+            if obj.get("pane").is_none()
+                && let Some(pane) = obj.get("pane_id").cloned()
+            {
+                obj.insert("pane".into(), pane);
+            }
+        }
+        crate::plugin::runner::dispatch_hook_event(
+            "agent.started",
+            hook_agent.clone(),
+            Some(hook_agent),
+            Some(manager.native.socket.clone()),
+        )
+        .await;
+    }
     Ok(outcome)
 }
 
@@ -495,6 +591,7 @@ pub(super) fn answer_reply(args: &[String]) -> Result<super::answer::Reply, Stri
     let mut choice = None;
     let mut message = None;
     let mut answers = Vec::new();
+    let mut answers_json: Option<Vec<Vec<String>>> = None;
     let mut reject = false;
     let mut i = 0;
     while i < args.len() {
@@ -502,6 +599,13 @@ pub(super) fn answer_reply(args: &[String]) -> Result<super::answer::Reply, Stri
             "--choice" if choice.is_none() => choice = Some(value(args, i)?),
             "--message" if message.is_none() => message = Some(value(args, i)?.to_owned()),
             "--answer" => answers.push(value(args, i)?.to_owned()),
+            "--answers-json" if answers_json.is_none() => {
+                let raw = value(args, i)?;
+                let parsed: Vec<Vec<String>> = serde_json::from_str(raw).map_err(
+                    |_| "invalid_argument: --answers-json expects a JSON array of string arrays",
+                )?;
+                answers_json = Some(parsed);
+            }
             "--reject" if !reject => {
                 reject = true;
                 i += 1;
@@ -513,17 +617,20 @@ pub(super) fn answer_reply(args: &[String]) -> Result<super::answer::Reply, Stri
         }
         i += 2;
     }
-    Ok(match (choice, answers.is_empty(), reject) {
-        (Some("once"), true, false) if message.is_none() => super::answer::Reply::Once,
-        (Some("always"), true, false) if message.is_none() => super::answer::Reply::Always,
-        (Some("reject"), true, false) => super::answer::Reply::Reject { message },
-        (None, false, false) if message.is_none() => super::answer::Reply::Answers(answers),
-        (None, true, true) if message.is_none() => super::answer::Reply::RejectQuestion,
-        (Some(other), _, _) if !["once", "always", "reject"].contains(&other) => {
+    Ok(match (choice, answers.is_empty(), answers_json, reject) {
+        (Some("once"), true, None, false) if message.is_none() => super::answer::Reply::Once,
+        (Some("always"), true, None, false) if message.is_none() => super::answer::Reply::Always,
+        (Some("reject"), true, None, false) => super::answer::Reply::Reject { message },
+        (None, false, None, false) if message.is_none() => super::answer::Reply::Answers(answers),
+        (None, true, Some(multi), false) if message.is_none() => {
+            super::answer::Reply::MultiAnswers(multi)
+        }
+        (None, true, None, true) if message.is_none() => super::answer::Reply::RejectQuestion,
+        (Some(other), _, _, _) if !["once", "always", "reject"].contains(&other) => {
             return Err("invalid_argument: --choice is once, always or reject".into());
         }
         _ => {
-            return Err("usage: answer TARGET REQUEST --choice once|always | --choice reject [--message TEXT] | --answer TEXT... | --reject".into());
+            return Err("usage: answer TARGET REQUEST --choice once|always | --choice reject [--message TEXT] | --answer TEXT... | --answers-json JSON | --reject".into());
         }
     })
 }
@@ -912,6 +1019,8 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             let mut extra = Vec::new();
             let mut answers = false;
             let mut worktree = None;
+            let mut sandbox_arg: Option<&str> = None;
+            let mut no_sandbox = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -921,6 +1030,12 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                         i += 1;
                         continue;
                     }
+                    "--no-sandbox" if !no_sandbox => {
+                        no_sandbox = true;
+                        i += 1;
+                        continue;
+                    }
+                    "--sandbox" if sandbox_arg.is_none() => sandbox_arg = Some(value(args, i)?),
                     "--cwd" if cwd.is_none() => cwd = Some(PathBuf::from(value(args, i)?)),
                     "--split" if split.is_none() => split = Some(value(args, i)?),
                     "--session" if session.is_none() => session = Some(value(args, i)?),
@@ -936,6 +1051,9 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                 }
                 i += 2;
             }
+            let guard_cfg = crate::guard::config::GuardConfig::load();
+            let sandbox =
+                crate::sandbox::resolve_start_profile(sandbox_arg, no_sandbox, &guard_cfg.sandbox)?;
             let here = std::env::current_dir().map_err(|e| e.to_string())?;
             // With a worktree, the directory is that worktree, or --cwd
             // inside it; the start then leases it like any start there.
@@ -943,7 +1061,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                 Some(spec) => crate::worktree::start_dir(spec, &here, cwd.as_deref())?,
                 None => cwd.unwrap_or(here),
             };
-            let outcome = launch(
+            let outcome = launch_with_sandbox(
                 &manager,
                 &args[0],
                 &args[1],
@@ -953,6 +1071,7 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                 split,
                 client_key(boot, operation, "--boot BOOT")?,
                 answers,
+                sandbox,
             )
             .await?;
             return print_record(&manager, &outcome, false).await;
@@ -1077,6 +1196,35 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     result => result?,
                 }
             };
+            if crate::plugin::manifest::load_catalog()
+                .is_ok_and(|cat| cat.has_hooks_for("agent.closed"))
+            {
+                let sock_str = manager.native.socket.to_string_lossy().into_owned();
+                let hook_agent = json!({
+                    "name": agent.name,
+                    "provider": agent.provider,
+                    "state": agent.state,
+                    "cwd": agent.cwd,
+                    "pane": agent.pane_id,
+                    "pane_id": agent.pane_id,
+                    "run": agent.run,
+                    "session_id": agent.session_id,
+                    "server_socket": sock_str,
+                });
+                crate::plugin::runner::dispatch_hook_event(
+                    "agent.closed",
+                    json!({
+                        "target": args[0],
+                        "name": agent.name,
+                        "pane": agent.pane_id,
+                        "provider": agent.provider,
+                        "server_socket": sock_str,
+                    }),
+                    Some(hook_agent),
+                    Some(manager.native.socket.clone()),
+                )
+                .await;
+            }
             return print_record(&manager, &outcome, false).await;
         }
         "find" => print(&manager.find(args).await?)?,
@@ -1129,6 +1277,346 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
                     "checkpoint_partial: some files were not restored; checkpoint {} holds them as they were before",
                     value["before"]
                 ));
+            }
+        }
+        "audit" if !args.is_empty() => {
+            let agent = manager.get(&args[0]).await?;
+            let mut turn_spec: Option<String> = None;
+            let mut history = false;
+            let mut challenge_id: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--turn" => {
+                        turn_spec = Some(value(args, i)?.to_owned());
+                        i += 2;
+                    }
+                    "--challenge" => {
+                        challenge_id = Some(value(args, i)?.to_owned());
+                        i += 2;
+                    }
+                    "--history" => {
+                        history = true;
+                        i += 1;
+                    }
+                    "--json" => {
+                        i += 1;
+                    }
+                    other => return Err(format!("usage: unknown audit option: {other}")),
+                }
+            }
+            let socket = manager.native.socket.clone();
+            if history {
+                let run_id = agent.run.clone();
+                let pane_id = agent.pane_id.clone();
+                let rows = tokio::task::spawn_blocking(move || {
+                    let store = super::Store::open(&socket)?;
+                    store.list_turn_audits(Some(&run_id), Some(&pane_id), 30)
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+                let reports: Vec<crate::audit::AuditReport> = rows
+                    .into_iter()
+                    .map(crate::audit::AuditReport::from_record)
+                    .collect();
+                print(&json!({
+                    "agent": agent.name,
+                    "pane_id": agent.pane_id,
+                    "run": agent.run,
+                    "audits": reports,
+                }))?;
+                return Ok(0);
+            }
+            let report = {
+                let sock = socket.clone();
+                let run_id = agent.run.clone();
+                let pane_id = agent.pane_id.clone();
+                let provider = agent.provider.clone();
+                let cwd = agent.cwd.clone();
+                let session_id = agent.session_id.clone();
+                let turn_arg = turn_spec.clone();
+                tokio::task::spawn_blocking(move || -> Result<crate::audit::AuditReport, String> {
+                    let store = super::Store::open(&sock)?;
+                    if let Some(spec) = turn_arg.as_deref()
+                        && spec != "latest"
+                    {
+                        let id = spec.parse::<i64>().map_err(|_| {
+                            format!("invalid_argument: `{spec}` is not an audit ID")
+                        })?;
+                        let rec = store
+                            .turn_audit_by_id(id)?
+                            .ok_or_else(|| format!("target_absent: audit {id} not found"))?;
+                        return Ok(crate::audit::AuditReport::from_record(rec));
+                    }
+                    if let Some(rec) = store.latest_turn_audit(Some(&run_id), Some(&pane_id))? {
+                        return Ok(crate::audit::AuditReport::from_record(rec));
+                    }
+                    // Run an on-demand passive audit when none has been stored yet.
+                    let pane_tail = crate::remote::prompts::capture_visible_pane(
+                        &sock.to_string_lossy(),
+                        &pane_id,
+                    )
+                    .unwrap_or_default();
+                    crate::audit::run_and_persist_turn_audit(
+                        &sock,
+                        &pane_id,
+                        &run_id,
+                        &provider,
+                        &cwd,
+                        session_id.as_deref(),
+                        None,
+                        &pane_tail,
+                    )
+                    .ok_or_else(|| "audit_disabled: audit is disabled in audit.toml".into())
+                })
+                .await
+                .map_err(|e| e.to_string())??
+            };
+            if let Some(fid) = challenge_id {
+                let prompt_text =
+                    crate::audit::ui_card::build_challenge_prompt(&report, Some(&fid), None);
+                let queued = crate::collision::warn_agent_via_queue(
+                    &manager.native.socket,
+                    &agent.pane_id,
+                    &prompt_text,
+                )?;
+                print(&json!({
+                    "challenged": true,
+                    "audit_id": report.id,
+                    "finding_id": fid,
+                    "prompt": prompt_text,
+                    "queue_result": queued,
+                }))?;
+                return Ok(0);
+            }
+            let ui = crate::audit::ui_card::audit_to_ui_document(&report);
+            print(&json!({
+                "agent": agent.name,
+                "pane_id": agent.pane_id,
+                "run": agent.run,
+                "audit": report,
+                "ui": ui,
+            }))?;
+        }
+        "dvr" if args.len() >= 2 => {
+            let sub = args[0].clone();
+            let target = &args[1];
+            let agent = manager.get(target).await?;
+            let socket = manager.native.socket.clone();
+            let cwd = PathBuf::from(&agent.cwd);
+            let run_id = agent.run.clone();
+            let pane_id = agent.pane_id.clone();
+            let agent_name = agent.name.clone();
+            let provider = agent.provider.clone();
+            let mut turn_num: Option<u64> = None;
+            let mut note: Option<String> = None;
+            let mut branch: Option<String> = None;
+            let mut dest: Option<PathBuf> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--turn" => {
+                        turn_num =
+                            Some(value(args, i)?.parse::<u64>().map_err(
+                                |_| "invalid_argument: --turn must be a positive integer",
+                            )?);
+                        i += 2;
+                    }
+                    "--note" => {
+                        note = Some(value(args, i)?.to_owned());
+                        i += 2;
+                    }
+                    "--branch" => {
+                        branch = Some(value(args, i)?.to_owned());
+                        i += 2;
+                    }
+                    "--dest" => {
+                        dest = Some(PathBuf::from(value(args, i)?));
+                        i += 2;
+                    }
+                    "--json" => i += 1,
+                    other => return Err(format!("usage: unknown dvr option: {other}")),
+                }
+            }
+            let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+                match sub.as_str() {
+                    "list" => {
+                        let turns = crate::dvr::list_turns(&socket, &run_id, 200)?;
+                        Ok(json!({
+                            "agent": agent_name,
+                            "pane_id": pane_id,
+                            "run": run_id,
+                            "turns": turns,
+                        }))
+                    }
+                    "snapshot" => {
+                        let excerpt = crate::remote::prompts::capture_visible_pane(
+                            &socket.to_string_lossy(),
+                            &pane_id,
+                        );
+                        let rec = crate::dvr::capture_turn_snapshot(
+                            &socket,
+                            &cwd,
+                            &agent_name,
+                            &run_id,
+                            &pane_id,
+                            &provider,
+                            note.as_deref(),
+                            excerpt.as_deref(),
+                        )?;
+                        Ok(json!({ "stage": "recorded", "turn": rec }))
+                    }
+                    "inspect" => crate::dvr::inspect_turn(&socket, &cwd, &run_id, turn_num),
+                    "pin" => {
+                        let seq = turn_num.ok_or("usage: agent dvr pin TARGET --turn N [--note TEXT]")?;
+                        crate::dvr::set_pin(&socket, &cwd, &run_id, seq, true, note.as_deref())
+                    }
+                    "unpin" => {
+                        let seq = turn_num.ok_or("usage: agent dvr unpin TARGET --turn N")?;
+                        crate::dvr::set_pin(&socket, &cwd, &run_id, seq, false, None)
+                    }
+                    "restore" => {
+                        let seq = turn_num.ok_or("usage: agent dvr restore TARGET --turn N")?;
+                        crate::dvr::restore_turn(&socket, &cwd, &run_id, seq)
+                    }
+                    "fork" => {
+                        let seq = turn_num.ok_or("usage: agent dvr fork TARGET --turn N [--branch NAME]")?;
+                        crate::dvr::fork_turn(
+                            &socket,
+                            &cwd,
+                            &run_id,
+                            seq,
+                            branch.as_deref(),
+                            dest.as_deref(),
+                        )
+                    }
+                    other => Err(format!(
+                        "usage: unknown dvr action `{other}` (list|snapshot|inspect|pin|unpin|restore|fork)"
+                    )),
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            print(&out)?;
+        }
+        "trace" if args.len() >= 2 && args[0] == "export" => {
+            let agent = manager.get(&args[1]).await?;
+            let mut out_path: Option<PathBuf> = None;
+            let mut strict = false;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--out" => {
+                        out_path = Some(PathBuf::from(value(args, i)?));
+                        i += 2;
+                    }
+                    "--redact-strict" => {
+                        strict = true;
+                        i += 1;
+                    }
+                    "--json" => i += 1,
+                    other => return Err(format!("usage: unknown trace export option: {other}")),
+                }
+            }
+            let socket = manager.native.socket.clone();
+            let cwd = PathBuf::from(&agent.cwd);
+            let name = agent.name.clone();
+            let provider = agent.provider.clone();
+            let run_id = agent.run.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                crate::dvr::export_trace(
+                    &socket,
+                    &cwd,
+                    &name,
+                    &provider,
+                    &run_id,
+                    strict,
+                    out_path.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            print(&json!({
+                "stage": "exported",
+                "agent": agent.name,
+                "run": agent.run,
+                "out": res.1,
+                "turn_count": res.0.turn_count,
+                "total_redactions": res.0.total_redactions,
+                "redaction_kinds": res.0.redaction_kinds,
+                "bytes": res.0.html.len(),
+            }))?;
+        }
+        "guard" if !args.is_empty() => {
+            let agent = manager.get(&args[0]).await?;
+            let sub = args.get(1).map(String::as_str).unwrap_or("status");
+            let socket = manager.native.socket.clone();
+            match sub {
+                "status" => {
+                    let run_id = agent.run.clone();
+                    let pane_id = agent.pane_id.clone();
+                    let provider = agent.provider.clone();
+                    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+                        let store = super::Store::open(&socket)?;
+                        let cfg = crate::guard::config::GuardConfig::load();
+                        let focused = crate::guard::breaker::is_pane_actively_focused(
+                            &socket,
+                            &pane_id,
+                            cfg.circuit_breaker.active_focus_grace_secs,
+                        );
+                        let breaker = store.get_circuit_breaker(&run_id)?.map(|rec| {
+                            crate::guard::breaker::record_to_json(&rec, None, focused, None)
+                        });
+                        let warmth = store.get_cache_warmth(&run_id)?.map(|rec| {
+                            crate::guard::cache_warmth::CacheWarmthSnapshot::from_record(
+                                &rec,
+                                crate::observation::now_ms(),
+                            )
+                            .to_json()
+                        });
+                        Ok(json!({
+                            "run": run_id,
+                            "pane_id": pane_id,
+                            "provider": provider,
+                            "breaker": breaker,
+                            "cache_warmth": warmth,
+                        }))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    print(&out)?;
+                }
+                "extend" => {
+                    let mut turns: u64 = 10;
+                    if let Some(pos) = args.iter().position(|a| a == "--turns") {
+                        turns = value(args, pos)?
+                            .parse::<u64>()
+                            .map_err(|_| "invalid_argument: --turns must be a positive integer")?;
+                    }
+                    let run_id = agent.run.clone();
+                    let pane_id = agent.pane_id.clone();
+                    let rec = tokio::task::spawn_blocking(move || {
+                        crate::guard::breaker::extend_bypass(&socket, &run_id, &pane_id, turns)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    print(&crate::guard::breaker::record_to_json(
+                        &rec, None, false, None,
+                    ))?;
+                }
+                "dismiss" => {
+                    let run_id = agent.run.clone();
+                    let pane_id = agent.pane_id.clone();
+                    let rec = tokio::task::spawn_blocking(move || {
+                        crate::guard::breaker::dismiss_trip(&socket, &run_id, &pane_id)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    print(&crate::guard::breaker::record_to_json(
+                        &rec, None, false, None,
+                    ))?;
+                }
+                other => return Err(format!("usage: unknown guard action: {other}")),
             }
         }
         "answer" if args.len() >= 3 => {
@@ -1194,8 +1682,32 @@ async fn execute(mut manager: Manager, command: &str, args: &[String]) -> Result
             if run.is_some_and(|run| run != agent.run) {
                 return Err("identity_mismatch: prompt target run changed; this operation cannot be replayed".into());
             }
+            let prompt_text = if std::env::var_os("MASIL_SKIP_PROMPT_HOOK").is_none()
+                && crate::plugin::manifest::load_catalog()
+                    .is_ok_and(|cat| cat.has_hooks_for("prompt.before"))
+            {
+                let hook_agent = json!({
+                    "name": agent.name,
+                    "provider": agent.provider,
+                    "state": agent.state,
+                    "cwd": agent.cwd,
+                    "pane": agent.pane_id,
+                    "pane_id": agent.pane_id,
+                    "run": agent.run,
+                    "session_id": agent.session_id,
+                    "server_socket": manager.native.socket.to_string_lossy(),
+                });
+                crate::plugin::runner::run_prompt_before_hooks(
+                    &args[1],
+                    Some(hook_agent),
+                    Some(manager.native.socket.clone()),
+                )
+                .await
+            } else {
+                args[1].clone()
+            };
             let outcome = manager
-                .prompt_with_operation(&agent, &args[1], operation)
+                .prompt_with_operation(&agent, &prompt_text, operation)
                 .await?;
             return print_record(&manager, &outcome, false).await;
         }
@@ -2170,6 +2682,23 @@ mod tests {
     fn answer_once_rejects_a_message() {
         let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
         assert!(answer_reply(&words("--choice once")).is_ok());
+        assert!(answer_reply(&words("--choice always")).is_ok());
+        assert!(answer_reply(&words("--choice reject --message nope")).is_ok());
+        assert!(answer_reply(&words("--answer blue")).is_ok());
+        assert!(answer_reply(&words("--reject")).is_ok());
+        assert!(
+            answer_reply(&["--answers-json".to_owned(), r#"[["iOS","Web"]]"#.to_owned()]).is_ok()
+        );
+        assert!(answer_reply(&["--answers-json".to_owned(), "not-json".to_owned()]).is_err());
+        assert!(
+            answer_reply(&[
+                "--answer".to_owned(),
+                "a".to_owned(),
+                "--answers-json".to_owned(),
+                r#"[["a"]]"#.to_owned()
+            ])
+            .is_err()
+        );
         let Err(error) = answer_reply(&words("--choice once --message hi")) else {
             panic!("once with a message was accepted");
         };

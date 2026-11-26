@@ -9,7 +9,9 @@
 //! server has one coordinator whichever client asks.
 
 use crate::ipc;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -18,8 +20,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Inbox writes reported to this process since it started.
@@ -32,7 +34,288 @@ static POKES: AtomicUsize = AtomicUsize::new(0);
 /// does, so it must not prompt through an older coordinator.
 /// 5: a prompt may carry `submit: "two_step"` (cursor). An older coordinator
 /// refuses it, so a client replaces that coordinator first.
-pub(crate) const GENERATION: u64 = 5;
+/// 6: 512-slot CoordinatorEvent bus, unified local plugin hook dispatch
+/// (`agent.state_changed`, `inbox.event`), and D-01 intelligence features.
+pub(crate) const GENERATION: u64 = 6;
+
+/// Bounded ring-buffer capacity for the coordinator internal event bus.
+pub(crate) const EVENT_BUS_CAPACITY: usize = 512;
+
+/// Default intelligence coordinator features enabled automatically when
+/// entering managed agent workflows (`agent ui`, `sidebar`, `start`, `remote`)
+/// unless explicitly disabled in `~/.config/masil/{checkpoints,audit,guard}.toml`.
+pub(crate) const INTELLIGENCE_FEATURES: &[&str] =
+    &["auto_turn_checkpoint", "audit", "collision", "guard"];
+
+pub(crate) fn is_intelligence_feature(name: &str) -> bool {
+    INTELLIGENCE_FEATURES.contains(&name)
+}
+
+/// Internal lifecycle events emitted by the coordinator and consumed by
+/// Phase 1–3 subsystems and local plugin hooks.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CoordinatorEvent {
+    TurnStarted {
+        pane_id: String,
+        run_id: String,
+        provider: String,
+        prompt_sha256: String,
+        at_ms: u64,
+    },
+    TurnCompleted {
+        pane_id: String,
+        run_id: String,
+        provider: String,
+        checkpoint_id: Option<u64>,
+        tree_oid: Option<String>,
+        at_ms: u64,
+    },
+    StateChanged {
+        pane_id: String,
+        run_id: String,
+        prev: String,
+        next: String,
+        at_ms: u64,
+    },
+    PromptBlocked {
+        pane_id: String,
+        run_id: String,
+        prompt_digest: String,
+        at_ms: u64,
+    },
+    WorktreeDirty {
+        repo_key: String,
+        worktree_id: String,
+        changed_count: usize,
+        at_ms: u64,
+    },
+}
+
+/// One sequenced entry in [`CoordinatorEventBus`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SequencedEvent {
+    pub(crate) seq: u64,
+    #[serde(flatten)]
+    pub(crate) event: CoordinatorEvent,
+}
+
+/// 512-slot ring buffer + broadcast pub/sub bus shared across coordinator tasks.
+pub(crate) struct CoordinatorEventBus {
+    ring: Mutex<VecDeque<SequencedEvent>>,
+    next_seq: AtomicU64,
+    tx: tokio::sync::broadcast::Sender<SequencedEvent>,
+}
+
+impl Default for CoordinatorEventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CoordinatorEventBus {
+    pub(crate) fn new() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(EVENT_BUS_CAPACITY);
+        Self {
+            ring: Mutex::new(VecDeque::with_capacity(EVENT_BUS_CAPACITY)),
+            next_seq: AtomicU64::new(0),
+            tx,
+        }
+    }
+
+    pub(crate) fn publish(&self, event: CoordinatorEvent) -> SequencedEvent {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let entry = SequencedEvent { seq, event };
+        if let Ok(mut ring) = self.ring.lock() {
+            if ring.len() >= EVENT_BUS_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(entry.clone());
+        }
+        let _ = self.tx.send(entry.clone());
+        entry
+    }
+
+    pub(crate) fn latest_seq(&self) -> u64 {
+        self.next_seq.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn recent(&self, after_seq: u64, limit: usize) -> Vec<SequencedEvent> {
+        let cap = limit.clamp(1, EVENT_BUS_CAPACITY);
+        let Ok(ring) = self.ring.lock() else {
+            return Vec::new();
+        };
+        ring.iter()
+            .filter(|entry| entry.seq > after_seq)
+            .take(cap)
+            .cloned()
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SequencedEvent> {
+        self.tx.subscribe()
+    }
+}
+
+fn config_base() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".config"))
+        })
+        .map(|base| base.join("masil"))
+}
+
+fn read_private_toml(path: &Path) -> Option<toml::Value> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(64 * 1024).read_to_string(&mut text).ok()?;
+    text.parse::<toml::Value>().ok()
+}
+
+/// Computes which default intelligence features are enabled under `config_dir`
+/// (`~/.config/masil`). Each defaults to ON unless explicitly opted out.
+fn default_intelligence_features_in(config_dir: Option<&Path>) -> Vec<&'static str> {
+    let checkpoints_disabled = config_dir
+        .and_then(|dir| read_private_toml(&dir.join("checkpoints.toml")))
+        .and_then(|val| val.try_into::<crate::checkpoint::Settings>().ok())
+        .is_some_and(|settings| settings.auto_turn_checkpoint_disabled());
+    let audit_disabled = config_dir
+        .and_then(|dir| read_private_toml(&dir.join("audit.toml")))
+        .is_some_and(|val| val.get("enabled").and_then(toml::Value::as_bool) == Some(false));
+    let guard_toml = config_dir.and_then(|dir| read_private_toml(&dir.join("guard.toml")));
+    let collision_disabled = guard_toml.as_ref().is_some_and(|val| {
+        val.get("collision")
+            .and_then(|c| c.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            == Some(false)
+    });
+    let guard_disabled = guard_toml.as_ref().is_some_and(|val| {
+        let breaker_off = val
+            .get("circuit_breaker")
+            .and_then(|c| c.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            == Some(false);
+        let cache_off = val
+            .get("cache_warmth")
+            .and_then(|c| c.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            == Some(false);
+        breaker_off && cache_off
+    });
+
+    let mut features = Vec::with_capacity(INTELLIGENCE_FEATURES.len());
+    if !checkpoints_disabled {
+        features.push("auto_turn_checkpoint");
+    }
+    if !audit_disabled {
+        features.push("audit");
+    }
+    if !collision_disabled {
+        features.push("collision");
+    }
+    if !guard_disabled {
+        features.push("guard");
+    }
+    features
+}
+
+/// D-01: Called on managed agent entrypoints (`agent ui`, `sidebar`, `start`,
+/// `remote daemon`). Registers enabled default intelligence features in the
+/// server's operation store and brings up/reloads the coordinator without
+/// blocking the caller. Plain `masil` and read-only queries never call this.
+pub(crate) fn ensure_default_intelligence_features(socket: &Path) {
+    let Ok(server) = check_state(socket) else {
+        return;
+    };
+    let canonical_socket = socket
+        .canonicalize()
+        .unwrap_or_else(|_| socket.to_path_buf());
+    let cfg = config_base();
+    let enabled = default_intelligence_features_in(cfg.as_deref());
+    let now = now_ms();
+    let changed = crate::managed::sync_coordinator_features(
+        &canonical_socket,
+        INTELLIGENCE_FEATURES,
+        &enabled,
+        now,
+    )
+    .unwrap_or(false);
+    let has_any = crate::managed::coordinator_features(&server.state, &canonical_socket)
+        .is_ok_and(|features| !features.is_empty());
+    if has_any {
+        spawn_detached(&canonical_socket);
+        if changed {
+            reload(&canonical_socket);
+        }
+    }
+}
+
+/// Fast non-spawning check: true when a Gen >= 6 coordinator is currently
+/// running and watching panes for `socket` (so callers like `remote/daemon.rs`
+/// avoid duplicate local plugin hook dispatch).
+pub(crate) fn is_watching(socket: &Path) -> bool {
+    let Ok(state) = crate::managed::state_base() else {
+        return false;
+    };
+    let Ok(paths) = paths(socket, &state) else {
+        return false;
+    };
+    let Ok(info) = request(&paths.listen, "hello", Duration::from_millis(80)) else {
+        return false;
+    };
+    if info["generation"].as_u64().unwrap_or(0) < 6 {
+        return false;
+    }
+    info["features"].as_array().is_some_and(|arr| {
+        arr.iter()
+            .filter_map(Value::as_str)
+            .any(|f| f == "inbox" || is_intelligence_feature(f))
+    })
+}
+
+/// Best-effort fire-and-forget event publication to a running coordinator.
+/// Never starts a coordinator and ignores failures.
+pub(crate) fn publish_event(socket: &Path, event: &CoordinatorEvent) {
+    let Ok(state) = crate::managed::state_base() else {
+        return;
+    };
+    let Ok(paths) = paths(socket, &state) else {
+        return;
+    };
+    let Ok(mut stream) = StdUnixStream::connect(&paths.listen) else {
+        return;
+    };
+    let timeout = Some(Duration::from_millis(50));
+    if stream.set_write_timeout(timeout).is_err() || stream.set_read_timeout(timeout).is_err() {
+        return;
+    }
+    let Ok(params) = serde_json::to_value(event) else {
+        return;
+    };
+    let body =
+        json!({"v": 1, "id": "evt", "method": "publish_event", "params": params}).to_string();
+    let _ = stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .and_then(|()| stream.write_all(body.as_bytes()));
+}
 const REQUEST_FRAME: usize = 8 * 1024;
 const ACTION_REQUEST_FRAME: usize = 64 * 1024;
 const RESPONSE_FRAME: usize = 64 * 1024;
@@ -2036,18 +2319,37 @@ async fn supervise(
             })
             .await;
         }
-        // The inbox and `--answers` runs both need the panes watched.
-        let wanted = shared
-            .features()
+        // The inbox, intelligence features, and `--answers` runs need the panes watched.
+        let current_features = shared.features();
+        let has_full_watch_feature = current_features
             .iter()
-            .any(|feature| feature == "inbox" || feature == "answers");
-        // Without the inbox, only the panes of `--answers` runs need the
+            .any(|feature| feature == "inbox" || is_intelligence_feature(feature));
+        let wanted =
+            has_full_watch_feature || current_features.iter().any(|feature| feature == "answers");
+        // Without inbox or intelligence features, only the panes of `--answers` runs need the
         // watch. Set before a watch starts, so its first pass already knows.
-        let answers_only = {
-            let features = shared.features();
-            features.iter().any(|feature| feature == "answers")
-                && !features.iter().any(|feature| feature == "inbox")
-        };
+        let answers_only =
+            current_features.iter().any(|feature| feature == "answers") && !has_full_watch_feature;
+        shared.control.auto_turn_checkpoint.store(
+            current_features
+                .iter()
+                .any(|feature| feature == "auto_turn_checkpoint"),
+            Ordering::SeqCst,
+        );
+        shared.control.audit_enabled.store(
+            current_features.iter().any(|feature| feature == "audit"),
+            Ordering::SeqCst,
+        );
+        shared.control.collision_enabled.store(
+            current_features
+                .iter()
+                .any(|feature| feature == "collision"),
+            Ordering::SeqCst,
+        );
+        shared.control.guard_enabled.store(
+            current_features.iter().any(|feature| feature == "guard"),
+            Ordering::SeqCst,
+        );
         if shared
             .control
             .answers_only
@@ -2822,6 +3124,7 @@ fn respond(
             value["clients"] = json!(clients.load(Ordering::SeqCst));
             value["idle_seconds"] = json!(idle_seconds);
             value["pokes"] = json!(POKES.load(Ordering::SeqCst));
+            value["event_seq"] = json!(shared.control.event_bus.latest_seq());
             if let Ok(report) = shared.control.report.lock() {
                 value["watch"] = json!(*report);
             }
@@ -2833,6 +3136,36 @@ fn respond(
             names.sort();
             value["environment"] = json!(names);
             (ok(value), false)
+        }
+        Some("events") => {
+            let params = object.get("params").unwrap_or(&Value::Null);
+            let after_seq = params["after_seq"].as_u64().unwrap_or(0);
+            let limit = params["limit"].as_u64().unwrap_or(64) as usize;
+            let events = shared.control.event_bus.recent(after_seq, limit);
+            (
+                ok(json!({
+                    "events": events,
+                    "latest_seq": shared.control.event_bus.latest_seq(),
+                })),
+                false,
+            )
+        }
+        Some("publish_event") => {
+            let params = object.get("params").cloned().unwrap_or(Value::Null);
+            match serde_json::from_value::<CoordinatorEvent>(params) {
+                Ok(event) => {
+                    let published = shared.control.event_bus.publish(event);
+                    (ok(json!({"seq": published.seq})), false)
+                }
+                Err(error) => (
+                    failure(
+                        &id,
+                        "invalid_request",
+                        &format!("invalid coordinator event: {error}"),
+                    ),
+                    false,
+                ),
+            }
         }
         Some("stop") => (ok(json!({"stopping": true})), true),
         Some("links_status") => (ok(shared.links.status()), false),
@@ -2984,6 +3317,111 @@ mod tests {
             "exe": {"path": "/another/masil-agent"},
         });
         assert!(!current(&replaced, &server));
+        // A Gen 5 coordinator is not current for Gen 6 and triggers automatic replacement.
+        let gen5 = json!({
+            "boot": "boot-a",
+            "server_pid": 42,
+            "state_dir": "/tmp/state",
+            "generation": 5,
+            "action_protocol": crate::managed::core_action::ACTION_PROTOCOL,
+            "exe": exe_identity(),
+        });
+        assert_eq!(GENERATION, 6);
+        assert!(!current(&gen5, &server));
+    }
+
+    #[test]
+    fn event_bus_retains_512_ring_slots_and_serves_control_methods() {
+        let bus = CoordinatorEventBus::new();
+        let mut sub = bus.subscribe();
+        for i in 0..(EVENT_BUS_CAPACITY + 12) {
+            let published = bus.publish(CoordinatorEvent::StateChanged {
+                pane_id: format!("%{i}"),
+                run_id: "r1".into(),
+                prev: "idle".into(),
+                next: "working".into(),
+                at_ms: i as u64,
+            });
+            assert_eq!(published.seq, (i + 1) as u64);
+        }
+        assert_eq!(bus.latest_seq(), (EVENT_BUS_CAPACITY + 12) as u64);
+        let all = bus.recent(0, EVENT_BUS_CAPACITY);
+        assert_eq!(all.len(), EVENT_BUS_CAPACITY);
+        assert_eq!(all[0].seq, 13);
+        assert_eq!(all.last().unwrap().seq, (EVENT_BUS_CAPACITY + 12) as u64);
+        let tail = bus.recent((EVENT_BUS_CAPACITY + 10) as u64, 10);
+        assert_eq!(tail.len(), 2);
+        // Broadcast channel notifies lagged/live subscribers without panic.
+        assert!(sub.try_recv().is_err());
+
+        // Control socket `publish_event` and `events` methods round-trip cleanly.
+        let shared = shared();
+        let clients = AtomicUsize::new(1);
+        let pub_req = json!({
+            "v": 1,
+            "id": "e1",
+            "method": "publish_event",
+            "params": {
+                "kind": "turn_started",
+                "pane_id": "%3",
+                "run_id": "run-3",
+                "provider": "claude",
+                "prompt_sha256": "deadbeef",
+                "at_ms": 12345
+            }
+        })
+        .to_string();
+        let (resp, stop) = respond(pub_req.as_bytes(), &shared, &clients, 60);
+        assert!(!stop);
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["value"]["seq"], 1);
+
+        let list_req = r#"{"v":1,"id":"e2","method":"events","params":{"after_seq":0,"limit":10}}"#;
+        let (listed, _) = respond(list_req.as_bytes(), &shared, &clients, 60);
+        assert_eq!(listed["ok"], true);
+        assert_eq!(listed["value"]["latest_seq"], 1);
+        assert_eq!(listed["value"]["events"][0]["kind"], "turn_started");
+        assert_eq!(listed["value"]["events"][0]["pane_id"], "%3");
+    }
+
+    #[test]
+    fn default_intelligence_features_respect_per_file_opt_out() {
+        let dir = std::env::temp_dir().join(format!(
+            "masil-intel-cfg-{}",
+            crate::managed::nonce().unwrap()
+        ));
+        private_directory(&dir).unwrap();
+        assert_eq!(
+            default_intelligence_features_in(Some(&dir)),
+            vec!["auto_turn_checkpoint", "audit", "collision", "guard"]
+        );
+        fs::write(
+            dir.join("checkpoints.toml"),
+            "before_prompt = false\nauto_after_turn = false\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            dir.join("checkpoints.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(dir.join("audit.toml"), "enabled = false\n").unwrap();
+        fs::set_permissions(dir.join("audit.toml"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            dir.join("guard.toml"),
+            "[collision]\nenabled = false\n[circuit_breaker]\nenabled = false\n[cache_warmth]\nenabled = true\n",
+        )
+        .unwrap();
+        fs::set_permissions(dir.join("guard.toml"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(default_intelligence_features_in(Some(&dir)), vec!["guard"]);
+
+        fs::write(
+            dir.join("guard.toml"),
+            "[collision]\nenabled = false\n[circuit_breaker]\nenabled = false\n[cache_warmth]\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(default_intelligence_features_in(Some(&dir)).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3138,7 +3576,11 @@ mod tests {
                 .is_none()
         );
         drop(file);
-        assert!(!lock_held(&path).unwrap());
+        // Parallel tests calling `Command` (fork+exec) can hold an inherited
+        // `O_CLOEXEC` fd for a few milliseconds until `execve` completes.
+        let unlocked = acquire(&path, Duration::from_millis(500)).unwrap();
+        assert!(unlocked.is_some());
+        drop(unlocked);
         fs::remove_dir_all(dir).unwrap();
     }
 
