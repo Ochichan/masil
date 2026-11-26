@@ -1,0 +1,11 @@
+# Keeps the SHA-pinned actions in .github/workflows/ and .github/actions/ current
+# (the `# vN` comments next to each pin tell dependabot the intended track).
+# Cargo and npm dependency updates are reviewed deliberately alongside cargo-deny
+# and dependency-review gates.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

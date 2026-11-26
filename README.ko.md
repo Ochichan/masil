@@ -43,20 +43,45 @@ masil은 무거운 일렉트론으로 터미널을 감싸거나 셸 입출력 �
 
 ## 설치
 
-| 환경 | 명령어 |
+패키지 관리자(Homebrew, Nix, AUR)는 `masil`, `masil-agent`와 필요한 C 런타임 라이브러리(`libevent`, `ncurses`, `utf8proc`, `jemalloc`)를 한 번에 설치합니다. 직접 설치 스크립트(`install.sh`)는 SHA-256을 검증해 사전 빌드 아카이브를 설치하며(`--build`로 소스 빌드 가능), 누락된 라이브러리를 안내합니다.
+
+| 환경 / 채널 | 명령어 |
 | --- | --- |
-| **macOS / Linux (Homebrew)** | `brew tap Ochichan/masil https://github.com/Ochichan/masil && brew install --HEAD Ochichan/masil/masil` |
-| **사전 빌드 아카이브** *(macOS 15+ arm64, Ubuntu 24.04 x86_64)* | [GitHub Releases](https://github.com/Ochichan/masil/releases)에서 아카이브와 `SHA256SUMS` 다운로드 |
-| **소스에서 빌드** *(macOS / Linux)* | `make && make install` *(`~/.local` 설치, 다른 경로는 `PREFIX=/path` 지정)* |
+| **macOS / Linux (Homebrew 탭, 릴리스)** | `brew install Ochichan/tap/masil` |
+| **macOS / Linux (Homebrew, `main` HEAD)** | `brew tap Ochichan/masil https://github.com/Ochichan/masil && brew install --HEAD Ochichan/masil/masil` |
+| **Linux / macOS ([Nix](https://nixos.org/download))** | `nix run github:Ochichan/masil` |
+| **Arch Linux (AUR)** | `yay -S masil` |
+| **macOS / Ubuntu 24.04 (직접 설치 스크립트)** | `curl -fsSL https://github.com/Ochichan/masil/releases/latest/download/install.sh \| bash` |
+| **소스에서 빌드** *(macOS / Linux)* | `./install.sh --build` 또는 `make && make install` *(`~/.local` 설치, 다른 경로는 `PREFIX=/path` 지정)* |
 | **셀프 호스팅 E2EE 릴레이** *(선택)* | `make relay` 또는 `cd relay && docker compose -f docker-compose.example.yml up -d` |
 | **모바일 앱** *(Android / iOS)* | `cd mobile && npm ci && npm run build:apk:arm64` *(iOS: `npm run build:ios:local`)* |
 
-Homebrew 업데이트는 `brew upgrade --fetch-HEAD Ochichan/masil/masil`로 진행합니다. Windows는 호스트로 지원하지 않습니다.
+Homebrew 업데이트는 `brew upgrade Ochichan/tap/masil`(또는 `brew upgrade --fetch-HEAD Ochichan/masil/masil`)로 진행합니다. Windows는 호스트로 지원하지 않습니다.
+
+<details>
+<summary><b>다운로드 검증하기</b> <i>(선택)</i></summary>
+
+모든 태그 릴리스는 4개 Unix 타깃(`macos-arm64`, `macos-x86_64`, `linux-x86_64`, `linux-arm64`) 아카이브와 소스 아카이브에 대해 `SHA256SUMS`, 릴리스 고정 `install.sh`, GitHub 빌드 출처 증명(Build Provenance Attestation)을 함께 배포합니다:
+
+```sh
+# 릴리스에 고정된 설치 스크립트 실행 (SHA256SUMS 자동 검증):
+curl -fsSL https://github.com/Ochichan/masil/releases/latest/download/install.sh | bash
+
+# 수동 체크섬 검증 (아카이브와 SHA256SUMS가 같은 디렉터리에 있을 때):
+sha256sum -c --ignore-missing SHA256SUMS        # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+
+# 빌드 출처 증명 검증 (이 저장소의 릴리스 워크플로에서 빌드되었음을 증명):
+gh attestation verify masil-vX.Y.Z-linux-x86_64.tar.gz --repo Ochichan/masil
+```
+
+자세한 공급망 보안 및 배포 채널 구성은 [SECURITY.md](SECURITY.md)와 [packaging/README.md](packaging/README.md)를 참고하세요.
+
+</details>
 
 <details>
 <summary><b>런타임 라이브러리 및 설치 세부 안내</b></summary>
 
-사전 빌드 아카이브나 소스 빌드에는 아래 런타임 라이브러리가 필요합니다.
+사전 빌드 아카이브(`macos-arm64`, `macos-x86_64`, `linux-x86_64`, `linux-arm64`)나 소스 빌드에는 아래 런타임 라이브러리가 필요합니다.
 
 - **macOS:** `brew install libevent ncurses utf8proc jemalloc`
 - **Ubuntu 24.04:** `sudo apt-get install libevent-core-2.1-7t64 libncursesw6 libtinfo6 libutf8proc3 libjemalloc2`

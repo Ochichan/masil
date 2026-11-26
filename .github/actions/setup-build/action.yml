@@ -19,7 +19,11 @@ runs:
       shell: bash
       env:
         HOMEBREW_NO_AUTO_UPDATE: '1'
-      run: brew install autoconf automake m4 pkgconf libevent ncurses utf8proc jemalloc
+      run: |
+        if brew tap | grep -Fxq 'aws/tap'; then
+          brew untap aws/tap
+        fi
+        brew install autoconf automake m4 pkgconf libevent ncurses utf8proc jemalloc
     - name: Install Rust
       shell: bash
       run: |

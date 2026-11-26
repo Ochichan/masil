@@ -41,24 +41,51 @@ def run(args, cwd, env, name):
         raise SystemExit(f'{name} failed ({result.returncode})')
 
 
+def homebrew_prefixes():
+    prefixes = []
+    seen = set()
+    candidates = []
+    if os.environ.get('HOMEBREW_PREFIX'):
+        candidates.append(Path(os.environ['HOMEBREW_PREFIX']))
+    brew = shutil.which('brew')
+    if brew:
+        result = subprocess.run([brew, '--prefix'], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            candidates.append(Path(result.stdout.strip()))
+    candidates.extend([Path('/opt/homebrew'), Path('/usr/local')])
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen and candidate.is_dir():
+            seen.add(key)
+            prefixes.append(candidate)
+    return prefixes
+
+
 def environment():
     env = os.environ.copy()
+    brew_prefixes = homebrew_prefixes()
     # Homebrew's m4 is keg-only; without it macOS's m4 1.4.6 forces a download.
-    keg_m4 = Path('/opt/homebrew/opt/m4/bin')
-    tools = [str(BUILD / 'tools' / 'bin')] + ([str(keg_m4)] if keg_m4.is_dir() else [])
+    tools = [str(BUILD / 'tools' / 'bin')]
+    for prefix in brew_prefixes:
+        keg_m4 = prefix / 'opt/m4/bin'
+        if keg_m4.is_dir():
+            tools.append(str(keg_m4))
     env['PATH'] = os.pathsep.join(tools + [env['PATH']])
-    pcs = [Path('/opt/homebrew/opt/libevent/lib/pkgconfig'),
-           Path('/opt/homebrew/opt/ncurses/lib/pkgconfig'),
-           Path('/opt/homebrew/opt/utf8proc/lib/pkgconfig'),
-           Path('/opt/homebrew/opt/jemalloc/lib/pkgconfig')]
-    paths = [str(p) for p in pcs if p.is_dir()]
+    paths = []
+    for prefix in brew_prefixes:
+        for dep in ('libevent', 'ncurses', 'utf8proc', 'jemalloc'):
+            pc = prefix / 'opt' / dep / 'lib/pkgconfig'
+            if pc.is_dir():
+                paths.append(str(pc))
     if env.get('PKG_CONFIG_PATH'):
         paths.append(env['PKG_CONFIG_PATH'])
     env['PKG_CONFIG_PATH'] = os.pathsep.join(paths)
-    macros = Path('/opt/homebrew/share/aclocal')
-    if macros.is_dir():
-        env['ACLOCAL_PATH'] = str(macros) + (os.pathsep + env['ACLOCAL_PATH']
-                                           if env.get('ACLOCAL_PATH') else '')
+    aclocal_paths = [str(prefix / 'share/aclocal') for prefix in brew_prefixes
+                     if (prefix / 'share/aclocal').is_dir()]
+    if env.get('ACLOCAL_PATH'):
+        aclocal_paths.append(env['ACLOCAL_PATH'])
+    if aclocal_paths:
+        env['ACLOCAL_PATH'] = os.pathsep.join(aclocal_paths)
     env.setdefault('CC', 'clang' if shutil.which('clang') else 'cc')
     # Identical optimization settings for masil and the upstream comparison.
     # Upstream's macOS debug build already exempts these compatibility headers.

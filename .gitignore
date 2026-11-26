@@ -25,6 +25,8 @@ core/etc/
 *.md
 !/README.md
 !/README.ko.md
+!/SECURITY.md
+!/packaging/README.md
 !/agent/src/plugin/skill_bundle/SKILL.md
 !/agent/src/plugin/skill_bundle/references/ui-spec.md
 !/agent/src/plugin/skill_bundle/references/examples.md
@@ -63,6 +65,7 @@ core/etc/
 !/tests/test_compatibility.py
 !/tests/test_core_ledger.py
 !/tests/test_core_prompt.py
+!/tests/test_download_release_artifacts.py
 !/tests/test_install.py
 !/tests/test_managed_agents.py
 !/tests/test_managed_restore.py
@@ -72,6 +75,7 @@ core/etc/
 !/tests/test_phase3.py
 !/tests/test_management_probe.py
 !/tests/test_plugins_e2e.py
+!/tests/test_release.py
 !/tests/test_remote_e2e.py
 !/tests/test_remote_links.py
 !/tests/test_restore.py

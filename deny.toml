@@ -1,0 +1,50 @@
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Single source of truth for RUSTSEC exceptions across agent, relay, and masil-wire.
+# CI runs `cargo deny --all-features check advisories` so optional features are covered too.
+# Every entry added here must state: reachable path, why accepted, removal condition, review date.
+ignore = []
+yanked = "warn"
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# Shared config across agent, relay, and masil-wire; smaller crates don't pull every allowed license.
+unused-allowed-license = "allow"
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "allow"
+highlight = "all"
+# Shared config across agent, relay, and masil-wire; not every crate contains every transitive duplicate.
+skip = [
+    { crate = "base64@0.22.1", reason = "masil-wire/agent/relay depend on base64 0.22 while tungstenite/reqwest transitive deps use 0.23. Review 2027-01." },
+    { crate = "getrandom@0.2.17", reason = "rand_core 0.6 (x25519-dalek/chacha20poly1305) uses getrandom 0.2 while rand 0.9 uses 0.3. Review 2027-01." },
+    { crate = "hashbrown@0.16.1", reason = "kasuari 0.4 (via ratatui-core) uses hashbrown 0.16 while indexmap/lru use 0.17. Review 2027-01." },
+    { crate = "rand_core@0.6.4", reason = "x25519-dalek 2 and chacha20poly1305 0.10 require rand_core 0.6 while rand 0.9 uses 0.9. Review 2027-01." },
+    { crate = "syn@2.0.119", reason = "serde_derive 1.0.229 moved to syn 3 while the rest of the proc-macro graph is on syn 2. Review 2027-01." },
+    { crate = "windows-sys@0.52.0", reason = "relay transitive crates span windows-sys 0.52 and 0.61 (never linked on Unix hosts). Review 2027-01." },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

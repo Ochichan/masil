@@ -43,20 +43,45 @@ masil fixes this without wrapping your shell in Electron or inserting a proxy in
 
 ## Install
 
-| Target | Command |
+Package managers (Homebrew, Nix, AUR) install `masil`, `masil-agent`, and their C runtime libraries (`libevent`, `ncurses`, `utf8proc`, `jemalloc`) together. The direct installer downloads a SHA-256 verified archive (or builds from source with `--build`) and checks those libraries for you.
+
+| Target / Channel | Command |
 | --- | --- |
-| **macOS / Linux (Homebrew)** | `brew tap Ochichan/masil https://github.com/Ochichan/masil && brew install --HEAD Ochichan/masil/masil` |
-| **Prebuilt archives** *(macOS 15+ arm64, Ubuntu 24.04 x86_64)* | Download archive + `SHA256SUMS` from [GitHub Releases](https://github.com/Ochichan/masil/releases) |
-| **From source** *(macOS / Linux)* | `make && make install` *(installs to `~/.local`; override with `PREFIX=/path`)* |
+| **macOS / Linux (Homebrew tap, releases)** | `brew install Ochichan/tap/masil` |
+| **macOS / Linux (Homebrew, `main` HEAD)** | `brew tap Ochichan/masil https://github.com/Ochichan/masil && brew install --HEAD Ochichan/masil/masil` |
+| **Linux / macOS ([Nix](https://nixos.org/download))** | `nix run github:Ochichan/masil` |
+| **Arch Linux (AUR)** | `yay -S masil` |
+| **macOS / Ubuntu 24.04 (direct installer)** | `curl -fsSL https://github.com/Ochichan/masil/releases/latest/download/install.sh \| bash` |
+| **From source** *(macOS / Linux)* | `./install.sh --build` or `make && make install` *(installs to `~/.local`; override with `PREFIX=/path`)* |
 | **Self-hosted E2EE Relay** *(optional)* | `make relay` or `cd relay && docker compose -f docker-compose.example.yml up -d` |
 | **Mobile app** *(Android / iOS)* | `cd mobile && npm ci && npm run build:apk:arm64` *(iOS: `npm run build:ios:local`)* |
 
-Update Homebrew installs anytime with `brew upgrade --fetch-HEAD Ochichan/masil/masil`. Windows is not supported as a masil host.
+Update Homebrew installs with `brew upgrade Ochichan/tap/masil` (or `brew upgrade --fetch-HEAD Ochichan/masil/masil`). Windows is not supported as a masil host.
+
+<details>
+<summary><b>Verify what you download</b> <i>(optional)</i></summary>
+
+Every tagged release ships `SHA256SUMS`, a release-pinned `install.sh`, and GitHub build-provenance attestations for all 4 Unix targets (`macos-arm64`, `macos-x86_64`, `linux-x86_64`, `linux-arm64`) and the source archive:
+
+```sh
+# Release-pinned installer (verifies SHA-256 against SHA256SUMS automatically):
+curl -fsSL https://github.com/Ochichan/masil/releases/latest/download/install.sh | bash
+
+# Manual checksum verification (archive + SHA256SUMS in the same directory):
+sha256sum -c --ignore-missing SHA256SUMS        # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+
+# Build provenance — proves the artifact came from this repository's release workflow:
+gh attestation verify masil-vX.Y.Z-linux-x86_64.tar.gz --repo Ochichan/masil
+```
+
+See [SECURITY.md](SECURITY.md) and [packaging/README.md](packaging/README.md) for supply-chain details.
+
+</details>
 
 <details>
 <summary><b>Runtime libraries & installation details</b></summary>
 
-For prebuilt archives or building from source, ensure these runtime libraries are present:
+For prebuilt archives (`macos-arm64`, `macos-x86_64`, `linux-x86_64`, `linux-arm64`) or building from source, ensure these runtime libraries are present:
 
 - **macOS:** `brew install libevent ncurses utf8proc jemalloc`
 - **Ubuntu 24.04:** `sudo apt-get install libevent-core-2.1-7t64 libncursesw6 libtinfo6 libutf8proc3 libjemalloc2`

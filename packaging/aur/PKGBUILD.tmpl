@@ -1,0 +1,58 @@
+# Maintainer: Ochichan <ohstar94@gmail.com>
+#
+# Source of truth for the AUR package `masil`. The Release workflow renders this
+# template on every stable v* tag and pushes to ssh://aur@aur.archlinux.org/masil.git.
+# Edit this template, not the copy on AUR.
+#
+# Built from the release source tarball rather than Ubuntu binaries because `masil`
+# dynamically links libevent, ncurses (no separate libtinfo on Arch), libutf8proc,
+# and jemalloc against the host system's ABI.
+pkgname=masil
+pkgver=__VERSION__
+pkgrel=1
+pkgdesc="tmux-compatible terminal workspace for running multiple AI coding agents side by side"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Ochichan/masil"
+license=('MIT' 'ISC' 'Apache-2.0')
+depends=('libevent' 'ncurses' 'libutf8proc' 'jemalloc')
+makedepends=('autoconf' 'automake' 'bison' 'm4' 'pkgconf' 'python' 'rust')
+source=("$pkgname-v$pkgver-source.tar.gz::https://github.com/Ochichan/masil/releases/download/v$pkgver/masil-v$pkgver-source.tar.gz")
+sha256sums=('__SHA_SOURCE__')
+
+prepare() {
+  cd "$srcdir/$pkgname-v$pkgver"
+  cargo fetch --locked --manifest-path agent/Cargo.toml
+}
+
+build() {
+  cd "$srcdir/$pkgname-v$pkgver"
+  local jobs
+  jobs="$(nproc)"
+  if (( jobs > 32 )); then jobs=32; fi
+  python3 scripts/build.py --jobs "$jobs"
+  CARGO_NET_OFFLINE=true python3 scripts/build.py --agent --jobs "$jobs"
+  python3 scripts/licenses.py --output THIRD-PARTY-LICENSES.txt
+}
+
+check() {
+  cd "$srcdir/$pkgname-v$pkgver"
+  ./bin/masil -V | grep -q '^tmux '
+  ./bin/masil-agent --version | grep -q "^masil-agent $pkgver"
+}
+
+package() {
+  cd "$srcdir/$pkgname-v$pkgver"
+  install -Dm755 bin/masil "$pkgdir/usr/bin/masil"
+  install -Dm755 bin/masil-agent "$pkgdir/usr/bin/masil-agent"
+
+  sed 's|@SYSCONFDIR@|/etc|g' core/tmux.1 > masil.1
+  install -Dm644 masil.1 "$pkgdir/usr/share/man/man1/masil.1"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  install -Dm644 THIRD-PARTY-LICENSES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES.txt"
+  install -Dm644 core/COPYING "$pkgdir/usr/share/licenses/$pkgname/core-COPYING"
+  install -Dm644 core/UPSTREAM.json "$pkgdir/usr/share/licenses/$pkgname/UPSTREAM.json"
+  install -Dm644 core/compat/yyjson/LICENSE "$pkgdir/usr/share/licenses/$pkgname/yyjson-LICENSE"
+  install -Dm644 agent/src/manifests/LICENSE "$pkgdir/usr/share/licenses/$pkgname/manifests-LICENSE"
+}
